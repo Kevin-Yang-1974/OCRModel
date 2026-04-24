@@ -1,0 +1,29 @@
+研究背景
+
+在数字化转型持续推进的背景下，人工智能正迅速进入文化遗产保护与利用领域，并逐渐成为推动数字遗产创新的重要技术力量。已有研究表明，人工智能已被广泛应用于文化遗产图像修复、对象识别、古文字转写、自动文本分析、沉浸式展示和文化内容生成等多个方向，不仅提升了文化资源整理与研究效率，也拓展了文化传播和公众参与的方式[1]。同时，文化遗产数字化的对象已不再局限于有形遗产，而是逐步覆盖非物质文化遗产及数字文化遗产，推动“保护—研究—传播”全过程的智能化发展[1]。
+
+对于非物质文化遗产而言，其知识体系往往历史跨度大、载体类型多、语义结构复杂，传统依赖人工整理与阐释的方式在规模、效率和传播范围上都存在明显局限。生成式人工智能、多模态建模和知识组织技术的发展，为非遗资源的数字化处理、语义理解和创新表达提供了新的可能。因此，围绕非遗保护开展人工智能研究，既顺应数字人文与智能技术交叉融合的趋势，也具有鲜明的现实需求。
+
+在相关研究中，敦煌文化遗产已成为人工智能赋能文化遗产保护的重要案例。Yu等提出“AI for Dunhuang”项目框架，将敦煌文化遗产保护问题拆分为数字复原、风格迁移、目标检测和属性检索等任务，并构建相应数据集开展基准研究[2]，说明人工智能已经能够为大规模文化遗产资源的处理、分析与利用提供方法支撑。与此同时，Sommerschield等关于古代语言机器学习的综述表明，机器学习已逐步形成覆盖古文献数字化、复原、归属、语言分析、翻译与破译等环节的方法链，为古文献释读与知识提取奠定了基础[3]。在文献图像处理方面，历史文献二值化与退化修复研究进一步指出，透墨、污损、褪色、弱笔画和背景噪声等问题会直接影响文本识别质量，而图像预处理、背景补偿、前景提取与后续识别之间具有紧密关联，因而高质量数字化并不只是单一识别问题，而是一个涵盖图像复原、文本释读、知识提取和生成式表达的连续处理过程。
+
+然而，现有研究虽然为“人工智能赋能文化遗产保护”奠定了基础，但从非遗保护的整体需求来看，仍存在若干不足。现有成果大多聚焦于图像修复、文本识别、知识建模或数字展示等单点任务，跨环节整合不足，尚未形成贯通“处理—理解—表达—传播”的智能化框架[1][5]。在古文献处理链上，已有研究较多关注识别本身，但对 OCR 后校正、文本质量优化和结构化整理关注不够，导致后续语义提取与知识应用的基础仍不稳固[3][6]。知识图谱和本体建模虽已被引入文化遗产与非遗研究，但相关成果多集中于特定案例或单一资源类型，图像、文本和知识之间的联动仍较有限，距离支撑综合性智能应用还有差距[7][8]。与此同时，生成式人工智能在文化表达与传播中的应用不断增强，但真实性、解释偏差和责任归属等伦理问题也更加突出，相关约束机制尚未充分嵌入技术流程[5]。
+
+更重要的是，非遗资源的智能化利用并不是若干独立技术的简单叠加，而需要形成前后衔接的处理链条。如果图像预处理与数字复原不足，文本识别的准确性就难以保证；如果文本识别与后校正不充分，语义提取与知识组织便缺乏稳定基础；如果知识结构未能有效建立，生成式表达与传播展示也容易停留在表层呈现，难以体现非遗资源的历史语境与文化内涵。因此，有必要在已有研究基础上，进一步探索面向敦煌文献等非遗资源的智能化处理框架，将图像预处理与数字复原、文本识别与后校正、语义提取与知识组织、生成式表达与传播展示有机衔接起来，并通过专家审校与来源标注机制保障结果的可信性与学术规范性。这样的研究不仅能够回应当前非遗保护中“数据多而利用不足、资源散而关联不强、展示新而知识支撑不足”的现实问题，也有助于推动生成式人工智能从单点应用走向面向非遗保护全过程的系统化实践。
+
+参考文献
+
+[1] Münster S, Maiwald F, di Lenardo I, et al. Artificial Intelligence for Digital Heritage Innovation: Setting up a R&D Agenda for Europe[J]. Heritage,2024,7:794-816. DOI:10.3390/heritage7020038.
+
+[2] Yu T, Lin C, Zhang S, et al. Artificial Intelligence for Dunhuang Cultural Heritage Protection: The Project and the Dataset[J]. International Journal of Computer Vision,2022,130:2646-2673. DOI:10.1007/s11263-022-01665-x.
+
+[3] Sommerschield T, Assael Y, Pavlopoulos J, et al. Machine Learning for Ancient Languages: A Survey[J]. Computational Linguistics,2023,49(3):703-747. DOI:10.1162/coli_a_00481.
+
+[4] Xiong W, Zhou L, Yue L, et al. An enhanced binarization framework for degraded historical document images[J]. EURASIP Journal on Image and Video Processing,2021,2021:13. DOI:10.1186/s13640-021-00556-4.
+
+[5] Tiribelli S, Pansoni S, Frontoni E, et al. Ethics of Artificial Intelligence for Cultural Heritage: Opportunities and Challenges[J]. IEEE Transactions on Technology and Society,2024,5(3):293-305. DOI:10.1109/TTS.2024.3432407.
+
+[6] Nguyen T T H, Jatowt A, Coustaty M, et al. Survey of Post-OCR Processing Approaches[J]. ACM Computing Surveys,2021,54(12):1-37. DOI:10.1145/3453476.
+
+[7] Liu F, Hindmarch J, Hess M. A Review of the Cultural Heritage Linked Open Data Ontologies and Models[C]. The International Archives of the Photogrammetry, Remote Sensing and Spatial Information Sciences,2023. DOI:10.5194/isprs-archives-XLVIII-M-2-2023-943-2023.
+
+[8] Yan L, Xie B, Tan W, et al. Ontology-based construction of embroidery intangible cultural heritage knowledge graph: A case study of Qingyang sachets[J]. PLoS ONE,2025,20(1): e0317447. DOI:10.1371/journal.pone.0317447.
