@@ -1,0 +1,1704 @@
+Citation: Gîrbacia, F. An Analysis of
+Research Trends for Using Artificial
+Intelligence in Cultural Heritage.
+Electronics 2024, 13, 3738.
+https://doi.org/10.3390/
+electronics13183738
+Academic Editor: Xenophon Zabulis
+Received: 16 August 2024
+Revised: 15 September 2024
+Accepted: 18 September 2024
+Published: 20 September 2024
+Copyright:
+© 2024 by the author.
+Licensee MDPI, Basel, Switzerland.
+This article is an open access article
+distributed
+under
+the
+terms
+and
+conditions of the Creative Commons
+Attribution (CC BY) license (https://
+creativecommons.org/licenses/by/
+4.0/).
+electronics
+Article
+An Analysis of Research Trends for Using Artificial Intelligence
+in Cultural Heritage
+Florin Gîrbacia
+Faculty of Mechanical Engineering, Transilvania University of Brasov, 29 Eroilor, 500036 Brasov, Romania;
+garbacia@unitbv.ro
+Abstract: Artificial intelligence (AI) techniques have been increasingly applied in assisting various
+cultural heritage (CH)-related tasks. The aim of this study is to examine the research trends and
+current applications of AI in this vast domain. After obtaining a dataset from the Web of Science
+and Scopus databases, a scientometric analysis of research publications from 2019 to 2023 related
+to the use of AI in CH was conducted. The trending topics based on the author’s keywords were
+identified by using the ScientoPy v2.1.3 software. Through this approach, five main topics were
+identified: classification, computer vision, 3D reconstruction, recommender systems, and intangible
+cultural heritage. The analysis highlights the upward trend in publications in this field since 2019,
+indicating a growing interest in the application of AI techniques in CH. By analyzing the latest
+research in the field, it is observed that AI techniques are mostly applied to assist CH in the discovery,
+description, classification, and preservation tasks. The report gives insights into the main research
+areas and developing trends in the field of artificial intelligence and machine learning. The study
+offers important information about the key research areas and emerging trends related to using
+AI techniques in the CH field. This helps to recognize the potential, development, and increasing
+influence of these technologies within the CH domain. The findings of this study contribute to
+the future development of AI applications in CH, enabling professionals to use the advantages of
+these technologies.
+Keywords: artificial intelligence; machine learning; cultural heritage; heritage science
+1. Introduction
+Artificial intelligence (AI) and its subfield machine learning (ML) techniques have
+been applied in various application fields, including cultural heritage (CH). Numerous
+AI applications have been developed for CH, such as automated historical document
+classification and knowledge extraction, automated 3D reconstruction, and identification
+of CH assets. These applications could be used to extract or generate information from
+a digitized CH object, manage digital heritage databases, or support the development of
+assisting tools for CH professionals.
+Recent literature reviews studied various aspects of using AI techniques in CH. Several
+studies have examined ML techniques for assessing heritage building health conditions [1],
+point cloud data acquisition and semantic segmentation algorithms for CH [2], and damage
+detection and structural health monitoring in masonry structures [3]. Neural networks
+(NNs) and deep learning (DL) techniques have demonstrated potential in archaeology,
+specifically in reconstruction, remote sensing, and collection management [4]. Emerging
+techniques like Neural Radiance Fields (NeRFs) have been identified as effective in creating
+detailed 3D models of CH assets, especially those with challenging characteristics for
+traditional photogrammetry [5]. AI and subfield ML/DL techniques have also been used
+to significantly improve the performance of image-restoration methods [6], extract choreo-
+graphic sequences from traditional dance [7], improve accessibility of museum and online
+CH content [8], and improve the management of archives [9]. Recently, ref. [10] explored
+Electronics 2024, 13, 3738. https://doi.org/10.3390/electronics13183738
+https://www.mdpi.com/journal/electronics
+
+
+Electronics 2024, 13, 3738
+2 of 24
+how AI can enhance visitor interactions with cultural assets, focusing on techniques and
+tool integration.
+In recent years, bibliometric analyses have been utilized often to determine the trends
+of research from publication [11], including in the intersection of AI and CH. For instance,
+the bibliometric analysis of AI and big data applications in CH and museum applications
+revealed that AI applications were peripheral to main keyword clusters, suggesting a
+need for further research [8]. Another study on Heritage Building Information Modeling
+(HBIM) shows a shift from conceptualization to multidisciplinary applications since 2017,
+with a recent focus on semiautomatic 3D modeling, heritage information systems, pilot
+studies, and virtual reality [12,13] identifies emerging trends in the field of relic tourism
+research by analyzing articles from the Web of Science database, with a particular focus
+on discovering key keywords and mapping out collaborative author networks within this
+scholarly literature.
+Previous review studies have explored the potential opportunities for specific AI
+techniques or CH applications. Still, no comprehensive study has reviewed the main
+research trends on this technological advancement within the CH domain. The present
+study contributes to the field of CH in a number of unique directions. First, the present
+study explores the main emerging research trends of AI in CH by conducting scientometric
+analyses of the documents published since 2019 that have not been previously conducted at
+this scale in this field. Scientometric analysis is a quantitative method used to study scien-
+tific literature and research activities. Scientometric tools use algorithms to identify trends
+and patterns within a specific search criterion, such as author keywords [14]. This method
+allows for the identification of key areas where AI is making an important impact in CH,
+which is important for understanding the direction of technological advancements. Second,
+by examining recent applications and case studies the proposed study presents trending AI
+techniques for CH tasks, including discovery, description, classification, and preservation.
+Third, the study identifies advantages and challenges when using AI for CH applications,
+emphasizing research directions that require additional exploration.
+2. Research Method
+The dataset for this scientometric analysis was obtained through a search conducted
+on Clarivate Web of Science (WoS) and Scopus databases in January 2024. The databases
+selected for this study are widely recognized for their extensive coverage of metadata about
+documents related to the analyzed research field, including computer science, engineering,
+and cultural heritage studies [15]. The criteria used to include bibliographic sources were
+conference papers, articles, reviews, proceedings papers, and articles in press, all of them
+being relevant to AI applications in CH and published between 2019 and 2023. Exclusion
+criteria were applied to book chapters, editorials, letters, publications not directly related to
+AI applications in CH, and duplicate entries across Scopus and WoS databases. To retrieve a
+relevant bibliographic dataset that is related to the application of AI within the CH domain,
+two search queries were designed: “Artificial AND intelligence AND (Cultur* AND Her-
+itage)” and “(Machine OR Deep) Learning AND (Cultur* AND Heritage)”. These queries
+were designed to capture a broad range of AI applications while maintaining specificity to
+cultural heritage contexts. During the query design process, I used OpenAI ChatGPT-4.0
+(https://chat.openai.com/) to assist me with refining the queries. The timeframe chosen
+was limited to the period from 2019 to 2023 because that period covers the most recent
+developments in the applications of AI in the CH domain and provides sufficient data for
+trend analysis. The search was conducted without language restrictions to ensure a global
+perspective. But, due to the nature of the WoS and Scopus databases, the bibliographic
+dataset contains mostly English language publications. A substantial number of docu-
+ments were retrieved after conducting a search using the chosen queries in both databases.
+The WoS database returned a total of 1323 documents that matched the specified search
+criteria. Similarly, the Scopus database returned 1269 documents relevant to the study’s
+focus. In the next step, the retrieved datasets were compiled and preprocessed into a single
+
+
+Electronics 2024, 13, 3738
+3 of 24
+dataset for further analysis using ScientoPy v2.1.3 scientometric tool [14]. ScientoPy v2.1.3
+is an open-source Python-based scientometric tool that merges data from different sources,
+performs temporal scientometric analysis for authors, institutions, and trending topics, and
+offers various visualization options for studies in emerging fields [14]. The preprocessing
+process includes title and author’s name normalization to exclude inconsistencies between
+WoS and Scopus, publication type filtering, and automatic duplicate removal based on
+DOI, publication normalized title, and first author’s last name. After merging datasets
+from the WoS and Scopus databases, and preprocessing the bibliographic sources, a total of
+1702 unique entities were identified.
+3. Emerging Research Trends of Artificial Intelligence in Cultural Heritage
+Analysis of authors’ keywords can provide valuable insights into research trends.
+In the next step, a scientometric analysis was conducted on the retrieved bibliographic
+dataset to determine the most frequently occurring keywords used by the authors in their
+publications and identify the emerging topics. ScientoPy v2.1.3 utilizes three separate
+topic growth indicators to determine emerging trends and their associated relative and
+absolute growth: Average Growth Rate (AGR), Average Documents Per Year (ADY), and
+Percentage of Documents in the Last Years (PDLY). The author’s keywords were ranked
+based on the number of documents and AGR to identify prominent trends from the dataset
+(see Figure 1). Table 1 presents the ScientoPy v2.1.3 indices for the five identified trends:
+AGR, ADY, PDLY, and h-index of each topic [14,16,17]. Analysis has revealed five important
+trends: (1) classification; (2) computer vision; (3) 3D reconstruction; (4) intangible cultural
+heritage and (5) recommender systems.
+Figure 1. Evolution of top trending topics generated from the author’s keyword using ScientoPy v2.1.3.
+The graph from Figure 1 illustrates the constant increase in interest for the selected
+trending topics from 2022 to 2023. The right-hand diagram from Figure 1 outlines the
+Annual Growth Rate (AGR) of each topic on the vertical axis, indicating the year-over-year
+change between 2022 and 2023. The horizontal axis represents the number of published
+documents related to each topic in the previous year (PDLY), showcasing the recent popu-
+larity of the topics. The most popular trending topic, based on the number of documents,
+is “Classification”. The trend that is growing at the quickest pace is “Intangible cultural
+heritage”. A more in-depth analysis is provided for these five trends, referencing the most
+relevant and highly cited articles relating to each topic. The knowledge graph represen-
+tations used to explore the intersection between AI and CH for these five trends were
+generated using InstaGraph v1.0 online software (https://instagraph.ai).
+
+
+Electronics 2024, 13, 3738
+4 of 24
+Table 1. ScientoPy v2.1.3 trend indices of selected topics.
+Pos
+Author Keywords
+Total
+AGR
+ADY
+PDLY
+h-Index
+1
+Classification
+124
+7.5
+32.5
+52.4
+19
+2
+Computer vision
+100
+3.5
+24.5
+49.0
+14
+3
+3D Reconstruction
+81
+6.0
+18.5
+45.7
+15
+4
+Intangible Cultural
+Heritage
+32
+4.0
+10.5
+65.6
+4
+5
+Recommender
+systems
+16
+−1.0
+2.0
+25.0
+3
+3.1. Classification
+The “Classification” topic leads, with an AGR of 7.5 publications in 2022–2023 and
+124 documents. Classification is an important task within the digitalization of CH assets.
+Many examples of ML classification applications have already been developed in the
+field of CH management and preservation. These include the automatic organization and
+cataloging of cultural heritage objects, such as paintings, sculptures, manuscripts, and
+archaeological artifacts. ML techniques have also been employed to monitor the condition
+of these objects, detecting changes or deterioration over time. Additionally, ML has enabled
+the 3D reconstruction and preservation of intangible cultural heritage, allowing for more
+comprehensive documentation and analysis of these CH assets (see Figure 2).
+Figure 2. Knowledge graph representation of research trends in the classification of CH.
+Substantial amounts of CH data exist in the form of images, text documents, and
+artifacts. Classification models can automatically categorize these items based on various
+criteria, like object type, artistic style, historical period, and provenance. The application
+of Convolutional Neural Networks (CNNs) for classifying CH images has demonstrated
+good results across various studies. Ref. [18] demonstrated the effectiveness of CNN in
+classifying CH images into ten categories with up to 90% accuracy. Abed et al. [19] applied
+pre-trained CNN models, achieving high accuracies in classifying architectural heritage
+images. Rehman et al. [20] introduce a novel approach using CNNs and data augmentation
+for classifying augmented CH images, demonstrating superior performance metrics over
+traditional models. The Convolutional Neural Network Attention Retrieval Framework
+(CNNAR Framework) was utilized for the classification and retrieval of diaspora Chinese
+architectural heritage images in Jiangmen, China, achieving a classification accuracy of
+98.3% and a mean Average Precision (mAP) of 76.6% on heritage image datasets [21].
+
+
+Electronics 2024, 13, 3738
+5 of 24
+This framework incorporates transfer learning and a fusion attention mechanism for en-
+hanced feature extraction. Other ML techniques for classifying CH heritage images have
+shown promising results. Wang et al. [22] introduced Tk-SENet, a fine-grained classification
+method for Thangka images, incorporating spatial and channel attention mechanisms to
+significantly improve classification accuracy. Ref. [23] employs a Self-Organizing Map
+(SOM) on an Artificial Neural Network (ANN) for classifying Javanese batik motifs, with a
+notable accuracy increase when combining multiple feature-extraction algorithms. The en-
+semble classification technique proposed by Prasomphan [24] focuses on distinguishing
+Thai architectural styles in CH images through ML and image processing, achieving an
+average accuracy of 80.83%. Meanwhile, the development of an AI model based on the
+LeNet architecture for classifying wayang images reported an accuracy range of 80% to 85%
+on 2515 Punakawan wayang images, indicating its potential for cultural preservation [25].
+The application of ML techniques has demonstrated promising results in the recogni-
+tion and classification of patterns within historical documents and handwritten materials.
+Two studies by Barucci et al. [26,27] explore the application of CNN in the classification and seg-
+mentation of ancient Egyptian hieroglyphs. In ref. [26], three CNN architectures—ResNet-50,
+Inception-v3, Xception—were evaluated alongside a custom-designed CNN named Glyphnet
+for hieroglyph classification. Glyphnet demonstrated superior classification performance
+over the other CNN models. The latest study [27] extended this work by incorporating
+Mask-RCNN for glyph segmentation and reaffirmed Glyphnet’s enhanced performance and
+computational efficiency in both classifying and segmenting hieroglyphs, presenting the po-
+tential of DL in Egyptology. Fidatama et al. [28] utilized the Local Binary Pattern (LBP) feature
+extraction and K-Nearest Neighbour (K-NN) classification to achieve an 86.056% accuracy
+in recognizing handwritten Bima script patterns. Mustiari et al. [29] applied the Histogram
+of Oriented Gradients (HOG) feature-extraction and backpropagation classification method,
+achieving high accuracy (97.70%), precision (97.72%), and recall (97.65%) rates, in recognizing
+the handwriting pattern of the Bima script.
+Classification techniques have shown high accuracy in identifying and categorizing
+fragments of ceramics and frescoes. Ref. [30] demonstrates the effectiveness of a retrained
+Residual Neural Network (ResNet) in the automatic feature extraction and classification
+of Iberian wheel-made pottery vessels. Utilizing transfer learning on a binary image
+database, the model achieved a mean accuracy and f-measure of 0.96, showcasing superior
+performance over traditional ML approaches in archaeology. Cascone et al. [31] explored
+the application of machine and deep learning techniques for classifying fresco fragments
+within the DAFNE dataset. This study presents the potential of these methods in handling
+binary and multi-class classification tasks, particularly in the context of reconstructing
+destroyed frescoes, by addressing challenges like irregular shapes and color alterations.
+Classification of architectural styles and buildings shows improved accuracy and
+efficient data management. Obeso et al. [32] explores a saliency-driven method for training
+CNNs in architectural style classification.
+Ref. [33] introduces HierarchyNet, a hierarchical CNN model that outperforms tra-
+ditional CNNs in urban building classification by employing a coarse-to-fine hierarchy
+and a novel multiplicative layer. Recent studies have explored ML techniques for damage
+identification and classification in structural health monitoring (SHM). Marafini et al. [34]
+introduce a classification scheme for ML vibration-based damage identification methods
+in SHM, emphasizing pre-processing and post-processing, feature extraction, and pattern
+recognition. Mehta et al. [35] demonstrate the effectiveness of CNN and Support Vector
+Machines (SVM) in classifying damage severity in heritage buildings, with CNN slightly
+outperforming SVM. Ref. [36] presents a DL-based system’s success in classifying sur-
+face damages on wooden architectural heritage, achieving high damage-detection rates.
+Roy et al. [37] discuss a hybrid CNN-SVM method for classifying defective paint inten-
+sity levels in heritage buildings, showcasing high recognition accuracies and precision
+values. Ref. [38] employs a Region-Based CNN within a Building Information Modeling
+(BIM) methodology for automating the recognition and classification of defects in historical
+
+
+Electronics 2024, 13, 3738
+6 of 24
+buildings. These techniques facilitate automated and real-time damage assessment, po-
+tentially transforming heritage building management and preservation by enabling better
+monitoring [36,38].
+The adoption of ML for classifying statues enables the acquisition of more accurate
+and detailed information. Fu et al. [39] explores an improved PointNet network for the au-
+tomatic classification of grotto temple statues, achieving an overall accuracy improvement
+of 89.73% over the random forest classification method.
+The ML techniques for the classification of 3D digital heritage data were successfully
+applied in several studies. The Random Forest algorithm was used for semantic classi-
+fication for the 3D reconstruction of the Temple of Hera, demonstrating its effectiveness
+in classifying point clouds generated by UAV photogrammetry and GNSS survey [40].
+Another study highlighted the use of both supervised and unsupervised ML strategies for
+classifying 3D digital heritage data, validating the approach on archaeological/architectural
+scenarios for restoration and documentation purposes [41]. The development of semi-
+automatic 2D/3D data annotation methods on the Aïoli platform using DL techniques
+provided efficient and accurate classification tools, marking a significant advancement in
+the annotation of architectural objects [42].
+ML techniques can be used to classify and analyze ICH, specifically in dance styles
+and music. The Convolutional Neural Network-Long Short-Term Memory (CNN-LSTM)
+architecture shows good effectiveness in classifying Indian classical dance poses and hand
+mudras, achieving high accuracy, precision, recall, Area Under the Curve (AUC) score,
+and F1 score in both testing and training phases [43,44]. Another study utilized a hybrid
+CNN-Recurrent Neural Network (CNN-RNN) approach for classifying Indian dance styles,
+demonstrating superior accuracy compared to traditional methods [45]. These hybrid CNN-
+RNN and CNN-LSTM networks effectively capture both spatial and temporal features,
+showcasing their potential to preserve and manage ICH data [45,46]. Additionally, the
+Covariance Graph Convolutional Network (CoGCNet) model was applied to Cantonese
+opera singing genre classification, outperforming common neural network models with
+high precision (95.69%), recall (95.58%), and F1 value (95.60%) [46]. ML classification offers
+innovative digital solutions for accurate classification, preservation, and provides new
+insights into ICH studies.
+These studies present the effectiveness of ML techniques in the classification and
+retrieval of CH images, demonstrating their potential for aiding in the preservation and
+understanding of cultural artifacts. But, limitations exist, such as challenges in handling
+complex or diverse CH assets shapes, which could decrease the effectiveness of ML in
+certain contexts. Also, extensive datasets are needed for training, and specialized hardware
+is needed for the implementation of these technologies in the field. For the reader’s
+convenience, Table 2 presents a concise overview of several case studies exploring the use
+of AI in the classification of CH assets.
+Table 2. Case studies exploring the use of AI in the classification of CH assets.
+Reference
+Brief Summary of the Method
+Data
+Key Findings
+Challenges
+[21]
+Enhance the classification and retrieval
+of diaspora Chinese architectural
+images in Jiangmen, utilizing a
+Convolutional Neural Network with
+an Attention Mechanism
+(CNNAR Framework)
+5073 images of diaspora
+Chinese buildings,
+auxiliary datasets from
+JMI architectural heritage
+images, Paris500K
+and Corel5K
+CNNAR model achieved a
+mean average precision of
+76.6% and high
+classification accuracy of
+98.3% in JMI datasets
+Managing variations in
+lighting; occlusions;
+redundancy; and complex
+feature extraction across
+architectural styles
+[26]
+Developing a custom architecture
+called Glyphnet to classify ancient
+Egyptian hieroglyphs
+Two labeled datasets
+comprising over 4000
+images of hieroglyphs
+Glyphnet outperformed
+existing CNN models
+(ResNet-50, Inception-v3,
+Xception) in accuracy and
+computational efficiency
+Historical complexity of
+hieroglyphs; effective
+methods for semi-
+automated recognition
+
+
+Electronics 2024, 13, 3738
+7 of 24
+Table 2. Cont.
+Reference
+Brief Summary of the Method
+Data
+Key Findings
+Challenges
+[30]
+Classification of Iberian ceramics using
+automated methods, including transfer
+learning with ResNet-18 and various
+classifiers to optimize
+feature extraction
+1282 labeled images of
+ceramic vessels
+The study achieved high
+accuracy, improving
+classification flexibility
+and accuracy
+Variability among image
+quality of pottery vessels,
+limited sample sizes
+affecting model training;
+managing overfitting
+[39]
+Explore an improved PointNet
+network for the automatic
+classification of grotto temple statues
+3D point cloud data from
+the Eighteen Grottoes of
+Yungang, captured with
+3D laser scanners
+Achieved overall
+classification accuracy of
+89.73%, outperforming
+random forest classifiers
+Managing irregular statue
+positions; rough edge
+detail resolution
+[41]
+Using of both supervised and
+unsupervised ML strategies for
+semi-automatic classification of digital
+heritage on the Aïoli platform.
+Digital models from
+photogrammetric surveys
+and 2D/3D datasets
+Improvements in
+classification accuracy and
+the successful transfer of
+annotations across formats
+Difficulties with aligning
+2D images with 3D point
+clouds; managing
+extensive datasets
+3.2. Computer Vision
+The second trending topic is Computer vision (CV), with an AGR of 3.4 publications
+in 2022–2023, and 100 documents. Aspects of CH that can benefit from CV and AI tech-
+niques include preservation, accessibility, documentation, analysis, documentation, and
+engagement with CH assets. CV and ML techniques enable historians to better understand
+visual arts by performing unsupervised feature extraction and knowledge discovery in
+digital painting datasets [47–49]. Object-detection DL algorithms can be used to localize
+and detect damage in images of complex heritage structures [50] reconstruction of façade
+buildings [51], tracking and analyzing visitor behavior at archaeological heritage sites [52]
+or museum [53], effective segmentation of mosaic images [54] and processing historical
+photographs and film footage [55] (see Figure 3).
+Figure 3. Knowledge graph representation used to explore the intersection of CV and AI in CH.
+AI/ML models can be trained to recognize particular damage types, including erosion,
+cracks, or color changes, which makes early identification and preventive conservation
+measures possible. YOLOv4 has been applied to identify various types of damage to
+historical buildings, demonstrating the model’s capability to enhance quality judgment
+and evaluation of heritage assets [56]. CNNs and SVMs have been effectively used for au-
+
+
+Electronics 2024, 13, 3738
+8 of 24
+tomated damage severity classification in heritage buildings, showing high accuracy levels
+in identifying damage under real-world conditions [35]. CNNs were found to slightly out-
+perform SVMs in classifying damage severity levels on a dataset of 4500 images. The study
+demonstrated that both models were effective, with CNN achieving a 98% accuracy rate in
+damage severity evaluation. EfficientNetB0, EfficientNetB2, ShuffleNet_v2, and AlexNet
+models were employed to detect minute inclinations and roof tilts in immovable cultural
+assets, with EfficientNet models achieving the highest prediction accuracies [57].
+Ref. [58] introduces an automatic damage-detection system utilizing the Faster R-CNN
+algorithm to identify four types of damages in stone cultural properties, achieving a high
+94.6% confidence score and employing image augmentation for improved performance.
+Li et al. [59] explore the use of a Generator-Discriminator Network for the digital
+restoration of damaged murals, focusing on enhancing texture, color, and structural conti-
+nuity. This method shows important improvements in Peak Signal-to-Noise Ratio (PSNR)
+and Structural Similarity Index (SSIM) values, indicating better restoration quality.
+Generative Adversarial Networks (GAN), specifically through a modified U-Net archi-
+tecture, offers an approach for the virtual restoration of artworks without mask generation,
+simplifying the restoration process [60]. These technologies present limitations, mainly
+related to the need for extensive validation, concerns about scalability, and the dependency
+on high-quality datasets for training, increased training data and parameter adjustments,
+and the need for improved accuracy in detecting small or unclear damaged areas.
+In the field of archeology, CV and AI/ML techniques can be used for the interpretation
+and analysis of data. These advanced tools can assist in classifying and recognizing artifacts,
+mapping site layouts, and reconstructing historical environments. Machine learning-based
+methods have proven effective in predictive modeling and in overcoming data constraints,
+thereby improving data reliability for archaeological predictive modeling [61]. In ref. [61],
+the Random Forest (RF) algorithm was effectively used to predict Roman site locations
+in Zurich, Switzerland, by analyzing geo-environmental features and demonstrating the
+algorithm’s capability to handle data challenges. Automated potsherd detection employed
+high-resolution drone imagery was combined with ML, offering a cost-effective and de-
+tailed method for archaeological surveys [62]. Ref. [63] study a hybrid integration approach
+combining a conditional attention mechanism (AM) with a frequency ratio (FR) model and
+the MaxEnt method is developed. This AM_FR approach demonstrated superior perfor-
+mance in predicting archaeological site locations in Japan and Shaanxi, China, by effectively
+capturing environmental factors highly correlated with site locations. Additionally, ref. [64]
+presents the use of CNN, in detecting archaeological remains through aerial, satellite, and
+LiDAR imagery. In a different application, DL has been employed as a surrogate for X-ray
+fluorescence (XRF) to estimate the elemental composition of archaeological artifacts, specifi-
+cally targeting iron and copper objects. This non-invasive, radiation-free, and cost-effective
+DL regression model analyzes stereo microscopy images of artifacts to approximate metal
+concentrations, offering a promising alternative to traditional XRF methods for elemental
+analysis before artifact restoration [65]. These approaches demonstrate the potential of these
+techniques to enhance efficiency, accuracy, and detail in archaeological surveys, overcoming
+traditional limitations. Still, challenges like the need for high-resolution data, necessity for
+ground-truthing to confirm findings and limitations to independently interpret complex
+archaeological contexts.
+Generative Adversarial Networks (GANs) have been effectively applied in artwork
+restoration, utilizing a modified U-Net architecture for the generator and pre-trained resid-
+ual networks for the encoder, demonstrating superior performance [60]. A heuristic-based
+framework has been proposed for generating training data for Named Entity Recognition
+(NER) of artwork titles, significantly improving NER performance [66]. Spatiotemporal
+Deep Neural Networks (STDNNs) have been used for defect identification in artworks
+through infrared thermography, achieving outstanding performance with a high mean
+F1 score [67]. DL algorithms have been applied to detect physical damages on artwork
+
+
+Electronics 2024, 13, 3738
+9 of 24
+surfaces, employing specific activation maps for identifying deteriorations such as cracks,
+blisters, and detachments [68].
+Computer vision and AI techniques are used in Historical Document Processing (HDP)
+mainly to digitize, reconstruct, and analyze ancient historical documents. Techniques
+include the use of Gaussian filters for handwritten text segmentation in Arabic documents,
+demonstrating superior segmentation capabilities [69]. Convolutional Recurrent Neural
+Networks (CRNNs) have been applied for automatic handwriting recognition, achieving a
+Character Error Rate (CER) below 10% with minimal training data [70]. SVM classifiers
+facilitate text line identification in layout analysis, enhancing text recognition accuracy
+without the need for text alignment correction [71]. Additionally, Graph Neural Networks
+(GNNs) offer innovative approaches for reconstructing ancient documents by classifying
+spatial relationships between document fragments, enabling partial or full document
+reconstruction [72]. Babi et al. demonstrated the use of an ensemble of CNN models,
+specifically leveraging the Inception-ResNet-v2 architecture, to achieve high accuracy in
+writer identification from historical documents [73]. Unsupervised methods for lower-
+baseline localization based on writing style features have outperformed traditional methods
+in historical document analysis [74]. Zero-shot restoration techniques, particularly using
+Denoising Diffusion Restoration Models (DDRM) for ancient document restoration, have
+been evaluated for their effectiveness in inpainting missing characters [75]. Also, the
+Transkribus platform employs machine learning-based neural networks for automated
+transcription and keyword spotting, demonstrating the practical application of AI in
+making historical documents accessible [76]. These approaches can enhance accuracy in text
+segmentation, writer identification, document restoration, and transcription. Limitations of
+the approach include challenges in handling diverse document styles and a dependency
+on the availability, quality of the training data and the need for labeled data, and the
+adaptation to diverse historical document characteristics [70].
+CV techniques can be used to create comprehensive digital archives enabling efficient
+cataloging and management. Jaillant et al. [77] emphasized the role of ML in automating
+tasks and improving access to digital archives, particularly through sensitivity review
+and intelligent searching. Tzouganatou [78] focuses on a human-centered approach to
+AI development for democratizing access to digital archives, presenting the importance
+of balancing openness with privacy. These approaches contribute to the accessibility of
+digital archives. But challenges like bias, misrepresentation, and ethical concerns persist,
+necessitating a framework of AI governance informed by ethical principles.
+Another application of CV and AI techniques is related to the field of textile cultural
+heritage for the classification and preservation of traditional textile patterns. Schleider
+et al. propose a zero-shot learning technique that uses a knowledge base called ConceptNet
+to predict categorical metadata for silk textiles. This method demonstrates competitive
+performance without requiring training data, offering a promising solution for textile clas-
+sification [79]. Ref. [80] explores the application of a U-Net architecture with the perceptual
+loss for the semantic inpainting of traditional Romanian vests, addressing the challenges
+of degradation and restoration of traditional clothing. The findings demonstrated the
+potential of the proposed model to enhance fidelity in the restoration of traditional clothing,
+achieving low numerical error. AI-powered analysis of scanning electron microscopy (SEM)
+imagery analysis was used to assess the impact of washing historic textiles, revealing
+structural changes in the textiles [81]. Liu and Binbin [82] employed a conditional GAN
+model for the design of Chinese traditional textile patterns, successfully generating new
+patterns with traditional features. These studies demonstrate the potential of AI in pre-
+serving and innovating within the textile cultural heritage sector. But, these approaches
+present limitations, including the need for quality improvement in generated patterns
+and challenges in addressing heterogeneity in metadata representation. For the reader’s
+convenience, Table 3 presents summarize several case studies exploring the use of CV and
+AI for CH applications.
+
+
+Electronics 2024, 13, 3738
+10 of 24
+Table 3. Case studies exploring the use of CV and AI for CH applications.
+Reference
+Brief Summary of the Method
+Data
+Key Findings
+Challenges
+[56]
+Identification of damage types in
+Chinese gray-brick ancient
+buildings within the Macau World
+Heritage Buffer Zone using the
+YOLOv4 ML model
+1000 labeled images
+covering five specific
+damaged gray bricks
+Detected damage with
+85.7% accuracy, but
+misidentified some
+stains as missing bricks
+and struggled with low-
+contrast conditions.
+Limited training data,
+ambiguity in labeling,
+and the effects of
+environmental
+conditions on
+detection accuracy
+[59]
+Restore non-structurally damaged
+murals in Bao’an District using a
+Generator-Discriminator Network
+(GAN) approach, focusing on
+enhancing texture, color, and
+structural continuity
+137 murals images for
+training and
+22 damaged murals for
+restoration from
+Shenzhen Bao’
+Improvements in
+restoration quality,
+achieving an average
+Peak Signal-to-Noise
+Ratio of 34.36 and a
+Structural Similarity
+Index Measure of 0.91
+Predicting missing
+details; managing
+noise; preserving
+original details
+during reconstruction
+[61]
+Assess the spatial probability of
+Roman settlements in the Canton
+of Zurich using the Random Forest
+(RF) algorithm for archaeological
+predictive modeling
+227 occurrences of
+Roman settlements,
+extracted from a larger
+collection of
+5812 entries, and
+incorporated geo-
+environmental factors
+Findings indicated an
+Area Under the Curve
+(AUC) of 0.72, with
+significant correlations
+between agricultural
+suitability and
+site locations
+Data quality issues; the
+need for spatial
+resolution
+standardization
+[70]
+Develop AI-assisted digitization of
+historical documents by
+improving automatic handwriting
+recognition through transfer
+learning and
+fine-tuning techniques
+IAM dataset for
+pre-training; various
+historical datasets
+including Saint Gall,
+Parzival, Washington,
+and
+Specchieri Marigold
+Achieving a Character
+Error Rate of less than
+10% is feasible with
+sufficient
+training samples
+Noise from text
+deterioration; limited
+access to extensive
+labeled data
+[75]
+Restore ancient documents using a
+zero-shot approach with the
+Denoising Diffusion Restoration
+Model (DDRM), and
+noise masking
+Kuzushi-ji dataset
+consists of 4328 classes
+and 1,086,236 Japanese
+ancient characters
+Effective restoration
+without retraining;
+PSNR scores indicating
+performance improve-
+ments
+Dependency on
+pre-trained models;
+handling
+various degradations
+3.3. 3D Reconstruction
+Integration of AI and ML techniques has transformed the reconstruction of 3D models
+of CH objects and sites. By combining these techniques and CV algorithms is possible to
+acquire accurate features and geometries of CH assets that facilitate analysis, monitoring,
+recognition, and documentation of these cultural resources (see Figure 4). This topic is one
+of the applications of AI that has undergone a steady growth in last five year (81 documents
+and AGR = 6 in 2022–2023).
+One of the most popular techniques for 3D reconstruction of CH artifacts is pho-
+togrammetry. Using AI techniques in photogrammetry enables the automation of data
+generation, which reduces manual labor and enhances the applicability of DL in digital
+heritage activities [83]. Ref. [83] discusses the fusion of real and synthetic datasets to
+optimize DL performance in CH photogrammetry, highlighting the importance of dataset
+balance. In [55], photogrammetry and AI are integrated to enhance methods for finding
+architectural heritage assets in video content and to lessen the time and effort required for
+an operator to manually review them in the archive. These techniques also enable augmen-
+tation of source image datasets, improving visualization, creating immersive experiences,
+and increasing accessibility to heritage sites. Condorelli [84] utilizes prompt-to-image AI
+systems for image dataset extension, enabling 3D modeling of historical sites from limited
+sources. Mask R-CNN DL networks have proven effective in improving the efficiency and
+accuracy of photogrammetric modeling, as evidenced by high recall rates in background
+
+
+Electronics 2024, 13, 3738
+11 of 24
+triangles simplification of 3D models [85]. The effectiveness of these methods depends
+on the identification of proper geometric and radiometric features and the challenges of
+noise reduction [86,87]. Also, was observed a reduced efficiency when applied to large
+models [85].
+Figure 4. Knowledge graph representation of research trends in 3D reconstruction of CH.
+In CH applications, point clouds obtained from various scans or sensors can be auto-
+matically processed using AI algorithms to filter out noise, segment, classify, register, and
+align multiple point cloud datasets of cultural heritage objects and sites. The quality and
+accuracy of the 3D reconstruction can be increased by using ML techniques to denoise point
+clouds and eliminate outliers. Gujski et al. [87] utilized unsupervised learning algorithms
+Self-Organizing Map (SOM) and K-means algorithms to filter noise and enhance 3D model
+definitions from UAV image-generated point clouds, identifying the angle of intersection
+between homologous points as a critical factor. The AI techniques can also improve the
+efficiency and accuracy of CH point cloud segmentation [88,89]. Yang et al. discuss a broad
+spectrum of algorithms including region growing, model fitting, unsupervised clustering,
+supervised ML, and DL [2]. Cao et al. compare ML methods, specifically the Random
+Forest classifier, with DL approaches like Dynamic Graph Convolutional Neural Networks
+(DGCNN), demonstrating their efficiency in semantic segmentation of architectural cultural
+heritage point clouds [90]. Additionally, ref. [8] presents an overview of traditional meth-
+ods, ML, and DL for point cloud segmentation, highlighting the importance of evaluation
+metrics, public datasets, and post-segmentation applications in CH preservation.
+Pellis et al. introduced a dataset for semantic segmentation of heritage buildings to fa-
+cilitate the comparison of point-based and multiview-based approaches, aiming to simplify
+the creation of geometrical and informative models [91]. Furthermore, a study from the
+same research group [88] proposed a workflow using a multi-view approach for automatic
+semantic segmentation of 3D point clouds, showing promising performance in image
+segmentation and potential in 3D reconstruction. Musicco et al. [92] employed color-based
+segmentation with hierarchical clustering in the HSV color-space and geometry-based
+segmentation to analyze decay morphologies, demonstrating the effectiveness of AI tech-
+niques in identifying alterations in historical buildings. Malinverni et al. apply PointNet++
+for automatic labeling and clustering of point cloud elements, showcasing its effectiveness
+in 3D point cloud classification and segmentation [93]. More recently, Haznedar et al. [94]
+discussed the implementation of PointNet, emphasizing the importance of training with
+restitution-based heritage data for improved accuracy in segmenting heritage buildings.
+Cao et al. developed a label-efficient DL network, 3DLEB-Net, for semantic segmentation
+
+
+Electronics 2024, 13, 3738
+12 of 24
+of building point clouds with limited supervision, achieving state-of-the-art results on
+the ArCH dataset with only 10% of labeled training data [89]. Ref. [95] employs SVD for
+boundary plane detection and mesh segmentation, achieving high accuracy without mesh
+conversion, indicating its potential for Scan-to-BIM applications in cultural heritage.
+These methods show promise in enhancing the detection of alterations and deteri-
+oration morphologies on historical buildings, thereby aiding in their conservation [92],
+handling complex geometries and diverse architectural styles, and improving accuracy and
+efficiency in segmenting elements [92,95,96]. Limitations involve the challenges in apply-
+ing these methods effectively across the diverse and complex nature of cultural heritage
+objects, lack of dedicated benchmarks for heritage buildings, handling of deformation and
+deterioration in heritage buildings, where methods like PointNet require extensive training
+to achieve high accuracy.
+Multiple point cloud datasets can be automatically registered and aligned using AI
+algorithms, allowing for the integration of data from different sources and the development
+of complete 3D models. Recently, ref. [97] introduced the Fast Adaptive Multimodal Feature
+Registration (FAMFR) workflow, which uses handcrafted color and shape features for high-
+resolution point cloud registration. The proposed approach outperforms other methods by
+at least 35% in accuracy, showcasing its efficacy in handling intricate geometric and decora-
+tive surfaces. Additionally, DL allows for handling complex geometries, as demonstrated
+by the DeepGMR network’s application in cross-time registration [98]. But, limitations may
+arise from the need for specialized methods and datasets, to evaluate performance effec-
+tively [98]. The application of AI techniques in the analysis of 3D reconstruction includes
+the ability to accurately classify 3D point clouds in cultural heritage applications [86,99],
+enhance architectural modeling through techniques such as depth image estimation, spher-
+ical projection mapping, and 3D adversarial generation networks [100]. Additionally, the
+integration of SVD algorithm allows automation and high accuracy in detecting elements
+in complex scenarios, such as heavily ruined monuments [95]. The effectiveness of these
+methods depends on the identification of proper geometric and radiometric features and
+the challenges of noise reduction. A summary of several case studies is presented for the
+convenience of the reader in Table 4.
+Table 4. Case studies exploring the use of AI for 3D reconstruction.
+Reference
+Brief Summary of the Method
+Data
+Key Findings
+Challenges
+[92]
+Automate point cloud segmentation
+for detecting alterations in historical
+buildings using erarchical clustering in
+the HSV color space and RANSAC for
+shape identification
+Point clouds from
+photogrammetric data of
+three architectural
+case studies
+Effectiveness of HSV for
+segmentation, achieving
+accurate classifications of
+surface conditions
+Adapting algorithms for
+diverse architectural
+features; accurate
+clustering; capturing
+complex masonry
+surface pathologies
+[94]
+Segment historical structures from 3D
+point cloud data using PointNet
+Point clouds from heritage
+buildings in Gaziantep,
+comprising 19 buildings
+and 140 rooms
+Improved segmentation
+accuracy, achieving up to
+91.20% when restitution
+data was included
+High-quality data labeling;
+management of deformed
+building elements
+[95]
+Improve stone-level segmentation of
+the Apollo Temple’s point cloud using
+Singular Value Decomposition (SVD)
+for structural analysis and minimal
+user intervention.
+Point cloud data from
+Terrestrial Laser Scanning
+(TLS) and UAVs
+Enables segmentation
+without prior shape
+knowledge, 92% accuracy
+in identifying joints in
+multi-slab columns
+Accurate boundary
+detection; local
+geometry reconstruction
+[97]
+Development of the Fast Adaptive
+Multimodal Feature Registration
+(FAMFR) workflow for effective
+registration of high-resolution point
+clouds in cultural heritage interiors
+Point clouds from 3D
+scanners,
+photogrammetry, and
+LiDAR from complex
+decorative surfaces at the
+Museum of King Jan
+III’s Palace
+FAMFR significantly
+improve registration
+accuracy, showcasing its
+efficacy in handling
+intricate geometric and
+decorative surfaces
+Complex alignment of
+multiple point clouds;
+noise from
+reflective surfaces
+
+
+Electronics 2024, 13, 3738
+13 of 24
+3.4. Intangible Cultural Heritage
+Intangible cultural heritage (ICH) is a significant resource to every community [101].
+This is a trending topic that rise in the last year, AGR = 4.0 in 2022–2023. One of the
+important threats to ICH is related to globalization, climatic change, urbanization, and
+technology, mainly because of the increasing pace of modern civilization. Digitization
+techniques have opened new possibilities for the preservation, analysis, and dissemination
+of ICH (see Figure 5).
+Figure 5. Knowledge graph representation of top research trends in ICH.
+Rallis et al. [7] demonstrated the importance of using ML technologies for preserving,
+understanding, and analyzing dance-related ICH content. The study explored the chal-
+lenges associated with the dynamic and multifaceted nature of choreographic patterns
+and dance movements. The authors also outlined the potential of recent ML technological
+advancements in addressing these challenges effectively. In [102] traditional Greek dance
+choreographies postures are classified using CNN. The developed AI module can also
+be used for evaluating the performance of learners of traditional Greek dance. Ref. [103]
+explores how traditional games, such as the Mediterranean game of Mùrra, can be digitized
+and leveraged using technology to preserve cultural heritage and facilitate cross-cultural
+exchange and learning. Understanding and managing the semantic content of ICH re-
+sources can be aided by ML. Fugini et al. [104] introduces a framework named MAGIS
+(Multimedia Adaptive Geo-referenced Information System) that associates semantic content
+with geographic maps based on an approach that combines natural language processing
+with human expert intervention to classify stored contents. Sotiropoulos et al. present
+MUSILYAN framework based on advanced natural language processing, text mining, and
+thematic modeling techniques to support computer-aided functions of musical and lyrical
+analysis, with a focus on the automated management and labeling of the semantic content
+of textual information related to the poetic activity of a Greek lyric writer [105]. In [106]
+is presented the classification of ICH images based on SVM models. Ref. [107] proposes
+a method based on ML algorithms and OSBE protocol to safeguard sensitive intangible
+cultural heritage information within communication networks.
+
+
+Electronics 2024, 13, 3738
+14 of 24
+AI-powered ICH Platforms facilitate the management, documentation, and promotion
+of ICH [22,108–110]. These platforms aim to improve the synergy between cultural tradi-
+tions and modern technology, providing advanced methods to preserve and disseminate
+cultural knowledge. Ref. [110] proposes a database system for ICH using AI for Mongolian
+stringed instruments, enabling the preservation, display, and education of such resources.
+In [111], a platform for ICH protection is presented, which includes big data and virtual sys-
+tems to promote ICH preservation and the development of related skills. This platform aims
+to facilitate the wider dissemination and understanding of ICH. It presents four significant
+attributes of AI for ICH: digitalization, informatization, networking, and intelligence.
+The application of AI technology to the protection and dissemination of ICH was
+investigated from multiple perspectives. The advantage of AI is related to the possibility
+of reproducing ICH in a historical setting for audiences, making it more accessible and
+engaging. AI can also provide an immersive experience for visitors to learn about ICH
+through personal experience, which is preferred by 66% of visitors according to the ques-
+tionnaire presented in ref. [22]. Huang et al. explore the potential of ML in the management
+of ICH, with a focus on the case study of Huaer music in China’s northwest region [109].
+This study suggests that the application of ML in Huaer information mining can provide
+a large amount of data for its survival as an ICH and a method for intelligent machine
+creation and inheritance of Huaer music.
+Knowledge graphs (KGs) provide a structured representation of complex connec-
+tions between various aspects of ICH. In ref. [112], interpretable neural-symbol learning
+techniques that combine DL with symbolic knowledge from a KG are used to improve
+interpretability in an ICH use case using Zhejiang cuisine recipes. The method can increase
+interpretability while improving performance in detecting the variety of ingredients using
+a camera placed above the refrigerator.
+AI technology can be used to improve learning resources for ICH education in the
+classroom. Huang et al. [113] introduce the construction of a personalized learning ecosys-
+tem, which includes aspects such as an intelligent environment and the roles of teachers.
+The study examines the feasibility and effectiveness of this ecosystem through a compar-
+ative analysis of teaching classes in Boluo Cock, a Chinese ICH. In [114] is presented an
+AI-powered curriculum for colleges and universities ICH education. The results indicate
+that students adopted the proposed model, 69.3% of subjects chose to like the AI-powered
+curriculum, and 83.3% of subjects agreed is helpful.
+Public involvement with ICH assets can be enhanced by interactivity and immersive
+visualization. In [115] is presented the CHROMATA platform that uses AI technologies
+such as 3D pose estimation, dance recognition, and textual analysis to facilitate the creation
+of immersive experiences that can help preserve and revive ICH. Ref. [116] describes
+the development of an intelligent multimedia display interactive system for the ICH of
+martial arts, which uses AI technology to capture and analyze the movements of martial
+artists. Ref. [117] introduce a mobile augmented reality system to display and preserve
+ICH. The system utilizes AI technology for knowledge modeling of ICH resources and
+ORB-FV, KLT algorithms for image recognition and tracking registration, allowing users to
+interact with and experience the ICH in an entertaining way. For the reader’s convenience,
+Table 5 presents a concise overview of several case studies exploring the use of AI in ICH.
+AI technology facilitates the integration of ICH into an interactive entertainment space,
+allowing for a more engaging and immersive experience for users, especially children and
+adolescents [118]. The potential of AI in preserving and promoting ICH is important, but it
+also comes with challenges related to addressing data representation, availability of datasets,
+cultural sensitivity, the complexity of AI models needed for processing multiple forms
+of expression (oral, visual, auditory, etc.), interdisciplinary collaboration, and availability
+of extensive computational resources for processing large amounts of data required for
+ICH analysis.
+
+
+Electronics 2024, 13, 3738
+15 of 24
+Table 5. Case studies on the application of AI in intangible cultural heritage.
+Reference
+Brief Summary of the Method
+Data
+Key Findings
+Challenges
+[105]
+Develop the MUSILYAN tool for
+automated analysis of Greek song
+lyrics through thematic
+organization and semantic
+categorization using
+k-means clustering
+447 songs by Costas
+Virvos filtered to
+identify 1250
+unique terms
+Revealed significant
+emotional and semantic
+information in lyrics
+Integrating diverse
+data forms for audio
+analysis, automation of
+thematic organization
+[109]
+Using recurrent neural network to
+manage and recognize the Huaer
+Northwest China folk music
+Lyrics and audio
+resources collected
+through Python
+web crawlers
+Enhancing dataset
+accessibility; effective
+recognition algorithms
+Data collection due to
+regional diversity,
+difficulties in
+Chinese word
+segmentation, and
+[112]
+Develop RF-YOLOv5 interpretable
+neural-symbol learning method to
+enhance the interpretability of DL
+models for recipe
+recommendations in
+Zhejiang cuisine
+3005 images of food
+items across
+15 ingredient categories
+Improved Zhejiang
+cuisine recipe
+recommendation
+system aligning target
+detection with a
+knowledge graph;
+identification accuracy
+of 93.61%
+Model complexity; the
+need for extensively
+annotated datasets;
+data
+cleaning challenges
+3.5. Recommender Systems
+The application of recommender systems powered by AI and user data analysis is rel-
+atively new, therefore this topic has reduced growth, 16 documents and AGR = −1.0 in
+2022–2023. Integrating artificial intelligence and machine learning can improve the capabilities
+and effectiveness of recommender systems in cultural heritage applications [119,120]. The AI
+techniques can be used to analyze user data and provide personalized content recommenda-
+tions for users exploring cultural heritage information. This will help users search for items
+of interest through the vast amount of cultural heritage data. The research trends are mainly
+focused on exploring the potential of these systems to enhance visitor experiences, promote
+cultural engagement, and facilitate the preservation and dissemination of cultural knowledge
+(see Figure 6).
+ 
+Figure 6. Knowledge and relationships within the field of recommender systems research in CH.
+Ferrato et al. [121] propose a high-level architecture of a museum recommender
+system, called META4RS, which is capable of tracking the location of the visitor by using
+DL and assessing the emotional reaction to the artworks. The proposed system has the
+
+
+Electronics 2024, 13, 3738
+16 of 24
+potential to create individual itineraries that may promote a better perception of the
+artworks by understanding visitor preferences without explicit input. Recently, in [122]
+was used a Generative Pretrained Transformer (GPT) to create a digital museum guide
+and a recommender system for cultural heritage spaces. The proposed Large Language
+Model (LLM) allows to personalize the visitor experience by offering adapted information,
+recommendations, and even immersive storytelling based on visitor input.
+Nafis et al. focus on developing an AI-powered recommender system for Semantic
+Cultural Heritage (SCH) objects in the Drâa-Tafilalet region, Morocco which is rich in
+heritage data that has been little known. The system proposes several ML algorithms
+(CNN, Naive-Bays, SVM, KNN) that can be used to analyze content and user preferences to
+create personalized recommendations of relevant SCH objects. This system aims to preserve
+and increase visibility for a wider audience of this heritage region in Morocco [123].
+Ref. [124] introduces an AI-powered Context-Aware Path Recommendation approach
+that combines a Context-Aware Recommender System and an optimization model for
+planning tourist itineraries. The proposed system uses a SVD technique to analyze user
+preferences and contextual data enabling the generation of personalized visiting paths that
+maximize the number of POIs visited within the available time.
+Casillo et al. [125] propose a recommender approach for enhancing Italian Cultural
+Heritage by presenting the cultural sites through digital storytelling. In this study is
+developed a content-based recommendation method, based on SVD algorithm, able to
+analyze users’ preferences and contexts like location or mood that recommends culturally
+relevant sites. It has a triple-layer system architecture: a data layer, responsible for the
+collection of data; an elaboration layer that processes data, generating recommendations by
+making use of context information; and a presentation layer, responsible for presenting the
+recommended content before the user in an engaging storytelling methodology. The rating
+forecasting results by the proposed system are better than those obtained using previous
+methods. Su et al. [126] present a user-centered recommendation strategy, through a mobile
+app called Smart Search Museum, that uses semantic searches and machine learning-based
+inference to suggest museums and other points of interest to the visiting user in a city.
+In this research, recommendation techniques are combined with edge AI capabilities to
+create personalized itineraries. For the reader’s convenience, Table 6 provides a concise
+overview of several case studies exploring the use of AI for recommender systems.
+Table 6. Case studies exploring the use of AI for recommender systems.
+Reference
+Brief Summary of the Method
+Data
+Key Findings
+Challenges
+[121]
+Development of the META4RS
+system capable of tracking the
+location of the visitor by using DL;
+assessing the emotional reaction to
+the artworks observed through
+simple badges and
+off-the-shelf cameras.
+Visitor positional data
+and
+emotional reactions
+Personalized
+recommendations can
+enhance the
+visitor experience
+Ensuring visitor
+anonymity; accuracy of
+emotion inference;
+system integration
+[122]
+Enhance museum experiences
+using Generative Pretrained
+Transformer (GPT-4) for
+personalized guidance and
+storytelling through the
+MAGICAL project.
+Fictional museum
+MMMA
+Provide adapted
+information,
+recommendations, and
+even immersive
+storytelling based on
+visitor input
+Technological
+limitations of smart
+glasses; handling
+diverse visitor
+knowledge levels;
+inaccuracies in
+AI-generated responses
+[123]
+Development of a hybrid
+recommender system for Scientific
+Cultural Heritage (SCH) data
+using ML algorithms and semantic
+web technologies
+SCH data collected
+from the Drâa-Tafilalet
+region,
+Morocco
+Analyze content and
+user preferences to
+create personalized
+recommendations of
+relevant SCH object
+Data dispersion;
+refining profiles with
+collaborative filtering;
+
+
+Electronics 2024, 13, 3738
+17 of 24
+Table 6. Cont.
+Reference
+Brief Summary of the Method
+Data
+Key Findings
+Challenges
+[124]
+Design personalized visiting paths
+using Context-Aware
+Recommender Systems (CARSs)
+and a mathematical model to
+optimize the number of visited
+Points of Interest (POIs) within a
+given timeframe
+Contextual information
+Effective
+personalization and
+optimization of visiting
+paths for tourists
+Integration of diverse
+contextual data;
+Although CH recommender systems have been very promising, challenges and lim-
+itations related to implementations and effectiveness are still presented. Most current
+recommender techniques depend on user-generated content and behaviors when making
+appropriate recommendations for a particular user. In many cases, CH visitors may have
+varied engagement levels, and their preferences may not be well acquired if they do not
+interact frequently with the recommender systems. This leads to challenges in accurately
+capturing user interests and possibly irrelevant recommendations [119,120]. The complex-
+ity of the algorithm within a recommendation system, especially the ones which employ
+ML, can become a barrier. Large computational demands of ML techniques might require
+large resources that smaller cultural institutions do not hold, which can further limit their
+capabilities in applying advanced recommendation systems.
+4. Conclusions
+Substantial progress has been achieved in applying AI techniques across various
+areas of CH. This comprises applications ranging from the 3D reconstruction of heritage
+artifacts to music, dance, and historical text analysis. In this paper is presented an outline
+of research related to five emerging trends in using AI techniques in the field of CH.
+These emerging trends were identified using a scientometric analysis based on an advanced
+tool like ScientoPy v2.1.3 on a dataset of 1702 relevant articles gathered from Clarivate Web
+of Science and Scopus databases.
+In many applications, AI techniques have proved to be beneficial compared to tradi-
+tional methods in enhancing the digital transformation of the CH and increasing perfor-
+mance in data management, preservation, and sharing. AI automates damage detection,
+object recognition, data analysis, and 3D reconstruction. Also, the application of AI in
+CH extends from basic automation, reaching specialized domains that are improving un-
+derstanding and interaction with cultural artifacts. In the field of damage detection and
+conservation of CH assets, advanced AI models such as CNNs, YOLO, and SVMs have
+demonstrated significant accuracy in identifying and classifying various types of damage
+in historical buildings and artifacts. These models can detect patterns of deterioration that
+might escape the human eye, enabling proactive conservation efforts. AI’s impact on digital
+archiving has been transformative. AI techniques facilitate access and understanding of
+CH documents through automated transcription, document restoration, and personalized
+recommendations. ML algorithms can automate the process of digitizing vast collections of
+documents, photographs, and audio recordings. Also, ML techniques can identify patterns
+and connections across massive datasets of artifacts, texts, and historical records. NLP
+techniques have made significant advances in automated transcription and translation
+of historical texts, making previously inaccessible documents available to a global audi-
+ence. Also, AI improves CH preservation by enabling analysis of deterioration and virtual
+restoration of artworks. In the field of object recognition and 3D reconstruction, AI has
+enabled the creation of highly detailed digital models of artifacts and historical sites. DL
+models can reconstruct damaged or partially destroyed artifacts, improving understanding
+of their original form and function. AI technology facilitates the integration of CH into
+interactive Virtual/Augmented Reality environments, allowing for a more engaging and
+immersive experience for users, especially children and adolescents. AI algorithms can cre-
+
+
+Electronics 2024, 13, 3738
+18 of 24
+ate personalized, context-aware AR overlays in museums, providing visitors with adapted
+information based on their interests and prior knowledge.
+The application of AI in CH presents ethical considerations and potential limitations.
+Data privacy is an important ethical concern when using AI in CH. The digitization
+and analysis of cultural artifacts using AI-powered analysis tools often involve sensitive
+information (for example the provenance of objects, location data of archaeological sites,
+and personal details CH institutions individuals), which can be at risk of unauthorized
+access when used in AI systems that require large datasets. The use of AI in CH necessitates
+the implementation in CH Institutions of robust data protection measures and ethical
+guidelines to address privacy concerns [127]. Cultural sensitivity is another critical aspect
+that demands careful consideration when applying AI to Cultural Heritage. There is a risk,
+if AI algorithms are not properly designed and trained, of simplification or distortion of
+complex cultural contexts and nuances. To address these issues, the development of AI
+systems for CH applications can involve cultural experts and community representatives.
+The ethical implications of using AI-powered analysis tools include risks of dependence
+on technological interpretations of cultural artifacts. This may affect the use of traditional
+methods of analysis and cultural knowledge passed down through generations. Also, the
+use of AI in reconstructing or restoring artifacts may influence how the public understands
+recreated CH assets compared to the original ones, raising questions about the preservation
+of historical integrity.
+Although this study adopted a comprehensive approach, there are several limitations
+and potential biases. The results of the study are limited to the publications indexed in
+the WoS and Scopus databases and contain a reduced number of non-English publications
+and research from developing countries. There is also a potential bias towards academic
+publications. Additionally, the study did not consider the latest advancements that are not
+yet included in the Web of Science and Scopus databases. Future research can build upon
+the existing foundation by integrating other databases and addressing broad subjects in a
+systematic literature review or meta-analysis.
+Based on the analysis of current research trends and applications of AI in CH discussed
+in this article, several future research directions need further investigation. Further research
+is still needed to overcome some limitations of using these techniques in CH applications.
+AI techniques present lower performance on complex tasks like interpreting unclear dam-
+age areas or handling diverse CH objects. Although the automation of several CH tasks has
+made significant advances, human expertise remains necessary for interpreting difficult
+contexts, validating results, and guaranteeing the ethical application of these technologies
+in the CH field.
+Addressing data limitations remains an important challenge in the application of
+AI to CH. Future research in cultural heritage AI should prioritize the development of
+comprehensive, open-source datasets that integrate diverse multimodal data sources such
+as high-resolution images, 3D models, and historical texts. These datasets will enable
+the training of more accurate AI models. In addition, developing hybrid AI models that
+integrate multimodal data sources and combine AI techniques with traditional methods
+can improve the performance of AI applications in complex cultural heritage tasks like
+interpreting unclear damaged areas or managing the diverse properties of cultural artifacts.
+This could involve also, the exploration of advanced ML techniques (for example few-shot
+learning and transfer learning) to improve performance on tasks with limited data. Enhanc-
+ing human–AI collaboration is important for the successful integration of AI technologies
+in CH practices. Future studies should explore the development of AI systems that provide
+transparent explanations of the outputs and facilitate easier interpretation of AI-generated
+results by CH human experts. Ethical considerations and cultural sensitivity are important
+future research areas. This includes developing ethical standards for digitizing and inter-
+preting CH content, as well as methods for involving local communities in the AI-driven
+preservation process. Lastly, future research should expand into underrepresented areas
+within the CH domain. This research direction involves exploring the potential of AI in
+
+
+Electronics 2024, 13, 3738
+19 of 24
+preserving linguistic heritage, particularly endangered languages, as well as exploring its
+role in interactive storytelling for cultural education.
+Funding: This research received no external funding.
+Data Availability Statement: Data are contained within the article.
+Acknowledgments: I acknowledge the use of OpenAI ChatGPT-4.0 (https://chat.openai.com/)
+throughout the paper to improve the writing style, clarity, and consistency. Subsequently, I thoroughly
+reviewed and edited the content as necessary. Care was taken to ensure no copyright violations.
+Conflicts of Interest: The author declares no conflicts of interest.
+References
+1.
+Mishra, M. Machine Learning Techniques for Structural Health Monitoring of Heritage Buildings: A State-of-the-art Review and
+Case Studies. J. Cult. Herit. 2021, 47, 227–245. [CrossRef]
+2.
+Yang, S.; Hou, M.; Li, S. Three-dimensional Point Cloud Semantic Segmentation for Cultural Heritage: A Comprehensive Review.
+Remote Sens. 2023, 15, 548. [CrossRef]
+3.
+Soleymani, A.; Jahangir, H.; Nehdi, M.L. Damage Detection and Monitoring in Heritage Masonry Structures: Systematic Review.
+Constr. Build. Mater. 2023, 397, 132402. [CrossRef]
+4.
+Barceló, J.; Del Castillo, F.; Kayikci, D.; Urbistondo, B. Neural Networks for Archaeological Classification and Typology:
+An overview. Eur. J. Post Class. Archaeol. 2022, 12, 7–32.
+5.
+Croce, V.; Caroti, G.; De Luca, L.; Piemonte, A.; Véron, P. Neural radiance fields (nerf): Review and Potential Applications to
+Digital Cultural Heritage. Int. Arch. Photogramm. Remote Sens. Spat. Inf. Sci. 2023, 48, 453–460. [CrossRef]
+6.
+Liu, Z. Literature Review on Image Restoration. J. Phys. Conf. Ser. 2022, 2386, 012041. [CrossRef]
+7.
+Rallis, I.; Voulodimos, A.; Bakalos, N.; Protopapadakis, E.; Doulamis, N.; Doulamis, A. Machine Learning for Intangible Cultural
+Heritage: A Review of Techniques on Dance Analysis. In Visual Computing for Cultural Heritage; Springer: Cham, Switzerland,
+2020; pp. 103–119.
+8.
+Zhao, M.; Wu, X.; Liao, H.-T.; Liu, Y. Exploring Research Fronts and Topics of Big Data and Artificial Intelligence Application for
+Cultural Heritage and Museum Research. In IOP Conference Series: Materials Science and Engineering; IOP Publishing: Bristol, UK,
+2020; p. 012036.
+9.
+Colavizza, G.; Blanke, T.; Jeurgens, C.; Noordegraaf, J. Archives and AI: An Overview of Current Debates and Future Perspectives.
+ACM J. Comput. Cult. Herit. (JOCCH) 2021, 15, 1–15. [CrossRef]
+10.
+Casillo, M.; Colace, F.; Gupta, B.B.; Lorusso, A.; Santaniello, D.; Valentino, C. The Role of AI in Improving Interaction with
+Cultural Heritage: An Overview. In Handbook of Research on AI and ML for Intelligent Machines and Systems; IGI Global: Hershey,
+PA, USA, 2024; pp. 107–136.
+11.
+Münster, S.; Ioannides, M. A Scientific Community of Digital Heritage in Time And Space. In Proceedings of the 2015 Digital
+Heritage, Granada, Spain, 28 September–2 October 2015; pp. 267–274.
+12.
+Zhang, Z.; Zou, Y. Research Hotspots and Trends in Heritage Building Information Modeling: A Review Based on Citespace
+Analysis. Humanit. Soc. Sci. Commun. 2022, 9, 394. [CrossRef]
+13.
+Das, S.; Mondal, S.; Puri, V.; Vrana, V. Structural Review of Relics Tourism by Text Mining and Machine Learning. J. Tour. Herit.
+Serv. Mark. (JTHSM) 2022, 8, 25–34.
+14.
+Ruiz-Rosero, J.; Ramírez-González, G.; Viveros-Delgado, J. Software Survey: Scientopy, a Scientometric Tool for Topics Trend
+Analysis in Scientific Publications. Scientometrics 2019, 121, 1165–1188. [CrossRef]
+15.
+Pranckut˙e, R. Web of Science (Wos) and Scopus: The Titans of Bibliographic Information in Today’s Academic World. Publications
+2021, 9, 12. [CrossRef]
+16.
+Voinea, G.-D.; Gîrbacia, F.; Duguleană, M.; Boboc, R.G.; Gheorghe, C. Mapping the Emergent Trends in Industrial Augmented
+Reality. Electronics 2023, 12, 1719. [CrossRef]
+17.
+Munoz-Ausecha, C.; Ruiz-Rosero, J.; Ramirez-Gonzalez, G. RFID Applications and Security Review. Computation 2021, 9, 69.
+[CrossRef]
+18.
+´Cosovi´c, M.; Jankovi´c, R. CNN Classification of the Cultural Heritage Images. In Proceedings of the 2020 19th International
+Symposium INFOTEH-JAHORINA (INFOTEH), East Sarajevo, Bosnia and Herzegovina, 18–20 March 2020; pp. 1–6.
+19.
+Abed, M.H.; Al-Asfoor, M.; Hussain, Z.M. Architectural Heritage Images Classification Using Deep Learning with CNN. In Pro-
+ceedings of the 2nd International Workshop on Visual Pattern Extraction and Recognition for Cultural Heritage Understanding,
+Bari, Italy, 29 January 2020.
+20.
+Rehman, I.U.; Ali, Z.; Jan, Z.; Rashid, M.; Abbas, A.; Tariq, N. Deep Learning Empowered Classification of Augmented Cultural
+Heritage Images. In Proceedings of the VIPERC 2023: The 2nd International Conference on Visual Pattern Extraction and
+Recognition for Cultural Heritage Understanding, Zadar, Croatia, 25–26 September 2023.
+
+
+Electronics 2024, 13, 3738
+20 of 24
+21.
+Gao, L.; Wu, Y.; Yang, T.; Zhang, X.; Zeng, Z.; Chan, C.K.D.; Chen, W. Research on Image Classification and Retrieval Using Deep
+Learning with Attention Mechanism on Diaspora Chinese Architectural Heritage in Jiangmen, China. Buildings 2023, 13, 275.
+[CrossRef]
+22.
+Wang, F.; Geng, S.; Zhang, D.; Zhou, M.; Nian, W.; Li, L. A Fine-Grained Classification Method of Thangka Image Based on Senet.
+In Proceedings of the 2022 International Conference on Cyberworlds (CW), Kanazawa, Japan, 27–29 September 2022; pp. 23–30.
+23.
+Wibawa, A.D.; Wicaksono, E.A.; Suryani, S.D.; Rumadi, R. Javanese Batik Image Classification using Self-Organizing Map.
+In Proceedings of the 2023 International Conference on Computer Science, Information Technology and Engineering (ICCoSITE),
+Jakarta, Indonesia, 16 February 2023; pp. 472–477.
+24.
+Prasomphan, S. Ensemble Classification Technique for Cultural Heritage Image. In Proceedings of the International Conference
+on Machine Learning and Intelligent Communications, Wuzhou, China, 17–18 November 2021; pp. 17–27.
+25.
+Muhathir, M.; Khairina, N.; Karenina, R.; Barus, I.; Ula, M.; Sahputra, I. Preserving Cultural Heritage Through AI: Developing
+LeNet Architecture for Wayang Image Classification. (IJACSA) Int. J. Adv. Comput. Sci. Appl. 2023, 14, 174. [CrossRef]
+26.
+Barucci, A.; Cucci, C.; Franci, M.; Loschiavo, M.; Argenti, F. A Deep Learning Approach to Ancient Egyptian Hieroglyphs
+Classification. IEEE Access 2021, 9, 123438–123447. [CrossRef]
+27.
+Barucci, A.; Canfailla, C.; Cucci, C.; Forasassi, M.; Franci, M.; Guarducci, G.; Guidi, T.; Loschiavo, M.; Picollo, M.; Pini, R. Ancient
+Egyptian Hieroglyphs Segmentation and Classification with Convolutional Neural Networks. In Proceedings of the International
+Conference Florence Heri-Tech: The Future of Heritage Science and Technologies, Florence, Italy, 16–18 May 2022; pp. 126–139.
+28.
+Fidatama, M.I.; Bimantoro, F.; Nugraha, G.S.; Irmawati, B.; Dwiyansaputra, R. Recognition of Bima Script Handwriting Patterns
+Using the Local Binary Pattern Feature Extraction Method and K-Nearest Neighbour Classification Method. In AIP Conference
+Proceedings; AIP Publishing: Melville, NY, USA, 2023.
+29.
+Mustiari, M.; Bimantoro, F.; Nugraha, G.S.; Husodo, A.Y. Bima Script Handwriting Pattern Recognition using Histogram of
+Oriented Gradients and Backpropagation Classification Method. In AIP Conference Proceedings; AIP Publishing: Melville, NY,
+USA, 2023.
+30.
+Navarro, P.; Cintas, C.; Lucena, M.; Fuertes, J.M.; Delrieux, C.; Molinos, M. Learning Feature Representation of Iberian Ceramics
+with Automatic Classification Models. J. Cult. Herit. 2021, 48, 65–73. [CrossRef]
+31.
+Cascone, L.; Dondi, P.; Lombardi, L.; Narducci, F. Automatic Classification of Fresco Fragments: A Machine and Deep Learning
+Study. In Proceedings of the International Conference on Image Analysis and Processing, Lecce, Italy, 23–27 May 2022; pp. 701–712.
+32.
+Obeso, A.M.; Benois-Pineau, J.; Vázquez, M.G.; Acosta, A.R. Saliency-Based Selection of Visual Content for Deep Convolutional
+Neural Networks: Application to Architectural Style Classification. Multimed. Tools Appl. 2019, 78, 9553–9576. [CrossRef]
+33.
+Taoufiq, S.; Nagy, B.; Benedek, C. Hierarchynet: Hierarchical CNN-based Urban Building Classification. Remote Sens. 2020,
+12, 3794. [CrossRef]
+34.
+Marafini, F.; Betti, M.; Bartoli, G.; Zini, G.; Barontini, A.; Mendes, N. A Proposal of Classification for Machine-Learning
+Vibration-Based Damage Identification Methods. Mater. Res. Proc. 2023, 26, 593–598.
+35.
+Mehta, S.; Kukreja, V.; Gupta, A. Exploring the Efficacy of CNN and SVM Models for Automated Damage Severity Classification
+in Heritage Buildings. In Proceedings of the 2023 Second International Conference on Augmented Intelligence and Sustainable
+Systems (ICAISS), Trichy, India, 23–25 August 2023; pp. 252–257.
+36.
+Lee, J.; Yu, J. Automatic Surface Damage Classification Developed Based on Deep Learning for Wooden Architectural Heritage.
+ISPRS Ann. Photogramm. Remote Sens. Spat. Inf. Sci. 2023, X-M-1-2023, 151–157. [CrossRef]
+37.
+Roy, P.S.; Kukreja, V.; Jain, V.; Vats, S. Classification of Defective Intensity Levels of Paint in Heritage Buildings using the
+CNN-SVM Technique. In Proceedings of the 2023 5th International Conference on Inventive Research in Computing Applications
+(ICIRCA), Coimbatore, India, 3–5 August 2023; pp. 17–22.
+38.
+Rodrigues, F.; Cotella, V.; Rodrigues, H.; Rocha, E.; Freitas, F.; Matos, R. Application of Deep Learning Approach for the
+Classification of Buildings’ Degradation State. In A BIM Methodology. Appl. Sci. 2022, 12, 7403. [CrossRef]
+39.
+Fu, Q.; Hou, M.; Hua, W. Based on Improved Pointnet Automatic Classification Method of Grotto Temple Statues. ISPRS Ann.
+Photogramm. Remote Sens. Spat. Inf. Sci. 2023, X-M-1-2023, 87–92. [CrossRef]
+40.
+Pepe, M.; Alfio, V.S.; Costantino, D.; Scaringi, D. Data for 3D Reconstruction and Point Cloud Classification using Machine
+Learning in Cultural Heritage Environment. Data Brief 2022, 42, 108250. [CrossRef]
+41.
+Grilli, E.; Remondino, F. Classification of 3D Digital Heritage. Remote Sens. 2019, 11, 847. [CrossRef]
+42.
+Croce, V.; Manuel, A.; Caroti, G.; Piemonte, A.; De Luca, L.; Véron, P. Semi-Automatic Classification of Digital Heritage on the
+Aïoli Open Source 2D/3D Annotation Platform via Machine Learning and Deep Learning. J. Cult. Herit. 2023, 62, 187–197.
+[CrossRef]
+43.
+Rani, C.J.; Devarakonda, N. An Effectual Classical Dance Pose Estimation and Classification System Employing Convolution
+Neural Network–Long Shortterm Memory (CNN-LSTM) Network for Video Sequences. Microprocess. Microsyst. 2022, 95, 104651.
+[CrossRef]
+44.
+Malavath, P.; Devarakonda, N. Natya Shastra: Deep Learning for Automatic Classification of Hand Mudra in Indian Classical
+Dance Videos. Rev. D’Intell. Artif. 2023, 37, 689. [CrossRef]
+45.
+Tiwari, R.G.; Gautam, V.; Trivedi, N.K. Heritage of India: Advanced Monuments Classification using Artificial Intelligence.
+In Proceedings of the 2023 3rd International Conference on Computing and Information Technology (ICCIT), Tabuk, Saudi Arabia,
+13–14 September 2023; pp. 206–210.
+
+
+Electronics 2024, 13, 3738
+21 of 24
+46.
+Chen, Q.; Zhao, W.; Wang, Q.; Zhao, Y. The Sustainable Development of Intangible Cultural Heritage with AI: Cantonese Opera
+Singing Genre Classification Based On Cogcnet Model In China. Sustainability 2022, 14, 2923. [CrossRef]
+47.
+Castellano, G.; Lella, E.; Vessio, G. Visual Link Retrieval and Knowledge Discovery in Painting Datasets. Multimed. Tools Appl.
+2021, 80, 6599–6616. [CrossRef]
+48.
+Castellano, G.; Vessio, G. A brief Overview of Deep Learning Approaches to Pattern Extraction and Recognition in Paintings
+and Drawings. In Proceedings of the International Conference on Pattern Recognition, Shanghai, China, 15–17 October 2021;
+pp. 487–501.
+49.
+Marinescu, M.-C.; Reshetnikov, A.; López, J.M. Improving Object Detection in Paintings Based on Time Contexts. In Proceedings
+of the 2020 International Conference on Data Mining Workshops (ICDMW), Sorrento, Italy, 17–20 November 2020; pp. 926–932.
+50.
+Pathak, R.; Saini, A.; Wadhwa, A.; Sharma, H.; Sangwan, D. An Object Detection Approach for Detecting Damages in Heritage
+Sites Using 3-D Point Clouds and 2-D Visual Data. J. Cult. Herit. 2021, 48, 74–82. [CrossRef]
+51.
+Bacharidis, K.; Sarri, F.; Ragia, L. 3D Building Façade Reconstruction using Deep Learning. ISPRS Int. J. Geo-Inf. 2020, 9, 322.
+[CrossRef]
+52.
+Payntar, N.D.; Hsiao, W.-L.; Covey, R.A.; Grauman, K. Learning Patterns of Tourist Movement and Photography from Geotagged
+Photos at Archaeological Heritage Sites in Cuzco, Peru. Tour. Manag. 2021, 82, 104165. [CrossRef]
+53.
+Ferrato, A.; Limongelli, C.; Mezzini, M.; Sansonetti, G. Using Deep Learning for Collecting Data about Museum Visitor Behavior.
+Appl. Sci. 2022, 12, 533. [CrossRef]
+54.
+Fenu, G.; Medvet, E.; Panfilo, D.; Pellegrino, F.A. Mosaic Images Segmentation using U-net. In Proceedings of the 9th International
+Conference on Pattern Recognition Applications and Methods, Valletta, Malta, 22–24 February 2020; pp. 485–492.
+55.
+Condorelli, F. Processing Historical Photographs and Film Footage with Photogrammetry and Artificial Intelligence for Cultural
+Heritage Documentation and Virtual Reconstruction. ELCVIA Electron. Lett. Comput. Vis. Image Anal. 2020, 19, 11–16. [CrossRef]
+56.
+Yang, X.; Zheng, L.; Chen, Y.; Feng, J.; Zheng, J. Recognition of Damage Types of Chinese Gray-Brick Ancient Buildings Based on
+Machine Learning—Taking the Macau World Heritage Buffer Zone as an example. Atmosphere 2023, 14, 346. [CrossRef]
+57.
+Lee, S.-Y.; Cho, H.-H. Damage Detection and Safety Diagnosis for Immovable Cultural Assets Using Deep Learning Framework.
+In Proceedings of the 2023 25th International Conference on Advanced Communication Technology (ICACT), Pyeongchang,
+Republic of Korea, 19–22 February 2023; pp. 310–313.
+58.
+Kwon, D.; Yu, J. Automatic Damage Detection of Stone Cultural Property Based on Deep Learning Algorithm. Int. Arch.
+Photogramm. Remote Sens. Spat. Inf. Sci. 2019, 42, 639–643. [CrossRef]
+59.
+Li, J.; Wang, H.; Deng, Z.; Pan, M.; Chen, H. Restoration of Non-Structural Damaged Murals in Shenzhen Bao’an Based on a
+Generator–Discriminator Network. Herit. Sci. 2021, 9, 6. [CrossRef]
+60.
+Kumar, P.; Gupta, V. Restoration of Damaged Artworks Based on a Generative Adversarial Network. Multimed. Tools Appl. 2023,
+82, 40967–40985. [CrossRef]
+61.
+Castiello, M.E.; Tonini, M. An Explorative Application of Random Forest Algorithm for Archaeological Predictive Modeling.
+A Swiss Case Study. J. Comput. Appl. Archaeol. 2021, 4, 110–125. [CrossRef]
+62.
+Orengo, H.A.; Garcia-Molsosa, A. A Brave New World for Archaeological Survey: Automated Machine Learning-Based Potsherd
+Detection using High-Resolution Drone Imagery. J. Archaeol. Sci. 2019, 112, 105013. [CrossRef]
+63.
+Wang, Y.; Shi, X.; Oguchi, T. Archaeological Predictive Modeling Using Machine Learning and Statistical Methods for Japan and
+China. ISPRS Int. J. Geo-Inf. 2023, 12, 238. [CrossRef]
+64.
+Argyrou, A.; Agapiou, A. A Review of Artificial Intelligence and Remote Sensing For Archaeological Research. Remote Sens. 2022,
+14, 6000. [CrossRef]
+65.
+Stoean, R.; Ionescu, L.; Stoean, C.; Boicea, M.; Atencia, M.; Joya, G. A Deep Learning-Based Surrogate for the Xrf Approximation of
+Elemental Composition within Archaeological Artefacts before Restoration. Procedia Comput. Sci. 2021, 192, 2002–2011. [CrossRef]
+66.
+Jain, N.; Sierra-Múnera, A.; Ehmueller, J.; Krestel, R. Generation of Training Data for Named Entity Recognition of Artworks.
+Semant. Web 2023, 14, 239–260. [CrossRef]
+67.
+Moradi, M.; Ghorbani, R.; Sfarra, S.; Tax, D.M.; Zarouchas, D. A Spatiotemporal Deep Neural Network useful for Defect
+Identification and Reconstruction of Artworks using Infrared Thermography. Sensors 2022, 22, 9361. [CrossRef] [PubMed]
+68.
+Anghelu¸tă, L.; Chiro¸sca, A. Physical Degradation Detection on Artwork Surface Polychromies using Deep Learning Models. Rom.
+Rep. Phys. 2020, 72, 805.
+69.
+El Makhfi, N. Handwritten Text Segmentation Approach in Historical Arabic Documents. In Embedded Systems and Artificial
+Intelligence: Proceedings of ESAI 2019, Fez, Morocco, 2–3 May 2019; Springer: Singapore, 2020; pp. 645–654.
+70.
+Ferro, S.; Pelillo, M.; Traviglia, A. AI-Assisted Digitalisation of Historical Documents. Int. Arch. Photogramm. Remote Sens. Spat.
+Inf. Sci. 2023, 48, 557–562. [CrossRef]
+71.
+Philips, J.; Tabrizi, N. Historical Document Processing: A Survey of Techniques, Tools, and Trends. In Proceedings of the
+12th International Joint Conference on Knowledge Discovery, Knowledge Engineering and Knowledge Management (IC3K
+2020)—Volume 1: KDIR, Online, 2–4 November 2020; pp. 341–349.
+72.
+Ostertag, C.; Beurton-Aimar, M. Using Graph Neural Networks to Reconstruct Ancient Documents. In Proceedings of the Pattern
+Recognition. ICPR International Workshops and Challenges, Virtual Event, 10–15 January 2021; Proceedings, Part VII. Springer
+International Publishing: Berlin/Heidelberg, Germany, 2021; pp. 39–53.
+
+
+Electronics 2024, 13, 3738
+22 of 24
+73.
+Babi´c, R.J.; Amelio, A.; Draganov, I.R. Writer Identification From Historical Documents Using Ensemble Deep Learning Transfer
+Models. In Proceedings of the 2022 21st International Symposium INFOTEH-JAHORINA (INFOTEH), East Sarajevo, Bosnia and
+Herzegovina, 16–18 March 2022; pp. 1–5.
+74.
+Ángel García-Calderón, M.; García-Hernndez, R.; Ledeneva, Y. An Unsupervised Lower-Baseline Localization Method Based on
+Writing Style Features for Historical Documents. J. Intell. Fuzzy Syst. 2020, 39, 2509–2520. [CrossRef]
+75.
+Kaneko, H.; Yoshizu, Y.; Ishibashi, R.; Meng, L. An Attempt at Zero-shot Ancient Documents Restoration Based on Diffusion
+Models. In Proceedings of the 2023 International Conference on Advanced Mechatronic Systems (ICAMechS), Melbourne,
+Australia, 4–7 September 2023; pp. 1–6.
+76.
+Colutto, S.; Kahle, P.; Guenter, H.; Muehlberger, G. Transkribus. A Platform for Automated Text Recognition and Searching of
+Historical Documents. In Proceedings of the 2019 15th International Conference on eScience (eScience), San Diego, CA, USA,
+24–27 September 2019; pp. 463–466.
+77.
+Jaillant, L.; Caputo, A. Unlocking Digital Archives: Cross-Disciplinary Perspectives on AI and Born-Digital Data. AI Soc. 2022, 37,
+823–835. [CrossRef]
+78.
+Tzouganatou, A. Openness and Privacy in Born-Digital Archives: Reflecting the Role of AI Development. AI Soc. 2022, 37,
+991–999. [CrossRef]
+79.
+Schleider, T.; Troncy, R. Zero-Shot Information Extraction to Enhance a Knowledge Graph Describing Silk Textiles. In Proceedings
+of the 5th Joint SIGHUM Workshop on Computational Linguistics for Cultural Heritage, Social Sciences, Humanities and
+Literature, Online, 11 November 2021; pp. 138–146.
+80.
+Stoean, C.; Bacanin, N.; Stoean, R.; Ionescu, L.; Alecsa, C.; Hotoleanu, M.; Atencia, M.; Joya, G. On Using Perceptual Loss within
+the U-Net Architecture for the Semantic Inpainting of Textile Artefacts with Traditional Motifs. In Proceedings of the 2022 24th
+International Symposium on Symbolic and Numeric Algorithms for Scientific Computing (SYNASC), Hagenberg/Linz, Austria,
+12–15 September 2022; pp. 276–283.
+81.
+Ilies, D.C.; Zlatev, Z.; Ilies, A.; Zharas, B.; Pantea, E.; Hodor, N.; Indrie, L.; Turza, A.; Taghiyari, H.R.; Caciora, T. Interdisciplinary
+Research to Advance Digital Imagery and Natural Compounds for Eco-Cleaning and for Preserving Textile Cultural Heritage.
+Sensors 2022, 22, 4442. [CrossRef]
+82.
+Liu, M.; Zhou, B. Innovative Design of Chinese Traditional Textile Patterns Based on Conditional Generative Adversarial Network.
+In Proceedings of the International Conference on Human-Computer Interaction, Virtual Event, 26 June–1 July 2022; pp. 234–245.
+83.
+Ch’ng, E.; Feng, P.; Yao, H.; Zeng, Z.; Cheng, D.; Cai, S. Balancing Performance and Effort in Deep Learning via the Fusion of Real
+and Synthetic Cultural Heritage Photogrammetry Training Sets. In Proceedings of the ICAART (1), Online, 4–6 February 2021;
+pp. 611–621.
+84.
+Condorelli, F. Image Retrieval for 3D Modelling of Architecture using AI and Photogrammetry. Int. Arch. Photogramm. Remote
+Sens. Spat. Inf. Sci. 2023, 48, 441–446. [CrossRef]
+85.
+Niu, W.; Huang, X.; Jin, J.; Mao, Z.; Gong, Y.; Xu, J.; Zhao, J. Recognition Method of the main Object of Three-Dimensional
+Photogrammetric Modeling of Cultural Relics. Natl. Remote Sens. Bull. 2022, 25, 2409–2420. [CrossRef]
+86.
+Grilli, E.; Farella, E.M.; Torresani, A.; Remondino, F. Geometric Features Analysis for the Classification of Cultural Heritage Point
+Clouds. Int. Arch. Photogramm. Remote Sens. Spat. Inf. Sci. 2019, 42, 541–548. [CrossRef]
+87.
+Gujski, L.; di Filippo, A.; Limongiello, M. Machine Learning Clustering for Point Clouds Optimisation via Feature Analysis in
+Cultural Heritage. Int. Arch. Photogramm. Remote Sens. Spat. Inf. Sci. 2022, 46, 245–251. [CrossRef]
+88.
+Pellis, E.; Murtiyoso, A.; Masiero, A.; Tucci, G.; Betti, M.; Grussenmeyer, P. An Image-based Deep Learning Workflow for
+3D Heritage Point Cloud Semantic Segmentation. In Proceedings of the 9th International Workshop 3D-ARCH “3D Virtual
+Reconstruction and Visualization of Complex Architectures”, Mantua, Italy, 2–4 March 2022; pp. 426–434.
+89.
+Cao, Y.; Scaioni, M. 3DLEB-Net: Label-Efficient Deep Learning-Based Semantic Segmentation of Building Point Clouds at Lod3
+Level. Appl. Sci. 2021, 11, 8996. [CrossRef]
+90.
+Cao, Y.; Teruggi, S.; Fassi, F.; Scaioni, M. A Comprehensive Understanding f Machine Learning and Deep Learning Methods for
+3d Architectural Cultural Heritage Point Cloud Semantic Segmentation. In Proceedings of the Italian Conference on Geomatics
+and Geospatial Technologies, Genova, Italy, 18–20 December 2022; pp. 329–341.
+91.
+Pellis, E.; Masiero, A.; Tucci, G.; Betti, M.; Grussenmeyer, P. Assembling an Image and Point Cloud Dataset for Heritage Building
+Semantic Segmentation. Int. Arch. Photogramm. Remote Sens. Spat. Inf. Sci. 2021, 46, 539–546. [CrossRef]
+92.
+Musicco, A.; Galantucci, R.A.; Bruno, S.; Verdoscia, C.; Fatiguso, F. Automatic Point Cloud Segmentation for the Detection of
+Alterations on Historical Buildings Through an Unsupervised and Clustering-Based Machine Learning Approach. ISPRS Ann.
+Photogramm. Remote Sens. Spat. Inf. Sci. 2021, 2, 129–136. [CrossRef]
+93.
+Malinverni, E.S.; Pierdicca, R.; Paolanti, M.; Martini, M.; Morbidoni, C.; Matrone, F.; Lingua, A. Deep Learning for Semantic
+Segmentation of 3D Point Cloud. Int. Arch. Photogramm. Remote Sens. Spat. Inf. Sci. 2019, 42, 735–742. [CrossRef]
+94.
+Haznedar, B.; Bayraktar, R.; Ozturk, A.E.; Arayici, Y. Implementing Pointnet for Point Cloud Segmentation in the Heritage
+Context. Herit. Sci. 2023, 11, 2. [CrossRef]
+95.
+Galanakis, D.; Maravelakis, E.; Pocobelli, D.P.; Vidakis, N.; Petousis, M.; Konstantaras, A.; Tsakoumaki, M. SVD-based Point
+Cloud 3D Stone by Stone Segmentation for Cultural Heritage Structural Analysis–The Case of the Apollo Temple at Delphi.
+J. Cult. Herit. 2023, 61, 177–187. [CrossRef]
+
+
+Electronics 2024, 13, 3738
+23 of 24
+96.
+Pierdicca, R.; Paolanti, M.; Matrone, F.; Martini, M.; Morbidoni, C.; Malinverni, E.S.; Frontoni, E.; Lingua, A.M. Point Cloud
+Semantic Segmentation using a Deep Learning Framework for Cultural Heritage. Remote Sens. 2020, 12, 1005. [CrossRef]
+97.
+Fory´s, P.; Sitnik, R.; Markiewicz, J.; Bunsch, E. Fast Adaptive Multimodal Feature Registration (FAMFR): An Effective High-
+Resolution Point Clouds Registration Workflow for Cultural Heritage Interiors. Herit. Sci. 2023, 11, 190. [CrossRef]
+98.
+Saiti, E.; Danelakis, A.; Theoharis, T. Cross-Time Registration of 3D Point Clouds. Comput. Graph. 2021, 99, 139–152. [CrossRef]
+99.
+Tabib, R.A.; Kulkarni, S.; Kagalkar, A.; Hurakadli, V.; Ganapule, A.; Dhanakshirur, R.R.; Mudenagudi, U. Deep Learning-Based
+Filtering of Images For 3d Reconstruction of Heritage Sites. In Digital Techniques for Heritage Presentation and Preservation; Springer:
+Cham, Switzerland, 2021; pp. 147–156.
+100. Wang, Z.; Xiong, H. Analysis of the Application of Deep Learning in Model Reconstruction of Ancient Buildings. Adv. Multimed.
+2022, 2022, 4273937. [CrossRef]
+101. Dou, J.; Qin, J.; Jin, Z.; Li, Z. Knowledge Graph Based on Domain Ontology and Natural Language Processing Technology for
+Chinese Intangible Cultural Heritage. J. Vis. Lang. Comput. 2018, 48, 19–28. [CrossRef]
+102. Bakalos, N.; Rallis, I.; Doulamis, N.; Doulamis, A.; Protopapadakis, E.; Voulodimos, A. Choreographic Pose Identification Using
+Convolutional Neural Networks. In Proceedings of the 2019 11th International Conference on Virtual Worlds and Games for
+Serious Applications (VS-Games), Vienna, Austria, 4–6 September 2019; pp. 1–7.
+103. Serra, L. Preservation of Mediterranean Intangible Cultural Heritage through Virtual Gaming and Informatics: The Case of
+Sardinian Mùrra. In Proceedings of the 14th International Multi-Conference on Society, Cybernetics and Informatics (IMSCI 2020),
+Online, 13–16 September 2020; pp. 94–98.
+104. Fugini, M.; Finocchi, J.; Rossi, E. Semantic Adaptive Enrichment of Cartography for Intangible Cultural Heritage and Citizen
+Journalism. In Proceedings of the Future of Information and Communication Conference, Berlin, Germany, 4–5 April 2022;
+pp. 173–185.
+105. Sotiropoulos, D.N.; Tsihrintzis, G.A.; Virvou, M.; Tsichrintzi, E.-A. Machine Learning in Intangible Cultural Analytics: The Case of
+Greek Songs’ Lyrics. In Proceedings of the 2021 IEEE 33rd International Conference on Tools with Artificial Intelligence (ICTAI),
+Washington, DC, USA, 1–3 November 2021; pp. 299–305.
+106. Do, T.-N.; Pham, N.-K.; Nguyen, H.-H.; Tabia, K.; Benferhat, S. Stacking of Svms for Classifying Intangible Cultural Heritage
+Images. In Proceedings of the International Conference on Computer Science, Applied Mathematics and Applications, Hanoi,
+Vietnam, 19–20 December 2019; pp. 186–196.
+107. Zhang, X.; Jin, Y. A Method of Protecting Sensitive Information in Intangible Cultural Heritage Communication Network Based
+on Machine Learning. In Proceedings of the International Conference on Machine Learning for Cyber Security, Guangzhou,
+China, 2–4 December 2022; pp. 214–227.
+108. Zhu, L.; Pang, T. Research on Digital Platform Technology of Intangible Cultural Heritage in Beijing Section of Great Wall Cultural
+Belt. In Proceedings of the 2022 International Conference on Culture-Oriented Science and Technology (CoST), Lanzhou, China,
+18–21 August 2022; pp. 426–430.
+109. Huang, L.; Song, Y. Intangible Cultural Heritage Management using Machine Learning Model: A Case Study of Northwest Folk
+Song Huaer. Sci. Program. 2022, 2022, 1383520. [CrossRef]
+110. Zhao, H. The Database Construction of Intangible Cultural Heritage Based on Artificial Intelligence. Math. Probl. Eng. 2022, 2022,
+8576002. [CrossRef]
+111. Li, Q. Intelligent Intangible Cultural Heritage Innovation Platform under the Background of Big Data and Virtual Systems.
+In Proceedings of the 2022 Second International Conference on Artificial Intelligence and Smart Energy (ICAIS), Coimbatore,
+India, 23–25 February 2022; pp. 560–563.
+112. Yang, Z.; Jia, X.; Zhang, X.; Tang, J. Interpretable Neural Symbol Learning Methods to Fuse Deep Learning Representation and
+Knowledge Graph: Zhejiang Cuisine Recipe Intangible Cultural Heritage Use Case. In Design Studies and Intelligence Engineering;
+IOS Press: Amsterdam, The Netherlands, 2023; pp. 53–61.
+113. Huang, W.; Zheng, J.; Chen, W. The Construction of Intelligent Education for Intangible Cultural Heritage into the Classroom.
+In Proceedings of the The International Conference on Natural Computation, Fuzzy Systems and Knowledge Discovery, Xi’an,
+China, 1–3 August 2020; pp. 1172–1181.
+114. Xu, Z.; Zou, D. Big Data Analysis Research on the Deep Integration of Intangible Cultural Heritage Inheritance and Art Design
+Education in Colleges and Universities. Mob. Inf. Syst. 2022, 2022, 1172405. [CrossRef]
+115. Pistola, T.; Diplaris, S.; Stentoumis, C.; Stathopoulos, E.A.; Loupas, G.; Mandilaras, T.; Kalantzis, G.; Kalisperakis, I.; Tellios, A.;
+Zavraka, D. Creating Immersive Experiences Based on Intangible Cultural Heritage. In Proceedings of the 2021 IEEE International
+Conference on Intelligent Reality (ICIR), Piscataway, NJ, USA, 12–13 May 2021; pp. 17–24.
+116. Cui, J.; Fu, L. Multimedia Display of Wushu Intangible Cultural Heritage Based on Interactive System and Artificial Intelligence.
+Soft Comput. 2023, 27, 1–9. [CrossRef]
+117. Hu, R. Research on the Digital Protection Technology of Intangible Cultural Heritage Information under Computer Artificial
+Intelligence. In Proceedings of the 2022 International Conference on Computers, Information Processing and Advanced Education
+(CIPAE), Ottawa, ON, Canada, 26–28 August 2022; pp. 92–96.
+118. Yu, X.; Shan, W.; Ding, H.; Li, B. Research on Intangible Cultural Heritage Amusement Space Design from the Perspective
+of Artificial Intelligence. In Proceedings of the 2021 2nd International Conference on Intelligent Design (ICID), Xi’an, China,
+19 October 2021; pp. 203–207.
+
+
+Electronics 2024, 13, 3738
+24 of 24
+119. Pavlidis, G. Recommender Systems, Cultural Heritage Applications, and The Way Forward. J. Cult. Herit. 2019, 35, 183–196.
+[CrossRef]
+120. Dam, N.A.K.; Le Dinh, T. A Literature Review of Recommender Systems for the Cultural Sector. In Proceedings of the 22nd
+International Conference on Enterprise Information Systems (ICEIS 2020), Prague, Czech Republic, 5–7 May 2020; Volume 1,
+pp. 715–726.
+121. Ferrato, A.; Limongelli, C.; Mezzini, M.; Sansonetti, G. The META4RS Proposal: Museum Emotion and Tracking Analysis for
+Recommender Systems. In Proceedings of the Adjunct Proceedings of the 30th ACM Conference on User Modeling, Adaptation
+and Personalization, Barcelona, Spain, 4–7 July 2022; pp. 406–409.
+122. Trichopoulos, G. Large Language Models for Cultural Heritage. In Proceedings of the 2nd International Conference of the ACM
+Greek SIGCHI Chapter, Athens, Greece, 27–28 September 2023; pp. 1–5.
+123. Nafis, F.; Al Fararni, K.; Yahyaouy, A.; Aghoutane, B. An Approach Based on Machine Learning Algorithms for the Recommenda-
+tion of Scientific Cultural Heritage Objects. Int. J. Adv. Comput. Sci. Appl. 2021, 12, 230. [CrossRef]
+124. Colace, F.; D’Arienzo, M.P.; Lorusso, A.; Lombardi, M.; Santaniello, D.; Valentino, C. A Novel Context Aware Paths Recommen-
+dation Approach for the Cultural Heritage Enhancement. In Proceedings of the 2023 IEEE International Conference on Smart
+Computing (SMARTCOMP), Nashville, TN, USA, 26–30 June 2023; pp. 273–278.
+125. Casillo, M.; Conte, D.; Lombardi, M.; Santaniello, D.; Valentino, C. Recommender System For Digital Storytelling: A Novel
+Approach to Enhance Cultural Heritage. In Proceedings of the Pattern Recognition. ICPR International Workshops and
+Challenges, Virtual Event„ 10–15 January 2021; Proceedings, Part VII. Springer International Publishing: Berlin/Heidelberg,
+Germany, 2021; pp. 304–317.
+126. Su, X.; Sperlì, G.; Moscato, V.; Picariello, A.; Esposito, C.; Choi, C. An Edge Intelligence Empowered Recommender System
+Enabling Cultural Heritage Applications. IEEE Trans. Ind. Inform. 2019, 15, 4266–4275. [CrossRef]
+127. Arrieta, A.B.; Díaz-Rodríguez, N.; Ser, J.D.; Bennetot, A.; Tabik, S.; Barbado, A.; Garcia, S.; Gil-Lopez, S.; Molina, D.; Benjamins, R.;
+et al. Explainable Artificial Intelligence (XAI): Concepts, Taxonomies, Opportunities and Challenges toward Responsible AI. Inf.
+Fusion 2019, 58, 82–115. [CrossRef]
+Disclaimer/Publisher’s Note: The statements, opinions and data contained in all publications are solely those of the individual
+author(s) and contributor(s) and not of MDPI and/or the editor(s). MDPI and/or the editor(s) disclaim responsibility for any injury to
+people or property resulting from any ideas, methods, instructions or products referred to in the content.
