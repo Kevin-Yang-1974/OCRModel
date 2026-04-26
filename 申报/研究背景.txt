@@ -1,28 +1,27 @@
 研究背景
 
-比起一般文献图像，敦煌曲谱更适合被视为兼具文献性、符号性和音乐性的复合对象。近年来，乐谱识别与符号音乐生成研究的发展，为这一对象的智能处理提供了新的方法来源。在乐谱识别方面，针对中国传统工尺谱的 OMR研究已经证明，古代东方记谱法可以通过图像预处理、符号识别、音乐语义解释与 MIDI表达等环节转化为可机读、可播放的数字格式[4]；面向中世纪乐谱图像的深度学习研究进一步表明，乐谱图像可以通过像素级分层处理实现背景、符号和文本信息的自动区分，从而减少对人工启发式规则的依赖[5]；而围绕同声乐谱的端到端识别研究则说明，乐谱内容虽然不同于普通文本，但仍可通过合理的序列化编码方式进入深度学习识别流程，并可借助合成数据缓解真实样本不足的问题[6]。在数据资源方面，面向中国古代俗字谱的 KuiSCIMA 数据集表明，针对古谱场景建立“页面—字符—符号”多层级标注体系是可行的，也说明中国古谱 OMR研究正在从个别算法尝试走向数据集建设和可比评测[7]。在音乐生成方面，符号音乐生成研究已从一般性的旋律续写拓展到更复杂的结构建模、条件生成与可控补全，相关综述表明，基于 Transformer 的方法已经能够围绕符号音乐的表示、编码、生成与检索构建较完整的技术框架[8]。这些成果说明，敦煌曲谱从图像识别走向符号表达、再走向音乐合成和AIGC创作，在方法论上已具备跨领域衔接的现实基础。
+敦煌音乐资料是敦煌文化遗产和中国非物质文化遗产体系中的重要组成部分，兼具文献性、图像性、符号性和音乐性。它既包括敦煌曲谱图像、谱字符号、乐舞图像等视觉材料，也涉及文献释读、音乐知识、参考音频和当代传播场景。近年来，人工智能已经在敦煌文化遗产保护中形成了一定基础，相关研究在壁画图像修复、目标检测、图像检索、风格分析和数据集建设等方面取得进展，说明 AI 技术能够有效服务文化遗产的数字化保护与研究[1]。与此同时，传统乐谱光学识别、符号音乐生成、多模态学习和生成式人工智能的发展，也为敦煌音乐资料从图像识别走向结构化表达、音乐生成和活化传播提供了新的方法来源[2][3][4]。
 
-然而，从当前研究现状看，面向敦煌曲谱的系统性智能处理研究仍明显不足。首先，现有敦煌 AI研究的重点多集中于壁画、洞窟图像及一般文化遗产视觉对象，针对敦煌曲谱这一特殊音乐文献的专门研究尚不充分，已有成果很少直接触及谱字识别、谱面结构解析、节奏标记关联和曲谱到音乐表示的连续转换问题。其次，现有 OMR研究虽然已覆盖西方乐谱、中世纪手稿以及部分中国传统记谱法，但敦煌曲谱在符号体系、版面结构、残损形态和释读难度上具有较强特殊性，难以直接套用通用乐谱识别方法；尤其在数据集建设、标注规范和模型评测方面，敦煌曲谱仍缺少针对性基础资源[4][7]。再次，已有研究往往分别讨论图像修复、乐谱识别和符号音乐生成，缺少贯通“谱面—符号—声音”的整体链条：如果图像预处理和缺损修复不足，后续符号识别就容易出现错识和漏识；如果识别结果不能转化为稳定的符号化表达，音乐合成与生成式创作便缺少可靠依据；如果生成结果缺乏专家审校和来源标注，又容易削弱其文化可信性与学术规范性[2][8][9]。因此，敦煌曲谱研究的关键问题已不再只是单点识别或单次生成，而是如何围绕曲谱图像识别、缺损修复、音乐合成与AIGC创作建立前后衔接的研究链条。
+然而，现有研究直接迁移到敦煌音乐场景时仍存在明显不足。首先，现有敦煌 AI研究多集中于壁画、洞窟图像和一般视觉对象，对敦煌音乐资料中“曲谱—图像—文本—音频”之间关系的建模仍不充分。敦煌曲谱不是普通文献图像，也不是现代五线谱或简谱，其谱字符号、版面关系和音乐属性之间具有复杂对应关系。若只采用通用 OCR 或普通乐谱识别方法，模型往往只能得到局部字符结果，难以同时保留谱字类别、空间位置、阅读关系、版面结构和音乐含义，因而不能直接支撑后续音乐生成。
 
-正因如此，围绕敦煌曲谱开展人工智能研究具有明确的必要性。一方面，敦煌曲谱不仅是敦煌文献的重要组成部分，也是连接中古音乐史、记谱史、演奏传统与文化传播的重要载体，对其进行图像识别、数字修复和音乐再现，有助于提升这一珍贵音乐遗产的整理效率与保存质量。另一方面，敦煌曲谱相较一般静态文献更具有“可听化”“可演绎化”和“可传播化”潜力，其价值并不止于图像保存或文本转写，而在于通过符号建模、音乐合成与生成式表达实现从文献资源到可感知文化内容的转换。特别是在当前生成式人工智能快速发展的背景下，若能在曲谱识别和修复基础上进一步探索受约束的音乐补全和AIGC辅助创作，不仅能够拓展敦煌曲谱的数字活化路径，也有助于形成兼顾学术整理、音乐重建和公众传播的综合性方案。当然，这一过程不能脱离史料依据和学术规范，而应通过人机协同、专家审校和来源标注等机制保证生成结果的可解释性与可信性[10]。因此，有必要在已有文化遗产 AI、古谱识别、图像修复和符号音乐生成研究基础上，进一步聚焦敦煌曲谱这一具体对象，构建贯通“图像识别—缺损修复—音乐合成—AIGC创作”的研究框架，为敦煌曲谱的数字化保护、智能化整理与创新性传播提供更有针对性的技术路径。
+其次，现有乐谱识别模型在敦煌曲谱上的效果容易受数据条件限制。传统 OMR 方法通常依赖较清晰的符号边界、稳定的记谱规则和相对充分的训练样本[2]，而敦煌曲谱样本规模有限，谱字形态特殊，材料可能存在残损、褪色、模糊、遮挡和采集质量不一致等问题。古代中国俗字谱数据集 KuiSCIMA说明，通过页面、文本字符和谱字符号的联合标注可以推动传统谱式识别研究[3]，但敦煌曲谱仍缺少足够规模的专门标注资源和可比评测基础。由于样本少、标注难、符号异质性强，直接训练大规模端到端识别模型容易出现过拟合；而只依赖规则或模板的方法又难以处理残损符号、异体写法和复杂版面关系。这是现有模型在敦煌曲谱场景中效果不稳定的重要原因。
+
+再次，现有音乐生成模型虽然已能利用文本、旋律或音频条件生成音乐，但在敦煌音乐场景中仍存在“风格可控但依据不足”的问题。符号音乐生成研究表明，音乐可以被表示为类似语言的事件序列，Transformer 等模型能够用于旋律生成、补全和检索[4]；Anticipatory Music Transformer进一步提出将控制事件插入音乐事件序列附近，使模型在生成音乐事件之前提前感知控制信息[5]。但是，敦煌音乐生成不能只依赖单一文本提示、旋律片段或参考音频，而需要同时考虑曲谱骨架、敦煌图像风格、文献释读、参考音色和用户意图。通用文本到音乐模型通常缺少曲谱依据，容易生成泛化的“古风音乐”；图像到音乐或音频扩散模型则往往依赖大规模图像—音乐或文本—音频配对数据，而敦煌音乐资料中这类配对样本数量有限，直接训练或深度微调大型音频生成模型并不现实。其结果是，现有模型要么难以体现敦煌曲谱的具体依据，要么模型规模和数据需求超出本项目条件。
+
+此外，多模态生成式 AI 在文化遗产应用中还面临真实性和解释边界问题。文化遗产人工智能伦理研究指出，AI参与文化遗产再现和生成时，需要关注来源说明、解释偏差、真实性边界和责任归属[6]。因此，敦煌音乐生成不能被表述为对历史音乐的自动复原，而应定位为在曲谱、图像、文本和音频资料约束下的辅助再现、辅助创作与活化传播。项目需要在模型结构上保留曲谱依据，在生成结果中说明材料来源和风格条件，使生成音乐与原始文献、识别结果和艺术化表达之间保持清晰边界。
+
+基于上述背景，本项目拟面向非物质文化遗产保护与活化传播，以敦煌音乐资料为核心场景，研究小样本条件下的敦煌曲谱结构化识别、多模态敦煌风格音乐生成和交互式生成系统构建方法。项目的关键不在于简单叠加现有识别模型、音乐生成模型和交互界面，而在于围绕敦煌曲谱的特殊性，建立“识别—桥接—生成”的一体化技术路线：先通过 Dunhuang-ScoreFormer 将曲谱图像转化为包含符号、位置、版面关系、音乐属性和置信度的结构化曲谱表示；再通过敦煌风格桥接 Token 将曲谱骨架、文本提示、敦煌图像、参考音频和文献知识统一为可进入音乐生成过程的控制条件；最后通过 S-AMT生成符号音乐草图，并结合潜空间符号音乐细化和可选音频渲染，使生成结果既具有敦煌风格指向，又与曲谱材料保持可追溯关系。
+
 参考文献
 
-[1] Münster S, Maiwald F, di Lenardo I, et al. Artificial Intelligence for Digital Heritage Innovation: Setting up a R&D Agenda for Europe[J]. Heritage,2024,7:794-816. DOI:10.3390/heritage7020038.
+[1] Yu T, Lin C, Zhang S, Wang C, Ding X, An H, Liu X, Qu T, Wan L, You S, Wu J, Zhang J. Artificial Intelligence for Dunhuang Cultural Heritage Protection: The Project and the Dataset[J]. International Journal of Computer Vision,2022,130:2646-2673. DOI:10.1007/s11263-022-01665-x.
 
-[2] Yu T, Lin C, Zhang S, et al. Artificial Intelligence for Dunhuang Cultural Heritage Protection: The Project and the Dataset[J]. International Journal of Computer Vision,2022,130:2646-2673. DOI:10.1007/s11263-022-01665-x.
+[2] Chen G F, Sheu J S. An optical music recognition system for traditional Chinese Kunqu Opera scores written in Gong-Che Notation[J]. EURASIP Journal on Audio, Speech, and Music Processing,2014,2014:7. DOI:10.1186/1687-4722-2014-7.
 
-[3] Xiong W, Zhou L, Yue L, et al. An enhanced binarization framework for degraded historical document images[J]. EURASIP Journal on Image and Video Processing,2021,2021:13. DOI:10.1186/s13640-021-00556-4.
+[3] Repolusk T, Veas E. The KuiSCIMA Dataset for Optical Music Recognition of Ancient Chinese Suzipu Notation[C]//Document Analysis and Recognition - ICDAR2024. Cham: Springer,2024:38-54. DOI:10.1007/978-3-031-70552-6_3.
 
-[4] Chen G F, Sheu J S. An optical music recognition system for traditional Chinese Kunqu Opera scores written in Gong-Che Notation[J]. EURASIP Journal on Audio, Speech, and Music Processing,2014,2014:7. DOI:10.1186/1687-4722-2014-7.
+[4] Le D V T, Bigo L, Herremans D, Keller M. Natural Language Processing Methods for Symbolic Music Generation and Information Retrieval: A Survey[J]. ACM Computing Surveys,2025,57(7): Article175. DOI:10.1145/3714457.
 
-[5] Calvo-Zaragoza J, Castellanos F J, Vigliensoni G, et al. Deep Neural Networks for Document Processing of Music Score Images[J]. Applied Sciences,2018,8(5):654. DOI:10.3390/app8050654.
+[5] Thickstun J, Hall D, Donahue C, Liang P. Anticipatory Music Transformer[J]. Transactions on Machine Learning Research,2024.
 
-[6] Alfaro-Contreras M, Iñesta J M, Calvo-Zaragoza J. Optical music recognition for homophonic scores with neural networks and synthetic music generation[J]. International Journal of Multimedia Information Retrieval,2023,12:12. DOI:10.1007/s13735-023-00278-5.
-
-[7] Repolusk T, Veas E. The KuiSCIMA Dataset for Optical Music Recognition of Ancient Chinese Suzipu Notation[C]//ICDAR2024. Lecture Notes in Computer Science,2024:38-54. DOI:10.1007/978-3-031-70552-6_3.
-
-[8] Le D V T, Bigo L, Herremans D, et al. Natural Language Processing Methods for Symbolic Music Generation and Information Retrieval: A Survey[J]. ACM Computing Surveys,2025,57(7):175. DOI:10.1145/3714457.
-
-[9] Thickstun J, Hall D, Donahue C, et al. Anticipatory Music Transformer[J/OL]. Transactions on Machine Learning Research,2024. DOI:10.48550/arXiv.2306.08620.
-
-[10] Tiribelli S, Pansoni S, Frontoni E, et al. Ethics of Artificial Intelligence for Cultural Heritage: Opportunities and Challenges[J]. IEEE Transactions on Technology and Society,2024,5(3):293-305. DOI:10.1109/TTS.2024.3432407.
+[6] Tiribelli S, Pansoni S, Frontoni E, Giovanola B. Ethics of Artificial Intelligence for Cultural Heritage: Opportunities and Challenges[J]. IEEE Transactions on Technology and Society,2024,5(3):293-305. DOI:10.1109/TTS.2024.3432407.
