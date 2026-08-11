@@ -60,11 +60,11 @@ page image -> 1024x1024 processor -> Vary ViT -> 256 visual tokens
 
 记最终视觉表示为：
 
-$$\mathbf V_i=\operatorname{Projector}(\operatorname{VaryViT}(P_i))\in\mathbb R^{N_v\times D},\qquad N_v=256,\ D=1024.$$
+$$\mathbf{V}_i=\mathrm{Projector}(\mathrm{VaryViT}(P_i))\in\mathbb{R}^{N_v\times D},\qquad N_v=256,\ D=1024.$$
 
 Vary ViT 在两次 stride-2 卷积前还存在更高分辨率的中间特征。记可供布局查询读取的特征为：
 
-$$\mathbf H_i\in\mathbb R^{N_h\times D_h}.$$
+$$\mathbf{H}_i\in\mathbb{R}^{N_h\times D_h}.$$
 
 首轮最小实现令 $\mathbf H_i=\mathbf V_i$，即直接使用现有 $16\times16$ token；只有在定位指标证明分辨率不足时，才暴露下采样前的 $64\times64$ 特征作为查询 Key/Value。高分辨率特征只供布局分支读取，不全部送入 Qwen。
 
@@ -72,31 +72,31 @@ $$\mathbf H_i\in\mathbb R^{N_h\times D_h}.$$
 
 设置 $K$ 个区域查询和一个可选全局查询：
 
-$$\mathbf Q^{(0)}\in\mathbb R^{K\times d_a}.$$
+$$\mathbf{Q}^{(0)}\in\mathbb{R}^{K\times d_a}.$$
 
 $K$ 表示单页可建模区域数上限，由训练数据的列或版面区域分布确定，不预设为固定最优值。首轮采用**按阅读顺序编号的有序查询**：第 $k$ 个有效 query 对应真值排列 $\pi_i(k)$ 中的第 $k$ 个阅读区域；页面区域不足 $K$ 时，其余位置使用 `no-object` mask。这样把阅读顺序监督落实到 query 与区域的目标分配中，并避免无序查询的排列歧义。
 
-令 $\boldsymbol\Pi_i$ 为继承自整页视觉网格的二维位置表示，布局读取为：
+令 $\mathbf{\Pi}_i$ 为继承自整页视觉网格的二维位置表示，布局读取为：
 
-$$\mathbf G'_i=\mathbf Q^{(0)}+\operatorname{MHA}(\operatorname{LN}(\mathbf Q^{(0)}),\operatorname{LN}(\mathbf H_i+\boldsymbol\Pi_i)\mathbf W_K,\operatorname{LN}(\mathbf H_i)\mathbf W_V).$$
+$$\mathbf{G}'_i=\mathbf{Q}^{(0)}+\mathrm{MHA}(\mathrm{LN}(\mathbf{Q}^{(0)}),\mathrm{LN}(\mathbf{H}_i+\mathbf{\Pi}_i)\mathbf{W}_K,\mathrm{LN}(\mathbf{H}_i)\mathbf{W}_V).$$
 
-$$\mathbf G_i=\mathbf G'_i+\operatorname{FFN}(\operatorname{LN}(\mathbf G'_i))\in\mathbb R^{K\times d_a}.$$
+$$\mathbf{G}_i=\mathbf{G}'_i+\mathrm{FFN}(\mathrm{LN}(\mathbf{G}'_i))\in\mathbb{R}^{K\times d_a}.$$
 
 $\mathbf G_i$ 由页面图像直接产生，不接收外部 bbox、列序或方向。由于有序槽位的 query ID 已携带顺序，不再用“从 query 预测自己的槽位编号”作为有效辅助任务；该任务可以脱离图像直接完成，不能证明模型学习了阅读顺序。若后续需要支持更复杂、无固定顺序的异构版面，可将有序槽位改为 DETR 式集合预测，再在匹配后增加独立顺序预测；该方案不是首轮最小实现。
 
 ### 4.3 训练期布局辅助头
 
-对第 $k$ 个 query，先使用最终归一化 $\widetilde{\mathbf G}_i=\operatorname{LN}(\mathbf G_i)$ 隔离 query 主干的异常尺度，再在训练阶段预测：
+对第 $k$ 个 query，先使用最终归一化 $\widetilde{\mathbf{G}}_i=\mathrm{LN}(\mathbf{G}_i)$ 隔离 query 主干的异常尺度，再在训练阶段预测：
 
-$$\hat p^{\mathrm{obj}}_{i,k}=\operatorname{sigmoid}(\mathbf w_{\mathrm{obj}}^{\mathsf T}\widetilde{\mathbf G}_{i,k}+b_{\mathrm{obj}}).$$
+$$\hat{p}^{\mathrm{obj}}_{i,k}=\mathrm{sigmoid}(\mathbf{w}_{\mathrm{obj}}^{\top}\widetilde{\mathbf{G}}_{i,k}+b_{\mathrm{obj}}).$$
 
-$$\hat{\mathbf b}_{i,k}=\operatorname{sigmoid}(\mathbf W_{\mathrm{box}}\widetilde{\mathbf G}_{i,k}+\mathbf b_{\mathrm{box}})\in[0,1]^4.$$
+$$\hat{\mathbf{b}}_{i,k}=\mathrm{sigmoid}(\mathbf{W}_{\mathrm{box}}\widetilde{\mathbf{G}}_{i,k}+\mathbf{b}_{\mathrm{box}})\in[0,1]^4.$$
 
-$$\hat{\mathbf p}^{\mathrm{dir}}_{i,k}=\operatorname{softmax}(\mathbf W_{\mathrm{dir}}\widetilde{\mathbf G}_{i,k}+\mathbf b_{\mathrm{dir}}).$$
+$$\hat{\mathbf{p}}^{\mathrm{dir}}_{i,k}=\mathrm{softmax}(\mathbf{W}_{\mathrm{dir}}\widetilde{\mathbf{G}}_{i,k}+\mathbf{b}_{\mathrm{dir}}).$$
 
 其中 bbox 使用归一化中心点和宽高或归一化角点，两种参数化必须在实现中固定一种；`writing_direction` 的最小类别集合为 `horizontal_ltr`、`horizontal_rtl`、`vertical_rtl`、`vertical_ltr` 和 `unknown`。阅读顺序由有序 query 的目标分配监督，不设置可由固定 query ID 平凡完成的顺序分类头。bbox、方向和顺序真值只用于训练监督及评测，不是主模型推理输入。辅助头可在部署时保留用于解释和质量控制，也可在只需 OCR 输出时丢弃。
 
-无序 query 对照采用 DETR 式匹配后，才允许增加独立顺序预测 $\hat o_{i,k}=\operatorname{sigmoid}(\mathbf w_{\mathrm{ord}}^{\mathsf T}\mathbf G_{i,k}+b_{\mathrm{ord}})$；此时顺序损失必须在匹配后的区域上计算。
+无序 query 对照采用 DETR 式匹配后，才允许增加独立顺序预测 $\hat{o}_{i,k}=\mathrm{sigmoid}(\mathbf{w}_{\mathrm{ord}}^{\top}\mathbf{G}_{i,k}+b_{\mathrm{ord}})$；此时顺序损失必须在匹配后的区域上计算。
 
 `col` 不必作为独立网络输入。对规则多栏页面，可由有效区域的 bbox、方向和顺序得到列位置；若复杂版面实验表明几何规则不足，再增加区域类型或列组预测头。
 
@@ -104,9 +104,9 @@ $$\hat{\mathbf p}^{\mathrm{dir}}_{i,k}=\operatorname{softmax}(\mathbf W_{\mathrm
 
 布局 queries 不直接替换 GOT2 的 256 个视觉 token。以原视觉 token 为 Query、布局表示为 Key/Value，得到布局残差：
 
-$$\mathbf C_i=\operatorname{MHA}(\operatorname{LN}(\mathbf V_i)\mathbf W_Q,(\widetilde{\mathbf G}_i+\mathbf E^{\mathrm{ord}})\mathbf W_K^{G},\widetilde{\mathbf G}_i\mathbf W_V^{G})\in\mathbb R^{N_v\times d_a}.$$
+$$\mathbf{C}_i=\mathrm{MHA}(\mathrm{LN}(\mathbf{V}_i)\mathbf{W}_Q,(\widetilde{\mathbf{G}}_i+\mathbf{E}^{\mathrm{ord}})\mathbf{W}_K^{G},\widetilde{\mathbf{G}}_i\mathbf{W}_V^{G})\in\mathbb{R}^{N_v\times d_a}.$$
 
-$$\Delta\mathbf V_i=\operatorname{LN}(\mathbf C_i)\mathbf W_O\in\mathbb R^{N_v\times D}.$$
+$$\Delta\mathbf{V}_i=\mathrm{LN}(\mathbf{C}_i)\mathbf{W}_O\in\mathbb{R}^{N_v\times D}.$$
 
 $$\mathbf V_i^{\mathrm{layout}}=\mathbf V_i+\tanh(\alpha)\Delta\mathbf V_i.$$
 
@@ -118,9 +118,9 @@ $\mathbf E^{\mathrm{ord}}$ 是 query 槽位或预测顺序 embedding，$\alpha$ 
 
 主候选可写为：
 
-$$P_i\xrightarrow{\mathrm{VaryViT}}(\mathbf H_i,\mathbf V_i),\qquad (\mathbf Q^{(0)},\mathbf H_i)\xrightarrow{\mathrm{layout\ query}}\mathbf G_i.$$
+$$\left(\mathbf{H}_i,\mathbf{V}_i\right)=\mathrm{VaryViT}(P_i),\qquad \mathbf{G}_i=\mathrm{LayoutQuery}\left(\mathbf{Q}^{(0)},\mathbf{H}_i\right).$$
 
-$$\mathbf G_i\xrightarrow{\mathrm{auxiliary\ heads}}(\hat{\mathbf b}_i,\hat{\mathbf p}^{\mathrm{obj}}_i,\hat{\mathbf p}^{\mathrm{dir}}_i),\qquad (\mathbf V_i,\mathbf G_i)\xrightarrow{\mathrm{gated\ writeback}}\mathbf V_i^{\mathrm{layout}}.$$
+$$\left(\hat{\mathbf{b}}_i,\hat{\mathbf{p}}^{\mathrm{obj}}_i,\hat{\mathbf{p}}^{\mathrm{dir}}_i\right)=\mathrm{AuxHeads}(\mathbf{G}_i),\qquad \mathbf{V}_i^{\mathrm{layout}}=\mathrm{GatedWriteback}(\mathbf{V}_i,\mathbf{G}_i).$$
 
 $$p_{\theta}(\mathbf y_i\mid P_i)=\prod_{t=1}^{T_i}p_{\theta}(y_{i,t}\mid y_{i,<t},\mathbf V_i^{\mathrm{layout}}).$$
 
@@ -140,7 +140,7 @@ $\mathcal L_{\mathrm{ocr}}$ 是唯一直接优化页面符号转写的主损失�
 
 对有效区域 mask $m_{i,k}$，使用：
 
-$$\mathcal L_{\mathrm{obj}}=\operatorname{BCE}(\hat p^{\mathrm{obj}}_{i,k},m_{i,k}).$$
+$$\mathcal{L}_{\mathrm{obj}}=\mathrm{BCE}(\hat{p}^{\mathrm{obj}}_{i,k},m_{i,k}).$$
 
 $$\mathcal L_{\mathrm{box}}=\frac{1}{\max(1,\sum_{i,k}m_{i,k})}\sum_{i,k}m_{i,k}\left(\|\hat{\mathbf b}_{i,k}-\mathbf b_{i,k}\|_1+\lambda_{\mathrm{giou}}\mathcal L_{\mathrm{GIoU}}(\hat{\mathbf b}_{i,k},\mathbf b_{i,k})\right).$$
 
