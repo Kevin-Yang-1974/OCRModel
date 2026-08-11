@@ -22,7 +22,7 @@
 - `../GOT/model/layout_query.py`：有序 queries、object/bbox/direction 头、零门控写回与损失；
 - `../../../tools/preprocessing`：HTML 页面生成和无泄漏审计。
 
-`../../../tools/training/run_layout_a100.py` 已把环境、数据、GPU、P1/P2 和 checkpoint 检查串成受限入口，并已在 A100 打通 CUDA forward/backward、整页 batch、P1→P2 加载和最终模型重载。首次 2 页长跑没有通过 P1 可拟合性检查，当前代码已增加 FP32 分项日志和固定 P1 两样本 `--mode overfit`；该诊断通过前不启动新 pilot。validation loader 和统一指标仍未实现，当前不得报告训练效果。最短上传与运行命令见 `../../../docs/SYNC_AND_RUN.md`。
+`../../../tools/training/run_layout_a100.py` 已把环境、数据、GPU、P1/P2、validation 和 checkpoint 检查串成受限入口，并已在 A100 打通 CUDA forward/backward、整页 batch、P1→P2 加载和最终模型重载。`layout_overfit_20260812_002747` 已通过固定 1000 steps 的 P1 两样本实现诊断；`layout_page_dataset.py`、`evaluate_GOT_layout.py` 和 `layout_validation_metrics.py` 已提供 prompt-only validation loader、整页 generation 与统一页面指标。tokenizer 预检修复后的 `layout_validate_20260812_014816` 已在两页 `train` split 上完成链路验证，但使用的是同页 P1 overfit checkpoint；正式 split、held-out 效果验证仍未完成，当前不得报告泛化性能。最短上传与运行命令见 `../../../docs/SYNC_AND_RUN.md`。
 
 ## 页面兼容入口
 

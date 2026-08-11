@@ -290,6 +290,80 @@ class LayoutPageConversationDataset(LineLevelConversationDataset):
         return item
 
 
+class LayoutPageValidationDataset(LayoutPageConversationDataset):
+    """Prompt-only whole-page samples for generation and layout evaluation."""
+
+    def __init__(
+        self,
+        datasets: str,
+        tokenizer: Any,
+        multimodal_cfg: dict[str, Any],
+        manifest: Path,
+        image_root: Path | None,
+        split: str,
+        max_regions: int,
+        max_records: int = 0,
+    ) -> None:
+        super().__init__(
+            datasets=datasets,
+            tokenizer=tokenizer,
+            multimodal_cfg=multimodal_cfg,
+            manifest=manifest,
+            image_root=image_root,
+            split=split,
+            max_regions=max_regions,
+            max_records=max_records,
+            supervise_ocr=False,
+        )
+
+    def _prompt_input_ids(self, record: dict[str, Any]) -> tuple[torch.Tensor, str, str]:
+        human_message = copy.deepcopy(record["conversations"][0])
+        processed = self.multimodal_processor([[human_message]])[0][0]["value"]
+        conversation = conversation_lib.default_conversation.copy()
+        conversation.messages = []
+        conversation.append_message(conversation.roles[0], processed)
+        conversation.append_message(conversation.roles[1], None)
+        prompt = conversation.get_prompt()
+        input_ids = self.tokenizer(
+            [prompt],
+            return_tensors="pt",
+            padding=False,
+            truncation=False,
+        ).input_ids[0]
+        if input_ids.numel() > self.tokenizer.model_max_length:
+            raise RuntimeError(
+                f"Validation prompt for {record['page_id']} has {input_ids.numel()} tokens, "
+                f"exceeding model_max_length={self.tokenizer.model_max_length}."
+            )
+        stop_string = (
+            conversation.sep
+            if conversation.sep_style != conversation_lib.SeparatorStyle.TWO
+            else conversation.sep2
+        )
+        return input_ids, prompt, stop_string
+
+    def __getitem__(self, index: int) -> dict[str, Any]:
+        record = copy.deepcopy(self.records[index])
+        image_path = resolve_image_path(self.image_root, record["image"], record["page_id"])
+        with Image.open(image_path) as source:
+            image = self.image_processor(source.convert("RGB"))
+        input_ids, prompt, stop_string = self._prompt_input_ids(record)
+        item: dict[str, Any] = {
+            "input_ids": input_ids,
+            "image": [image],
+            "image_high": [image],
+            "page_id": record["page_id"],
+            "page_text": record["page_text"],
+            "regions": record.get("regions", []),
+            "layout_annotation_status": record.get("layout_annotation_status", "none"),
+            "image_path": str(image_path),
+            "prompt": prompt,
+            "stop_string": stop_string,
+        }
+        item.update(self._layout_targets(record))
+        return item
+
+
 class LayoutPageDataCollator:
     def __init__(self, tokenizer: Any) -> None:
         self.base = DataCollatorForSupervisedDataset(tokenizer=tokenizer)
@@ -304,6 +378,46 @@ class LayoutPageDataCollator:
             "layout_direction_targets",
         ):
             batch[key] = torch.stack([instance[key] for instance in instances])
+        return batch
+
+
+class LayoutPageValidationCollator:
+    def __init__(self, tokenizer: Any) -> None:
+        self.tokenizer = tokenizer
+
+    def __call__(self, instances: Sequence[dict[str, Any]]) -> dict[str, Any]:
+        if not instances:
+            raise ValueError("Validation collator received an empty batch.")
+        input_ids = torch.nn.utils.rnn.pad_sequence(
+            [instance["input_ids"] for instance in instances],
+            batch_first=True,
+            padding_value=self.tokenizer.pad_token_id,
+        )
+        images = [torch.stack(instance["image"]) for instance in instances]
+        images_high = [torch.stack(instance["image_high"]) for instance in instances]
+        batch: dict[str, Any] = {
+            "input_ids": input_ids,
+            "attention_mask": input_ids.ne(self.tokenizer.pad_token_id),
+            "images": list(zip(images, images_high)),
+        }
+        for key in (
+            "layout_bbox_targets",
+            "layout_bbox_mask",
+            "layout_object_targets",
+            "layout_object_mask",
+            "layout_direction_targets",
+        ):
+            batch[key] = torch.stack([instance[key] for instance in instances])
+        for key in (
+            "page_id",
+            "page_text",
+            "regions",
+            "layout_annotation_status",
+            "image_path",
+            "prompt",
+            "stop_string",
+        ):
+            batch[key] = [instance[key] for instance in instances]
         return batch
 
 
@@ -342,4 +456,38 @@ def make_layout_page_data_module(
         "train_dataset": train_dataset,
         "eval_dataset": None,
         "data_collator": LayoutPageDataCollator(tokenizer=tokenizer),
+    }
+
+
+def make_layout_page_validation_data_module(
+    tokenizer: Any,
+    manifest: Path,
+    image_root: Path | None,
+    split: str,
+    max_regions: int,
+    image_processor: Any,
+    image_token_len: int = 256,
+    max_records: int = 0,
+) -> dict[str, Any]:
+    eval_dataset = LayoutPageValidationDataset(
+        tokenizer=tokenizer,
+        datasets="layout-page-jsonl",
+        multimodal_cfg={
+            "sep_image_conv_front": False,
+            "image_token_len": image_token_len,
+            "image_aspect_ratio": "square",
+            "use_im_start_end": True,
+            "image_processor": image_processor,
+            "image_processor_high": image_processor,
+            "box_limit": 0,
+        },
+        manifest=manifest,
+        image_root=image_root,
+        split=split,
+        max_regions=max_regions,
+        max_records=max_records,
+    )
+    return {
+        "eval_dataset": eval_dataset,
+        "data_collator": LayoutPageValidationCollator(tokenizer=tokenizer),
     }

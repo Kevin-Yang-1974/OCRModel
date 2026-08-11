@@ -6,17 +6,17 @@
 
 ## 当前状态
 
-更新于 2026 年 8 月 11 日。
+更新于 2026 年 8 月 12 日。
 
 | 模块 | 状态 | 当前结论 |
 |---|---|---|
 | 整页 HTML/Playwright 合成与 manifest 审计 | 已实现并通过本地 smoke | 可生成 `S0-html-text`、`S1-html-crop` 和 `S2-hard` schema v2 数据；正式字体包仍未锁定 |
 | 页面级 dataset/collator 与 VLQA | 已实现首版 | 支持有序 queries、object/bbox/direction 辅助损失和零门控写回 |
 | A100 forward/backward 与 P1→P2 保存重载 | 工程链路已打通 | 只证明代码链路可运行，不构成性能证据 |
-| P1 两样本 overfit | 首次诊断失败 | 首步出现约 1680 的异常 logit 与 bbox 饱和；初始化修复已在本地完成，待同协议复测 |
-| validation、正式指标与统一消融 | 未实现 | 当前没有可报告的 VLQA 性能结果 |
+| P1 两样本 overfit | 1000 steps 实现诊断通过 | `layout_overfit_20260812_002747` 的 object/direction、bbox L1/GIoU/IoU 均达到实现门槛；仍不是性能结果 |
+| validation loader 与统一页面指标 | 两页链路验证通过，正式 split 待执行 | `layout_validate_20260812_014816` 确认整页 prompt-only checkpoint 重载、generation 和统一指标；使用 overfit checkpoint/同一 `train` split，不能作为泛化结果 |
 
-当前唯一优先实验是复测修复后的 P1 两样本 `overfit`。该检查通过前不启动 P2 pilot，不扩大数据规模掩盖实现问题。完整状态和证据边界见 [PROJECT_STATUS.md](docs/PROJECT_STATUS.md)。
+当前 P1 两样本实现诊断已经通过；随后 `layout_validate_20260812_014816` 在同一个 VLQA checkpoint 和两页 `train` split 上完成了整页 prompt-only validation 链路。布局区域 precision/recall/F1 均为 `1.0`，有序槽位 bbox mean IoU 为 `0.956666`，方向和阅读顺序指标均为 `1.0`；OCR 页面 CER 为 `0.215909`、去空白 CER 为 `0.086420`。这些数字来自 P1 同页 overfit checkpoint，P1 不优化 OCR，不能作为正式性能或泛化结果。下一步是锁定隔离的 held-out split 和原 GOT2 baseline；在正式划分、消融和跨域验证完成前，不启动未解锁的 pilot。完整状态和证据边界见 [PROJECT_STATUS.md](docs/PROJECT_STATUS.md)。
 
 ## 目录
 
@@ -65,9 +65,10 @@ py -3 -m venv .venv
 |---|---|---|
 | `tools/training/run_layout_a100.py --mode overfit` | 两样本实现正确性检查 | 否 |
 | `tools/training/run_layout_a100.py --mode smoke` | 环境、单步训练与 checkpoint 链路检查 | 否 |
+| `tools/training/run_layout_a100.py --mode validate` | 整页 prompt-only 推理与统一页面指标 | 暂不作为正式性能结论；需明确 VLQA checkpoint 和正式 split |
 | `src/GOT-OCR-2.0/scripts/run_linelevel_smoke.sh` | 既有单行/单列工程诊断 | 否 |
 | AncientDoc 旧 split 训练与兼容评估 | 历史页面兼容基线 | 否；存在书籍级重叠 |
-| 统一整页划分下的 validation 与 `A0`–`A6` 消融 | 正式实验 | 待实现 |
+| 统一整页划分下的 validation 与 `A0`–`A6` 消融 | 正式实验 | validation 代码已实现；正式 split、A100 结果和消融待完成 |
 
 AnandaSky 是 line-level 高分辨率转写基线。双 GOT2 的“先分割、再识别”是独立两阶段系统对照。两者只有在页面输入、数据划分、训练预算和页面级指标一致时才可与本仓库路线比较。
 

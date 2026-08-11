@@ -19,6 +19,12 @@ A100 run `layout_pilot_20260811_023528` 已打通上述工程链路，但其 2 �
 
 A100 run `layout_overfit_20260811_110317` 已执行首次受控诊断并返回 fail。第 1 步 object/direction logits 已约为 1680，bbox 同时饱和到约 0/1，说明主要异常在优化前的 VLQA 初始化或前向尺度，而不是训练后期逐渐发散。当前修复在加载原始 GOT2 后显式完整初始化 VLQA，严格区分无布局权重、完整布局权重和部分布局权重，并在辅助头前增加最终 LayerNorm 与小尺度 bbox 输出层初始化。
 
-当前下一步仍使用一次 `--mode overfit` 复测修复版。该模式固定只运行 P1、2 条记录和 200 optimizer steps；布局损失以 FP32 计算，Trainer 记录分项损失、object/direction accuracy、bbox mean IoU、query/raw-logit/bbox 范围、残差门和 query 梯度，结束时直接返回初始化方式、首步观测、末 20 步均值和 `overfit_assessment`。`status=pass` 只代表两样本实现检查通过，不代表泛化性能。
+A100 run `layout_overfit_20260811_113817` 已确认初始化修复有效：首步 object/direction/bbox raw logits 分别为 0.1592、0.3984 和 0.0010。200 步后 object 与 direction 已通过阈值；bbox L1 从 0.9761 降至尾段均值 0.1159，bbox mean IoU 从 0.0726 升至 0.3496，说明 bbox 正在学习但现有步数不足以完成严格实现检查。
 
-`pilot` 没有默认训练步数，必须同时提供 `--allow-unvalidated-pilot`、`--p1-max-steps` 和 `--p2-max-steps`。在 `overfit` 通过并实现 validation loader 前，不应再次启动 pilot。
+`layout_overfit_20260812_002747` 已完成固定 P1、2 条记录、1000 optimizer steps 的实现诊断并返回 `overfit_assessment.status=pass`。末 20 步均值为 object loss `0.00201755`、bbox L1 `0.00531464`、bbox GIoU `0.05508578`、direction loss `0.00154159`、object/direction accuracy `1.0`、bbox mean IoU `0.94497279`。`status=pass` 只代表两样本实现检查通过，不代表泛化性能。
+
+当前 validation 入口为 `--mode validate`。它只执行环境/manifest/component preflight 和 prompt-only 整页评测，不启动 DeepSpeed 训练；必须通过 `--source-model` 指向包含 VLQA 权重的 checkpoint，并可用 `--tokenizer-model` 指向原始 GOT tokenizer。评测输出统一写入 run 目录，布局 metadata 只用于离线指标。
+
+首轮 run `layout_validate_20260812_012924` 在模型加载前被 evaluator 的 tokenizer 文件名白名单错误拦截。当前 loader 已改为直接让 Transformers 离线验证本地 GOT/Qwen tokenizer；修复后的 `layout_validate_20260812_014816` 已在两页 `train` split 上通过 prompt-only checkpoint 重载和指标链路。该结果只属于同页 P1 overfit 诊断，正式 held-out validation 仍待执行。
+
+`pilot` 没有默认训练步数，必须同时提供 `--allow-unvalidated-pilot`、`--p1-max-steps` 和 `--p2-max-steps`。在真实 validation 和统一实验协议锁定前，不应启动 pilot。

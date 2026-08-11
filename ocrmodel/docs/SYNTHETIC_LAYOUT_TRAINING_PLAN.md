@@ -1,10 +1,10 @@
 # GOT2 整页布局查询合成预训练方案
 
-> 更新日期：2026 年 8 月 11 日
+> 更新日期：2026 年 8 月 12 日
 >
 > 文档性质：Visual Layout Query Adapter（VLQA）的数据与训练执行方案
 >
-> 当前状态：整页生成与审计及 A100 工程链路已经打通；`layout_overfit_20260811_110317` 未通过 P1 两样本可拟合性检查，并暴露出首步极端 logit 与 bbox 饱和；显式初始化修复已在本地完成、待 A100 复测；以下参数和比例仍是首轮候选
+> 当前状态：整页生成与审计及 A100 工程链路已经打通；`layout_overfit_20260812_002747` 已通过固定 1000 steps 的 P1 两样本实现诊断，object/direction/bbox 均达到实现门槛；tokenizer 预检修复后的 `layout_validate_20260812_014816` 已在两页 `train` split 上完成 prompt-only 链路验证，但正式 held-out validation、消融和效果验证仍未完成；以下参数和比例仍是首轮候选
 
 ## 1. 目标与边界
 
@@ -202,7 +202,7 @@ $$\mathcal L_{\mathrm{total}}=\mathcal L_{\mathrm{ocr}}+\mathcal L_{\mathrm{layo
 
 ## 9. 当前工程前置条件
 
-截至 2026-08-11，以下内容已完成首版本地实现：
+截至 2026-08-12，以下内容已完成首版本地实现：
 
 1. `generate_synthetic_layout.py`：`S0-html-text`、`S1-html-crop`、`S2-hard` 页面规划，Playwright DOM 渲染、整页截图、实际字体检查和 provenance；
 2. `audit_synthetic_layout.py`：图片/HTML 路径、尺寸、哈希、bbox、顺序、页面转写、实际字体及跨 split 内容/来源泄漏检查；
@@ -210,19 +210,24 @@ $$\mathcal L_{\mathrm{total}}=\mathcal L_{\mathrm{ocr}}+\mathcal L_{\mathrm{layo
 4. `layout_query.py`：有序 queries、object/bbox/direction 头、二维位置编码、预测前 LayerNorm、零门控写回、显式完整初始化及以 FP32 计算的 BCE/L1/GIoU/方向损失；
 5. GOT2 的 256-token 接线和 OCR/layout 总损失；
 6. `train_GOT_layout.py`：`P1` 查询预热和 `P2` 联合训练的开发入口，以及原始/续训 safetensors 的 VLQA 键完整性审计；
-7. `run_layout_a100.py` 与 `verify_layout_checkpoint.py`：环境、数据、GPU 0、初始 logit 尺度、P1/P2 单步训练、权重有限性和模型重载的受限 A100 smoke 编排，以及固定为 P1、2 条记录、200 steps 的 `overfit` 诊断。
+7. `run_layout_a100.py` 与 `verify_layout_checkpoint.py`：环境、数据、GPU 0、初始 logit 尺度、P1/P2 单步训练、权重有限性和模型重载的受限 A100 smoke 编排，以及固定为 P1、2 条记录、1000 steps 的 `overfit` 诊断；
+8. `layout_page_dataset.py`、`evaluate_GOT_layout.py` 和 `layout_validation_metrics.py`：prompt-only 整页 validation loader、GPU 推理和统一页面指标。
 
 本地已实际完成 `S0` 与 `S2-hard` 的 Edge 截图和全量 manifest 审计；`S1` 的文件 URI、orientation 与源图哈希通过 CPU 单元测试。生成器已使用 Chromium 平台字体接口拒绝未允许 fallback，但正式字体文件、版本和哈希仍待随数据环境锁定。当前仍未完成：
 
 1. 正式字体包文件/版本/哈希锁定和真实 crop 内容清单；
-2. 初始化修复版 P1 两样本 `overfit` 的 A100 复测；
-3. validation loader，以及页面 CER、bbox、方向和阅读顺序的统一评测；
+2. A100 上用明确 VLQA checkpoint 执行真实 prompt-only validation，并确认整页生成与 summary；
+3. 正式 validation/test split、页面 CER、bbox、方向和阅读顺序的统一结果；
 4. `A0/A1/A2/A4` 的同预算启动器；
 5. `P3` 真实页适配、`P4` 64×64 特征路径及任何效果验证。
 
 A100 run `layout_pilot_20260811_023528` 已经验证 CUDA、整页 batch、P1→P2 权重衔接、checkpoint 保存和完整模型重载。该 run 仅含 2 页且每阶段重复 500 epoch；P1 最后 5 步平均总损失为 11.4，P2 最后 5 步平均总损失为 18.8376，当时又没有分项损失和 validation。因此它是工程链路证据，不是有效 pilot，也不能支持布局学习或 OCR 改善结论。
 
-A100 run `layout_overfit_20260811_110317` 已使用新版 FP32 分项日志执行 P1 两样本 200 steps，`overfit_assessment.status=fail`。第 1 步 object/direction logit 绝对值上限均约为 1680，bbox 已饱和到约 0/1，表明异常先于优化过程出现；末 20 步 object accuracy 为 0.5375、bbox mean IoU 为 0。当前修复在原始 checkpoint 没有 VLQA 键时强制完整重置适配器，在完整 P1 checkpoint 上保留已加载权重，部分 VLQA 状态则直接拒绝；同时增加预测前 LayerNorm、小尺度 bbox 输出层初始化和 query/bbox raw-logit 诊断。该根因判断仍需修复版 A100 首步复测确认。
+A100 run `layout_overfit_20260811_110317` 已使用新版 FP32 分项日志执行 P1 两样本 200 steps，`overfit_assessment.status=fail`。第 1 步 object/direction logit 绝对值上限均约为 1680，bbox 已饱和到约 0/1，表明异常先于优化过程出现；末 20 步 object accuracy 为 0.5375、bbox mean IoU 为 0。修复版随后在原始 checkpoint 没有 VLQA 键时强制完整重置适配器，在完整 P1 checkpoint 上保留已加载权重，部分 VLQA 状态则直接拒绝；同时增加预测前 LayerNorm、小尺度 bbox 输出层初始化和 query/bbox raw-logit 诊断。
+
+A100 run `layout_overfit_20260811_113817` 已确认上述初始化与尺度修复有效：完整模型的源/预期布局张量为 `0/45`，参数绝对值上限为 1.0；首步 object/direction/bbox raw logits 分别为 0.1592、0.3984 和 0.0010。200 步后 object 与 direction 已通过阈值，bbox L1 从 0.9761 降至尾段均值 0.1159，bbox mean IoU 从 0.0726 升至 0.3496。当前没有 bbox 参数化或监督断链的直接证据。
+
+A100 run `layout_overfit_20260812_002747` 已完成固定 P1、2 条记录、1000 steps 的实现诊断并返回 `overfit_assessment.status=pass`。末 20 步均值为 object loss 0.00201755、bbox L1 0.00531464、bbox GIoU 0.05508578、direction loss 0.00154159、object/direction accuracy 1.0、bbox mean IoU 0.94497279，尾段范围也通过阈值。该 run 只证明两页实现可拟合。
 
 现有 `scripts/linelevel_dataset.py`、`train_GOT_linelevel.py` 和 `run_linelevel_smoke.sh` 只保留为既有工程链路与 line-level 诊断入口，不能作为新版整页 VLQA 的正式运行命令。现有 `ancientdoc_dataset.py` 可用于核对整页数据读取方式，但其历史 split 存在书籍级重叠，不能直接充当无泄漏主实验。
 
@@ -235,19 +240,19 @@ HTML page generator                      [local smoke passed]
 -> minimal 16x16 VLQA                  [A100 forward/backward passed]
 -> P1/P2 save and reload chain         [A100 engineering check passed]
 -> FP32 component logging              [A100 diagnostic completed]
--> P1 two-record overfit gate          [first A100 run failed]
--> explicit init and scale guard       [local fix; A100 rerun pending]
--> validation loader and metrics
+-> P1 two-record overfit gate          [1000 steps passed; implementation diagnostic]
+-> explicit init and scale guard       [A100 verified]
+-> validation loader and metrics       [two-page A100 chain passed; held-out run pending]
 -> A0/A1/A2/A4 single-step smoke
 -> small-scale synthetic pilot
 -> real-page adaptation
 -> optional 64x64 query path
 ```
 
-前一项通过后再进入下一项。当前首先要验证 P1 能否拟合两个固定模板页面；`overfit` 未通过时不得启动 P2 或扩大数据。即使 `overfit` 通过，它也只是实现正确性检查，仍需 validation loader、未见内容/模板/方向和真实页面评测，不能写成模型性能结果。
+前一项通过后再进入下一项。`overfit` 已通过，但只代表两个固定模板页面的实现正确性；仍需在明确 VLQA checkpoint 上执行 prompt-only validation，并完成未见内容/模板/方向和真实页面评测，不能写成模型性能结果。
 
 ## 10. 当前结论
 
 HTML 合成页不再只是为 line crop 制造外部 bbox，而是直接作为整页视觉输入，用 DOM 真值监督布局 queries。主训练内容采用“HTML 控制版面＋真实 crop 保留字形”的混合方式，纯浏览器字体页面用于几何预热与模板覆盖。推理阶段只输入页面图像；bbox、方向和阅读顺序是训练标签或可选输出，不是外部条件。
 
-该方案已经完成首版 A100 工程链路验证，但首次受控 P1 两样本诊断明确失败；初始化与尺度保护修复尚待 A100 复测，因此仍属于待实现诊断、待 validation 和待实验判定的候选。只有完整布局监督模型在真实整页、小样本跨域和统一预算消融中稳定优于原 GOT2、普通视觉 adaptor 和无监督 queries，才能保留 VLQA 作为有效结构候选。
+该方案已经完成首版 A100 工程链路、初始化修复验证、固定 1000 步两页实现诊断和两页 prompt-only checkpoint 重载验证。validation loader、evaluator 和统一页面指标已在 A100 链路运行，但正式 held-out split、validation 与消融仍待完成。只有完整布局监督模型在真实整页、小样本跨域和统一预算消融中稳定优于原 GOT2、普通视觉 adaptor 和无监督 queries，才能保留 VLQA 作为有效结构候选。
