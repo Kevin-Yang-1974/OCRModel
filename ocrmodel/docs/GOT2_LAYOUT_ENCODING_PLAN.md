@@ -122,7 +122,7 @@ $$\left(\mathbf{H}_i,\mathbf{V}_i\right)=\mathrm{VaryViT}(P_i),\qquad \mathbf{G}
 
 $$\left(\hat{\mathbf{b}}_i,\hat{\mathbf{p}}^{\mathrm{obj}}_i,\hat{\mathbf{p}}^{\mathrm{dir}}_i\right)=\mathrm{AuxHeads}(\mathbf{G}_i),\qquad \mathbf{V}_i^{\mathrm{layout}}=\mathrm{GatedWriteback}(\mathbf{V}_i,\mathbf{G}_i).$$
 
-$$p_{\theta}(\mathbf y_i\mid P_i)=\prod_{t=1}^{T_i}p_{\theta}(y_{i,t}\mid y_{i,<t},\mathbf V_i^{\mathrm{layout}}).$$
+$$p_{\theta}\left(\mathbf{y}_i\mid P_i\right)=\prod_{t=1}^{T_i}p_{\theta}\left(y_{i,t}\mid \mathbf{y}_{i,1:t-1},\mathbf{V}_i^{\mathrm{layout}}\right).$$
 
 推理接口仍为“整页图像＋OCR prompt”。模型内部可以输出布局预测用于审计，但不要求用户或上游模块提供 bbox。
 
@@ -132,7 +132,7 @@ $$p_{\theta}(\mathbf y_i\mid P_i)=\prod_{t=1}^{T_i}p_{\theta}(y_{i,t}\mid y_{i,<
 
 设 $a_{i,t}\in\{0,1\}$ 表示该 token 是否属于需要监督的答案，页面 OCR 自回归交叉熵为：
 
-$$\mathcal L_{\mathrm{ocr}}=-\frac{1}{\sum_{i,t}a_{i,t}}\sum_i\sum_{t=1}^{T_i}a_{i,t}\log p_{\theta}(y_{i,t}\mid y_{i,<t},\mathbf V_i^{\mathrm{layout}}).$$
+$$\mathcal L_{\mathrm{ocr}}=-\frac{1}{\sum_{i,t}a_{i,t}}\sum_i\sum_{t=1}^{T_i}a_{i,t}\log p_{\theta}\left(y_{i,t}\mid \mathbf{y}_{i,1:t-1},\mathbf{V}_i^{\mathrm{layout}}\right).$$
 
 $\mathcal L_{\mathrm{ocr}}$ 是唯一直接优化页面符号转写的主损失。bbox、方向或顺序指标不能替代页面 CER、编辑距离和完整页面精确匹配率。
 
