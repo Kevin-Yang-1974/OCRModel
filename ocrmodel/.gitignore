@@ -1,0 +1,56 @@
+# Local development
+/.venv/
+/.pytest_cache/
+/.ruff_cache/
+/.mypy_cache/
+**/__pycache__/
+*.py[cod]
+
+# Editor and agent-local configuration
+/.idea/
+/.vscode/
+/.claude/
+/AGENTS.md
+
+# Machine-specific path configuration
+/config/paths.env
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Large runtime assets must stay outside this source tree
+/data/
+/models/
+/checkpoints/
+/training_runs/
+/evaluation_runs/
+/logs/
+/cache/
+/outputs/
+/tmp/
+**/model_weights/
+*.safetensors
+*.ckpt
+*.pth
+*.pt
+
+# Local migration packages and generated logs are retained outside Git
+/archive/source-packages/*.tar.gz
+/archive/server-export/extracted/
+/archive/pre-migration/
+/archive/generated-cache/
+train.log
+run.log
+trainer_state.json
+wandb/
+
+# Private migration material and downloaded experiment artifacts. These remain
+# available in the maintainer's parent workspace but are not part of the shared
+# source repository.
+/archive/
+/results/
+/docs/MIGRATION_*.md
+/docs/*LEGACY*.md
+/docs/README_SAMPLE_RESULTS.md

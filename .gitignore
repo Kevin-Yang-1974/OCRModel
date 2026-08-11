@@ -1,0 +1,5 @@
+# This parent workspace contains private research material. Only the OCR code
+# directory is eligible for the shared repository snapshot.
+/*
+!/.gitignore
+!/ocrmodel/

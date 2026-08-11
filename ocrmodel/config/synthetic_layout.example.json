@@ -1,0 +1,34 @@
+{
+  "page_width": 1024,
+  "page_height": 1024,
+  "min_regions": 4,
+  "max_regions": 12,
+  "margin_min": 72,
+  "margin_max": 112,
+  "gap_min": 12,
+  "gap_max": 30,
+  "region_inset_min": 1,
+  "region_inset_max": 5,
+  "font_size_min": 28,
+  "font_size_max": 46,
+  "region_padding": 4,
+  "page_text_separator": "\n",
+  "font_family": "\"Noto Serif CJK SC\", \"Source Han Serif SC\", SimSun, serif",
+  "allowed_rendered_fonts": [
+    "Noto Serif CJK SC",
+    "Source Han Serif SC",
+    "SimSun"
+  ],
+  "directions": [
+    "horizontal_ltr",
+    "horizontal_rtl",
+    "vertical_rtl",
+    "vertical_ltr"
+  ],
+  "backgrounds": [
+    "#f5f0e4",
+    "#eee6d5",
+    "#f8f4ea",
+    "#e9dfc8"
+  ]
+}
