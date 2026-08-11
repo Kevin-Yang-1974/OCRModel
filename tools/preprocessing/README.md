@@ -124,4 +124,4 @@ python tools/preprocessing/audit_synthetic_layout.py `
 
 `P1` 只训练 layout queries、query cross-attention 和辅助头，OCR 标签全部 mask，残差 gate 固定为 0。`P2` 打开完整 VLQA 与 `mm_projector_vary`，联合优化页面 OCR 和布局损失。A100 上不需要安装 Playwright，也不重新渲染页面；应先在本机生成完整的 `manifest.jsonl`、`images/` 和 `html/`，再整体上传数据目录。
 
-`tools/training/run_layout_a100.py` 已在 A100 打通 manifest 复审、CUDA 组件检查、P1/P2 训练衔接和 checkpoint 重载。首次 2 页长跑未通过 P1 可拟合性检查，且尚无 validation loader，因此当前下一步是运行固定 P1 两样本诊断的 `--mode overfit`，不得报告为正式训练结果。具体命令见 `../../docs/SYNC_AND_RUN.md`。
+`tools/training/run_layout_a100.py` 已在 A100 打通 manifest 复审、CUDA 组件检查、P1/P2 训练衔接和 checkpoint 重载；`layout_overfit_20260812_002747` 已通过固定 1000 steps 的 P1 两样本实现诊断。validation loader、prompt-only evaluator 和统一指标已在本地实现，下一步是在明确 VLQA checkpoint 上执行一次 `--mode validate`；该链路仍不是正式性能结果。具体命令见 `../../docs/SYNC_AND_RUN.md`。

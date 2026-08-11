@@ -100,30 +100,35 @@ python3 tools/environment/check_server_envs.py --include-anandasky
 
 当前服务器 profile 固定使用物理 GPU 0。编排器发现 GPU 0 忙碌时以退出码 75 结束，不等待、不抢占，也不终止其他任务。
 
-## 5. 当前优先实验：P1 两样本 overfit
+## 5. 已完成的 P1 两样本 overfit
 
-当前代码已经打通整页 batch、VLQA CUDA forward/backward、P1→P2、checkpoint 保存和完整重载，但首次 P1 两样本 overfit 失败。初始化修复版仍需在相同两页数据、相同 200 steps 的协议上复测。
+当前代码已经打通整页 batch、VLQA CUDA forward/backward、P1→P2、checkpoint 保存和完整重载。`layout_overfit_20260812_002747` 已完成固定 P1、2 条记录、1000 steps 的实现诊断并通过；末 20 步 bbox L1、GIoU 和 mean IoU 分别为 `0.00531464`、`0.05508578` 和 `0.94497279`。该结果只证明两页实现可拟合，不是 validation 或性能结果。
 
-确认数据目录中包含已审计的 `manifest.jsonl`、`images/` 和 `html/`，然后只启动一次：
+该 run 已完成。不要因终端输出截断或网络波动重复启动同一 run；如需核对，只读取其 `summary.json` 的 `overfit_assessment` 紧凑字段。
+
+## 6. 下一步：整页 prompt-only validation
+
+validation 代码已在本地实现。运行时必须把 `--source-model` 指向包含 `use_vlqa=true` 和布局权重的 checkpoint；原始 GOT2 权重只能作为训练起点，不能直接作为 VLQA validation 模型。下面的两页 checkpoint 只用于验证加载、整页 generation 和指标链路，不构成正式性能结果：
+
+首轮 run `layout_validate_20260812_012924` 被 evaluator 的 tokenizer 文件名预检错误拦截，未进入 checkpoint 加载或推理。当前代码已删除该白名单，改为直接使用 `AutoTokenizer.from_pretrained(..., local_files_only=True)` 验证 GOT/Qwen tokenizer；修复后的 `layout_validate_20260812_014816` 已在两页 `train` split 上完成链路验证。该 run 使用 `layout_overfit_20260812_002747/p1/model`，只证明 checkpoint 重载、整页 generation 和指标汇总，不是正式 validation 或性能结果。
 
 ```bash
-dataset_root="$GOT_LAYOUT_DATA/<dataset-id>"
+dataset_root="$GOT_LAYOUT_DATA/vlqa_smoke_s0s2_seed20260810_v4"
+validation_model="$GOT_TRAINING_RUNS/layout_overfit_20260812_002747/p1/model"
+tokenizer_model="${GOT_TOKENIZER_MODEL:-$GOT_SOURCE_MODEL}"
 bash "$OCRMODEL_ROOT/tools/environment/run_got2.sh" \
   "$OCRMODEL_ROOT/tools/training/run_layout_a100.py" \
   --dataset-root "$dataset_root" \
-  --mode overfit
+  --source-model "$validation_model" \
+  --tokenizer-model "$tokenizer_model" \
+  --layout-split train \
+  --validation-max-records 2 \
+  --mode validate
 ```
 
-`overfit` 固定只运行 P1、2 条记录和 200 optimizer steps，不能通过命令行放大。完成事件中的关键字段应满足：
+validation 不训练，不把 bbox、阅读顺序或书写方向传入模型。`layout_validate_20260812_014816` 已确认完成事件报告 `model_inputs=["whole_page_image","ocr_prompt"]` 和 `layout_metadata_as_model_input=false`。后续正式 split 仍只回传最后一条 `layout_a100_completed` JSON；生成的 `validation/layout_validation_metrics.json` 与 `validation/layout_validation_predictions.jsonl` 留在服务器 run 目录。
 
-- `overfit_assessment.initialization.mode` 为 `fresh_explicit_reset`；
-- `source_layout_tensor_count` 为 0；
-- component smoke 与训练首步不再出现约 1680 的 object/direction/bbox raw logits；
-- 最终 `overfit_assessment.status` 明确为 `pass` 或 `fail`。
-
-`fail` 是实现诊断结果，不表示编排器启动失败。应根据失败分项继续修复，不运行 P2 或 `pilot`。`pass` 也只表示两样本可拟合，不是 validation 或性能结果。
-
-## 6. 新数据的单步 smoke
+## 7. 新数据的单步 smoke
 
 页面数据应先在本地按 [整页布局合成工具](../tools/preprocessing/README.md) 生成并审计，再由协作者显式上传到 `$GOT_LAYOUT_DATA/<dataset-id>`。数据不通过代码同步脚本传输。
 
@@ -150,9 +155,9 @@ bash "$OCRMODEL_ROOT/tools/environment/run_got2.sh" \
 <run_root>/LAYOUT_A100_FINISHED
 ```
 
-`pilot` 没有默认步数，并要求显式 `--allow-unvalidated-pilot`。在两样本 overfit 通过且 validation loader 完成前，不启动 pilot。
+`pilot` 没有默认步数，并要求显式 `--allow-unvalidated-pilot`。在真实 validation 和统一实验协议锁定前，不启动 pilot。
 
-## 7. line-level 兼容诊断
+## 8. line-level 兼容诊断
 
 以下入口只检查既有单行/单列数据链路，不属于正式整页协议：
 
@@ -170,7 +175,7 @@ GOT_RUN_ID="linelevel_smoke_$(date +%Y%m%d_%H%M%S)" \
 
 单步 line-level smoke 只验证加载、反向传播、保存和重载，不验证布局 queries，也不能与页面 CER 直接比较。
 
-## 8. AncientDoc 历史兼容入口
+## 9. AncientDoc 历史兼容入口
 
 AncientDoc 旧 split 存在书籍级重叠。这些命令只用于复现历史页面兼容链路，不属于小样本或 VLQA 正式实验。
 
@@ -195,7 +200,7 @@ GOT_EVAL_MODEL="$GOT_SOURCE_MODEL" \
 
 该入口复用 `references/legacy-ancientdoc-eval/GOT/eval/myeval.py` 的历史解码参数，并将预测、日志和指标写入 `$GOT_EVALUATION_RUNS`。输出字段 `metrics_page_macro_legacy_editops` 只代表该兼容口径。
 
-## 9. 回传与协作
+## 10. 回传与协作
 
 不要复制完整 `train.log`、`trainer_state.json` 或 `predictions.json`。布局 run 正常结束时优先回传终端最后一条完成 JSON。需要补充核对时只选择紧凑字段：
 

@@ -36,6 +36,9 @@ class GOTBaseModelOutputWithPast(BaseModelOutputWithPast):
     layout_query_abs_max: Optional[torch.FloatTensor] = None
     layout_prediction_query_abs_max: Optional[torch.FloatTensor] = None
     layout_bbox_logit_abs_max: Optional[torch.FloatTensor] = None
+    layout_object_logits: Optional[torch.FloatTensor] = None
+    layout_bbox_xyxy: Optional[torch.FloatTensor] = None
+    layout_direction_logits: Optional[torch.FloatTensor] = None
 
 
 @dataclass
@@ -56,6 +59,9 @@ class GOTCausalLMOutputWithPast(CausalLMOutputWithPast):
     layout_query_abs_max: Optional[torch.FloatTensor] = None
     layout_prediction_query_abs_max: Optional[torch.FloatTensor] = None
     layout_bbox_logit_abs_max: Optional[torch.FloatTensor] = None
+    layout_object_logits: Optional[torch.FloatTensor] = None
+    layout_bbox_xyxy: Optional[torch.FloatTensor] = None
+    layout_direction_logits: Optional[torch.FloatTensor] = None
 
 class GOTConfig(Qwen2Config):
     model_type = "GOT"
@@ -345,6 +351,9 @@ class GOTQwenModel(Qwen2Model):
 
             inputs_embeds = torch.stack(new_input_embeds, dim=0)
 
+        combined_layout_output = (
+            self._concatenate_layout_outputs(layout_outputs) if layout_outputs else None
+        )
         layout_losses = None
         if has_layout_targets:
             if len(layout_outputs) != layout_bbox_targets.shape[0]:
@@ -352,7 +361,6 @@ class GOTQwenModel(Qwen2Model):
                     "VLQA output/target batch mismatch: "
                     f"outputs={len(layout_outputs)}, targets={layout_bbox_targets.shape[0]}."
                 )
-            combined_layout_output = self._concatenate_layout_outputs(layout_outputs)
             layout_losses = self.layout_criterion(
                 output=combined_layout_output,
                 bbox_targets_xyxy=layout_bbox_targets,
@@ -421,6 +429,21 @@ class GOTQwenModel(Qwen2Model):
             ),
             layout_bbox_logit_abs_max=(
                 layout_losses.bbox_logit_abs_max if layout_losses is not None else None
+            ),
+            layout_object_logits=(
+                combined_layout_output.object_logits
+                if combined_layout_output is not None
+                else None
+            ),
+            layout_bbox_xyxy=(
+                combined_layout_output.bbox_xyxy
+                if combined_layout_output is not None
+                else None
+            ),
+            layout_direction_logits=(
+                combined_layout_output.direction_logits
+                if combined_layout_output is not None
+                else None
             ),
         )
 
@@ -558,6 +581,9 @@ class GOTQwenForCausalLM(Qwen2ForCausalLM):
             layout_query_abs_max=outputs.layout_query_abs_max,
             layout_prediction_query_abs_max=outputs.layout_prediction_query_abs_max,
             layout_bbox_logit_abs_max=outputs.layout_bbox_logit_abs_max,
+            layout_object_logits=outputs.layout_object_logits,
+            layout_bbox_xyxy=outputs.layout_bbox_xyxy,
+            layout_direction_logits=outputs.layout_direction_logits,
         )
 
 

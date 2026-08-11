@@ -116,7 +116,7 @@ class LayoutA100RunnerTests(unittest.TestCase):
             output_dir=self.tmp_path / "p1-model",
             master_port=23456,
         )
-        self.assertEqual(option_value(command, "--max_steps"), "200")
+        self.assertEqual(option_value(command, "--max_steps"), "1000")
         self.assertEqual(option_value(command, "--max_train_records"), "2")
         with self.assertRaisesRegex(runner.RunFailure, "Overfit is fixed"):
             runner.resolve_settings(
@@ -126,6 +126,36 @@ class LayoutA100RunnerTests(unittest.TestCase):
                     "overfit",
                     "--p1-max-steps",
                     "10",
+                )
+            )
+
+    def test_validate_mode_has_no_training_stages(self) -> None:
+        settings = runner.resolve_settings(
+            make_args(
+                self.tmp_path,
+                "--mode",
+                "validate",
+                "--layout-split",
+                "validation",
+                "--validation-max-records",
+                "7",
+                "--validation-object-threshold",
+                "0.6",
+            )
+        )
+        self.assertEqual(settings.mode, "validate")
+        self.assertEqual(settings.stages, ())
+        self.assertEqual(settings.p1_max_steps, 0)
+        self.assertEqual(settings.validation_max_records, 7)
+        self.assertEqual(settings.validation_object_threshold, 0.6)
+        with self.assertRaisesRegex(runner.RunFailure, "does not train"):
+            runner.resolve_settings(
+                make_args(
+                    self.tmp_path,
+                    "--mode",
+                    "validate",
+                    "--p1-max-steps",
+                    "3",
                 )
             )
 
@@ -149,7 +179,10 @@ class LayoutA100RunnerTests(unittest.TestCase):
                 "log_count": runner.OVERFIT_P1_STEPS,
                 "tail_window": 20,
                 "first": dict(tail_mean),
+                "last": dict(tail_mean),
                 "tail_mean": tail_mean,
+                "tail_min": dict(tail_mean),
+                "tail_max": dict(tail_mean),
             },
         }
         passed = runner.assess_p1_overfit(metrics)
@@ -158,6 +191,8 @@ class LayoutA100RunnerTests(unittest.TestCase):
         self.assertEqual(passed["initialization"]["mode"], "fresh_explicit_reset")
         self.assertEqual(passed["initialization"]["parameter_abs_max"], 1.0)
         self.assertEqual(passed["observed_first"]["bbox_mean_iou"], 0.95)
+        self.assertEqual(passed["observed_last"]["bbox_mean_iou"], 0.95)
+        self.assertEqual(passed["bbox_tail_range"]["bbox_mean_iou_max"], 0.95)
 
         tail_mean["bbox_mean_iou"] = 0.5
         failed = runner.assess_p1_overfit(metrics)

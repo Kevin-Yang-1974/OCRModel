@@ -1,10 +1,10 @@
 # GOT2 整页端到端布局查询方案
 
-> 更新日期：2026 年 8 月 11 日
+> 更新日期：2026 年 8 月 12 日
 >
 > 文档性质：单模型 VLQA 路线的架构、目标函数与消融执行依据
 >
-> 当前状态：整页生成与审计及 A100 工程链路已经打通；`layout_overfit_20260811_110317` 未通过 P1 两样本可拟合性检查，并暴露出首步极端 logit 与 bbox 饱和；加载后显式初始化修复已在本地完成、待 A100 复测，validation 与效果评估尚未完成；本文参数均为首轮候选
+> 当前状态：整页生成与审计及 A100 工程链路已经打通；`layout_overfit_20260812_002747` 已通过固定 1000 steps 的 P1 两样本实现诊断，object/direction/bbox 均达到实现门槛；tokenizer 预检修复后的 `layout_validate_20260812_014816` 已在两页 `train` split 上完成 prompt-only 链路验证，但正式 held-out validation、消融和效果验证仍未完成；本文参数仍为首轮候选
 
 ## 1. 当前任务与输入口径
 
@@ -45,7 +45,7 @@ GOT 原论文同时支持 slice 与 whole-page 图像，并将单张 $1024\times
 | LayTokenLLM [8] | 将显式 bbox 压缩为少量 layout token | 显式 bbox 压缩基线 | 不作为当前端到端主结构 |
 | DocLayout-YOLO [9] | 通过多样合成数据增强文档版面分析 | 合成模板、背景和扰动多样性 | 其检测器不是本仓库的主识别结构 |
 
-本项目新增并正在验证的候选结构暂称 **Visual Layout Query Adapter（VLQA）**：布局 queries 直接读取整页视觉特征，使用布局辅助头进行语义约束，再通过零初始化门控残差写回 GOT2 的 256 个视觉 token。该结构已有首版代码，A100 forward/backward 与 P1→P2 工程链路已经打通，但首次 P1 两样本 overfit 失败，validation 和效果评估均未完成，不能表述为已取得性能提升。
+本项目新增并正在验证的候选结构暂称 **Visual Layout Query Adapter（VLQA）**：布局 queries 直接读取整页视觉特征，使用布局辅助头进行语义约束，再通过零初始化门控残差写回 GOT2 的 256 个视觉 token。该结构已有首版代码，A100 forward/backward、P1→P2 工程链路、固定 1000 steps 两页实现诊断和两页 prompt-only checkpoint 重载链路均已通过；后者使用同一 `train` split 的 P1 overfit checkpoint，只能证明工程链路，不能表述为真实页面性能或泛化提升。
 
 ## 4. 总体架构
 
@@ -260,7 +260,11 @@ $$\mathcal L_{\mathrm{total}}=\mathcal L_{\mathrm{ocr}}+\lambda_{\mathrm{obj}}\m
 
 上述代码保持权重、数据、checkpoint 和日志位于源码树外。生成器、DOM bbox 和 manifest 已通过本机真实浏览器 smoke。A100 run `layout_pilot_20260811_023528` 已完成 VLQA CUDA 反向传播、整页 batch、P1、P1→P2 加载、checkpoint 保存与完整模型重载；但它只有 2 页、每阶段 500 epoch 且没有 validation，只能确认工程链路。
 
-A100 run `layout_overfit_20260811_110317` 随后执行了 P1 两样本 200 steps 诊断，结果为 fail。object/direction logits 在第 1 步即达到约 1680，bbox 同时饱和到约 0/1；末 20 步 bbox mean IoU 仍为 0、object accuracy 仅为 0.5375。query 梯度存在，因此不是简单的监督断链。当前根因假设是原始 GOT2 checkpoint 缺少 VLQA 权重时，Hugging Face 快速加载路径没有可靠初始化全部自定义参数。修复版在加载后显式完整初始化新 VLQA，对 safetensors 中的布局键执行“全无、全有或拒绝部分状态”的严格审计，在辅助头前增加最终 LayerNorm，并使用小尺度 bbox 输出层初始化；该假设需由下一次 A100 首步尺度复测确认。
+A100 run `layout_overfit_20260811_110317` 随后执行了 P1 两样本 200 steps 诊断，结果为 fail。object/direction logits 在第 1 步即达到约 1680，bbox 同时饱和到约 0/1；末 20 步 bbox mean IoU 仍为 0、object accuracy 仅为 0.5375。query 梯度存在，因此不是简单的监督断链。问题由此定位到原始 GOT2 checkpoint 缺少 VLQA 权重时的加载后初始化与预测尺度路径。修复版在加载后显式完整初始化新 VLQA，对 safetensors 中的布局键执行“全无、全有或拒绝部分状态”的严格审计，在辅助头前增加最终 LayerNorm，并使用小尺度 bbox 输出层初始化。
+
+A100 run `layout_overfit_20260811_113817` 已验证该修复组合：完整模型报告 `fresh_explicit_reset`、`0/45` 个源/预期布局张量和 1.0 的参数绝对值上限；首步 object、direction 和 bbox raw logits 分别仅为 0.1592、0.3984 和 0.0010，bbox 初值为 0.25–0.75。200 步后 object loss/accuracy 与 direction loss/accuracy 均通过阈值；bbox L1 从 0.9761 降至尾段均值 0.1159，mean IoU 从 0.0726 升至 0.3496，表明 bbox 监督和梯度有效但步数不足。
+
+A100 run `layout_overfit_20260812_002747` 已完成固定 P1、2 条记录、1000 steps 的实现诊断并返回 `overfit_assessment.status=pass`。末 20 步均值为 object loss `0.00201755`、bbox L1 `0.00531464`、bbox GIoU `0.05508578`、direction loss `0.00154159`、object/direction accuracy `1.0`、bbox mean IoU `0.94497279`，bbox 尾段范围也通过阈值。该 run 仍只是实现诊断，不是 validation 或性能结果。
 
 建议实现顺序：
 
@@ -268,11 +272,12 @@ A100 run `layout_overfit_20260811_110317` 随后执行了 P1 两样本 200 steps
 2. 页面级 dataset/collator、CPU JSON 预检和 A100 batch：完成；
 3. 基于现有 $16\times16$ token 的最小 VLQA 与辅助头 forward/backward：完成；
 4. `P1→P2` 保存、加载和完整模型重载：完成；
-5. FP32 分项日志与 P1 两样本 `overfit`：首次 A100 诊断已执行并失败；
-6. 显式完整初始化、checkpoint 键审计、预测前归一化与 raw-logit 诊断：本地完成，A100 复测待验证；
-7. validation loader 和页面级指标；
-8. `A0/A1/A2/A4` 单步 smoke；
-9. 仅在定位失败后暴露 $64\times64$ 中间特征。
+5. FP32 分项日志与 P1 两样本 `overfit`：完成；
+6. 显式完整初始化、checkpoint 键审计、预测前归一化与 raw-logit 诊断：A100 验证通过；
+7. 固定 1000 steps 的 bbox 收敛检查：A100 已通过；
+8. validation loader、prompt-only evaluator 和页面级指标：本地已实现；`layout_validate_20260812_014816` 已完成两页链路验证，正式 held-out split 待执行；
+9. `A0/A1/A2/A4` 单步 smoke；
+10. 仅在定位失败后暴露 $64\times64$ 中间特征。
 
 ## 11. 风险与停止条件
 
@@ -290,7 +295,7 @@ A100 run `layout_overfit_20260811_110317` 随后执行了 P1 两样本 200 steps
 
 当前主候选已从“line crop＋显式 bbox/列序输入的 region-token adapter（旧 PCLA）”修订为“整页 GOT2＋端到端 Visual Layout Query Adapter”。页面视觉 token 提供原页面坐标参考，learnable queries 从视觉特征中产生布局表示；bbox、方向和阅读顺序只作为训练期辅助监督或评测标签，推理时不要求外部 metadata。显式 region-token adapter（旧 PCLA）、外部检测器路线和双 GOT2 路线均只作为独立对照。
 
-该方案已完成设计修订和首版工程链路验证，但 `layout_overfit_20260811_110317` 尚未通过 P1 两样本可拟合性检查。当前已针对首步异常尺度修复初始化路径，尚待 A100 复测，也未完成 validation 或效果评估。能否提高页面 OCR、阅读顺序和小样本跨域泛化，仍必须在先通过实现诊断后，由统一预算下的 `A0`–`A6` 消融决定。
+该方案已完成设计修订、首版工程链路、加载后初始化修复、1000 steps 两页实现诊断和两页 prompt-only checkpoint 重载验证。后一次验证使用同一 `train` split 的 P1 overfit checkpoint，不能替代正式 held-out validation。能否提高页面 OCR、阅读顺序和小样本跨域泛化，仍必须由正式 split 和统一预算下的 `A0`–`A6` 消融决定。
 
 ## 参考文献
 

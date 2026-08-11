@@ -5,7 +5,7 @@
 1. 当前研究对象是多场景、小样本条件下的通用符号识别。古籍、谱面和复杂文献是重点验证场景，不是能力边界。
 2. 正式主协议使用原始整页图像。bbox、阅读顺序和书写方向只作为训练监督、可选解释性输出或评测真值。
 3. 当前主候选是单个 GOT2 内部的 VLQA。双 GOT2 两阶段系统、AnandaSky line-level 模型和 AncientDoc 旧 split 均为独立对照或兼容诊断。
-4. 不把尚未验证的实现写成性能提升。当前首先要通过 P1 两样本 overfit，再实现 validation 和统一消融。
+4. 不把尚未验证的实现写成性能提升。P1 两样本 overfit 和同页 prompt-only validation 链路已通过；当前应先建立隔离的正式 split 和原 GOT2 baseline，再进行 held-out validation 与统一消融。
 
 ## 修改范围
 

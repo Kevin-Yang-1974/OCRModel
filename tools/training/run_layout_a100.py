@@ -31,7 +31,7 @@ EXIT_EXISTS = 74
 EXIT_GPU_BUSY = 75
 RUN_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 
-OVERFIT_P1_STEPS = 200
+OVERFIT_P1_STEPS = 1000
 OVERFIT_RECORDS = 2
 OVERFIT_THRESHOLDS = {
     "object_loss_max": 0.05,
@@ -66,6 +66,7 @@ class Settings:
     train_manifest: Path
     audit_manifests: tuple[Path, ...]
     source_model: Path
+    tokenizer_model: Path
     runs_root: Path
     run_id: str
     mode: str
@@ -82,6 +83,11 @@ class Settings:
     p2_max_records: int
     p1_learning_rate: float
     p2_learning_rate: float
+    validation_max_records: int
+    validation_max_new_tokens: int
+    validation_no_repeat_ngram_size: int
+    validation_object_threshold: float
+    validation_iou_threshold: float
     skip_source_hash: bool
 
     @property
@@ -147,6 +153,13 @@ def positive_float(value: str) -> float:
     return parsed
 
 
+def probability(value: str) -> float:
+    parsed = float(value)
+    if not math.isfinite(parsed) or not 0.0 <= parsed <= 1.0:
+        raise argparse.ArgumentTypeError("must be a finite number in [0, 1]")
+    return parsed
+
+
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     script_root = Path(__file__).resolve().parents[2]
     ocrmodel_root = Path(os.environ.get("OCRMODEL_ROOT", script_root))
@@ -156,6 +169,9 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     source_model = Path(
         os.environ.get("GOT_SOURCE_MODEL", workspace / "models" / "GOT-OCR2_0")
+    )
+    tokenizer_model = Path(
+        os.environ.get("GOT_TOKENIZER_MODEL", source_model)
     )
     runs_root = Path(
         os.environ.get("GOT_TRAINING_RUNS", workspace / "training_runs" / "GOT")
@@ -181,6 +197,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="Additional validation/test manifest to include in leakage audit; repeat as needed.",
     )
     parser.add_argument("--source-model", type=Path, default=source_model)
+    parser.add_argument("--tokenizer-model", type=Path, default=tokenizer_model)
     parser.add_argument("--runs-root", type=Path, default=runs_root)
     parser.add_argument("--workspace", type=Path, default=workspace)
     parser.add_argument("--ocrmodel-root", type=Path, default=ocrmodel_root)
@@ -188,13 +205,13 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--run-id")
     parser.add_argument(
         "--mode",
-        choices=("smoke", "overfit", "pilot"),
+        choices=("smoke", "overfit", "validate", "pilot"),
         default="smoke",
     )
     parser.add_argument(
         "--allow-unvalidated-pilot",
         action="store_true",
-        help="Required for pilot because a validation loader is not implemented yet.",
+        help="Required for pilot because pilot does not run validation automatically.",
     )
     parser.add_argument("--layout-split", default="train")
     parser.add_argument("--seed", type=int, default=42)
@@ -208,6 +225,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--p2-max-records", type=nonnegative_int)
     parser.add_argument("--p1-learning-rate", type=positive_float, default=1e-4)
     parser.add_argument("--p2-learning-rate", type=positive_float, default=5e-5)
+    parser.add_argument("--validation-max-records", type=nonnegative_int, default=0)
+    parser.add_argument("--validation-max-new-tokens", type=positive_int, default=2048)
+    parser.add_argument("--validation-no-repeat-ngram-size", type=nonnegative_int, default=20)
+    parser.add_argument("--validation-object-threshold", type=probability, default=0.5)
+    parser.add_argument("--validation-iou-threshold", type=probability, default=0.5)
     parser.add_argument(
         "--skip-source-hash",
         action="store_true",
@@ -219,7 +241,27 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 def resolve_settings(args: argparse.Namespace) -> Settings:
     if not args.layout_split.strip():
         raise RunFailure("--layout-split must be non-empty.", exit_code=EXIT_USAGE)
-    if args.mode == "smoke":
+    if args.mode == "validate":
+        supplied = {
+            "--p1-max-steps": args.p1_max_steps,
+            "--p2-max-steps": args.p2_max_steps,
+            "--p1-max-records": args.p1_max_records,
+            "--p2-max-records": args.p2_max_records,
+        }
+        invalid = {name: value for name, value in supplied.items() if value is not None}
+        if invalid:
+            raise RunFailure(
+                f"Validate does not train; remove training overrides: {invalid}",
+                exit_code=EXIT_USAGE,
+            )
+        if args.allow_unvalidated_pilot:
+            raise RunFailure(
+                "--allow-unvalidated-pilot is only valid with --mode pilot.",
+                exit_code=EXIT_USAGE,
+            )
+        p1_steps = p2_steps = p1_records = p2_records = 0
+        stages = ()
+    elif args.mode == "smoke":
         supplied = {
             "--p1-max-steps": args.p1_max_steps,
             "--p2-max-steps": args.p2_max_steps,
@@ -255,7 +297,7 @@ def resolve_settings(args: argparse.Namespace) -> Settings:
     else:
         if not args.allow_unvalidated_pilot:
             raise RunFailure(
-                "Pilot requires --allow-unvalidated-pilot because validation is not implemented.",
+                "Pilot requires --allow-unvalidated-pilot because pilot does not run validation automatically.",
                 exit_code=EXIT_USAGE,
             )
         if args.p1_max_steps is None or args.p2_max_steps is None:
@@ -295,6 +337,7 @@ def resolve_settings(args: argparse.Namespace) -> Settings:
         train_manifest=train_manifest,
         audit_manifests=tuple(audit_manifests),
         source_model=args.source_model.expanduser().resolve(),
+        tokenizer_model=args.tokenizer_model.expanduser().resolve(),
         runs_root=args.runs_root.expanduser().resolve(),
         run_id=run_id,
         mode=args.mode,
@@ -311,6 +354,11 @@ def resolve_settings(args: argparse.Namespace) -> Settings:
         p2_max_records=p2_records,
         p1_learning_rate=args.p1_learning_rate,
         p2_learning_rate=args.p2_learning_rate,
+        validation_max_records=args.validation_max_records,
+        validation_max_new_tokens=args.validation_max_new_tokens,
+        validation_no_repeat_ngram_size=args.validation_no_repeat_ngram_size,
+        validation_object_threshold=args.validation_object_threshold,
+        validation_iou_threshold=args.validation_iou_threshold,
         skip_source_hash=args.skip_source_hash,
     )
 
@@ -364,7 +412,11 @@ def validate_paths(settings: Settings) -> None:
         settings.source_model / "config.json",
         settings.project_root / "scripts" / "train_GOT_layout.py",
         settings.project_root / "scripts" / "verify_layout_checkpoint.py",
+        settings.project_root / "scripts" / "evaluate_GOT_layout.py",
+        settings.project_root / "scripts" / "layout_validation_metrics.py",
+        settings.project_root / "scripts" / "local_tokenizer.py",
         settings.project_root / "GOT" / "model" / "layout_query.py",
+        settings.project_root / "GOT" / "model" / "GOT_ocr_2_0.py",
         settings.project_root / "zero_config" / "zero2.json",
         settings.ocrmodel_root / "tools" / "preprocessing" / "audit_synthetic_layout.py",
         settings.ocrmodel_root / "tools" / "environment" / "check_server_envs.py",
@@ -379,16 +431,22 @@ def validate_paths(settings: Settings) -> None:
             "paths have one unambiguous root.",
             exit_code=EXIT_USAGE,
         )
+    if settings.mode == "validate" and not settings.tokenizer_model.is_dir():
+        raise RunFailure(
+            f"Validation tokenizer directory does not exist: {settings.tokenizer_model}",
+            exit_code=EXIT_MISSING,
+        )
     missing = [str(path) for path in required_files if not path.is_file()]
     missing.extend(str(path) for path in settings.audit_manifests if not path.is_file())
     if missing:
         raise RunFailure(f"Required files are missing: {missing}", exit_code=EXIT_MISSING)
-    deepspeed = Path(sys.executable).with_name("deepspeed")
-    if not deepspeed.is_file() or not os.access(deepspeed, os.X_OK):
-        raise RunFailure(
-            f"DeepSpeed executable is missing beside the active Python: {deepspeed}",
-            exit_code=EXIT_MISSING,
-        )
+    if settings.mode != "validate":
+        deepspeed = Path(sys.executable).with_name("deepspeed")
+        if not deepspeed.is_file() or not os.access(deepspeed, os.X_OK):
+            raise RunFailure(
+                f"DeepSpeed executable is missing beside the active Python: {deepspeed}",
+                exit_code=EXIT_MISSING,
+            )
 
 
 def training_environment(settings: Settings) -> dict[str, str]:
@@ -517,6 +575,7 @@ def record_provenance(context: RunContext) -> dict[str, Any]:
     source_weights = settings.source_model / "model.safetensors"
     payload: dict[str, Any] = {
         "source_model": str(settings.source_model),
+        "tokenizer_model": str(settings.tokenizer_model),
         "source_model_bytes": source_weights.stat().st_size,
         "source_model_sha256": None,
         "train_manifest": str(settings.train_manifest),
@@ -528,6 +587,9 @@ def record_provenance(context: RunContext) -> dict[str, Any]:
     code_paths = (
         settings.project_root / "scripts" / "train_GOT_layout.py",
         settings.project_root / "scripts" / "layout_page_dataset.py",
+        settings.project_root / "scripts" / "layout_validation_metrics.py",
+        settings.project_root / "scripts" / "evaluate_GOT_layout.py",
+        settings.project_root / "scripts" / "local_tokenizer.py",
         settings.project_root / "scripts" / "verify_layout_checkpoint.py",
         settings.project_root / "GOT" / "model" / "layout_query.py",
         settings.project_root / "GOT" / "model" / "GOT_ocr_2_0.py",
@@ -930,6 +992,9 @@ def assess_p1_overfit(metrics: dict[str, Any]) -> dict[str, Any]:
     diagnostics = metrics.get("diagnostics")
     tail_mean = diagnostics.get("tail_mean", {}) if isinstance(diagnostics, dict) else {}
     first = diagnostics.get("first", {}) if isinstance(diagnostics, dict) else {}
+    last = diagnostics.get("last", {}) if isinstance(diagnostics, dict) else {}
+    tail_min = diagnostics.get("tail_min", {}) if isinstance(diagnostics, dict) else {}
+    tail_max = diagnostics.get("tail_max", {}) if isinstance(diagnostics, dict) else {}
     observed_names = (
         "layout_loss",
         "object_loss",
@@ -949,15 +1014,23 @@ def assess_p1_overfit(metrics: dict[str, Any]) -> dict[str, Any]:
         "query_gradient_norm",
         "residual_gate",
     )
-    observed = {
-        name: float(tail_mean[name])
-        for name in observed_names
-        if isinstance(tail_mean.get(name), (int, float))
-    }
-    observed_first = {
-        name: float(first[name])
-        for name in observed_names
-        if isinstance(first.get(name), (int, float))
+    def select_observed(record: dict[str, Any]) -> dict[str, float]:
+        return {
+            name: float(record[name])
+            for name in observed_names
+            if isinstance(record.get(name), (int, float))
+        }
+
+    observed = select_observed(tail_mean)
+    observed_first = select_observed(first)
+    observed_last = select_observed(last)
+    bbox_tail_range = {
+        "bbox_l1_loss_min": tail_min.get("bbox_l1_loss"),
+        "bbox_l1_loss_max": tail_max.get("bbox_l1_loss"),
+        "bbox_giou_loss_min": tail_min.get("bbox_giou_loss"),
+        "bbox_giou_loss_max": tail_max.get("bbox_giou_loss"),
+        "bbox_mean_iou_min": tail_min.get("bbox_mean_iou"),
+        "bbox_mean_iou_max": tail_max.get("bbox_mean_iou"),
     }
     criteria = {
         "exactly_two_records": int(metrics.get("dataset_examples", -1))
@@ -1003,7 +1076,9 @@ def assess_p1_overfit(metrics: dict[str, Any]) -> dict[str, Any]:
             ),
         },
         "observed_first": observed_first,
+        "observed_last": observed_last,
         "observed_tail_mean": observed,
+        "bbox_tail_range": bbox_tail_range,
         "criteria": criteria,
     }
 
@@ -1195,6 +1270,147 @@ def verify_stage(
     return payload
 
 
+def run_validation(context: RunContext) -> dict[str, Any]:
+    settings = context.settings
+    validation_root = settings.run_root / "validation"
+    metadata_dir = validation_root / "metadata"
+    metadata_dir.mkdir(parents=True, exist_ok=False)
+    log_path = metadata_dir / "evaluate.log"
+    output_path = validation_root / "layout_validation_metrics.json"
+    status_path = metadata_dir / "status.txt"
+    status = {
+        "status": "running",
+        "stage": "validation",
+        "started_at": timestamp(),
+        "source_model": str(settings.source_model),
+        "output_root": str(validation_root),
+        "physical_gpu": 0,
+        "layout_split": settings.layout_split,
+        "max_records": settings.validation_max_records,
+        "object_threshold": settings.validation_object_threshold,
+        "iou_threshold": settings.validation_iou_threshold,
+    }
+    write_status(status_path, status)
+    command = [
+        sys.executable,
+        str(settings.project_root / "scripts" / "evaluate_GOT_layout.py"),
+        "--model-name-or-path",
+        str(settings.source_model),
+        "--tokenizer-name-or-path",
+        str(settings.tokenizer_model),
+        "--layout-manifest",
+        str(settings.train_manifest),
+        "--layout-image-root",
+        str(settings.dataset_root),
+        "--layout-split",
+        settings.layout_split,
+        "--output-dir",
+        str(validation_root),
+        "--max-regions",
+        str(settings.max_regions),
+        "--max-records",
+        str(settings.validation_max_records),
+        "--model-max-length",
+        str(settings.model_max_length),
+        "--max-new-tokens",
+        str(settings.validation_max_new_tokens),
+        "--no-repeat-ngram-size",
+        str(settings.validation_no_repeat_ngram_size),
+        "--object-threshold",
+        str(settings.validation_object_threshold),
+        "--iou-threshold",
+        str(settings.validation_iou_threshold),
+        "--dtype",
+        "bfloat16",
+        "--device",
+        "cuda",
+    ]
+    write_json(metadata_dir / "command.json", command)
+    context.latest_log = log_path
+    context.update_status(status="running_validation", active_stage="validation")
+    emit(
+        "layout_validation_started",
+        split=settings.layout_split,
+        max_records=settings.validation_max_records,
+        log=str(log_path),
+    )
+    require_gpu_free()
+    with log_path.open("w", encoding="utf-8") as log:
+        completed = subprocess.run(
+            command,
+            cwd=settings.project_root,
+            env=training_environment(settings),
+            stdout=log,
+            stderr=subprocess.STDOUT,
+            text=True,
+            check=False,
+        )
+    status["finished_at"] = timestamp()
+    status["exit_code"] = completed.returncode
+    if completed.returncode != 0 or not output_path.is_file():
+        status["status"] = "failed"
+        write_status(status_path, status)
+        raise RunFailure(
+            f"Validation failed with exit code {completed.returncode}.",
+            log_path=log_path,
+        )
+    try:
+        summary = read_json(output_path)
+    except Exception as exc:
+        status["status"] = "summary_invalid"
+        status["summary_error"] = bounded(str(exc))
+        write_status(status_path, status)
+        raise RunFailure("Validation summary JSON is invalid.", log_path=log_path) from exc
+    if summary.get("status") != "ok":
+        status["status"] = "summary_failed"
+        write_status(status_path, status)
+        raise RunFailure("Validation did not report status=ok.", log_path=log_path)
+    if int(summary.get("pages", 0)) < 1:
+        status["status"] = "summary_failed"
+        write_status(status_path, status)
+        raise RunFailure("Validation reported no processed pages.", log_path=log_path)
+    input_protocol = summary.get("input_protocol")
+    if not isinstance(input_protocol, dict):
+        raise RunFailure("Validation summary has no input_protocol.", log_path=log_path)
+    if input_protocol.get("model_inputs") != ["whole_page_image", "ocr_prompt"]:
+        raise RunFailure("Validation model input protocol is not page-image plus OCR prompt.")
+    if input_protocol.get("layout_metadata_as_model_input") is not False:
+        raise RunFailure("Validation incorrectly reports layout metadata as a model input.")
+    metrics = summary.get("metrics")
+    if not isinstance(metrics, dict) or not isinstance(metrics.get("ocr"), dict):
+        raise RunFailure("Validation summary has no OCR metrics.", log_path=log_path)
+    if not isinstance(metrics.get("layout"), dict):
+        raise RunFailure("Validation summary has no layout metrics.", log_path=log_path)
+    status.update(
+        {
+            "status": "completed",
+            "pages": summary["pages"],
+            "summary": str(output_path),
+            "predictions": summary.get("predictions"),
+        }
+    )
+    write_status(status_path, status)
+    (validation_root / "VALIDATION_FINISHED").touch(exist_ok=False)
+    emit(
+        "layout_validation_completed",
+        pages=summary["pages"],
+        summary=str(output_path),
+        metrics=metrics,
+    )
+    return {
+        "status": "validated",
+        "summary": str(output_path),
+        "predictions": summary.get("predictions"),
+        "pages": summary["pages"],
+        "model_inputs": input_protocol["model_inputs"],
+        "layout_metadata_as_model_input": input_protocol[
+            "layout_metadata_as_model_input"
+        ],
+        "metrics": metrics,
+        "runtime": summary.get("runtime"),
+    }
+
+
 def read_status(path: Path) -> dict[str, Any]:
     result: dict[str, Any] = {}
     for line in path.read_text(encoding="utf-8").splitlines():
@@ -1224,7 +1440,7 @@ def execute(settings: Settings) -> int:
             "train_manifest": str(settings.train_manifest),
             "source_model": str(settings.source_model),
             "physical_gpu": 0,
-            "validation_loader": "not_implemented",
+            "validation_loader": "implemented",
         }
         summary: dict[str, Any] = {
             "status": "running",
@@ -1232,7 +1448,7 @@ def execute(settings: Settings) -> int:
             "mode": settings.mode,
             "run_root": str(settings.run_root),
             "started_at": status["started_at"],
-            "validation_loader": "not_implemented",
+            "validation_loader": "implemented",
             "settings": {
                 key: str(value) if isinstance(value, Path) else value
                 for key, value in asdict(settings).items()
@@ -1294,6 +1510,36 @@ def execute(settings: Settings) -> int:
                 regions=audit["region_count"],
                 gpu=component["gpu"],
             )
+
+            if settings.mode == "validate":
+                require_gpu_free()
+                validation = run_validation(context)
+                context.summary["validation"] = validation
+                context.summary.update({"status": "ok", "finished_at": timestamp()})
+                context.update_status(
+                    status="completed",
+                    active_stage="none",
+                    finished_at=context.summary["finished_at"],
+                    validation_pages=validation["pages"],
+                )
+                context.write_summary()
+                (settings.run_root / "LAYOUT_A100_FINISHED").touch(exist_ok=False)
+                emit(
+                    "layout_a100_completed",
+                    run_id=settings.run_id,
+                    run_root=str(settings.run_root),
+                    summary=str(settings.run_root / "summary.json"),
+                    model_inputs=validation["model_inputs"],
+                    layout_metadata_as_model_input=validation[
+                        "layout_metadata_as_model_input"
+                    ],
+                    validation={
+                        "pages": validation["pages"],
+                        "summary": validation["summary"],
+                        "metrics": validation["metrics"],
+                    },
+                )
+                return 0
 
             p1 = run_stage(context, stage="p1", source_model=settings.source_model)
             context.summary["p1"] = p1

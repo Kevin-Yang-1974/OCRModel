@@ -544,6 +544,8 @@ def main() -> None:
     train_result = trainer.train(resume_from_checkpoint=bool(checkpoints))
     trainer.save_state()
     trainer._safe_save(output_dir=str(output_dir))
+    if training_args.local_rank in (-1, 0):
+        tokenizer.save_pretrained(output_dir)
 
     metrics = dict(train_result.metrics)
     diagnostics = summarize_diagnostic_history(trainer.state.log_history)
