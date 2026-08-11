@@ -1,0 +1,12 @@
+{"content_id":"train_text_000","source_group_id":"train_book_000","split":"train","kind":"text","orientation":"any","text":"天地玄黄，宇宙洪荒。"}
+{"content_id":"train_text_001","source_group_id":"train_book_000","split":"train","kind":"text","orientation":"any","text":"日月盈昃，辰宿列张。"}
+{"content_id":"train_text_002","source_group_id":"train_book_001","split":"train","kind":"text","orientation":"any","text":"寒来暑往，秋收冬藏。"}
+{"content_id":"train_text_003","source_group_id":"train_book_001","split":"train","kind":"text","orientation":"any","text":"闰余成岁，律吕调阳。"}
+{"content_id":"train_text_004","source_group_id":"train_book_002","split":"train","kind":"text","orientation":"any","text":"云腾致雨，露结为霜。"}
+{"content_id":"train_text_005","source_group_id":"train_book_002","split":"train","kind":"text","orientation":"any","text":"金生丽水，玉出昆冈。"}
+{"content_id":"train_text_006","source_group_id":"train_book_003","split":"train","kind":"text","orientation":"any","text":"剑号巨阙，珠称夜光。"}
+{"content_id":"train_text_007","source_group_id":"train_book_003","split":"train","kind":"text","orientation":"any","text":"符号：甲乙丙丁〇△□。"}
+{"content_id":"validation_text_000","source_group_id":"validation_book_000","split":"validation","kind":"text","orientation":"any","text":"验证页面第一条独立内容。"}
+{"content_id":"validation_text_001","source_group_id":"validation_book_000","split":"validation","kind":"text","orientation":"any","text":"验证页面第二条独立内容。"}
+{"content_id":"validation_text_002","source_group_id":"validation_book_001","split":"validation","kind":"text","orientation":"any","text":"验证页面第三条独立内容。"}
+{"content_id":"validation_text_003","source_group_id":"validation_book_001","split":"validation","kind":"text","orientation":"any","text":"验证页面第四条独立内容。"}

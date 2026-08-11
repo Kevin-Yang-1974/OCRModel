@@ -1,0 +1,7 @@
+# Optional Windows/local CPU development dependencies.
+# This file intentionally excludes torch, CUDA, DeepSpeed and model packages.
+numpy>=1.26,<3
+Pillow>=11,<13
+pytest>=8.3,<9
+# Browser rendering uses the separate exact lock:
+# requirements-layout-synthesis.lock.txt

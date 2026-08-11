@@ -1,0 +1,1442 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import math
+import os
+import re
+import socket
+import subprocess
+import sys
+import traceback
+from collections import deque
+from dataclasses import asdict, dataclass
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Sequence
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - the launcher itself runs on Linux.
+    fcntl = None  # type: ignore[assignment]
+
+
+EXIT_FAILURE = 1
+EXIT_USAGE = 64
+EXIT_MISSING = 66
+EXIT_LOCKED = 73
+EXIT_EXISTS = 74
+EXIT_GPU_BUSY = 75
+RUN_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+
+OVERFIT_P1_STEPS = 200
+OVERFIT_RECORDS = 2
+OVERFIT_THRESHOLDS = {
+    "object_loss_max": 0.05,
+    "bbox_l1_loss_max": 0.05,
+    "bbox_giou_loss_max": 0.15,
+    "direction_loss_max": 0.05,
+    "object_accuracy_min": 0.99,
+    "bbox_mean_iou_min": 0.90,
+    "direction_accuracy_min": 0.99,
+}
+
+
+class RunFailure(RuntimeError):
+    def __init__(
+        self,
+        message: str,
+        *,
+        exit_code: int = EXIT_FAILURE,
+        log_path: Path | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.exit_code = exit_code
+        self.log_path = log_path
+
+
+@dataclass(frozen=True)
+class Settings:
+    workspace: Path
+    ocrmodel_root: Path
+    project_root: Path
+    dataset_root: Path
+    train_manifest: Path
+    audit_manifests: tuple[Path, ...]
+    source_model: Path
+    runs_root: Path
+    run_id: str
+    mode: str
+    stages: tuple[str, ...]
+    layout_split: str
+    seed: int
+    max_regions: int
+    model_max_length: int
+    per_device_batch_size: int
+    gradient_accumulation_steps: int
+    p1_max_steps: int
+    p2_max_steps: int
+    p1_max_records: int
+    p2_max_records: int
+    p1_learning_rate: float
+    p2_learning_rate: float
+    skip_source_hash: bool
+
+    @property
+    def run_root(self) -> Path:
+        return self.runs_root / self.run_id
+
+
+@dataclass
+class RunContext:
+    settings: Settings
+    status: dict[str, Any]
+    summary: dict[str, Any]
+    latest_log: Path | None = None
+
+    @property
+    def metadata_dir(self) -> Path:
+        return self.settings.run_root / "metadata"
+
+    def update_status(self, **updates: Any) -> None:
+        self.status.update(updates)
+        self.status["updated_at"] = timestamp()
+        write_status(self.metadata_dir / "status.txt", self.status)
+
+    def write_summary(self) -> None:
+        write_json(self.settings.run_root / "summary.json", self.summary)
+
+
+def timestamp() -> str:
+    return datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def compact_json(payload: Any) -> str:
+    return json.dumps(payload, ensure_ascii=False, separators=(",", ":"), default=str)
+
+
+def emit(event: str, **payload: Any) -> None:
+    print(compact_json({"event": event, **payload}), flush=True)
+
+
+def bounded(value: str, limit: int = 600) -> str:
+    value = value.replace("\x00", "").strip()
+    return value if len(value) <= limit else value[:limit] + "...[truncated]"
+
+
+def positive_int(value: str) -> int:
+    parsed = int(value)
+    if parsed < 1:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return parsed
+
+
+def nonnegative_int(value: str) -> int:
+    parsed = int(value)
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("must be a non-negative integer")
+    return parsed
+
+
+def positive_float(value: str) -> float:
+    parsed = float(value)
+    if not math.isfinite(parsed) or parsed <= 0.0:
+        raise argparse.ArgumentTypeError("must be a positive finite number")
+    return parsed
+
+
+def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
+    script_root = Path(__file__).resolve().parents[2]
+    ocrmodel_root = Path(os.environ.get("OCRMODEL_ROOT", script_root))
+    workspace = Path(os.environ.get("OCR_WORKSPACE", ocrmodel_root.parent))
+    project_root = Path(
+        os.environ.get("GOT_PROJECT_ROOT", ocrmodel_root / "src" / "GOT-OCR-2.0")
+    )
+    source_model = Path(
+        os.environ.get("GOT_SOURCE_MODEL", workspace / "models" / "GOT-OCR2_0")
+    )
+    runs_root = Path(
+        os.environ.get("GOT_TRAINING_RUNS", workspace / "training_runs" / "GOT")
+    )
+
+    parser = argparse.ArgumentParser(
+        description=(
+            "Run bounded A100 preflight plus controlled GOT2 VLQA diagnostics/training. "
+            "Trainer output is kept in the run directory."
+        )
+    )
+    parser.add_argument("--dataset-root", type=Path, required=True)
+    parser.add_argument(
+        "--manifest",
+        type=Path,
+        help="Training manifest; defaults to DATASET_ROOT/manifest.jsonl.",
+    )
+    parser.add_argument(
+        "--audit-manifest",
+        action="append",
+        type=Path,
+        default=[],
+        help="Additional validation/test manifest to include in leakage audit; repeat as needed.",
+    )
+    parser.add_argument("--source-model", type=Path, default=source_model)
+    parser.add_argument("--runs-root", type=Path, default=runs_root)
+    parser.add_argument("--workspace", type=Path, default=workspace)
+    parser.add_argument("--ocrmodel-root", type=Path, default=ocrmodel_root)
+    parser.add_argument("--project-root", type=Path, default=project_root)
+    parser.add_argument("--run-id")
+    parser.add_argument(
+        "--mode",
+        choices=("smoke", "overfit", "pilot"),
+        default="smoke",
+    )
+    parser.add_argument(
+        "--allow-unvalidated-pilot",
+        action="store_true",
+        help="Required for pilot because a validation loader is not implemented yet.",
+    )
+    parser.add_argument("--layout-split", default="train")
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--max-regions", type=positive_int, default=16)
+    parser.add_argument("--model-max-length", type=positive_int, default=2048)
+    parser.add_argument("--per-device-batch-size", type=positive_int, default=1)
+    parser.add_argument("--gradient-accumulation-steps", type=positive_int, default=1)
+    parser.add_argument("--p1-max-steps", type=positive_int)
+    parser.add_argument("--p2-max-steps", type=positive_int)
+    parser.add_argument("--p1-max-records", type=nonnegative_int)
+    parser.add_argument("--p2-max-records", type=nonnegative_int)
+    parser.add_argument("--p1-learning-rate", type=positive_float, default=1e-4)
+    parser.add_argument("--p2-learning-rate", type=positive_float, default=5e-5)
+    parser.add_argument(
+        "--skip-source-hash",
+        action="store_true",
+        help="Skip hashing the large original model file; path and size are still recorded.",
+    )
+    return parser.parse_args(argv)
+
+
+def resolve_settings(args: argparse.Namespace) -> Settings:
+    if not args.layout_split.strip():
+        raise RunFailure("--layout-split must be non-empty.", exit_code=EXIT_USAGE)
+    if args.mode == "smoke":
+        supplied = {
+            "--p1-max-steps": args.p1_max_steps,
+            "--p2-max-steps": args.p2_max_steps,
+            "--p1-max-records": args.p1_max_records,
+            "--p2-max-records": args.p2_max_records,
+        }
+        invalid = {name: value for name, value in supplied.items() if value not in (None, 1)}
+        if invalid:
+            raise RunFailure(
+                f"Smoke is fixed to one step and one record per stage; use pilot: {invalid}",
+                exit_code=EXIT_USAGE,
+            )
+        p1_steps = p2_steps = p1_records = p2_records = 1
+        stages = ("p1", "p2")
+    elif args.mode == "overfit":
+        supplied = {
+            "--p1-max-steps": args.p1_max_steps,
+            "--p2-max-steps": args.p2_max_steps,
+            "--p1-max-records": args.p1_max_records,
+            "--p2-max-records": args.p2_max_records,
+        }
+        invalid = {name: value for name, value in supplied.items() if value is not None}
+        if invalid:
+            raise RunFailure(
+                f"Overfit is fixed to P1, {OVERFIT_RECORDS} records, and "
+                f"{OVERFIT_P1_STEPS} steps; do not override: {invalid}",
+                exit_code=EXIT_USAGE,
+            )
+        p1_steps = OVERFIT_P1_STEPS
+        p1_records = OVERFIT_RECORDS
+        p2_steps = p2_records = 0
+        stages = ("p1",)
+    else:
+        if not args.allow_unvalidated_pilot:
+            raise RunFailure(
+                "Pilot requires --allow-unvalidated-pilot because validation is not implemented.",
+                exit_code=EXIT_USAGE,
+            )
+        if args.p1_max_steps is None or args.p2_max_steps is None:
+            raise RunFailure(
+                "Pilot requires explicit --p1-max-steps and --p2-max-steps.",
+                exit_code=EXIT_USAGE,
+            )
+        p1_steps = args.p1_max_steps
+        p2_steps = args.p2_max_steps
+        p1_records = 0 if args.p1_max_records is None else args.p1_max_records
+        p2_records = 0 if args.p2_max_records is None else args.p2_max_records
+        stages = ("p1", "p2")
+
+    run_id = args.run_id or (
+        f"layout_{args.mode}_{datetime.now().astimezone().strftime('%Y%m%d_%H%M%S')}"
+    )
+    if not RUN_ID_PATTERN.fullmatch(run_id):
+        raise RunFailure(
+            "--run-id may contain only letters, digits, period, underscore, and hyphen "
+            "and must be at most 128 characters.",
+            exit_code=EXIT_USAGE,
+        )
+
+    dataset_root = args.dataset_root.expanduser().resolve()
+    train_manifest = (args.manifest or dataset_root / "manifest.jsonl").expanduser().resolve()
+    audit_manifests: list[Path] = [train_manifest]
+    for path in args.audit_manifest:
+        resolved = path.expanduser().resolve()
+        if resolved not in audit_manifests:
+            audit_manifests.append(resolved)
+
+    return Settings(
+        workspace=args.workspace.expanduser().resolve(),
+        ocrmodel_root=args.ocrmodel_root.expanduser().resolve(),
+        project_root=args.project_root.expanduser().resolve(),
+        dataset_root=dataset_root,
+        train_manifest=train_manifest,
+        audit_manifests=tuple(audit_manifests),
+        source_model=args.source_model.expanduser().resolve(),
+        runs_root=args.runs_root.expanduser().resolve(),
+        run_id=run_id,
+        mode=args.mode,
+        stages=stages,
+        layout_split=args.layout_split.strip(),
+        seed=args.seed,
+        max_regions=args.max_regions,
+        model_max_length=args.model_max_length,
+        per_device_batch_size=args.per_device_batch_size,
+        gradient_accumulation_steps=args.gradient_accumulation_steps,
+        p1_max_steps=p1_steps,
+        p2_max_steps=p2_steps,
+        p1_max_records=p1_records,
+        p2_max_records=p2_records,
+        p1_learning_rate=args.p1_learning_rate,
+        p2_learning_rate=args.p2_learning_rate,
+        skip_source_hash=args.skip_source_hash,
+    )
+
+
+def write_json(path: Path, payload: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(path.name + ".tmp")
+    temporary.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True, default=str) + "\n",
+        encoding="utf-8",
+    )
+    temporary.replace(path)
+
+
+def read_json(path: Path) -> dict[str, Any]:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise RunFailure(f"Expected a JSON object: {path}")
+    return payload
+
+
+def write_status(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lines = []
+    for key, value in payload.items():
+        rendered = compact_json(value) if isinstance(value, (dict, list, tuple)) else str(value)
+        lines.append(f"{key}={rendered.replace(chr(10), ' ')}")
+    temporary = path.with_name(path.name + ".tmp")
+    temporary.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    temporary.replace(path)
+
+
+def file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(8 * 1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def tail_lines(path: Path | None, count: int = 20) -> list[str]:
+    if path is None or not path.is_file():
+        return []
+    with path.open("r", encoding="utf-8", errors="replace") as handle:
+        return [bounded(line, 800) for line in deque(handle, maxlen=count)]
+
+
+def validate_paths(settings: Settings) -> None:
+    required_files = (
+        settings.source_model / "model.safetensors",
+        settings.source_model / "config.json",
+        settings.project_root / "scripts" / "train_GOT_layout.py",
+        settings.project_root / "scripts" / "verify_layout_checkpoint.py",
+        settings.project_root / "GOT" / "model" / "layout_query.py",
+        settings.project_root / "zero_config" / "zero2.json",
+        settings.ocrmodel_root / "tools" / "preprocessing" / "audit_synthetic_layout.py",
+        settings.ocrmodel_root / "tools" / "environment" / "check_server_envs.py",
+    )
+    if not settings.dataset_root.is_dir():
+        raise RunFailure(
+            f"Dataset root does not exist: {settings.dataset_root}", exit_code=EXIT_MISSING
+        )
+    if settings.train_manifest.parent != settings.dataset_root:
+        raise RunFailure(
+            "The training manifest must be directly inside --dataset-root so relative image "
+            "paths have one unambiguous root.",
+            exit_code=EXIT_USAGE,
+        )
+    missing = [str(path) for path in required_files if not path.is_file()]
+    missing.extend(str(path) for path in settings.audit_manifests if not path.is_file())
+    if missing:
+        raise RunFailure(f"Required files are missing: {missing}", exit_code=EXIT_MISSING)
+    deepspeed = Path(sys.executable).with_name("deepspeed")
+    if not deepspeed.is_file() or not os.access(deepspeed, os.X_OK):
+        raise RunFailure(
+            f"DeepSpeed executable is missing beside the active Python: {deepspeed}",
+            exit_code=EXIT_MISSING,
+        )
+
+
+def training_environment(settings: Settings) -> dict[str, str]:
+    environment = dict(os.environ)
+    environment.update(
+        {
+            "OCR_WORKSPACE": str(settings.workspace),
+            "OCRMODEL_ROOT": str(settings.ocrmodel_root),
+            "GOT_PROJECT_ROOT": str(settings.project_root),
+            "CUDA_DEVICE_ORDER": "PCI_BUS_ID",
+            "CUDA_VISIBLE_DEVICES": "0",
+            "PYTHONNOUSERSITE": "1",
+            "TOKENIZERS_PARALLELISM": "false",
+            "WANDB_DISABLED": "true",
+            "HF_HOME": str(settings.workspace / "cache" / "huggingface"),
+            "HF_HUB_DISABLE_XET": "1",
+            "TRANSFORMERS_OFFLINE": "1",
+            "HF_HUB_OFFLINE": "1",
+        }
+    )
+    return environment
+
+
+def gpu_processes() -> list[dict[str, Any]]:
+    command = [
+        "nvidia-smi",
+        "-i",
+        "0",
+        "--query-compute-apps=pid,process_name,used_memory",
+        "--format=csv,noheader,nounits",
+    ]
+    try:
+        completed = subprocess.run(
+            command,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise RunFailure(f"Cannot query GPU 0: {exc}", exit_code=EXIT_MISSING) from exc
+    if completed.returncode != 0:
+        raise RunFailure(
+            f"nvidia-smi failed: {bounded(completed.stderr)}", exit_code=EXIT_MISSING
+        )
+    processes: list[dict[str, Any]] = []
+    for line in completed.stdout.splitlines():
+        line = line.strip()
+        if not line or "no running processes" in line.lower():
+            continue
+        parts = [part.strip() for part in line.split(",", maxsplit=2)]
+        processes.append(
+            {
+                "pid": parts[0] if parts else "unknown",
+                "process_name": parts[1] if len(parts) > 1 else "unknown",
+                "used_memory_mib": parts[2] if len(parts) > 2 else "unknown",
+            }
+        )
+    return processes
+
+
+def require_gpu_free() -> None:
+    processes = gpu_processes()
+    if processes:
+        raise RunFailure(
+            f"GPU0_BUSY {compact_json(processes)}",
+            exit_code=EXIT_GPU_BUSY,
+        )
+
+
+def acquire_lock(runs_root: Path) -> Any:
+    if fcntl is None:
+        raise RunFailure("The A100 launcher requires Linux file locking.", exit_code=EXIT_MISSING)
+    runs_root.mkdir(parents=True, exist_ok=True)
+    handle = (runs_root / ".layout_a100.lock").open("a+", encoding="utf-8")
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError as exc:
+        handle.close()
+        raise RunFailure(
+            "Another layout A100 launcher holds the run lock.", exit_code=EXIT_LOCKED
+        ) from exc
+    return handle
+
+
+def run_environment_check(context: RunContext) -> dict[str, Any]:
+    output_path = context.metadata_dir / "environment_check.json"
+    log_path = context.metadata_dir / "environment_check.log"
+    context.latest_log = log_path
+    command = [
+        sys.executable,
+        str(context.settings.ocrmodel_root / "tools" / "environment" / "check_server_envs.py"),
+        "--workspace",
+        str(context.settings.workspace),
+        "--ocrmodel-root",
+        str(context.settings.ocrmodel_root),
+    ]
+    try:
+        completed = subprocess.run(
+            command,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=180,
+            env=training_environment(context.settings),
+        )
+        log_path.write_text(completed.stdout + completed.stderr, encoding="utf-8")
+        lines = [line for line in completed.stdout.splitlines() if line.strip()]
+        report = json.loads(lines[-1]) if lines else {}
+    except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError) as exc:
+        raise RunFailure(
+            f"Environment check could not be parsed: {exc}", log_path=log_path
+        ) from exc
+    write_json(output_path, report)
+    if completed.returncode != 0 or report.get("ok") is not True:
+        raise RunFailure(
+            "GOT environment check failed; inspect metadata/environment_check.json.",
+            exit_code=EXIT_MISSING,
+            log_path=log_path,
+        )
+    return report
+
+
+def record_provenance(context: RunContext) -> dict[str, Any]:
+    settings = context.settings
+    source_weights = settings.source_model / "model.safetensors"
+    payload: dict[str, Any] = {
+        "source_model": str(settings.source_model),
+        "source_model_bytes": source_weights.stat().st_size,
+        "source_model_sha256": None,
+        "train_manifest": str(settings.train_manifest),
+        "train_manifest_sha256": file_sha256(settings.train_manifest),
+        "code": {},
+    }
+    if not settings.skip_source_hash:
+        payload["source_model_sha256"] = file_sha256(source_weights)
+    code_paths = (
+        settings.project_root / "scripts" / "train_GOT_layout.py",
+        settings.project_root / "scripts" / "layout_page_dataset.py",
+        settings.project_root / "scripts" / "verify_layout_checkpoint.py",
+        settings.project_root / "GOT" / "model" / "layout_query.py",
+        settings.project_root / "GOT" / "model" / "GOT_ocr_2_0.py",
+        Path(__file__).resolve(),
+    )
+    code_hashes: dict[str, str] = {}
+    for path in code_paths:
+        try:
+            label = str(path.relative_to(settings.ocrmodel_root))
+        except ValueError:
+            label = str(path)
+        code_hashes[label] = file_sha256(path)
+    payload["code"] = code_hashes
+    write_json(context.metadata_dir / "provenance.json", payload)
+    return payload
+
+
+def run_audit(context: RunContext) -> dict[str, Any]:
+    summary_path = context.metadata_dir / "audit_summary.json"
+    log_path = context.metadata_dir / "audit.log"
+    command = [
+        sys.executable,
+        str(
+            context.settings.ocrmodel_root
+            / "tools"
+            / "preprocessing"
+            / "audit_synthetic_layout.py"
+        ),
+    ]
+    for manifest in context.settings.audit_manifests:
+        command.extend(("--manifest", str(manifest)))
+    command.extend(("--summary-json", str(summary_path)))
+    context.latest_log = log_path
+    with log_path.open("w", encoding="utf-8") as log:
+        completed = subprocess.run(
+            command,
+            cwd=context.settings.ocrmodel_root,
+            env=training_environment(context.settings),
+            stdout=log,
+            stderr=subprocess.STDOUT,
+            text=True,
+            check=False,
+        )
+    if completed.returncode != 0 or not summary_path.is_file():
+        raise RunFailure("Synthetic layout audit failed.", log_path=log_path)
+    summary = read_json(summary_path)
+    split_count = int(summary.get("split_counts", {}).get(context.settings.layout_split, 0))
+    required_records = OVERFIT_RECORDS if context.settings.mode == "overfit" else 1
+    if summary.get("status") != "ok" or split_count < required_records:
+        raise RunFailure(
+            f"Audit has {split_count} usable split={context.settings.layout_split!r} "
+            f"records; mode={context.settings.mode!r} requires {required_records}.",
+            log_path=log_path,
+        )
+    return summary
+
+
+# Run the CUDA probe in a child so its context disappears before the next GPU check.
+COMPONENT_SMOKE = r'''
+import importlib.util
+import json
+import sys
+
+import torch
+
+module_path = sys.argv[1]
+seed = int(sys.argv[2])
+if not torch.cuda.is_available():
+    raise RuntimeError("CUDA is not available")
+if torch.cuda.device_count() != 1:
+    raise RuntimeError(f"Expected exactly one visible GPU, got {torch.cuda.device_count()}")
+torch.manual_seed(seed)
+torch.cuda.manual_seed_all(seed)
+spec = importlib.util.spec_from_file_location("layout_query_component_smoke", module_path)
+module = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = module
+spec.loader.exec_module(module)
+device = torch.device("cuda:0")
+adapter = module.VisualLayoutQueryAdapter(
+    visual_dim=64,
+    layout_input_dim=64,
+    adapter_dim=32,
+    num_queries=4,
+    num_heads=4,
+    ffn_expansion=2,
+).to(device=device, dtype=torch.bfloat16)
+visual = torch.randn(2, 16, 64, device=device, dtype=torch.bfloat16) * 1_000_000.0
+output = adapter(visual, memory_grid_size=(4, 4), return_attention=True)
+if not torch.equal(output.visual_tokens, visual):
+    raise RuntimeError("Zero residual gate did not preserve visual tokens")
+initial_scales = {
+    "query_abs_max": float(output.layout_queries.detach().float().abs().max().cpu()),
+    "prediction_query_abs_max": float(
+        output.prediction_queries.detach().float().abs().max().cpu()
+    ),
+    "object_logit_abs_max": float(
+        output.object_logits.detach().float().abs().max().cpu()
+    ),
+    "direction_logit_abs_max": float(
+        output.direction_logits.detach().float().abs().max().cpu()
+    ),
+    "bbox_logit_abs_max": float(
+        output.bbox_logits.detach().float().abs().max().cpu()
+    ),
+}
+for name, value in initial_scales.items():
+    if not torch.isfinite(torch.tensor(value)) or value >= 10.0:
+        raise RuntimeError(f"VLQA initial {name} is out of bounds: {value}")
+criterion = module.VisualLayoutQueryLoss()
+boxes = torch.tensor(
+    [
+        [[0.1, 0.1, 0.3, 0.8], [0.4, 0.1, 0.6, 0.8], [0, 0, 0, 0], [0, 0, 0, 0]],
+        [[0.2, 0.2, 0.7, 0.4], [0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0]],
+    ],
+    dtype=torch.float32,
+    device=device,
+)
+bbox_mask = torch.tensor(
+    [[True, True, False, False], [True, False, False, False]], device=device
+)
+object_targets = bbox_mask.to(torch.float32)
+object_mask = torch.ones((2, 4), dtype=torch.bool, device=device)
+directions = torch.tensor([[2, 2, -100, -100], [0, -100, -100, -100]], device=device)
+losses = criterion(
+    output=output,
+    bbox_targets_xyxy=boxes,
+    bbox_mask=bbox_mask,
+    object_targets=object_targets,
+    object_mask=object_mask,
+    direction_targets=directions,
+)
+if not torch.isfinite(losses.loss):
+    raise RuntimeError("VLQA component loss is not finite")
+if losses.loss.dtype != torch.float32:
+    raise RuntimeError(f"VLQA loss must use FP32, got {losses.loss.dtype}")
+losses.loss.backward()
+gradient = adapter.query_embeddings.grad
+if gradient is None or not torch.isfinite(gradient).all():
+    raise RuntimeError("VLQA query gradient is missing or non-finite")
+print(json.dumps({
+    "status": "ok",
+    "torch": torch.__version__,
+    "gpu": torch.cuda.get_device_name(0),
+    "capability": list(torch.cuda.get_device_capability(0)),
+    "loss": float(losses.loss.detach().cpu()),
+    "loss_dtype": str(losses.loss.dtype),
+    "object_loss": float(losses.object_loss.detach().cpu()),
+    "bbox_l1_loss": float(losses.bbox_l1_loss.detach().cpu()),
+    "bbox_giou_loss": float(losses.bbox_giou_loss.detach().cpu()),
+    "direction_loss": float(losses.direction_loss.detach().cpu()),
+    "object_accuracy": float(losses.object_accuracy.detach().cpu()),
+    "bbox_mean_iou": float(losses.bbox_mean_iou.detach().cpu()),
+    "direction_accuracy": float(losses.direction_accuracy.detach().cpu()),
+    **initial_scales,
+    "query_gradient_norm": float(gradient.norm().detach().cpu()),
+    "visual_shape": list(output.visual_tokens.shape),
+    "query_shape": list(output.layout_queries.shape),
+}, separators=(",", ":")))
+'''
+
+
+def run_component_smoke(context: RunContext) -> dict[str, Any]:
+    log_path = context.metadata_dir / "component_smoke.log"
+    output_path = context.metadata_dir / "component_smoke.json"
+    context.latest_log = log_path
+    try:
+        completed = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                COMPONENT_SMOKE,
+                str(context.settings.project_root / "GOT" / "model" / "layout_query.py"),
+                str(context.settings.seed),
+            ],
+            cwd=context.settings.project_root,
+            env=training_environment(context.settings),
+            capture_output=True,
+            text=True,
+            timeout=180,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        log_path.write_text(f"{type(exc).__name__}: {exc}\n", encoding="utf-8")
+        raise RunFailure("VLQA CUDA component smoke could not complete.", log_path=log_path) from exc
+    log_path.write_text(completed.stdout + completed.stderr, encoding="utf-8")
+    if completed.returncode != 0:
+        raise RunFailure("VLQA CUDA component smoke failed.", log_path=log_path)
+    lines = [line for line in completed.stdout.splitlines() if line.strip()]
+    try:
+        payload = json.loads(lines[-1])
+    except (IndexError, json.JSONDecodeError) as exc:
+        raise RunFailure("VLQA component smoke returned invalid JSON.", log_path=log_path) from exc
+    if payload.get("status") != "ok":
+        raise RunFailure("VLQA component smoke did not report success.", log_path=log_path)
+    if payload.get("loss_dtype") != "torch.float32":
+        raise RunFailure("VLQA component smoke did not use FP32 loss.", log_path=log_path)
+    for name in (
+        "object_logit_abs_max",
+        "direction_logit_abs_max",
+        "bbox_logit_abs_max",
+    ):
+        value = float(payload.get(name, float("nan")))
+        if not math.isfinite(value) or value >= 10.0:
+            raise RunFailure(
+                f"VLQA component smoke reported invalid initial {name}: {value}.",
+                log_path=log_path,
+            )
+    write_json(output_path, payload)
+    return payload
+
+
+def free_master_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as handle:
+        handle.bind(("127.0.0.1", 0))
+        return int(handle.getsockname()[1])
+
+
+def build_training_command(
+    settings: Settings,
+    *,
+    stage: str,
+    source_model: Path,
+    output_dir: Path,
+    master_port: int,
+) -> list[str]:
+    if stage not in {"p1", "p2"}:
+        raise ValueError(stage)
+    steps = settings.p1_max_steps if stage == "p1" else settings.p2_max_steps
+    records = settings.p1_max_records if stage == "p1" else settings.p2_max_records
+    learning_rate = (
+        settings.p1_learning_rate if stage == "p1" else settings.p2_learning_rate
+    )
+    ocr_loss_weight = "0" if stage == "p1" else "1"
+    deepspeed = Path(sys.executable).with_name("deepspeed")
+    return [
+        str(deepspeed),
+        "--master_port",
+        str(master_port),
+        str(settings.project_root / "scripts" / "train_GOT_layout.py"),
+        "--deepspeed",
+        str(settings.project_root / "zero_config" / "zero2.json"),
+        "--model_name_or_path",
+        str(source_model),
+        "--layout_manifest",
+        str(settings.train_manifest),
+        "--layout_image_root",
+        str(settings.dataset_root),
+        "--layout_split",
+        settings.layout_split,
+        "--layout_stage",
+        stage,
+        "--max_regions",
+        str(settings.max_regions),
+        "--max_train_records",
+        str(records),
+        "--datasets",
+        "layout-page-jsonl",
+        "--conversation_version",
+        "mpt",
+        "--use_im_start_end",
+        "True",
+        "--bf16",
+        "True",
+        "--fp16",
+        "False",
+        "--gradient_accumulation_steps",
+        str(settings.gradient_accumulation_steps),
+        "--evaluation_strategy",
+        "no",
+        "--save_strategy",
+        "no",
+        "--save_safetensors",
+        "True",
+        "--weight_decay",
+        "0",
+        "--warmup_ratio",
+        "0",
+        "--lr_scheduler_type",
+        "constant",
+        "--logging_steps",
+        "1",
+        "--tf32",
+        "False",
+        "--model_max_length",
+        str(settings.model_max_length),
+        "--gradient_checkpointing",
+        "True",
+        "--dataloader_num_workers",
+        "0",
+        "--report_to",
+        "none",
+        "--remove_unused_columns",
+        "False",
+        "--per_device_train_batch_size",
+        str(settings.per_device_batch_size),
+        "--max_steps",
+        str(steps),
+        "--learning_rate",
+        str(learning_rate),
+        "--layout_loss_weight",
+        "1",
+        "--ocr_loss_weight",
+        ocr_loss_weight,
+        "--seed",
+        str(settings.seed),
+        "--data_seed",
+        str(settings.seed),
+        "--output_dir",
+        str(output_dir),
+    ]
+
+
+def validate_stage_metrics(
+    metrics: dict[str, Any],
+    *,
+    stage: str,
+    expected_steps: int,
+    max_regions: int,
+) -> None:
+    if metrics.get("layout_stage") != stage:
+        raise RunFailure(f"{stage.upper()} metrics contain the wrong layout_stage.")
+    if int(metrics.get("global_step", -1)) != expected_steps:
+        raise RunFailure(
+            f"{stage.upper()} global_step mismatch: "
+            f"{metrics.get('global_step')} != {expected_steps}."
+        )
+    train_loss = float(metrics.get("train_loss", float("nan")))
+    if not math.isfinite(train_loss) or train_loss <= 0.0:
+        raise RunFailure(f"{stage.upper()} train_loss is invalid: {train_loss}.")
+    if metrics.get("first_batch_bbox_shape") != [1, max_regions, 4]:
+        raise RunFailure(
+            f"{stage.upper()} bbox batch shape is invalid: "
+            f"{metrics.get('first_batch_bbox_shape')}."
+        )
+    supervised = int(metrics.get("first_batch_supervised_tokens", -1))
+    if stage == "p1" and supervised != 0:
+        raise RunFailure(f"P1 retained {supervised} OCR-supervised batch tokens.")
+    if stage == "p2" and supervised < 1:
+        raise RunFailure("P2 has no OCR-supervised batch tokens.")
+    if metrics.get("layout_loss_compute_dtype") != "float32":
+        raise RunFailure(
+            f"{stage.upper()} did not report FP32 layout loss computation."
+        )
+    initialization = metrics.get("layout_adapter_initialization")
+    try:
+        source_layout_count = int(metrics.get("source_layout_tensor_count", -1))
+        expected_layout_count = int(metrics.get("expected_layout_tensor_count", -1))
+        parameter_abs_max = float(
+            metrics.get("layout_adapter_parameter_abs_max", float("nan"))
+        )
+    except (TypeError, ValueError) as exc:
+        raise RunFailure(f"{stage.upper()} reported invalid VLQA initialization metadata.") from exc
+    if expected_layout_count < 1:
+        raise RunFailure(f"{stage.upper()} reported no expected VLQA tensors.")
+    if not math.isfinite(parameter_abs_max):
+        raise RunFailure(f"{stage.upper()} reported non-finite VLQA parameters.")
+    if stage == "p1" and (
+        initialization != "fresh_explicit_reset" or source_layout_count != 0
+    ):
+        raise RunFailure(
+            "P1 did not explicitly initialize a fresh VLQA from the original checkpoint."
+        )
+    if stage == "p1" and parameter_abs_max > 2.0:
+        raise RunFailure(
+            f"P1 fresh VLQA parameter scale is invalid: abs_max={parameter_abs_max}."
+        )
+    if stage == "p2" and (
+        initialization != "checkpoint_loaded"
+        or source_layout_count != expected_layout_count
+    ):
+        raise RunFailure("P2 did not load a complete VLQA checkpoint from P1.")
+    diagnostics = metrics.get("diagnostics")
+    if not isinstance(diagnostics, dict) or int(diagnostics.get("log_count", 0)) < 1:
+        raise RunFailure(f"{stage.upper()} did not record layout diagnostics.")
+    tail_mean = diagnostics.get("tail_mean")
+    if not isinstance(tail_mean, dict):
+        raise RunFailure(f"{stage.upper()} diagnostics have no tail mean.")
+    required = (
+        "layout_loss",
+        "object_loss",
+        "bbox_l1_loss",
+        "bbox_giou_loss",
+        "direction_loss",
+        "object_accuracy",
+        "bbox_mean_iou",
+        "direction_accuracy",
+        "query_abs_max",
+        "prediction_query_abs_max",
+        "bbox_logit_abs_max",
+    )
+    for name in required:
+        value = float(tail_mean.get(name, float("nan")))
+        if not math.isfinite(value):
+            raise RunFailure(
+                f"{stage.upper()} diagnostic {name} is invalid: {value}."
+            )
+
+
+def assess_p1_overfit(metrics: dict[str, Any]) -> dict[str, Any]:
+    diagnostics = metrics.get("diagnostics")
+    tail_mean = diagnostics.get("tail_mean", {}) if isinstance(diagnostics, dict) else {}
+    first = diagnostics.get("first", {}) if isinstance(diagnostics, dict) else {}
+    observed_names = (
+        "layout_loss",
+        "object_loss",
+        "bbox_l1_loss",
+        "bbox_giou_loss",
+        "direction_loss",
+        "object_accuracy",
+        "bbox_mean_iou",
+        "direction_accuracy",
+        "object_logit_abs_max",
+        "direction_logit_abs_max",
+        "bbox_pred_min",
+        "bbox_pred_max",
+        "query_abs_max",
+        "prediction_query_abs_max",
+        "bbox_logit_abs_max",
+        "query_gradient_norm",
+        "residual_gate",
+    )
+    observed = {
+        name: float(tail_mean[name])
+        for name in observed_names
+        if isinstance(tail_mean.get(name), (int, float))
+    }
+    observed_first = {
+        name: float(first[name])
+        for name in observed_names
+        if isinstance(first.get(name), (int, float))
+    }
+    criteria = {
+        "exactly_two_records": int(metrics.get("dataset_examples", -1))
+        == OVERFIT_RECORDS,
+        "enough_diagnostic_steps": int(
+            diagnostics.get("log_count", 0) if isinstance(diagnostics, dict) else 0
+        )
+        >= OVERFIT_P1_STEPS,
+        "object_loss": observed.get("object_loss", math.inf)
+        <= OVERFIT_THRESHOLDS["object_loss_max"],
+        "bbox_l1_loss": observed.get("bbox_l1_loss", math.inf)
+        <= OVERFIT_THRESHOLDS["bbox_l1_loss_max"],
+        "bbox_giou_loss": observed.get("bbox_giou_loss", math.inf)
+        <= OVERFIT_THRESHOLDS["bbox_giou_loss_max"],
+        "direction_loss": observed.get("direction_loss", math.inf)
+        <= OVERFIT_THRESHOLDS["direction_loss_max"],
+        "object_accuracy": observed.get("object_accuracy", -math.inf)
+        >= OVERFIT_THRESHOLDS["object_accuracy_min"],
+        "bbox_mean_iou": observed.get("bbox_mean_iou", -math.inf)
+        >= OVERFIT_THRESHOLDS["bbox_mean_iou_min"],
+        "direction_accuracy": observed.get("direction_accuracy", -math.inf)
+        >= OVERFIT_THRESHOLDS["direction_accuracy_min"],
+    }
+    return {
+        "status": "pass" if all(criteria.values()) else "fail",
+        "purpose": "two-record P1 implementation diagnostic; not validation performance",
+        "tail_window": (
+            int(diagnostics.get("tail_window", 0))
+            if isinstance(diagnostics, dict)
+            else 0
+        ),
+        "thresholds": OVERFIT_THRESHOLDS,
+        "initialization": {
+            "mode": metrics.get("layout_adapter_initialization"),
+            "source_layout_tensor_count": metrics.get(
+                "source_layout_tensor_count"
+            ),
+            "expected_layout_tensor_count": metrics.get(
+                "expected_layout_tensor_count"
+            ),
+            "parameter_abs_max": metrics.get(
+                "layout_adapter_parameter_abs_max"
+            ),
+        },
+        "observed_first": observed_first,
+        "observed_tail_mean": observed,
+        "criteria": criteria,
+    }
+
+
+def run_stage(
+    context: RunContext,
+    *,
+    stage: str,
+    source_model: Path,
+) -> dict[str, Any]:
+    settings = context.settings
+    stage_root = settings.run_root / stage
+    metadata_dir = stage_root / "metadata"
+    output_dir = stage_root / "model"
+    log_path = stage_root / "train.log"
+    metadata_dir.mkdir(parents=True, exist_ok=False)
+    status_path = metadata_dir / "status.txt"
+    steps = settings.p1_max_steps if stage == "p1" else settings.p2_max_steps
+    records = settings.p1_max_records if stage == "p1" else settings.p2_max_records
+    learning_rate = (
+        settings.p1_learning_rate if stage == "p1" else settings.p2_learning_rate
+    )
+    status = {
+        "status": "running",
+        "stage": stage,
+        "started_at": timestamp(),
+        "source_model": str(source_model),
+        "output_model": str(output_dir),
+        "physical_gpu": 0,
+        "max_steps": steps,
+        "max_train_records": records,
+        "learning_rate": learning_rate,
+    }
+    write_status(status_path, status)
+    command = build_training_command(
+        settings,
+        stage=stage,
+        source_model=source_model,
+        output_dir=output_dir,
+        master_port=free_master_port(),
+    )
+    write_json(metadata_dir / "command.json", command)
+    context.latest_log = log_path
+    context.update_status(status=f"running_{stage}", active_stage=stage)
+    emit(
+        "layout_stage_started",
+        stage=stage,
+        max_steps=steps,
+        max_records=records,
+        log=str(log_path),
+    )
+    require_gpu_free()
+    with log_path.open("w", encoding="utf-8") as log:
+        completed = subprocess.run(
+            command,
+            cwd=settings.project_root,
+            env=training_environment(settings),
+            stdout=log,
+            stderr=subprocess.STDOUT,
+            text=True,
+            check=False,
+        )
+    status["finished_at"] = timestamp()
+    status["exit_code"] = completed.returncode
+    if completed.returncode != 0:
+        status["status"] = "failed"
+        write_status(status_path, status)
+        raise RunFailure(
+            f"{stage.upper()} training failed with exit code {completed.returncode}.",
+            log_path=log_path,
+        )
+
+    metrics_path = output_dir / "layout_training_metrics.json"
+    if not metrics_path.is_file():
+        status["status"] = "failed"
+        write_status(status_path, status)
+        raise RunFailure(
+            f"{stage.upper()} did not write layout_training_metrics.json.",
+            log_path=log_path,
+        )
+    metrics = read_json(metrics_path)
+    try:
+        validate_stage_metrics(
+            metrics,
+            stage=stage,
+            expected_steps=steps,
+            max_regions=settings.max_regions,
+        )
+    except RunFailure as exc:
+        status["status"] = "metrics_validation_failed"
+        status["metrics_error"] = bounded(str(exc))
+        write_status(status_path, status)
+        raise RunFailure(str(exc), log_path=log_path) from exc
+    status.update(
+        {
+            "status": "trained",
+            "global_step": metrics["global_step"],
+            "train_loss": metrics["train_loss"],
+            "peak_allocated_mib": metrics.get("peak_allocated_mib"),
+        }
+    )
+    write_status(status_path, status)
+    return {
+        "status": "trained",
+        "stage": stage,
+        "model": str(output_dir),
+        "train_log": str(log_path),
+        "metrics": metrics,
+    }
+
+
+def verify_stage(
+    context: RunContext,
+    *,
+    stage: str,
+    model_dir: Path,
+    skip_model_reload: bool,
+) -> dict[str, Any]:
+    stage_root = context.settings.run_root / stage
+    output_path = stage_root / "metadata" / "checkpoint_verification.json"
+    log_path = stage_root / "metadata" / "checkpoint_verification.log"
+    command = [
+        sys.executable,
+        str(context.settings.project_root / "scripts" / "verify_layout_checkpoint.py"),
+        "--model",
+        str(model_dir),
+        "--stage",
+        stage,
+        "--max-regions",
+        str(context.settings.max_regions),
+        "--output",
+        str(output_path),
+    ]
+    if skip_model_reload:
+        command.append("--skip-model-reload")
+    environment = training_environment(context.settings)
+    environment["CUDA_VISIBLE_DEVICES"] = ""
+    context.latest_log = log_path
+    stage_status_path = stage_root / "metadata" / "status.txt"
+    stage_status = read_status(stage_status_path)
+    stage_status["status"] = "verifying"
+    write_status(stage_status_path, stage_status)
+    with log_path.open("w", encoding="utf-8") as log:
+        completed = subprocess.run(
+            command,
+            cwd=context.settings.project_root,
+            env=environment,
+            stdout=log,
+            stderr=subprocess.STDOUT,
+            text=True,
+            check=False,
+        )
+    if completed.returncode != 0 or not output_path.is_file():
+        stage_status["status"] = "verification_failed"
+        stage_status["verification_exit_code"] = completed.returncode
+        write_status(stage_status_path, stage_status)
+        raise RunFailure(
+            f"{stage.upper()} checkpoint verification failed.", log_path=log_path
+        )
+    try:
+        payload = read_json(output_path)
+    except Exception as exc:
+        stage_status["status"] = "verification_failed"
+        stage_status["verification_error"] = bounded(str(exc))
+        write_status(stage_status_path, stage_status)
+        raise RunFailure(
+            f"{stage.upper()} checkpoint verification JSON is invalid.",
+            log_path=log_path,
+        ) from exc
+    if payload.get("status") != "ok":
+        stage_status["status"] = "verification_failed"
+        write_status(stage_status_path, stage_status)
+        raise RunFailure(
+            f"{stage.upper()} checkpoint verification did not report success.",
+            log_path=log_path,
+        )
+    stage_status["status"] = "completed"
+    stage_status["checkpoint_verified"] = True
+    stage_status["model_reload"] = not skip_model_reload
+    write_status(stage_status_path, stage_status)
+    (stage_root / f"{stage.upper()}_FINISHED").touch(exist_ok=False)
+    emit(
+        "layout_stage_completed",
+        stage=stage,
+        global_step=payload["safetensors"]["global_step"],
+        train_loss=payload["safetensors"]["train_loss"],
+        checkpoint_reload=not skip_model_reload,
+    )
+    return payload
+
+
+def read_status(path: Path) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if "=" in line:
+            key, value = line.split("=", maxsplit=1)
+            result[key] = value
+    return result
+
+
+def execute(settings: Settings) -> int:
+    validate_paths(settings)
+    lock_handle = acquire_lock(settings.runs_root)
+    try:
+        require_gpu_free()
+        if settings.run_root.exists():
+            raise RunFailure(
+                f"Run output already exists: {settings.run_root}", exit_code=EXIT_EXISTS
+            )
+        (settings.run_root / "metadata").mkdir(parents=True, exist_ok=False)
+        status = {
+            "status": "running_preflight",
+            "started_at": timestamp(),
+            "run_id": settings.run_id,
+            "mode": settings.mode,
+            "run_root": str(settings.run_root),
+            "dataset_root": str(settings.dataset_root),
+            "train_manifest": str(settings.train_manifest),
+            "source_model": str(settings.source_model),
+            "physical_gpu": 0,
+            "validation_loader": "not_implemented",
+        }
+        summary: dict[str, Any] = {
+            "status": "running",
+            "run_id": settings.run_id,
+            "mode": settings.mode,
+            "run_root": str(settings.run_root),
+            "started_at": status["started_at"],
+            "validation_loader": "not_implemented",
+            "settings": {
+                key: str(value) if isinstance(value, Path) else value
+                for key, value in asdict(settings).items()
+            },
+            "preflight": {},
+            "p1": None,
+            "p2": None,
+        }
+        summary["settings"]["audit_manifests"] = [str(path) for path in settings.audit_manifests]
+        context = RunContext(settings=settings, status=status, summary=summary)
+        context.update_status()
+        write_json(context.metadata_dir / "resolved_settings.json", summary["settings"])
+        context.write_summary()
+        emit(
+            "layout_a100_started",
+            run_id=settings.run_id,
+            mode=settings.mode,
+            run_root=str(settings.run_root),
+        )
+
+        try:
+            context.update_status(status="environment_check")
+            emit("layout_environment_check_started")
+            environment_report = run_environment_check(context)
+            emit("layout_environment_check_completed")
+            context.update_status(status="provenance")
+            emit("layout_provenance_started")
+            provenance = record_provenance(context)
+            emit("layout_provenance_completed")
+            context.update_status(status="audit")
+            emit("layout_audit_started", manifest_count=len(settings.audit_manifests))
+            audit = run_audit(context)
+            emit(
+                "layout_audit_completed",
+                pages=audit["page_count"],
+                regions=audit["region_count"],
+            )
+            require_gpu_free()
+            context.update_status(status="component_smoke")
+            emit("layout_component_smoke_started")
+            component = run_component_smoke(context)
+            emit("layout_component_smoke_completed", gpu=component["gpu"])
+            require_gpu_free()
+            context.summary["preflight"] = {
+                "environment": environment_report,
+                "provenance": provenance,
+                "audit": audit,
+                "component_smoke": component,
+            }
+            context.update_status(
+                status="preflight_completed",
+                audited_pages=audit["page_count"],
+                audited_regions=audit["region_count"],
+            )
+            context.write_summary()
+            emit(
+                "layout_preflight_completed",
+                pages=audit["page_count"],
+                regions=audit["region_count"],
+                gpu=component["gpu"],
+            )
+
+            p1 = run_stage(context, stage="p1", source_model=settings.source_model)
+            context.summary["p1"] = p1
+            context.write_summary()
+            p1_model = Path(p1["model"])
+            p1["verification"] = verify_stage(
+                context,
+                stage="p1",
+                model_dir=p1_model,
+                skip_model_reload="p2" in settings.stages,
+            )
+            assessment_marker: str | None = None
+            if "p2" in settings.stages:
+                p1["reload_validated_by"] = "p2_source_model_load"
+            else:
+                p1["reload_validated_by"] = "p1_checkpoint_verification"
+            context.summary["p1"] = p1
+            context.write_summary()
+
+            if "p2" in settings.stages:
+                require_gpu_free()
+                p2 = run_stage(context, stage="p2", source_model=p1_model)
+                context.summary["p2"] = p2
+                context.write_summary()
+                p2_model = Path(p2["model"])
+                p2["verification"] = verify_stage(
+                    context,
+                    stage="p2",
+                    model_dir=p2_model,
+                    skip_model_reload=False,
+                )
+                context.summary["p2"] = p2
+            else:
+                p2 = None
+                context.summary["p2"] = {
+                    "status": "skipped",
+                    "reason": "P1-only overfit diagnostic",
+                }
+                context.summary["overfit_assessment"] = assess_p1_overfit(
+                    p1["metrics"]
+                )
+                assessment_marker = (
+                    "OVERFIT_PASSED"
+                    if context.summary["overfit_assessment"]["status"] == "pass"
+                    else "OVERFIT_FAILED"
+                )
+
+            context.summary.update({"status": "ok", "finished_at": timestamp()})
+            completion_status = {
+                "status": "completed",
+                "active_stage": "none",
+                "finished_at": context.summary["finished_at"],
+                "p1_global_step": p1["metrics"]["global_step"],
+            }
+            if p2 is not None:
+                completion_status["p2_global_step"] = p2["metrics"]["global_step"]
+            if "overfit_assessment" in context.summary:
+                completion_status["overfit_status"] = context.summary[
+                    "overfit_assessment"
+                ]["status"]
+            context.update_status(
+                **completion_status,
+            )
+            context.write_summary()
+            (settings.run_root / "LAYOUT_A100_FINISHED").touch(exist_ok=False)
+            if assessment_marker is not None:
+                (settings.run_root / assessment_marker).touch(exist_ok=False)
+            emit(
+                "layout_a100_completed",
+                run_id=settings.run_id,
+                run_root=str(settings.run_root),
+                summary=str(settings.run_root / "summary.json"),
+                overfit_assessment=context.summary.get("overfit_assessment"),
+            )
+            return 0
+        except (Exception, KeyboardInterrupt) as exc:
+            error_log = context.metadata_dir / "orchestrator_error.log"
+            error_log.write_text(traceback.format_exc(), encoding="utf-8")
+            exit_code = (
+                130
+                if isinstance(exc, KeyboardInterrupt)
+                else exc.exit_code
+                if isinstance(exc, RunFailure)
+                else EXIT_FAILURE
+            )
+            failure_log = exc.log_path if isinstance(exc, RunFailure) else context.latest_log
+            error_payload = {
+                "type": type(exc).__name__,
+                "message": bounded(str(exc)),
+                "exit_code": exit_code,
+                "log": str(failure_log) if failure_log else None,
+                "tail": tail_lines(failure_log),
+            }
+            context.summary.update(
+                {"status": "error", "finished_at": timestamp(), "error": error_payload}
+            )
+            context.update_status(
+                status="failed",
+                finished_at=context.summary["finished_at"],
+                exit_code=exit_code,
+                error_type=type(exc).__name__,
+                error=bounded(str(exc)),
+            )
+            context.write_summary()
+            (settings.run_root / "LAYOUT_A100_FAILED").touch(exist_ok=True)
+            emit(
+                "layout_a100_failed",
+                run_id=settings.run_id,
+                exit_code=exit_code,
+                error=bounded(str(exc)),
+                log=str(failure_log) if failure_log else None,
+                tail=error_payload["tail"],
+            )
+            return exit_code
+    finally:
+        assert fcntl is not None
+        fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
+        lock_handle.close()
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    try:
+        settings = resolve_settings(parse_args(argv))
+        return execute(settings)
+    except RunFailure as exc:
+        emit(
+            "layout_a100_rejected",
+            exit_code=exc.exit_code,
+            error=bounded(str(exc)),
+        )
+        return exc.exit_code
+    except KeyboardInterrupt:
+        emit("layout_a100_interrupted", exit_code=130)
+        return 130
+    except Exception as exc:
+        emit(
+            "layout_a100_rejected",
+            exit_code=EXIT_FAILURE,
+            error_type=type(exc).__name__,
+            error=bounded(str(exc)),
+        )
+        return EXIT_FAILURE
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
