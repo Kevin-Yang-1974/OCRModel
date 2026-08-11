@@ -55,7 +55,7 @@ HTML/CSS 负责页面尺寸、边距、列数、栏间距、横排/竖排和区�
 
 设第 $i$ 个合成页面为：
 
-$$P_i=\operatorname{Render}\left(T_i,B_i,\{C_{i,k}\}_{k=1}^{R_i}\right),$$
+$$P_i=\mathrm{Render}\left(T_i,B_i,\{C_{i,k}\}_{k=1}^{R_i}\right),$$
 
 其中 $T_i$ 为模板，$B_i$ 为背景，$C_{i,k}$ 为第 $k$ 个内容区域。DOM 给出区域框：
 
@@ -63,7 +63,7 @@ $$\mathbf b_{i,k}=(x_{0i,k},y_{0i,k},x_{1i,k},y_{1i,k}).$$
 
 所有 bbox 按截图宽高归一化。区域按模板定义的实际阅读规则生成 `reading_order`，而不是事后依据字符串或文件名猜测。页面级转写按真值顺序拼接：
 
-$$\mathbf y_i=\operatorname{Concat}\left(\mathbf y_{i,\pi_i(1)},\ldots,\mathbf y_{i,\pi_i(R_i)}\right),$$
+$$\mathbf y_i=\mathrm{Concat}\left(\mathbf y_{i,\pi_i(1)},\ldots,\mathbf y_{i,\pi_i(R_i)}\right),$$
 
 其中 $\pi_i$ 是页面阅读顺序。区域分隔符、换行和格式标记必须与 GOT2 的目标输出及评测规范统一，不能在训练与评估阶段分别处理。
 
