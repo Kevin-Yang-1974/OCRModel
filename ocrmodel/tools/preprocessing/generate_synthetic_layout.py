@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import importlib.metadata
+import json
 import platform
 import random
 import sys
@@ -66,7 +67,30 @@ def parse_args() -> argparse.Namespace:
         "--expected-browser-version",
         help="Fail when the launched Chromium version does not exactly match this value.",
     )
+    parser.add_argument(
+        "--expected-browser-sha256",
+        help="Fail when --chromium-executable does not match this SHA-256.",
+    )
+    parser.add_argument(
+        "--font-file",
+        type=Path,
+        action="append",
+        default=[],
+        help="Font file whose path and SHA-256 are recorded. Repeat as needed.",
+    )
+    parser.add_argument(
+        "--expected-font-sha256",
+        action="append",
+        default=[],
+        help="Expected SHA-256 paired by position with --font-file.",
+    )
     parser.add_argument("--headful", action="store_true")
+    parser.add_argument(
+        "--progress-every",
+        type=int,
+        default=100,
+        help="Print one compact progress line after this many rendered pages.",
+    )
     return parser.parse_args()
 
 
@@ -75,18 +99,55 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--num-pages must be positive.")
     if args.seed < 0:
         raise ValueError("--seed must be non-negative.")
+    if args.progress_every < 1:
+        raise ValueError("--progress-every must be positive.")
     if len(set(args.tier)) != len(args.tier):
         raise ValueError("--tier values must not be repeated.")
     if args.chromium_executable is not None:
         args.chromium_executable = args.chromium_executable.resolve()
         if not args.chromium_executable.is_file():
             raise FileNotFoundError(args.chromium_executable)
+    if args.expected_browser_sha256:
+        if args.chromium_executable is None:
+            raise ValueError("--expected-browser-sha256 requires --chromium-executable.")
+        expected = args.expected_browser_sha256.casefold()
+        actual = sha256_file(args.chromium_executable)
+        if len(expected) != 64 or any(character not in "0123456789abcdef" for character in expected):
+            raise ValueError("--expected-browser-sha256 must contain 64 hexadecimal characters.")
+        if actual != expected:
+            raise RuntimeError(
+                f"Browser executable SHA-256 mismatch: expected={expected}, actual={actual}"
+            )
+        args.expected_browser_sha256 = expected
+    if len(args.font_file) != len(args.expected_font_sha256):
+        raise ValueError("Each --font-file requires one paired --expected-font-sha256.")
+    resolved_fonts: list[Path] = []
+    normalized_font_hashes: list[str] = []
+    for path, expected_raw in zip(args.font_file, args.expected_font_sha256):
+        resolved = path.resolve()
+        if not resolved.is_file():
+            raise FileNotFoundError(resolved)
+        expected = expected_raw.casefold()
+        if len(expected) != 64 or any(character not in "0123456789abcdef" for character in expected):
+            raise ValueError("--expected-font-sha256 must contain 64 hexadecimal characters.")
+        actual = sha256_file(resolved)
+        if actual != expected:
+            raise RuntimeError(
+                f"Font file SHA-256 mismatch for {resolved}: expected={expected}, actual={actual}"
+            )
+        resolved_fonts.append(resolved)
+        normalized_font_hashes.append(expected)
+    args.font_file = resolved_fonts
+    args.expected_font_sha256 = normalized_font_hashes
     if args.chromium_executable is not None and args.browser_channel:
         raise ValueError("Use either --chromium-executable or --browser-channel, not both.")
     if args.plan_only and (
         args.chromium_executable is not None
         or args.browser_channel
         or args.expected_browser_version
+        or args.expected_browser_sha256
+        or args.font_file
+        or args.expected_font_sha256
         or args.headful
     ):
         raise ValueError("Browser options are not used with --plan-only.")
@@ -184,6 +245,8 @@ def collect_dom_regions(page: Any) -> list[dict[str, Any]]:
         (elements) => elements.map((element) => {
           const rect = element.getBoundingClientRect();
           const style = window.getComputedStyle(element);
+          const content = element.querySelector(".text-content, .crop-content");
+          const image = content instanceof HTMLImageElement ? content : null;
           return {
             region_id: element.dataset.regionId,
             reading_order: Number(element.dataset.readingOrder),
@@ -195,6 +258,14 @@ def collect_dom_regions(page: Any) -> list[dict[str, Any]]:
             writing_mode: style.writingMode,
             direction: style.direction,
             font_family: style.fontFamily,
+            content_client_width: content ? content.clientWidth : 0,
+            content_client_height: content ? content.clientHeight : 0,
+            content_scroll_width: content ? content.scrollWidth : 0,
+            content_scroll_height: content ? content.scrollHeight : 0,
+            content_text: content && !image ? content.textContent : null,
+            image_complete: image ? image.complete : null,
+            image_natural_width: image ? image.naturalWidth : null,
+            image_natural_height: image ? image.naturalHeight : null,
           };
         })
         """,
@@ -345,6 +416,14 @@ def main() -> None:
         "generator_config": config.to_dict(),
         "python_version": platform.python_version(),
         "platform": platform.platform(),
+        "browser_executable": str(args.chromium_executable) if args.chromium_executable else None,
+        "browser_executable_sha256": (
+            sha256_file(args.chromium_executable) if args.chromium_executable else None
+        ),
+        "font_files": [
+            {"path": str(path), "sha256": digest}
+            for path, digest in zip(args.font_file, args.expected_font_sha256)
+        ],
     }
 
     if args.plan_only:
@@ -363,6 +442,7 @@ def main() -> None:
     images_dir = output_dir / "images"
     images_dir.mkdir()
     manifest_records: list[dict[str, Any]] = []
+    manifest_path = output_dir / "manifest.jsonl"
     browser_version = ""
     playwright_version = importlib.metadata.version("playwright")
 
@@ -386,83 +466,128 @@ def main() -> None:
                     "Chromium version mismatch: "
                     f"expected={args.expected_browser_version!r}, actual={browser_version!r}"
                 )
-            for plan, html_path in zip(plans, html_paths):
-                page = browser.new_page(
-                    viewport={"width": config.page_width, "height": config.page_height},
-                    device_scale_factor=1,
-                    locale="zh-CN",
-                    color_scheme="light",
+            context = browser.new_context(
+                viewport={"width": config.page_width, "height": config.page_height},
+                device_scale_factor=1,
+                locale="zh-CN",
+                color_scheme="light",
+            )
+            page = context.new_page()
+            try:
+                write_json(
+                    output_dir / "dataset_meta.json",
+                    {
+                        **common_metadata,
+                        "status": "rendering",
+                        "formal_manifest_emitted": False,
+                        "playwright_version": playwright_version,
+                        "chromium_version": browser_version,
+                        "device_scale_factor": 1,
+                        "manifest": "manifest.jsonl",
+                    },
                 )
-                try:
-                    page.goto(html_path.resolve().as_uri(), wait_until="load")
-                    page.evaluate("() => document.fonts.ready")
-                    page.wait_for_function(
-                        "() => Array.from(document.images).every((image) => "
-                        "image.complete && image.naturalWidth > 0 && image.naturalHeight > 0)"
-                    )
-                    metrics = page.evaluate(
-                        """
-                        () => ({
-                          inner_width: window.innerWidth,
-                          inner_height: window.innerHeight,
-                          scroll_width: document.documentElement.scrollWidth,
-                          scroll_height: document.documentElement.scrollHeight,
-                          device_pixel_ratio: window.devicePixelRatio,
-                        })
-                        """
-                    )
-                    validate_page_metrics(metrics, config, plan.page_id)
-                    dom_regions = collect_dom_regions(page)
-                    font_usage = collect_rendered_font_usage(page)
-                    attach_and_validate_rendered_fonts(
-                        plan=plan,
-                        dom_regions=dom_regions,
-                        font_usage=font_usage,
-                        allowed_fonts=config.allowed_rendered_fonts,
-                    )
-                    image_path = images_dir / f"{plan.page_id}.png"
-                    page.screenshot(path=str(image_path), full_page=False, animations="disabled")
-                finally:
-                    page.close()
-
-                with Image.open(image_path) as rendered:
-                    if rendered.size != plan.page_size:
-                        raise RuntimeError(
-                            f"Screenshot size mismatch for {plan.page_id}: "
-                            f"expected={plan.page_size}, actual={rendered.size}"
+                with manifest_path.open("x", encoding="utf-8", newline="\n") as manifest_handle:
+                    for rendered_index, (plan, html_path) in enumerate(
+                        zip(plans, html_paths), start=1
+                    ):
+                        page.goto(html_path.resolve().as_uri(), wait_until="load")
+                        page.evaluate("() => document.fonts.ready")
+                        page.wait_for_function(
+                            "() => Array.from(document.images).every((image) => "
+                            "image.complete && image.naturalWidth > 0 && image.naturalHeight > 0)"
                         )
-                degradation: dict[str, Any]
-                if plan.tier == "s2-hard":
-                    degradation = apply_s2_degradation(image_path, plan.page_seed)
-                else:
-                    degradation = {
-                        "tier": args.tier,
-                        "geometry_preserved": True,
-                        "operations": {},
-                    }
-                manifest_records.append(
-                    manifest_record_from_dom(
-                        plan=plan,
-                        dom_regions=dom_regions,
-                        image_relative=image_path.relative_to(output_dir).as_posix(),
-                        html_relative=html_path.relative_to(output_dir).as_posix(),
-                        image_sha256=sha256_file(image_path),
-                        generator_metadata={
-                            "base_seed": args.seed,
-                            "playwright_version": playwright_version,
-                            "chromium_version": browser_version,
-                            "device_scale_factor": 1,
-                            "viewport": [config.page_width, config.page_height],
-                            "font_family": config.font_family,
-                            "allowed_rendered_fonts": config.allowed_rendered_fonts,
-                        },
-                        degradation=degradation,
-                    )
-                )
+                        metrics = page.evaluate(
+                            """
+                            () => ({
+                              inner_width: window.innerWidth,
+                              inner_height: window.innerHeight,
+                              scroll_width: document.documentElement.scrollWidth,
+                              scroll_height: document.documentElement.scrollHeight,
+                              device_pixel_ratio: window.devicePixelRatio,
+                            })
+                            """
+                        )
+                        validate_page_metrics(metrics, config, plan.page_id)
+                        dom_regions = collect_dom_regions(page)
+                        font_usage = collect_rendered_font_usage(page)
+                        attach_and_validate_rendered_fonts(
+                            plan=plan,
+                            dom_regions=dom_regions,
+                            font_usage=font_usage,
+                            allowed_fonts=config.allowed_rendered_fonts,
+                        )
+                        image_path = images_dir / f"{plan.page_id}.png"
+                        page.screenshot(
+                            path=str(image_path), full_page=False, animations="disabled"
+                        )
+                        with Image.open(image_path) as rendered:
+                            if rendered.size != plan.page_size:
+                                raise RuntimeError(
+                                    f"Screenshot size mismatch for {plan.page_id}: "
+                                    f"expected={plan.page_size}, actual={rendered.size}"
+                                )
+                        degradation: dict[str, Any]
+                        if plan.tier == "s2-hard":
+                            degradation = apply_s2_degradation(image_path, plan.page_seed)
+                        else:
+                            degradation = {
+                                "tier": plan.tier,
+                                "geometry_preserved": True,
+                                "operations": {},
+                            }
+                        record = manifest_record_from_dom(
+                            plan=plan,
+                            dom_regions=dom_regions,
+                            image_relative=image_path.relative_to(output_dir).as_posix(),
+                            html_relative=html_path.relative_to(output_dir).as_posix(),
+                            image_sha256=sha256_file(image_path),
+                            generator_metadata={
+                                "base_seed": args.seed,
+                                "playwright_version": playwright_version,
+                                "chromium_version": browser_version,
+                                "device_scale_factor": 1,
+                                "viewport": [config.page_width, config.page_height],
+                                "font_family": config.font_family,
+                                "allowed_rendered_fonts": config.allowed_rendered_fonts,
+                                "browser_executable": (
+                                    str(args.chromium_executable)
+                                    if args.chromium_executable
+                                    else None
+                                ),
+                                "browser_executable_sha256": (
+                                    sha256_file(args.chromium_executable)
+                                    if args.chromium_executable
+                                    else None
+                                ),
+                                "font_files": [
+                                    {"path": str(path), "sha256": digest}
+                                    for path, digest in zip(
+                                        args.font_file, args.expected_font_sha256
+                                    )
+                                ],
+                            },
+                            degradation=degradation,
+                        )
+                        manifest_records.append(record)
+                        manifest_handle.write(
+                            json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n"
+                        )
+                        manifest_handle.flush()
+                        if (
+                            rendered_index % args.progress_every == 0
+                            or rendered_index == len(plans)
+                        ):
+                            print(
+                                f"SYNTHETIC_LAYOUT_PROGRESS "
+                                f"rendered={rendered_index} total={len(plans)}"
+                            )
+                            sys.stdout.flush()
+            finally:
+                page.close()
+                context.close()
         finally:
             browser.close()
 
-    write_jsonl(output_dir / "manifest.jsonl", manifest_records)
     write_json(
         output_dir / "dataset_meta.json",
         {
@@ -480,7 +605,7 @@ def main() -> None:
     print(f"tiers={','.join(args.tier)}")
     print(f"chromium_version={browser_version}")
     print(f"output_dir={output_dir}")
-    print(f"manifest={output_dir / 'manifest.jsonl'}")
+    print(f"manifest={manifest_path}")
 
 
 if __name__ == "__main__":

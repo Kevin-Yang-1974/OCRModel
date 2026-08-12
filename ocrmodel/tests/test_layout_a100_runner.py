@@ -159,6 +159,112 @@ class LayoutA100RunnerTests(unittest.TestCase):
                 )
             )
 
+    def test_formal_pretrain_is_p1_only_and_requires_held_out_manifests(self) -> None:
+        with self.assertRaisesRegex(runner.RunFailure, "validation-manifest"):
+            runner.resolve_settings(
+                make_args(
+                    self.tmp_path,
+                    "--mode",
+                    "pretrain",
+                    "--p1-max-steps",
+                    "1200",
+                )
+            )
+
+        validation_manifest = self.tmp_path / "validation" / "manifest.jsonl"
+        test_manifest = self.tmp_path / "test" / "manifest.jsonl"
+        settings = runner.resolve_settings(
+            make_args(
+                self.tmp_path,
+                "--mode",
+                "pretrain",
+                "--p1-max-steps",
+                "1200",
+                "--validation-manifest",
+                str(validation_manifest),
+                "--test-manifest",
+                str(test_manifest),
+            )
+        )
+        self.assertEqual(settings.stages, ("p1",))
+        self.assertEqual(settings.p1_max_steps, 1200)
+        self.assertEqual(settings.p2_max_steps, 0)
+        self.assertEqual(settings.validation_manifest, validation_manifest.resolve())
+        self.assertEqual(settings.test_manifest, test_manifest.resolve())
+        self.assertEqual(
+            settings.audit_manifests,
+            (
+                (self.tmp_path / "manifest.jsonl").resolve(),
+                validation_manifest.resolve(),
+                test_manifest.resolve(),
+            ),
+        )
+        with self.assertRaisesRegex(runner.RunFailure, "pairwise distinct"):
+            runner.resolve_settings(
+                make_args(
+                    self.tmp_path,
+                    "--mode",
+                    "pretrain",
+                    "--p1-max-steps",
+                    "1200",
+                    "--validation-manifest",
+                    str(validation_manifest),
+                    "--test-manifest",
+                    str(test_manifest),
+                    "--test-split",
+                    "train",
+                )
+            )
+
+    def test_formal_joint_train_is_p2_only_from_a_p1_checkpoint(self) -> None:
+        validation_manifest = self.tmp_path / "validation" / "manifest.jsonl"
+        test_manifest = self.tmp_path / "test" / "manifest.jsonl"
+        settings = runner.resolve_settings(
+            make_args(
+                self.tmp_path,
+                "--mode",
+                "joint-train",
+                "--source-model",
+                str(self.tmp_path / "p1-model"),
+                "--p2-max-steps",
+                "2400",
+                "--validation-manifest",
+                str(validation_manifest),
+                "--test-manifest",
+                str(test_manifest),
+            )
+        )
+        self.assertEqual(settings.stages, ("p2",))
+        self.assertEqual(settings.p1_max_steps, 0)
+        self.assertEqual(settings.p2_max_steps, 2400)
+        command = runner.build_training_command(
+            settings,
+            stage="p2",
+            source_model=settings.source_model,
+            output_dir=self.tmp_path / "p2-model",
+            master_port=23456,
+        )
+        self.assertEqual(option_value(command, "--layout_stage"), "p2")
+        self.assertEqual(option_value(command, "--ocr_loss_weight"), "1")
+        self.assertEqual(option_value(command, "--max_steps"), "2400")
+
+        with self.assertRaisesRegex(runner.RunFailure, "P2-only"):
+            runner.resolve_settings(
+                make_args(
+                    self.tmp_path,
+                    "--mode",
+                    "joint-train",
+                    "--p1-max-steps",
+                    "1",
+                    "--p2-max-steps",
+                    "2400",
+                    "--validation-manifest",
+                    str(validation_manifest),
+                    "--test-manifest",
+                    str(test_manifest),
+                )
+            )
+
     def test_overfit_assessment_is_explicit_and_bounded(self) -> None:
         tail_mean = {
             "object_loss": 0.01,

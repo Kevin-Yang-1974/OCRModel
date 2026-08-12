@@ -19,7 +19,7 @@ WRITING_DIRECTIONS = (
     "vertical_rtl",
     "vertical_ltr",
 )
-VALID_ORIENTATIONS = ("horizontal", "vertical", "any")
+VALID_ORIENTATIONS = ("horizontal", "vertical", "any", *WRITING_DIRECTIONS)
 SAFE_ID_RE = re.compile(r'^[^\s<>:"/\\|?*\x00-\x1f]{1,128}$')
 HEX_COLOR_RE = re.compile(r"^#[0-9A-Fa-f]{6}$")
 
@@ -121,7 +121,7 @@ class ContentItem:
 
     def supports_direction(self, writing_direction: str) -> bool:
         orientation = writing_direction.split("_", maxsplit=1)[0]
-        return self.orientation in ("any", orientation)
+        return self.orientation in ("any", orientation, writing_direction)
 
 
 def load_content_items(manifest: Path, content_root: Path | None = None) -> list[ContentItem]:
@@ -167,7 +167,8 @@ def load_content_items(manifest: Path, content_root: Path | None = None) -> list
             )
         if kind == "image" and orientation == "any":
             raise ValueError(
-                f"{prefix}.orientation must be horizontal or vertical for an image crop."
+                f"{prefix}.orientation must be an orientation or exact writing direction "
+                "for an image crop."
             )
 
         source_image: str | None = None
@@ -641,6 +642,41 @@ def manifest_record_from_dom(
                 f"DOM bbox differs from CSS plan for {region.region_id}: "
                 f"planned={region.bbox_px}, actual={bbox_px}, max_delta={planned_delta:.4f}"
             )
+        try:
+            client_size = (
+                int(dom["content_client_width"]),
+                int(dom["content_client_height"]),
+            )
+            scroll_size = (
+                int(dom["content_scroll_width"]),
+                int(dom["content_scroll_height"]),
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError(f"Missing content visibility evidence for {region.region_id}.") from exc
+        if min(*client_size, *scroll_size) <= 0:
+            raise ValueError(
+                f"Empty content box for {region.region_id}: "
+                f"client={client_size}, scroll={scroll_size}"
+            )
+        overflow = scroll_size[0] > client_size[0] + 1 or scroll_size[1] > client_size[1] + 1
+        if overflow:
+            raise ValueError(
+                f"Content overflow for {region.region_id}: "
+                f"client={client_size}, scroll={scroll_size}"
+            )
+        if region.item.kind == "text":
+            if dom.get("content_text") != region.item.text:
+                raise ValueError(
+                    f"DOM text differs from label for {region.region_id}: "
+                    f"expected={region.item.text!r}, actual={dom.get('content_text')!r}"
+                )
+        else:
+            if dom.get("image_complete") is not True:
+                raise ValueError(f"Image content did not finish loading for {region.region_id}.")
+            if int(dom.get("image_natural_width") or 0) <= 0 or int(
+                dom.get("image_natural_height") or 0
+            ) <= 0:
+                raise ValueError(f"Image content is empty for {region.region_id}.")
         bbox_normalized = (x0 / width, y0 / height, x1 / width, y1 / height)
         region_records.append(
             {
@@ -658,6 +694,22 @@ def manifest_record_from_dom(
                 "computed_direction": str(dom.get("direction", "")),
                 "computed_font_family": str(dom.get("font_family", "")),
                 "rendered_fonts": list(dom.get("rendered_fonts", [])),
+                "content_visibility": {
+                    "client_size": list(client_size),
+                    "scroll_size": list(scroll_size),
+                    "overflow": False,
+                    "dom_text_matches_label": (
+                        True if region.item.kind == "text" else None
+                    ),
+                    "image_natural_size": (
+                        [
+                            int(dom.get("image_natural_width")),
+                            int(dom.get("image_natural_height")),
+                        ]
+                        if region.item.kind == "image"
+                        else None
+                    ),
+                },
                 "text": region.item.text,
                 "valid": True,
             }

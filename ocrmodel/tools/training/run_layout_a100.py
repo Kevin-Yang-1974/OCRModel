@@ -65,6 +65,10 @@ class Settings:
     dataset_root: Path
     train_manifest: Path
     audit_manifests: tuple[Path, ...]
+    validation_manifest: Path | None
+    test_manifest: Path | None
+    validation_image_root: Path | None
+    test_image_root: Path | None
     source_model: Path
     tokenizer_model: Path
     runs_root: Path
@@ -72,6 +76,10 @@ class Settings:
     mode: str
     stages: tuple[str, ...]
     layout_split: str
+    validation_split: str
+    test_split: str
+    validation_model_kind: str
+    validation_required_stage: str | None
     seed: int
     max_regions: int
     model_max_length: int
@@ -205,7 +213,14 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--run-id")
     parser.add_argument(
         "--mode",
-        choices=("smoke", "overfit", "validate", "pilot"),
+        choices=(
+            "smoke",
+            "overfit",
+            "validate",
+            "pilot",
+            "pretrain",
+            "joint-train",
+        ),
         default="smoke",
     )
     parser.add_argument(
@@ -214,6 +229,29 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="Required for pilot because pilot does not run validation automatically.",
     )
     parser.add_argument("--layout-split", default="train")
+    parser.add_argument(
+        "--validation-manifest",
+        type=Path,
+        help="Held-out validation manifest required by formal pretrain/joint-train modes.",
+    )
+    parser.add_argument(
+        "--test-manifest",
+        type=Path,
+        help="Held-out test manifest required by formal pretrain/joint-train modes and audit-only.",
+    )
+    parser.add_argument("--validation-image-root", type=Path)
+    parser.add_argument("--test-image-root", type=Path)
+    parser.add_argument("--validation-split", default="validation")
+    parser.add_argument("--test-split", default="test")
+    parser.add_argument(
+        "--validation-model-kind",
+        choices=("baseline", "vlqa"),
+        default="vlqa",
+    )
+    parser.add_argument(
+        "--validation-required-stage",
+        choices=("p1", "p2"),
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--max-regions", type=positive_int, default=16)
     parser.add_argument("--model-max-length", type=positive_int, default=2048)
@@ -241,6 +279,16 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 def resolve_settings(args: argparse.Namespace) -> Settings:
     if not args.layout_split.strip():
         raise RunFailure("--layout-split must be non-empty.", exit_code=EXIT_USAGE)
+    if not args.validation_split.strip() or not args.test_split.strip():
+        raise RunFailure(
+            "--validation-split and --test-split must be non-empty.",
+            exit_code=EXIT_USAGE,
+        )
+    if args.validation_model_kind == "baseline" and args.validation_required_stage:
+        raise RunFailure(
+            "--validation-required-stage is only valid for VLQA validation.",
+            exit_code=EXIT_USAGE,
+        )
     if args.mode == "validate":
         supplied = {
             "--p1-max-steps": args.p1_max_steps,
@@ -294,7 +342,7 @@ def resolve_settings(args: argparse.Namespace) -> Settings:
         p1_records = OVERFIT_RECORDS
         p2_steps = p2_records = 0
         stages = ("p1",)
-    else:
+    elif args.mode == "pilot":
         if not args.allow_unvalidated_pilot:
             raise RunFailure(
                 "Pilot requires --allow-unvalidated-pilot because pilot does not run validation automatically.",
@@ -310,6 +358,85 @@ def resolve_settings(args: argparse.Namespace) -> Settings:
         p1_records = 0 if args.p1_max_records is None else args.p1_max_records
         p2_records = 0 if args.p2_max_records is None else args.p2_max_records
         stages = ("p1", "p2")
+    elif args.mode == "pretrain":
+        if args.allow_unvalidated_pilot:
+            raise RunFailure(
+                "--allow-unvalidated-pilot is only valid with --mode pilot.",
+                exit_code=EXIT_USAGE,
+            )
+        if args.p1_max_steps is None:
+            raise RunFailure(
+                "Formal pretrain requires explicit --p1-max-steps.",
+                exit_code=EXIT_USAGE,
+            )
+        if args.p2_max_steps is not None or args.p2_max_records is not None:
+            raise RunFailure(
+                "Formal pretrain is P1-only; remove P2 overrides.",
+                exit_code=EXIT_USAGE,
+            )
+        if args.validation_manifest is None or args.test_manifest is None:
+            raise RunFailure(
+                "Formal pretrain requires --validation-manifest and --test-manifest.",
+                exit_code=EXIT_USAGE,
+            )
+        if args.validation_model_kind != "vlqa" or args.validation_required_stage not in (
+            None,
+            "p1",
+        ):
+            raise RunFailure(
+                "Formal pretrain validation must use a P1 VLQA checkpoint.",
+                exit_code=EXIT_USAGE,
+            )
+        p1_steps = args.p1_max_steps
+        p1_records = 0 if args.p1_max_records is None else args.p1_max_records
+        p2_steps = p2_records = 0
+        stages = ("p1",)
+    else:
+        if args.allow_unvalidated_pilot:
+            raise RunFailure(
+                "--allow-unvalidated-pilot is only valid with --mode pilot.",
+                exit_code=EXIT_USAGE,
+            )
+        if args.p2_max_steps is None:
+            raise RunFailure(
+                "Formal joint-train requires explicit --p2-max-steps.",
+                exit_code=EXIT_USAGE,
+            )
+        if args.p1_max_steps is not None or args.p1_max_records is not None:
+            raise RunFailure(
+                "Formal joint-train starts from a P1 checkpoint and is P2-only; "
+                "remove P1 overrides.",
+                exit_code=EXIT_USAGE,
+            )
+        if args.validation_manifest is None or args.test_manifest is None:
+            raise RunFailure(
+                "Formal joint-train requires --validation-manifest and --test-manifest.",
+                exit_code=EXIT_USAGE,
+            )
+        if args.validation_model_kind != "vlqa" or args.validation_required_stage not in (
+            None,
+            "p2",
+        ):
+            raise RunFailure(
+                "Formal joint-train validation must use a P2 VLQA checkpoint.",
+                exit_code=EXIT_USAGE,
+            )
+        p1_steps = p1_records = 0
+        p2_steps = args.p2_max_steps
+        p2_records = 0 if args.p2_max_records is None else args.p2_max_records
+        stages = ("p2",)
+
+    if args.mode in {"pretrain", "joint-train"}:
+        formal_splits = {
+            args.layout_split.strip(),
+            args.validation_split.strip(),
+            args.test_split.strip(),
+        }
+        if len(formal_splits) != 3:
+            raise RunFailure(
+                "Formal train, validation, and test split names must be pairwise distinct.",
+                exit_code=EXIT_USAGE,
+            )
 
     run_id = args.run_id or (
         f"layout_{args.mode}_{datetime.now().astimezone().strftime('%Y%m%d_%H%M%S')}"
@@ -323,7 +450,30 @@ def resolve_settings(args: argparse.Namespace) -> Settings:
 
     dataset_root = args.dataset_root.expanduser().resolve()
     train_manifest = (args.manifest or dataset_root / "manifest.jsonl").expanduser().resolve()
+    validation_manifest = (
+        args.validation_manifest.expanduser().resolve()
+        if args.validation_manifest is not None
+        else None
+    )
+    test_manifest = (
+        args.test_manifest.expanduser().resolve()
+        if args.test_manifest is not None
+        else None
+    )
+    validation_image_root = (
+        args.validation_image_root.expanduser().resolve()
+        if args.validation_image_root is not None
+        else None
+    )
+    test_image_root = (
+        args.test_image_root.expanduser().resolve()
+        if args.test_image_root is not None
+        else None
+    )
     audit_manifests: list[Path] = [train_manifest]
+    for path in (validation_manifest, test_manifest):
+        if path is not None and path not in audit_manifests:
+            audit_manifests.append(path)
     for path in args.audit_manifest:
         resolved = path.expanduser().resolve()
         if resolved not in audit_manifests:
@@ -336,6 +486,10 @@ def resolve_settings(args: argparse.Namespace) -> Settings:
         dataset_root=dataset_root,
         train_manifest=train_manifest,
         audit_manifests=tuple(audit_manifests),
+        validation_manifest=validation_manifest,
+        test_manifest=test_manifest,
+        validation_image_root=validation_image_root,
+        test_image_root=test_image_root,
         source_model=args.source_model.expanduser().resolve(),
         tokenizer_model=args.tokenizer_model.expanduser().resolve(),
         runs_root=args.runs_root.expanduser().resolve(),
@@ -343,6 +497,10 @@ def resolve_settings(args: argparse.Namespace) -> Settings:
         mode=args.mode,
         stages=stages,
         layout_split=args.layout_split.strip(),
+        validation_split=args.validation_split.strip(),
+        test_split=args.test_split.strip(),
+        validation_model_kind=args.validation_model_kind,
+        validation_required_stage=args.validation_required_stage,
         seed=args.seed,
         max_regions=args.max_regions,
         model_max_length=args.model_max_length,
@@ -431,15 +589,53 @@ def validate_paths(settings: Settings) -> None:
             "paths have one unambiguous root.",
             exit_code=EXIT_USAGE,
         )
-    if settings.mode == "validate" and not settings.tokenizer_model.is_dir():
+    if settings.mode in {"validate", "pretrain", "joint-train"} and not settings.tokenizer_model.is_dir():
         raise RunFailure(
             f"Validation tokenizer directory does not exist: {settings.tokenizer_model}",
             exit_code=EXIT_MISSING,
         )
+    for manifest, image_root, label in (
+        (settings.validation_manifest, settings.validation_image_root, "validation"),
+        (settings.test_manifest, settings.test_image_root, "test"),
+    ):
+        if manifest is None:
+            continue
+        resolved_root = image_root or manifest.parent
+        if not resolved_root.is_dir():
+            raise RunFailure(
+                f"{label.title()} image root does not exist: {resolved_root}",
+                exit_code=EXIT_MISSING,
+            )
     missing = [str(path) for path in required_files if not path.is_file()]
     missing.extend(str(path) for path in settings.audit_manifests if not path.is_file())
     if missing:
         raise RunFailure(f"Required files are missing: {missing}", exit_code=EXIT_MISSING)
+    try:
+        source_config = read_json(settings.source_model / "config.json")
+    except Exception as exc:
+        raise RunFailure(
+            f"Source model config is invalid: {settings.source_model / 'config.json'}",
+            exit_code=EXIT_MISSING,
+        ) from exc
+    source_has_vlqa = source_config.get("use_vlqa") is True
+    if settings.mode in {"smoke", "overfit", "pilot", "pretrain"} and source_has_vlqa:
+        raise RunFailure(
+            f"Mode {settings.mode!r} must start P1 from original GOT2 without VLQA.",
+            exit_code=EXIT_USAGE,
+        )
+    if settings.mode == "joint-train":
+        metrics_path = settings.source_model / "layout_training_metrics.json"
+        if not source_has_vlqa or not metrics_path.is_file():
+            raise RunFailure(
+                "Formal joint-train must start from a completed P1 VLQA checkpoint.",
+                exit_code=EXIT_USAGE,
+            )
+        source_metrics = read_json(metrics_path)
+        if source_metrics.get("layout_stage") != "p1":
+            raise RunFailure(
+                "Formal joint-train source checkpoint must report layout_stage='p1'.",
+                exit_code=EXIT_USAGE,
+            )
     if settings.mode != "validate":
         deepspeed = Path(sys.executable).with_name("deepspeed")
         if not deepspeed.is_file() or not os.access(deepspeed, os.X_OK):
@@ -580,6 +776,26 @@ def record_provenance(context: RunContext) -> dict[str, Any]:
         "source_model_sha256": None,
         "train_manifest": str(settings.train_manifest),
         "train_manifest_sha256": file_sha256(settings.train_manifest),
+        "validation_manifest": (
+            str(settings.validation_manifest)
+            if settings.validation_manifest is not None
+            else None
+        ),
+        "validation_manifest_sha256": (
+            file_sha256(settings.validation_manifest)
+            if settings.validation_manifest is not None
+            else None
+        ),
+        "test_manifest": (
+            str(settings.test_manifest)
+            if settings.test_manifest is not None
+            else None
+        ),
+        "test_manifest_sha256": (
+            file_sha256(settings.test_manifest)
+            if settings.test_manifest is not None
+            else None
+        ),
         "code": {},
     }
     if not settings.skip_source_hash:
@@ -644,6 +860,17 @@ def run_audit(context: RunContext) -> dict[str, Any]:
             f"records; mode={context.settings.mode!r} requires {required_records}.",
             log_path=log_path,
         )
+    if context.settings.mode in {"pretrain", "joint-train"}:
+        split_counts = summary.get("split_counts", {})
+        for split, label in (
+            (context.settings.validation_split, "validation"),
+            (context.settings.test_split, "test"),
+        ):
+            if int(split_counts.get(split, 0)) < 1:
+                raise RunFailure(
+                    f"Formal {label} split {split!r} is empty after audit.",
+                    log_path=log_path,
+                )
     return summary
 
 
@@ -1270,8 +1497,22 @@ def verify_stage(
     return payload
 
 
-def run_validation(context: RunContext) -> dict[str, Any]:
+def run_validation(
+    context: RunContext,
+    *,
+    model_path: Path | None = None,
+    manifest: Path | None = None,
+    image_root: Path | None = None,
+    split: str | None = None,
+    model_kind: str | None = None,
+    required_vlqa_stage: str | None = None,
+) -> dict[str, Any]:
     settings = context.settings
+    selected_model = model_path or settings.source_model
+    selected_manifest = manifest or settings.train_manifest
+    selected_image_root = image_root or settings.dataset_root
+    selected_split = split or settings.layout_split
+    selected_model_kind = model_kind or settings.validation_model_kind
     validation_root = settings.run_root / "validation"
     metadata_dir = validation_root / "metadata"
     metadata_dir.mkdir(parents=True, exist_ok=False)
@@ -1282,10 +1523,14 @@ def run_validation(context: RunContext) -> dict[str, Any]:
         "status": "running",
         "stage": "validation",
         "started_at": timestamp(),
-        "source_model": str(settings.source_model),
+        "source_model": str(selected_model),
         "output_root": str(validation_root),
         "physical_gpu": 0,
-        "layout_split": settings.layout_split,
+        "layout_manifest": str(selected_manifest),
+        "layout_image_root": str(selected_image_root),
+        "layout_split": selected_split,
+        "model_kind": selected_model_kind,
+        "required_vlqa_stage": required_vlqa_stage,
         "max_records": settings.validation_max_records,
         "object_threshold": settings.validation_object_threshold,
         "iou_threshold": settings.validation_iou_threshold,
@@ -1295,15 +1540,17 @@ def run_validation(context: RunContext) -> dict[str, Any]:
         sys.executable,
         str(settings.project_root / "scripts" / "evaluate_GOT_layout.py"),
         "--model-name-or-path",
-        str(settings.source_model),
+        str(selected_model),
+        "--model-kind",
+        selected_model_kind,
         "--tokenizer-name-or-path",
         str(settings.tokenizer_model),
         "--layout-manifest",
-        str(settings.train_manifest),
+        str(selected_manifest),
         "--layout-image-root",
-        str(settings.dataset_root),
+        str(selected_image_root),
         "--layout-split",
-        settings.layout_split,
+        selected_split,
         "--output-dir",
         str(validation_root),
         "--max-regions",
@@ -1325,12 +1572,15 @@ def run_validation(context: RunContext) -> dict[str, Any]:
         "--device",
         "cuda",
     ]
+    if required_vlqa_stage is not None:
+        command.extend(("--require-vlqa-stage", required_vlqa_stage))
     write_json(metadata_dir / "command.json", command)
     context.latest_log = log_path
     context.update_status(status="running_validation", active_stage="validation")
     emit(
         "layout_validation_started",
-        split=settings.layout_split,
+        split=selected_split,
+        model_kind=selected_model_kind,
         max_records=settings.validation_max_records,
         log=str(log_path),
     )
@@ -1379,8 +1629,10 @@ def run_validation(context: RunContext) -> dict[str, Any]:
     metrics = summary.get("metrics")
     if not isinstance(metrics, dict) or not isinstance(metrics.get("ocr"), dict):
         raise RunFailure("Validation summary has no OCR metrics.", log_path=log_path)
-    if not isinstance(metrics.get("layout"), dict):
-        raise RunFailure("Validation summary has no layout metrics.", log_path=log_path)
+    if selected_model_kind == "vlqa" and not isinstance(metrics.get("layout"), dict):
+        raise RunFailure("VLQA validation summary has no layout metrics.", log_path=log_path)
+    if selected_model_kind == "baseline" and metrics.get("layout") is not None:
+        raise RunFailure("Baseline validation unexpectedly reported layout metrics.")
     status.update(
         {
             "status": "completed",
@@ -1408,6 +1660,9 @@ def run_validation(context: RunContext) -> dict[str, Any]:
         ],
         "metrics": metrics,
         "runtime": summary.get("runtime"),
+        "model_kind": selected_model_kind,
+        "checkpoint_stage": summary.get("checkpoint_stage"),
+        "parameters": summary.get("parameters"),
     }
 
 
@@ -1513,7 +1768,11 @@ def execute(settings: Settings) -> int:
 
             if settings.mode == "validate":
                 require_gpu_free()
-                validation = run_validation(context)
+                validation = run_validation(
+                    context,
+                    model_kind=settings.validation_model_kind,
+                    required_vlqa_stage=settings.validation_required_stage,
+                )
                 context.summary["validation"] = validation
                 context.summary.update({"status": "ok", "finished_at": timestamp()})
                 context.update_status(
@@ -1541,23 +1800,32 @@ def execute(settings: Settings) -> int:
                 )
                 return 0
 
-            p1 = run_stage(context, stage="p1", source_model=settings.source_model)
-            context.summary["p1"] = p1
-            context.write_summary()
-            p1_model = Path(p1["model"])
-            p1["verification"] = verify_stage(
-                context,
-                stage="p1",
-                model_dir=p1_model,
-                skip_model_reload="p2" in settings.stages,
-            )
+            p1 = None
+            p1_model = settings.source_model
             assessment_marker: str | None = None
-            if "p2" in settings.stages:
-                p1["reload_validated_by"] = "p2_source_model_load"
+            if "p1" in settings.stages:
+                p1 = run_stage(context, stage="p1", source_model=settings.source_model)
+                context.summary["p1"] = p1
+                context.write_summary()
+                p1_model = Path(p1["model"])
+                p1["verification"] = verify_stage(
+                    context,
+                    stage="p1",
+                    model_dir=p1_model,
+                    skip_model_reload="p2" in settings.stages,
+                )
+                if "p2" in settings.stages:
+                    p1["reload_validated_by"] = "p2_source_model_load"
+                else:
+                    p1["reload_validated_by"] = "p1_checkpoint_verification"
+                context.summary["p1"] = p1
+                context.write_summary()
             else:
-                p1["reload_validated_by"] = "p1_checkpoint_verification"
-            context.summary["p1"] = p1
-            context.write_summary()
+                context.summary["p1"] = {
+                    "status": "external_checkpoint",
+                    "model": str(settings.source_model),
+                    "reason": "Formal P2 joint-train starts from a completed P1 checkpoint.",
+                }
 
             if "p2" in settings.stages:
                 require_gpu_free()
@@ -1576,26 +1844,57 @@ def execute(settings: Settings) -> int:
                 p2 = None
                 context.summary["p2"] = {
                     "status": "skipped",
-                    "reason": "P1-only overfit diagnostic",
+                    "reason": (
+                        "P1-only formal pretraining"
+                        if settings.mode == "pretrain"
+                        else "P1-only overfit diagnostic"
+                    ),
                 }
-                context.summary["overfit_assessment"] = assess_p1_overfit(
-                    p1["metrics"]
+                if settings.mode == "overfit":
+                    assert p1 is not None
+                    context.summary["overfit_assessment"] = assess_p1_overfit(
+                        p1["metrics"]
+                    )
+                    assessment_marker = (
+                        "OVERFIT_PASSED"
+                        if context.summary["overfit_assessment"]["status"] == "pass"
+                        else "OVERFIT_FAILED"
+                    )
+
+            validation = None
+            if settings.mode in {"pretrain", "joint-train"}:
+                validation_model = Path(
+                    p2["model"] if p2 is not None else p1["model"]  # type: ignore[index]
                 )
-                assessment_marker = (
-                    "OVERFIT_PASSED"
-                    if context.summary["overfit_assessment"]["status"] == "pass"
-                    else "OVERFIT_FAILED"
+                assert settings.validation_manifest is not None
+                validation = run_validation(
+                    context,
+                    model_path=validation_model,
+                    manifest=settings.validation_manifest,
+                    image_root=(
+                        settings.validation_image_root
+                        or settings.validation_manifest.parent
+                    ),
+                    split=settings.validation_split,
+                    model_kind="vlqa",
+                    required_vlqa_stage=(
+                        "p2" if settings.mode == "joint-train" else "p1"
+                    ),
                 )
+                context.summary["validation"] = validation
 
             context.summary.update({"status": "ok", "finished_at": timestamp()})
             completion_status = {
                 "status": "completed",
                 "active_stage": "none",
                 "finished_at": context.summary["finished_at"],
-                "p1_global_step": p1["metrics"]["global_step"],
             }
+            if p1 is not None:
+                completion_status["p1_global_step"] = p1["metrics"]["global_step"]
             if p2 is not None:
                 completion_status["p2_global_step"] = p2["metrics"]["global_step"]
+            if validation is not None:
+                completion_status["validation_pages"] = validation["pages"]
             if "overfit_assessment" in context.summary:
                 completion_status["overfit_status"] = context.summary[
                     "overfit_assessment"
@@ -1613,6 +1912,15 @@ def execute(settings: Settings) -> int:
                 run_root=str(settings.run_root),
                 summary=str(settings.run_root / "summary.json"),
                 overfit_assessment=context.summary.get("overfit_assessment"),
+                validation=(
+                    {
+                        "pages": validation["pages"],
+                        "summary": validation["summary"],
+                        "metrics": validation["metrics"],
+                    }
+                    if validation is not None
+                    else None
+                ),
             )
             return 0
         except (Exception, KeyboardInterrupt) as exc:

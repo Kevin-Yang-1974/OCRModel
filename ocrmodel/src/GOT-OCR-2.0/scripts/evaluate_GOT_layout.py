@@ -16,7 +16,11 @@ from GOT.model.GOT_ocr_2_0 import GOTQwenForCausalLM
 from GOT.model.plug.blip_process import BlipImageEvalProcessor
 from GOT.utils.utils import KeywordsStoppingCriteria, disable_torch_init
 from layout_page_dataset import make_layout_page_validation_data_module
-from layout_validation_metrics import DIRECTION_LABELS, LayoutValidationAccumulator
+from layout_validation_metrics import (
+    DIRECTION_LABELS,
+    LayoutValidationAccumulator,
+    OCRValidationAccumulator,
+)
 from local_tokenizer import load_local_tokenizer, tokenizer_candidates
 
 
@@ -53,6 +57,20 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         )
     )
     parser.add_argument("--model-name-or-path", type=Path, required=True)
+    parser.add_argument(
+        "--model-kind",
+        choices=("baseline", "vlqa"),
+        default="vlqa",
+        help=(
+            "Strict checkpoint protocol. baseline rejects VLQA, while vlqa requires "
+            "a complete layout adapter."
+        ),
+    )
+    parser.add_argument(
+        "--require-vlqa-stage",
+        choices=("p1", "p2"),
+        help="Optionally require layout_training_metrics.json to report this stage.",
+    )
     parser.add_argument("--tokenizer-name-or-path", type=Path)
     parser.add_argument("--layout-manifest", type=Path, required=True)
     parser.add_argument("--layout-image-root", type=Path)
@@ -139,6 +157,51 @@ def require_layout_predictions(outputs: Any, max_regions: int) -> None:
             raise RuntimeError(f"Model returned non-finite values in {name}.")
 
 
+def validate_model_protocol(
+    *,
+    model: GOTQwenForCausalLM,
+    model_path: Path,
+    model_kind: str,
+    max_regions: int,
+    required_vlqa_stage: str | None,
+) -> str | None:
+    adapter = model.get_model().layout_adapter
+    use_vlqa = getattr(model.config, "use_vlqa", False) is True
+    if model_kind == "baseline":
+        if required_vlqa_stage is not None:
+            raise ValueError("--require-vlqa-stage is only valid for --model-kind vlqa.")
+        if use_vlqa or adapter is not None:
+            raise RuntimeError(
+                "Baseline evaluation requires an original GOT2 checkpoint without VLQA."
+            )
+        return None
+
+    if not use_vlqa or adapter is None:
+        raise RuntimeError("VLQA evaluation requires config.use_vlqa=true and layout_adapter.")
+    model_queries = int(getattr(model.config, "vlqa_num_queries", -1))
+    if model_queries != max_regions:
+        raise RuntimeError(
+            f"Model VLQA query count {model_queries} does not match --max-regions "
+            f"{max_regions}."
+        )
+
+    metrics_path = model_path / "layout_training_metrics.json"
+    checkpoint_stage = None
+    if metrics_path.is_file():
+        metrics = json.loads(metrics_path.read_text(encoding="utf-8"))
+        if not isinstance(metrics, dict):
+            raise TypeError(f"Expected a JSON object: {metrics_path}")
+        stage = metrics.get("layout_stage")
+        if stage in {"p1", "p2"}:
+            checkpoint_stage = str(stage)
+    if required_vlqa_stage is not None and checkpoint_stage != required_vlqa_stage:
+        raise RuntimeError(
+            "VLQA checkpoint stage mismatch: "
+            f"{checkpoint_stage!r} != {required_vlqa_stage!r}."
+        )
+    return checkpoint_stage
+
+
 def evaluate(args: argparse.Namespace) -> dict[str, Any]:
     model_path = args.model_name_or_path.expanduser().resolve()
     manifest = args.layout_manifest.expanduser().resolve()
@@ -193,15 +256,13 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
         local_files_only=True,
     ).eval()
     model.to(device=device, dtype=dtype)
-    model_base = model.get_model()
-    if model_base.layout_adapter is None:
-        raise RuntimeError("Validation model does not contain a VLQA layout_adapter.")
-    model_queries = int(getattr(model.config, "vlqa_num_queries", -1))
-    if model_queries != args.max_regions:
-        raise RuntimeError(
-            f"Model VLQA query count {model_queries} does not match --max-regions "
-            f"{args.max_regions}."
-        )
+    checkpoint_stage = validate_model_protocol(
+        model=model,
+        model_path=model_path,
+        model_kind=args.model_kind,
+        max_regions=args.max_regions,
+        required_vlqa_stage=args.require_vlqa_stage,
+    )
 
     image_processor = BlipImageEvalProcessor(image_size=1024)
     data_module = make_layout_page_validation_data_module(
@@ -223,10 +284,15 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
         pin_memory=device.type == "cuda",
         collate_fn=data_module["data_collator"],
     )
-    accumulator = LayoutValidationAccumulator(
-        object_threshold=args.object_threshold,
-        iou_threshold=args.iou_threshold,
+    layout_accumulator = (
+        LayoutValidationAccumulator(
+            object_threshold=args.object_threshold,
+            iou_threshold=args.iou_threshold,
+        )
+        if args.model_kind == "vlqa"
+        else None
     )
+    ocr_accumulator = OCRValidationAccumulator()
 
     if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats(device)
@@ -246,23 +312,26 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
                 )
                 images = move_images(batch["images"], device)
 
-                synchronize(device)
-                layout_started = time.perf_counter()
-                with torch.inference_mode(), torch.autocast(
-                    device_type=device.type,
-                    dtype=dtype,
-                    enabled=device.type == "cuda" and dtype != torch.float32,
-                ):
-                    layout_outputs = model(
-                        input_ids=input_ids,
-                        attention_mask=attention_mask,
-                        images=images,
-                        use_cache=False,
-                        return_dict=True,
-                    )
-                synchronize(device)
-                layout_seconds = time.perf_counter() - layout_started
-                require_layout_predictions(layout_outputs, args.max_regions)
+                layout_outputs = None
+                layout_seconds = 0.0
+                if args.model_kind == "vlqa":
+                    synchronize(device)
+                    layout_started = time.perf_counter()
+                    with torch.inference_mode(), torch.autocast(
+                        device_type=device.type,
+                        dtype=dtype,
+                        enabled=device.type == "cuda" and dtype != torch.float32,
+                    ):
+                        layout_outputs = model(
+                            input_ids=input_ids,
+                            attention_mask=attention_mask,
+                            images=images,
+                            use_cache=False,
+                            return_dict=True,
+                        )
+                    synchronize(device)
+                    layout_seconds = time.perf_counter() - layout_started
+                    require_layout_predictions(layout_outputs, args.max_regions)
 
                 stop_string = batch["stop_string"][0]
                 stopping_criteria = KeywordsStoppingCriteria(
@@ -294,45 +363,59 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
 
                 decoded = tokenizer.decode(output_ids[0, input_ids.shape[1] :]).strip()
                 predicted_text = trim_generation(decoded, stop_string)
-                object_scores = (
-                    layout_outputs.layout_object_logits[0]
-                    .float()
-                    .sigmoid()
-                    .detach()
-                    .cpu()
-                    .tolist()
-                )
-                predicted_boxes = (
-                    layout_outputs.layout_bbox_xyxy[0].float().detach().cpu().tolist()
-                )
-                predicted_directions = (
-                    layout_outputs.layout_direction_logits[0]
-                    .float()
-                    .argmax(dim=-1)
-                    .detach()
-                    .cpu()
-                    .tolist()
-                )
-                page_metrics = accumulator.add_page(
-                    reference_text=batch["page_text"][0],
-                    predicted_text=predicted_text,
-                    regions=batch["regions"][0],
-                    annotation_status=batch["layout_annotation_status"][0],
-                    object_scores=object_scores,
-                    predicted_boxes=predicted_boxes,
-                    predicted_directions=predicted_directions,
-                )
-                query_predictions = [
-                    {
-                        "query_index": query_index,
-                        "object_probability": object_scores[query_index],
-                        "bbox_xyxy": predicted_boxes[query_index],
-                        "writing_direction": DIRECTION_LABELS[
-                            predicted_directions[query_index]
-                        ],
+                if layout_outputs is not None:
+                    object_scores = (
+                        layout_outputs.layout_object_logits[0]
+                        .float()
+                        .sigmoid()
+                        .detach()
+                        .cpu()
+                        .tolist()
+                    )
+                    predicted_boxes = (
+                        layout_outputs.layout_bbox_xyxy[0]
+                        .float()
+                        .detach()
+                        .cpu()
+                        .tolist()
+                    )
+                    predicted_directions = (
+                        layout_outputs.layout_direction_logits[0]
+                        .float()
+                        .argmax(dim=-1)
+                        .detach()
+                        .cpu()
+                        .tolist()
+                    )
+                    assert layout_accumulator is not None
+                    page_metrics = layout_accumulator.add_page(
+                        reference_text=batch["page_text"][0],
+                        predicted_text=predicted_text,
+                        regions=batch["regions"][0],
+                        annotation_status=batch["layout_annotation_status"][0],
+                        object_scores=object_scores,
+                        predicted_boxes=predicted_boxes,
+                        predicted_directions=predicted_directions,
+                    )
+                    query_predictions = [
+                        {
+                            "query_index": query_index,
+                            "object_probability": object_scores[query_index],
+                            "bbox_xyxy": predicted_boxes[query_index],
+                            "writing_direction": DIRECTION_LABELS[
+                                predicted_directions[query_index]
+                            ],
+                        }
+                        for query_index in range(args.max_regions)
+                    ]
+                else:
+                    page_metrics = {
+                        "ocr": ocr_accumulator.add_page(
+                            batch["page_text"][0],
+                            predicted_text,
+                        )
                     }
-                    for query_index in range(args.max_regions)
-                ]
+                    query_predictions = None
                 prediction_record = {
                     "page_id": batch["page_id"][0],
                     "image": batch["image_path"][0],
@@ -368,7 +451,9 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
     summary = {
         "schema_version": 1,
         "status": "ok",
-        "purpose": "whole-page validation; not a training or overfit metric",
+        "purpose": "whole-page checkpoint evaluation; not a training metric",
+        "model_kind": args.model_kind,
+        "checkpoint_stage": checkpoint_stage,
         "model": str(model_path),
         "tokenizer": str(tokenizer_path),
         "manifest": str(manifest),
@@ -390,9 +475,28 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
         "layout": {
             "max_regions": args.max_regions,
             "direction_labels": list(DIRECTION_LABELS),
-            "prediction_output": "optional_explanation_and_evaluation",
+            "prediction_output": (
+                "optional_explanation_and_evaluation"
+                if args.model_kind == "vlqa"
+                else "not_available_for_original_got2"
+            ),
         },
-        "metrics": accumulator.summary(),
+        "metrics": (
+            layout_accumulator.summary()
+            if layout_accumulator is not None
+            else {"ocr": ocr_accumulator.summary(), "layout": None}
+        ),
+        "parameters": {
+            "total": sum(parameter.numel() for parameter in model.parameters()),
+            "layout_adapter": (
+                sum(
+                    parameter.numel()
+                    for parameter in model.get_model().layout_adapter.parameters()
+                )
+                if model.get_model().layout_adapter is not None
+                else 0
+            ),
+        },
         "runtime": {
             "device": str(device),
             "dtype": args.dtype,
@@ -415,6 +519,7 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
             {
                 "event": "got_layout_validation_completed",
                 "summary": str(summary_path),
+                "model_kind": args.model_kind,
                 "pages": completed_pages,
                 "metrics": summary["metrics"],
             }

@@ -236,6 +236,42 @@ def audit_record(
             allowed_fonts=allowed_font_set,
             context=f"{region_context}.rendered_fonts",
         )
+        visibility = region.get("content_visibility")
+        if not isinstance(visibility, dict):
+            raise ValueError(f"{region_context}.content_visibility must be an object.")
+        client_size = visibility.get("client_size")
+        scroll_size = visibility.get("scroll_size")
+        if (
+            not isinstance(client_size, list)
+            or len(client_size) != 2
+            or any(not isinstance(value, int) or value <= 0 for value in client_size)
+        ):
+            raise ValueError(f"{region_context}.content_visibility.client_size is invalid.")
+        if (
+            not isinstance(scroll_size, list)
+            or len(scroll_size) != 2
+            or any(not isinstance(value, int) or value <= 0 for value in scroll_size)
+        ):
+            raise ValueError(f"{region_context}.content_visibility.scroll_size is invalid.")
+        if visibility.get("overflow") is not False:
+            raise ValueError(f"{region_context} must declare content overflow=false.")
+        if scroll_size[0] > client_size[0] + 1 or scroll_size[1] > client_size[1] + 1:
+            raise ValueError(f"{region_context} visibility sizes prove content overflow.")
+        if source_kind == "text":
+            if visibility.get("dom_text_matches_label") is not True:
+                raise ValueError(f"{region_context} text must match the DOM content.")
+            if visibility.get("image_natural_size") is not None:
+                raise ValueError(f"{region_context} text must not declare image dimensions.")
+        else:
+            natural_size = visibility.get("image_natural_size")
+            if (
+                not isinstance(natural_size, list)
+                or len(natural_size) != 2
+                or any(not isinstance(value, int) or value <= 0 for value in natural_size)
+            ):
+                raise ValueError(f"{region_context} image dimensions are invalid.")
+            if visibility.get("dom_text_matches_label") is not None:
+                raise ValueError(f"{region_context} image must not declare DOM text equality.")
         if region_id in region_ids:
             raise ValueError(f"{context} contains duplicate region_id={region_id!r}.")
         if content_id in page_content_ids:
@@ -345,6 +381,7 @@ def main() -> int:
     group_splits: dict[str, str] = {}
     crop_hash_splits: dict[str, str] = {}
     page_hash_splits: dict[str, str] = {}
+    text_hash_splits: dict[str, str] = {}
 
     def enforce_single_split(mapping: dict[str, str], key: str, split: str, label: str) -> None:
         previous = mapping.setdefault(key, split)
@@ -361,6 +398,8 @@ def main() -> int:
                 group_splits, region["source_group_id"], split, "source_group_id"
             )
             fingerprint = (region["text"], region["source_kind"])
+            normalized_text = " ".join(region["text"].casefold().split())
+            enforce_single_split(text_hash_splits, normalized_text, split, "normalized text")
             previous_fingerprint = content_fingerprints.setdefault(content_id, fingerprint)
             if previous_fingerprint != fingerprint:
                 errors.append(
