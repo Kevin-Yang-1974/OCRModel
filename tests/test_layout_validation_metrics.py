@@ -33,6 +33,16 @@ class LayoutValidationMetricTests(unittest.TestCase):
         self.assertEqual(metrics.levenshtein_distance("甲乙丙", "甲丁丙"), 1)
         self.assertEqual(metrics.remove_whitespace("甲 \n\t乙"), "甲乙")
 
+    def test_ocr_only_accumulator_matches_page_metric_schema(self) -> None:
+        accumulator = metrics.OCRValidationAccumulator()
+        page = accumulator.add_page("甲 乙", "甲乙")
+        self.assertEqual(page["edit_distance"], 1)
+        self.assertTrue(page["whitespace_normalized_exact_match"])
+        summary = accumulator.summary()
+        self.assertEqual(summary["pages"], 1)
+        self.assertEqual(summary["page_cer"], 1 / 3)
+        self.assertEqual(summary["whitespace_normalized_page_cer"], 0.0)
+
     def test_spatial_matching_exposes_reversed_query_order(self) -> None:
         page = metrics.evaluate_page(
             reference_text="甲乙",

@@ -24,18 +24,18 @@
 
 ### 2.1 推荐实现
 
-首轮采用 Python 驱动 Playwright/Chromium：
+首轮采用 Python 驱动 Playwright 调用系统 Edge：
 
 ```text
 Python sampler
   -> HTML/CSS template
-  -> Chromium deterministic rendering
+  -> Edge deterministic rendering
   -> full-page screenshot
   -> DOM bounding boxes and reading-order labels
   -> page-level manifest
 ```
 
-HTML/CSS 负责页面尺寸、边距、列数、栏间距、横排/竖排和区域组合；Pillow/OpenCV 负责截图后的纸张背景、透印、污渍、模糊、形变和扫描噪声。首轮应固定 Chromium 版本、字体包、viewport 和 `deviceScaleFactor=1`，并在读取 DOM bbox 前等待 `document.fonts.ready`。
+HTML/CSS 负责页面尺寸、边距、列数、栏间距、横排/竖排和区域组合；Pillow/OpenCV 负责截图后的纸张背景、透印、污渍、模糊、形变和扫描噪声。首轮应固定系统 Edge 版本、字体包、viewport 和 `deviceScaleFactor=1`，并在读取 DOM bbox 前等待 `document.fonts.ready`。
 
 竖排页面可以使用 `writing-mode: vertical-rl` 或 `vertical-lr`，但阅读顺序必须根据页面视觉坐标与模板规则显式生成，不能直接把 DOM 节点顺序当作真值。截图像素尺寸与 `getBoundingClientRect()` 的 CSS 坐标必须通过自动测试核对。
 
@@ -210,16 +210,18 @@ $$\mathcal L_{\mathrm{total}}=\mathcal L_{\mathrm{ocr}}+\mathcal L_{\mathrm{layo
 4. `layout_query.py`：有序 queries、object/bbox/direction 头、二维位置编码、预测前 LayerNorm、零门控写回、显式完整初始化及以 FP32 计算的 BCE/L1/GIoU/方向损失；
 5. GOT2 的 256-token 接线和 OCR/layout 总损失；
 6. `train_GOT_layout.py`：`P1` 查询预热和 `P2` 联合训练的开发入口，以及原始/续训 safetensors 的 VLQA 键完整性审计；
-7. `run_layout_a100.py` 与 `verify_layout_checkpoint.py`：环境、数据、GPU 0、初始 logit 尺度、P1/P2 单步训练、权重有限性和模型重载的受限 A100 smoke 编排，以及固定为 P1、2 条记录、1000 steps 的 `overfit` 诊断；
+7. `run_layout_a100.py` 与 `verify_layout_checkpoint.py`：环境、数据、GPU 0、初始 logit 尺度、P1/P2 单步训练、权重有限性和模型重载的受限 A100 smoke 编排，固定为 P1、2 条记录、1000 steps 的 `overfit` 诊断，以及正式 `pretrain`/`joint-train` 入口；前者从原始 GOT2 只跑 P1，后者从完整 P1 checkpoint 只跑 P2，并在正式模式启动前联合审计 train/validation/test manifest；
 8. `layout_page_dataset.py`、`evaluate_GOT_layout.py` 和 `layout_validation_metrics.py`：prompt-only 整页 validation loader、GPU 推理和统一页面指标。
+9. `tools/evaluation/compare_got2_vlqa.py`：在同一 test manifest、整页输入、OCR prompt 和解码配置下串行比较原始 GOT2 与 P2 VLQA；布局 metadata 只用于 VLQA 离线指标。
 
-本地已实际完成 `S0` 与 `S2-hard` 的 Edge 截图和全量 manifest 审计；`S1` 的文件 URI、orientation 与源图哈希通过 CPU 单元测试。生成器已使用 Chromium 平台字体接口拒绝未允许 fallback，但正式字体文件、版本和哈希仍待随数据环境锁定。当前仍未完成：
+本地已实际完成 `S0` 与 `S2-hard` 的 Edge 截图和全量 manifest 审计；`S1` 的文件 URI、orientation 与源图哈希通过 CPU 单元测试。生成器已使用浏览器平台字体接口拒绝未允许 fallback，但正式字体文件、版本和哈希仍待随数据环境锁定。当前仍未完成：
 
 1. 正式字体包文件/版本/哈希锁定和真实 crop 内容清单；
 2. A100 上用明确 VLQA checkpoint 执行真实 prompt-only validation，并确认整页生成与 summary；
 3. 正式 validation/test split、页面 CER、bbox、方向和阅读顺序的统一结果；
 4. `A0/A1/A2/A4` 的同预算启动器；
-5. `P3` 真实页适配、`P4` 64×64 特征路径及任何效果验证。
+5. 正式 P1/P2 A100 训练与 baseline/VLQA 对照的实跑结果；
+6. `P3` 真实页适配、`P4` 64×64 特征路径及任何效果验证。
 
 A100 run `layout_pilot_20260811_023528` 已经验证 CUDA、整页 batch、P1→P2 权重衔接、checkpoint 保存和完整模型重载。该 run 仅含 2 页且每阶段重复 500 epoch；P1 最后 5 步平均总损失为 11.4，P2 最后 5 步平均总损失为 18.8376，当时又没有分项损失和 validation。因此它是工程链路证据，不是有效 pilot，也不能支持布局学习或 OCR 改善结论。
 
@@ -243,6 +245,10 @@ HTML page generator                      [local smoke passed]
 -> P1 two-record overfit gate          [1000 steps passed; implementation diagnostic]
 -> explicit init and scale guard       [A100 verified]
 -> validation loader and metrics       [two-page A100 chain passed; held-out run pending]
+-> formal P1 pretrain                 [local launcher implemented; A100 run pending]
+-> formal P1 held-out validation      [required before P2]
+-> formal P2 joint-train              [local launcher implemented; A100 run pending]
+-> GOT2 baseline versus P2 VLQA test  [local comparator implemented; A100 run pending]
 -> A0/A1/A2/A4 single-step smoke
 -> small-scale synthetic pilot
 -> real-page adaptation
@@ -255,4 +261,4 @@ HTML page generator                      [local smoke passed]
 
 HTML 合成页不再只是为 line crop 制造外部 bbox，而是直接作为整页视觉输入，用 DOM 真值监督布局 queries。主训练内容采用“HTML 控制版面＋真实 crop 保留字形”的混合方式，纯浏览器字体页面用于几何预热与模板覆盖。推理阶段只输入页面图像；bbox、方向和阅读顺序是训练标签或可选输出，不是外部条件。
 
-该方案已经完成首版 A100 工程链路、初始化修复验证、固定 1000 步两页实现诊断和两页 prompt-only checkpoint 重载验证。validation loader、evaluator 和统一页面指标已在 A100 链路运行，但正式 held-out split、validation 与消融仍待完成。只有完整布局监督模型在真实整页、小样本跨域和统一预算消融中稳定优于原 GOT2、普通视觉 adaptor 和无监督 queries，才能保留 VLQA 作为有效结构候选。
+该方案已经完成首版 A100 工程链路、初始化修复验证、固定 1000 步两页实现诊断和两页 prompt-only checkpoint 重载验证。正式 P1/P2 编排器与原始 GOT2/VLQA 对照脚本已在本地完成并通过纯 Python 回归，但尚未在 A100 上执行正式训练或性能测试。只有完整布局监督模型在真实整页、小样本跨域和统一预算消融中稳定优于原 GOT2、普通视觉 adaptor 和无监督 queries，才能保留 VLQA 作为有效结构候选。

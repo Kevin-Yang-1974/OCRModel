@@ -1,6 +1,6 @@
 # 项目状态
 
-> 更新日期：2026 年 8 月 12 日
+> 更新日期：2026 年 8 月 13 日
 >
 > 状态依据：代码、受限运行摘要与已完成的本地/A100 诊断
 >
@@ -28,6 +28,8 @@ Visual Layout Query Adapter（VLQA）从 GOT2 的整页视觉 token 中读取固
 - `P1` 布局预热、`P2` OCR 联合训练开发入口，以及受限 A100 编排器。
 - 训练分项、query/raw-logit/bbox 范围、梯度、残差门和 checkpoint 重载诊断。
 - prompt-only 整页 validation dataset/collator、GPU evaluator 和统一页面指标代码；布局标注只进入离线评测。
+- 正式 A100 编排模式：`pretrain` 从原始 GOT2 只运行 P1，`joint-train` 从完整 P1 VLQA checkpoint 只运行 P2；两者都要求 train/validation/test manifest 联合审计。
+- 原始 GOT2 与 VLQA 对照脚本 `tools/evaluation/compare_got2_vlqa.py`；它强制同一 test 页面、OCR prompt、tokenizer 和贪心解码，VLQA 只接受 P2 checkpoint。
 
 ## 4. 已获得的工程证据
 
@@ -39,6 +41,8 @@ Visual Layout Query Adapter（VLQA）从 GOT2 的整页视觉 token 中读取固
 | `layout_overfit_20260812_002747` | 固定 P1、2 条记录、1000 steps 的实现诊断 | `overfit_assessment.status=pass`；只证明实现可拟合，不是 validation 或性能结果 |
 | `layout_validate_20260812_012924` | 首轮 prompt-only validation 启动检查 | evaluator 的 tokenizer 文件名白名单错误拒绝原始 GOT/Qwen tokenizer；未进入 checkpoint 加载、forward 或 generation，不是模型失败或性能结果 |
 | `layout_validate_20260812_014816` | 修复后两页 prompt-only validation 链路 | 输入协议正确；同一 P1 overfit checkpoint/`train` split 上 16/16 区域匹配、bbox mean IoU `0.956666`、方向和阅读顺序均为 `1.0`；不是正式性能结果 |
+| `layout_pretrain_20260813_003142` | 首轮正式合成数据 P1，`formal_pdf_short_seed20260812`，1000 steps，300 页 validation | 页面 CER `0.782540`，去空白 CER `0.676580`；完整区域 precision/recall/F1 `0.464259/0.363951/0.408031`；matched bbox mean IoU `0.683627`；有序槽位 bbox mean IoU `0.320758`；证明 P1 正式入口与 held-out validation 已跑通，不是 OCR 性能结论 |
+| `layout_joint-train_20260813_012356` | 首轮正式合成数据 P2，接 P1 checkpoint，2000 steps，300 页 validation | 页面 CER `0.198253`，去空白 CER `0.188622`；完整区域 precision/recall/F1 `0.354590/0.372617/0.363380`；matched bbox mean IoU `0.678319`；有序槽位 bbox mean IoU `0.276798`；OCR 较 P1 明显改善，但布局 F1 和槽位定位未改善，不能据此归因到布局查询或外推真实跨域 |
 
 首次 overfit 的第 1 步 object 与 direction logit 绝对值上限均约为 1680，bbox 已饱和到约 0/1，bbox mean IoU 为 0。末 20 步 object loss 为 3.5654、bbox L1 为 1.9023、bbox GIoU 为 1.8513、object accuracy 为 0.5375、bbox mean IoU 仍为 0。query 梯度存在，说明监督链路没有简单断开；direction accuracy 为 1.0 也不能作为证据，因为两页有效区域只有一个方向类别。
 
@@ -60,27 +64,27 @@ Visual Layout Query Adapter（VLQA）从 GOT2 的整页视觉 token 中读取固
 
 ## 5. 尚未完成
 
-- 在正式隔离的 held-out split 上，用明确的 VLQA checkpoint 完成真实整页 validation，并核对生成、布局输出和 summary；当前两页链路验证不能替代该步骤；
-- 正式 Chromium、字体文件、版本、哈希和缺字覆盖锁定；
+- 系统 Edge、字体文件、版本、哈希和缺字覆盖锁定；
 - 第一批真实 crop 的 `S1-html-crop` 内容清单；
-- 正式 validation/test split 与跨来源泄漏审计；
+- 同一 test split 上的原 GOT2 baseline 与 P2 VLQA prompt-only comparison；
 - `A0`–`A6` 同划分、同预算的消融启动器；
 - 小样本真实整页适配、跨域评估和 64×64 可选路径；
-- 任何足以支持 VLQA 性能提升的实验结果。
+- 任何足以把收益归因到 VLQA 结构本身，或支持真实跨域泛化的实验结果。
 
 ## 6. 下一步门槛
 
-1. 建立按来源组隔离的正式 validation/test split，并完成 manifest 泄漏审计；当前 `train` 两页只作为链路证据。
-2. 用原 GOT2 页面 baseline 和明确的 VLQA checkpoint 在正式 split 上执行 prompt-only validation，继续只回传紧凑完成 JSON。
-3. 锁定正式 Chromium/字体包，建立 `S1-html-crop` 内容清单和缺字覆盖报告。
-4. 按同一数据、预算和指标执行 `A0`–`A6` 消融；P2/P3 和正式训练在 protocol 锁定前不启动。
-5. 没有正式定位误差证据前不接入 64×64 分支；不能用两页 overfit bbox 结果决定分辨率升级。
+1. 用 P2 checkpoint 与原始 GOT2 baseline 在同一 `formal_pdf_short_seed20260812/test` split 上执行 prompt-only comparison，确认 OCR 收益是否超过原始模型。
+2. 针对 P2 的布局结果做误差诊断：区域 precision 下降、complete F1 下降、有序槽位 bbox mean IoU 偏低，应优先检查 object threshold、query 槽位分配、bbox loss 权重和预测区域数量。
+3. 按同一数据、预算和指标执行 `A0`–`A6` 消融；P3 和真实页适配待 P2 主链路稳定后再启动。
+4. 锁定正式字体包，建立 `S1-html-crop` 内容清单和缺字覆盖报告。
+5. 没有正式定位误差证据前不接入 64×64 分支；不能只因首轮 P2 槽位 IoU 偏低就直接扩大结构。
 
 ## 7. 结果表述边界
 
 - 可以表述：整页生成、审计、CUDA forward/backward、P1→P2 与 checkpoint 链路已打通。
-- 必须表述：`layout_overfit_20260812_002747` 和 `layout_validate_20260812_014816` 都只涉及两页同分布链路/实现诊断；正式 held-out validation 尚未完成。
-- 不得表述：VLQA 已改善 OCR、布局、阅读顺序或小样本泛化。
+- 可以表述：正式合成数据 `formal_pdf_short_seed20260812` 的 P1 1000 steps 与 P2 2000 steps 已完成，且均完成 300 页 validation；P2 相比 P1 明显降低合成 validation OCR CER。
+- 必须表述：`layout_overfit_20260812_002747` 和 `layout_validate_20260812_014816` 都只涉及两页同分布链路/实现诊断；`layout_pretrain_20260813_003142` 和 `layout_joint-train_20260813_012356` 是合成数据首轮结果，尚未完成同 test split 原 GOT2 对照、消融和真实跨域验证。
+- 不得表述：VLQA 已稳定改善布局、阅读顺序或小样本泛化；也不得在缺少 baseline/消融时把 P2 OCR 改善直接归因到布局查询。
 - AncientDoc 旧 split 有书籍级重叠，只能作为历史兼容基线。
 - line-level 与 whole-page 结果不可直接比较。
 - 双 GOT2 两阶段系统必须单独报告两次模型成本和错误传播。

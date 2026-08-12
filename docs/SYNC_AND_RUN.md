@@ -157,7 +157,97 @@ bash "$OCRMODEL_ROOT/tools/environment/run_got2.sh" \
 
 `pilot` 没有默认步数，并要求显式 `--allow-unvalidated-pilot`。在真实 validation 和统一实验协议锁定前，不启动 pilot。
 
-## 8. line-level 兼容诊断
+## 8. 正式 P1/P2 训练入口
+
+`overfit`、`smoke` 和 `pilot` 只是工程诊断，不是正式训练预算。正式入口已经实现，但截至本手册更新时尚未在 A100 上运行正式大规模实验。正式数据必须是已经按来源组隔离并通过同一次 train/validation/test 联合审计的 HTML 整页 manifest；训练、验证和推理都只读取整页图像与 `OCR: ` prompt，bbox、顺序和方向只进入训练标签或离线指标。
+
+正式 P1 使用原始 GOT2 权重，布局损失预训练 queries 和辅助头，OCR 标签全部 mask，写回门保持为 0。P1 只用于检验布局泛化，不能作为 OCR 性能比较 checkpoint。P1 held-out validation 通过后，再以同一 P1 checkpoint 启动 P2 `joint-train`；P2 才打开 OCR 损失和零门控写回，并可进入 baseline/VLQA OCR 对照。
+
+### 8.1 本地同步
+
+以下命令只同步活动源码、工具、配置模板和参考脚本，不上传数据、模型、checkpoint 或日志：
+
+```powershell
+Set-Location 'D:\yangky\学推计划\ocrmodel'
+.\tools\sync\sync_to_server.ps1 `
+  -RemoteHost a100-yky `
+  -RemoteRoot /data3/yky/yangky_ocr_models/ocrmodel
+```
+
+正式数据不通过 `sync_to_server.ps1` 上传。若本地已生成正式数据目录，例如 `D:\yangky\datasets\got_layout_pages\formal_pdf_short_seed20260812`，使用独立数据上传入口：
+
+```powershell
+Set-Location 'D:\yangky\学推计划\ocrmodel'
+.\tools\sync\upload_layout_dataset.ps1 `
+  -RemoteHost a100-yky `
+  -LocalDatasetRoot 'D:\yangky\datasets\got_layout_pages\formal_pdf_short_seed20260812' `
+  -RemoteLayoutDataRoot /data3/yky/yangky_ocr_models/training_data/got_layout_pages
+```
+
+服务器的 `config/paths.env` 中应把 `GOT_LAYOUT_DATA` 指向同一个远端数据根，例如：
+
+```bash
+export GOT_LAYOUT_DATA=/data3/yky/yangky_ocr_models/training_data/got_layout_pages
+```
+
+训练前在服务器做只读挂载检查：
+
+```bash
+cd /data3/yky/yangky_ocr_models/ocrmodel
+source config/paths.env
+bash tools/training/check_layout_dataset_mount.sh formal_pdf_short_seed20260812
+```
+
+该检查只确认 `train/`、`validation/`、`test/`、`split_audit.json` 和首条图片可读，不启动训练。输出应为一行 `layout_dataset_mount_ok` JSON。
+
+### 8.2 P1 正式预训练
+
+将 `<P1_STEPS>` 固定为预注册的训练预算。此命令只运行一次 P1，并在结束后自动对 held-out validation 做 prompt-only 评测；test 只参与泄漏审计，不会被提前评测：
+
+```bash
+cd /data3/yky/yangky_ocr_models/ocrmodel
+source config/paths.env
+bash tools/training/run_formal_layout_p1p2.sh \
+  pretrain formal_pdf_short_seed20260812 \
+  --p1-steps <P1_STEPS>
+```
+
+P1 完成事件中的 `validation` 只表示 held-out 布局/生成链路和该阶段指标已跑完，不代表 OCR 已改善。正式记录应保留最后一条 `layout_a100_completed` JSON，以及 run 目录中的 `summary.json`、`metadata/audit_summary.json` 和 validation 指标文件。
+
+### 8.3 P2 正式联合训练
+
+只有 P1 的 held-out validation、审计和 checkpoint reload 均通过后才运行 P2。`<P1_RUN_ID>` 必须指向 P1 run 的 `p1/model`；编排器会再次检查 `config.use_vlqa=true`、完整布局状态和 `layout_stage=p1`，拒绝原始 GOT2 或部分布局 checkpoint：
+
+```bash
+cd /data3/yky/yangky_ocr_models/ocrmodel
+source config/paths.env
+bash tools/training/run_formal_layout_p1p2.sh \
+  joint-train formal_pdf_short_seed20260812 \
+  --p1-model "$GOT_TRAINING_RUNS/<P1_RUN_ID>/p1/model" \
+  --p2-steps <P2_STEPS>
+```
+
+P2 的 validation 自动使用 P2 checkpoint，并要求 `layout_stage=p2`。P2 运行成功后才可以把该 checkpoint 用于 OCR 性能对照；P1 checkpoint 的 OCR 数字不应写入正式结果表。
+
+## 9. 原始 GOT2 与 VLQA 对照测试
+
+`tools/evaluation/compare_got2_vlqa.py` 在同一 test manifest 上串行启动两个独立 evaluator：baseline 必须是未包含 VLQA 的原始 GOT2，VLQA 必须是 `layout_stage=p2` 的完整 checkpoint。两个模型共享整页图像、`OCR: ` prompt、tokenizer、贪心解码、`max_new_tokens`、`no_repeat_ngram_size`、图像预处理和 test split；bbox、阅读顺序和方向不作为输入。正式 test 必须同时传 train/validation manifest 做一次跨 split 审计，不能使用 `--skip-audit` 或 `--allow-non-test-split`。
+
+```bash
+bash /data3/yky/yangky_ocr_models/ocrmodel/tools/environment/run_got2.sh \
+  /data3/yky/yangky_ocr_models/ocrmodel/tools/evaluation/compare_got2_vlqa.py \
+  --baseline-model /data3/yky/yangky_ocr_models/models/GOT-OCR2_0 \
+  --vlqa-model /data3/yky/yangky_ocr_models/training_runs/GOT/<P2_RUN_ID>/p2/model \
+  --tokenizer-model /data3/yky/yangky_ocr_models/models/GOT-OCR2_0 \
+  --train-manifest /data3/yky/yangky_ocr_models/training_data/got_layout_pages/<TRAIN_DATASET_ID>/manifest.jsonl \
+  --validation-manifest /data3/yky/yangky_ocr_models/training_data/got_layout_pages/<VALIDATION_DATASET_ID>/manifest.jsonl \
+  --layout-manifest /data3/yky/yangky_ocr_models/training_data/got_layout_pages/<TEST_DATASET_ID>/manifest.jsonl \
+  --layout-split test
+```
+
+终端只回传最后一条 `layout_comparison_completed` JSON。完整 OCR/layout 预测、审计和日志留在 comparison run 目录。汇总中的 CER、去空白 CER、exact-match 差值是 `VLQA - baseline`；VLQA 的布局指标和可选解释 forward 时间单独报告。由于 evaluator 会先做一次布局 forward 再做 OCR generation，`ocr_generation_seconds` 才是两模型可直接比较的 OCR 推理时间，`total_inference_seconds` 包含额外解释 forward，不能混作纯 OCR 延迟。
+
+## 10. line-level 兼容诊断
 
 以下入口只检查既有单行/单列数据链路，不属于正式整页协议：
 
@@ -175,7 +265,7 @@ GOT_RUN_ID="linelevel_smoke_$(date +%Y%m%d_%H%M%S)" \
 
 单步 line-level smoke 只验证加载、反向传播、保存和重载，不验证布局 queries，也不能与页面 CER 直接比较。
 
-## 9. AncientDoc 历史兼容入口
+## 11. AncientDoc 历史兼容入口
 
 AncientDoc 旧 split 存在书籍级重叠。这些命令只用于复现历史页面兼容链路，不属于小样本或 VLQA 正式实验。
 
@@ -200,7 +290,7 @@ GOT_EVAL_MODEL="$GOT_SOURCE_MODEL" \
 
 该入口复用 `references/legacy-ancientdoc-eval/GOT/eval/myeval.py` 的历史解码参数，并将预测、日志和指标写入 `$GOT_EVALUATION_RUNS`。输出字段 `metrics_page_macro_legacy_editops` 只代表该兼容口径。
 
-## 10. 回传与协作
+## 12. 回传与协作
 
 不要复制完整 `train.log`、`trainer_state.json` 或 `predictions.json`。布局 run 正常结束时优先回传终端最后一条完成 JSON。需要补充核对时只选择紧凑字段：
 

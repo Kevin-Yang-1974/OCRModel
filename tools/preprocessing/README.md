@@ -8,10 +8,10 @@
 
 ```powershell
 python -m pip install -r tools/environment/requirements-layout-synthesis.lock.txt
-python -m playwright install chromium
+# 本项目正式合成数据使用系统 Edge；不要安装或依赖 Playwright 捆绑 Chromium。
 ```
 
-正式数据应使用 Playwright 安装的配套 Chromium。`--chromium-executable` 或 `--browser-channel` 只用于本地兼容 smoke；生成结果会记录 Playwright 和浏览器版本。正式 manifest 当前使用 schema v2。
+正式数据应使用系统 Edge。可通过 `--browser-channel msedge` 或显式 `--chromium-executable` 指向本机 Edge；生成结果会记录 Playwright 和浏览器版本。正式 manifest 当前使用 schema v2。
 
 ## 2. 内容清单
 
@@ -27,11 +27,24 @@ python -m playwright install chromium
 {"content_id":"crop_001","source_group_id":"book_001","split":"train","kind":"image","orientation":"vertical","image":"crops/crop_001.png","text":"该列的真值转写"}
 ```
 
-`image` 必须相对 `--content-root`，并且 `orientation` 必须显式为 `horizontal` 或 `vertical`。同一 `source_group_id` 不得跨 split；相同 `content_id` 不得重复。
+`image` 必须相对 `--content-root`，并且 `orientation` 必须显式为 `horizontal`、`vertical` 或更严格的 `horizontal_ltr`、`horizontal_rtl`、`vertical_ltr`、`vertical_rtl`。对文本方向已知的真实 crop 应使用严格值，防止把 LTR 图像作为 RTL 监督。同一 `source_group_id` 不得跨 split；相同 `content_id` 不得重复。
 
-配置中的 `font_family` 控制 CSS 字体栈，`allowed_rendered_fonts` 列出允许实际绘制字形的字体族。正式渲染会通过 Chromium CDP 逐文本区域读取平台字体；没有实际 glyph、出现未声明 fallback，或审计时字体证据缺失都会报错。若确需符号字体 fallback，必须把其实际 family name 显式加入允许列表并保存同一字体包版本。
+配置中的 `font_family` 控制 CSS 字体栈，`allowed_rendered_fonts` 列出允许实际绘制字形的字体族。正式渲染会通过浏览器 CDP 逐文本区域读取平台字体；没有实际 glyph、出现未声明 fallback，或审计时字体证据缺失都会报错。若确需符号字体 fallback，必须把其实际 family name 显式加入允许列表并保存同一字体包版本。
 
 仓库中的 `config/synthetic_content.example.jsonl` 与 `config/synthetic_layout.example.json` 仅用于 schema 和本地 smoke，不是正式训练数据。
+
+若本地 PDF 自带可靠文本层，可以从文本块同时生成浏览器文字记录和真实 PDF crop 记录。该入口按 PDF 文件哈希去重，并把整份 PDF 固定到单一 split；crop 标签只取自 PDF 文本层，不执行 OCR 猜测：
+
+```powershell
+python tools/preprocessing/prepare_pdf_layout_content.py `
+  --pdf-root D:\corpus\pdf `
+  --output-dir D:\layout_source\pdf_content_seed20260812 `
+  --seed 20260812 `
+  --validation-sources 4 `
+  --test-sources 4
+```
+
+输出的 `content.jsonl` 同时包含 `kind=text` 与 `kind=image` 记录，`crops/` 保存真实 PDF 区域图像，`source_report.json` 保存重复 PDF、来源级 split、提取数量和 PyMuPDF 版本。扫描 PDF、损坏 PDF 和没有合格文本块的 PDF 会在报告中标记并跳过，不能用猜测转写补齐。
 
 ## 3. 规划与渲染
 
@@ -124,4 +137,4 @@ python tools/preprocessing/audit_synthetic_layout.py `
 
 `P1` 只训练 layout queries、query cross-attention 和辅助头，OCR 标签全部 mask，残差 gate 固定为 0。`P2` 打开完整 VLQA 与 `mm_projector_vary`，联合优化页面 OCR 和布局损失。A100 上不需要安装 Playwright，也不重新渲染页面；应先在本机生成完整的 `manifest.jsonl`、`images/` 和 `html/`，再整体上传数据目录。
 
-`tools/training/run_layout_a100.py` 已在 A100 打通 manifest 复审、CUDA 组件检查、P1/P2 训练衔接和 checkpoint 重载；`layout_overfit_20260812_002747` 已通过固定 1000 steps 的 P1 两样本实现诊断。validation loader、prompt-only evaluator 和统一指标已在本地实现，下一步是在明确 VLQA checkpoint 上执行一次 `--mode validate`；该链路仍不是正式性能结果。具体命令见 `../../docs/SYNC_AND_RUN.md`。
+`tools/training/run_layout_a100.py` 已在 A100 打通 manifest 复审、CUDA 组件检查、P1/P2 训练衔接和 checkpoint 重载；`layout_overfit_20260812_002747` 已通过固定 1000 steps 的 P1 两样本实现诊断，`layout_validate_20260812_014816` 已完成同两页 P1 checkpoint 的 prompt-only 评测链路。正式入口也已在本地实现：`--mode pretrain` 从原始 GOT2 只运行 P1，`--mode joint-train` 从完整 P1 checkpoint 只运行 P2，并要求 train/validation/test manifest 联合审计。`tools/evaluation/compare_got2_vlqa.py` 用于同一 test manifest 下比较原始 GOT2 与 P2 VLQA。上述正式入口尚未在 A100 实跑，不构成性能结果。具体命令见 `../../docs/SYNC_AND_RUN.md`。

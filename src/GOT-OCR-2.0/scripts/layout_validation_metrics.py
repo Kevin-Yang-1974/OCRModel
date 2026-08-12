@@ -43,6 +43,91 @@ def remove_whitespace(value: str) -> str:
     return "".join(character for character in value if not character.isspace())
 
 
+def evaluate_ocr_page(reference_text: str, predicted_text: str) -> dict[str, Any]:
+    edit_distance = levenshtein_distance(reference_text, predicted_text)
+    reference_without_whitespace = remove_whitespace(reference_text)
+    prediction_without_whitespace = remove_whitespace(predicted_text)
+    whitespace_edit_distance = levenshtein_distance(
+        reference_without_whitespace,
+        prediction_without_whitespace,
+    )
+    return {
+        "edit_distance": edit_distance,
+        "reference_characters": len(reference_text),
+        "cer": safe_ratio(edit_distance, len(reference_text)),
+        "exact_match": predicted_text == reference_text,
+        "whitespace_normalized_edit_distance": whitespace_edit_distance,
+        "whitespace_normalized_reference_characters": len(
+            reference_without_whitespace
+        ),
+        "whitespace_normalized_cer": safe_ratio(
+            whitespace_edit_distance,
+            len(reference_without_whitespace),
+        ),
+        "whitespace_normalized_exact_match": (
+            prediction_without_whitespace == reference_without_whitespace
+        ),
+    }
+
+
+class OCRValidationAccumulator:
+    def __init__(self) -> None:
+        self.pages = 0
+        self.character_edits = 0
+        self.reference_characters = 0
+        self.exact_matches = 0
+        self.whitespace_edits = 0
+        self.whitespace_reference_characters = 0
+        self.whitespace_exact_matches = 0
+
+    def add_page(self, reference_text: str, predicted_text: str) -> dict[str, Any]:
+        page = evaluate_ocr_page(reference_text, predicted_text)
+        self.pages += 1
+        self.character_edits += int(page["edit_distance"])
+        self.reference_characters += int(page["reference_characters"])
+        self.exact_matches += int(bool(page["exact_match"]))
+        self.whitespace_edits += int(page["whitespace_normalized_edit_distance"])
+        self.whitespace_reference_characters += int(
+            page["whitespace_normalized_reference_characters"]
+        )
+        self.whitespace_exact_matches += int(
+            bool(page["whitespace_normalized_exact_match"])
+        )
+        return page
+
+    def summary(self) -> dict[str, Any]:
+        return {
+            "pages": self.pages,
+            "character_edits": self.character_edits,
+            "reference_characters": self.reference_characters,
+            "page_cer": safe_ratio(
+                self.character_edits,
+                self.reference_characters,
+            ),
+            "mean_page_edit_distance": safe_ratio(
+                self.character_edits,
+                self.pages,
+            ),
+            "page_exact_matches": self.exact_matches,
+            "page_exact_match_rate": safe_ratio(self.exact_matches, self.pages),
+            "whitespace_normalized_character_edits": self.whitespace_edits,
+            "whitespace_normalized_reference_characters": (
+                self.whitespace_reference_characters
+            ),
+            "whitespace_normalized_page_cer": safe_ratio(
+                self.whitespace_edits,
+                self.whitespace_reference_characters,
+            ),
+            "whitespace_normalized_page_exact_matches": (
+                self.whitespace_exact_matches
+            ),
+            "whitespace_normalized_page_exact_match_rate": safe_ratio(
+                self.whitespace_exact_matches,
+                self.pages,
+            ),
+        }
+
+
 def _validated_box(value: Sequence[float], context: str) -> tuple[float, float, float, float]:
     if len(value) != 4:
         raise ValueError(f"{context} must contain four coordinates.")
@@ -246,13 +331,7 @@ def evaluate_page(
     if annotation_status == "complete" and not validated_regions:
         raise ValueError("annotation_status='complete' requires regions.")
 
-    edit_distance = levenshtein_distance(reference_text, predicted_text)
-    reference_without_whitespace = remove_whitespace(reference_text)
-    prediction_without_whitespace = remove_whitespace(predicted_text)
-    whitespace_edit_distance = levenshtein_distance(
-        reference_without_whitespace,
-        prediction_without_whitespace,
-    )
+    ocr_metrics = evaluate_ocr_page(reference_text, predicted_text)
 
     positive_indices = [
         index for index, score in enumerate(scores) if score >= object_threshold
@@ -304,19 +383,7 @@ def evaluate_page(
     matched_iou_sum = sum(float(match["iou"]) for match in matches)
     page: dict[str, Any] = {
         "ocr": {
-            "edit_distance": edit_distance,
-            "reference_characters": len(reference_text),
-            "cer": safe_ratio(edit_distance, len(reference_text)),
-            "exact_match": predicted_text == reference_text,
-            "whitespace_normalized_edit_distance": whitespace_edit_distance,
-            "whitespace_normalized_reference_characters": len(reference_without_whitespace),
-            "whitespace_normalized_cer": safe_ratio(
-                whitespace_edit_distance,
-                len(reference_without_whitespace),
-            ),
-            "whitespace_normalized_exact_match": (
-                prediction_without_whitespace == reference_without_whitespace
-            ),
+            **ocr_metrics,
         },
         "layout": {
             "annotation_status": annotation_status,

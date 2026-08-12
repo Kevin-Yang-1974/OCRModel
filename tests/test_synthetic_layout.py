@@ -13,6 +13,13 @@ PREPROCESSING_DIR = Path(__file__).resolve().parents[1] / "tools" / "preprocessi
 sys.path.insert(0, str(PREPROCESSING_DIR))
 
 from audit_synthetic_layout import audit_record  # noqa: E402
+from prepare_pdf_layout_content import (  # noqa: E402
+    PdfSource,
+    assign_splits,
+    discover_unique_pdfs,
+    normalize_text,
+    text_layer_fingerprint,
+)
 from synthetic_layout_common import (  # noqa: E402
     GeneratorConfig,
     build_page_plan,
@@ -80,6 +87,14 @@ def fake_dom(plan: object) -> list[dict[str, object]]:
                 "writing_mode": "vertical-rl",
                 "direction": "ltr",
                 "font_family": "SimSun",
+                "content_client_width": max(1, round(x1 - x0)),
+                "content_client_height": max(1, round(y1 - y0)),
+                "content_scroll_width": max(1, round(x1 - x0)),
+                "content_scroll_height": max(1, round(y1 - y0)),
+                "content_text": region.item.text if region.item.kind == "text" else None,
+                "image_complete": True if region.item.kind == "image" else None,
+                "image_natural_width": 24 if region.item.kind == "image" else None,
+                "image_natural_height": 96 if region.item.kind == "image" else None,
                 "rendered_fonts": (
                     [
                         {
@@ -111,6 +126,42 @@ def test_jsonl_loading_and_deterministic_rtl_plan(tmp_path: Path) -> None:
     x_positions = [region.bbox_px[0] for region in first.regions]
     assert x_positions == sorted(x_positions, reverse=True)
     assert first.page_text == "\n".join(region.item.text for region in first.regions)
+
+
+def test_pdf_content_normalization_and_source_split_are_deterministic(tmp_path: Path) -> None:
+    assert normalize_text("  第一行\n 第二   行 \r\n") == "第一行 第二 行"
+    extracted = []
+    for index in range(9):
+        source = PdfSource(
+            path=tmp_path / f"source_{index}.pdf",
+            sha256=f"{index:064x}",
+            size=index + 1,
+        )
+        extracted.append((source, [], {}))
+    first = assign_splits(extracted, seed=17, validation_sources=2, test_sources=2)
+    second = assign_splits(extracted, seed=17, validation_sources=2, test_sources=2)
+    assert first == second
+    assert list(first.values()).count("train") == 5
+    assert list(first.values()).count("validation") == 2
+    assert list(first.values()).count("test") == 2
+
+
+def test_pdf_discovery_deduplicates_identical_files(tmp_path: Path) -> None:
+    (tmp_path / "a.pdf").write_bytes(b"same pdf bytes")
+    (tmp_path / "nested").mkdir()
+    (tmp_path / "nested" / "b.PDF").write_bytes(b"same pdf bytes")
+    (tmp_path / "c.pdf").write_bytes(b"different pdf bytes")
+    sources, duplicates = discover_unique_pdfs([tmp_path])
+    assert len(sources) == 2
+    assert len(duplicates) == 1
+
+
+def test_pdf_text_fingerprint_ignores_block_order() -> None:
+    from prepare_pdf_layout_content import TextBlock
+
+    first = TextBlock(0, 0, (0, 0, 10, 10), "同一正文")
+    second = TextBlock(1, 0, (0, 0, 10, 10), "另一段落")
+    assert text_layer_fingerprint([first, second]) == text_layer_fingerprint([second, first])
 
 
 def test_page_ids_are_unique_across_synthesis_tiers(tmp_path: Path) -> None:
@@ -317,6 +368,30 @@ def test_s1_crop_html_uses_resolved_file_uris(tmp_path: Path) -> None:
     assert rendered.count('class="crop-content"') == 4
     assert rendered.count("file:///") == 4
     assert all(region.item.source_sha256 for region in plan.regions)
+
+
+def test_exact_crop_direction_does_not_match_opposite_direction(tmp_path: Path) -> None:
+    crop_path = tmp_path / "ltr.png"
+    Image.new("RGB", (96, 24), (245, 240, 225)).save(crop_path)
+    manifest = tmp_path / "directional.jsonl"
+    records = [
+        {
+            "content_id": f"ltr_{index}",
+            "source_group_id": "source_ltr",
+            "split": "train",
+            "kind": "image",
+            "orientation": "horizontal_ltr",
+            "image": crop_path.name,
+            "text": f"LTR {index}",
+        }
+        for index in range(4)
+    ]
+    manifest.write_text(
+        "\n".join(json.dumps(record) for record in records) + "\n", encoding="utf-8"
+    )
+    items = load_content_items(manifest)
+    assert all(item.supports_direction("horizontal_ltr") for item in items)
+    assert not any(item.supports_direction("horizontal_rtl") for item in items)
 
 
 def test_plan_only_cli_requires_no_playwright(tmp_path: Path) -> None:
