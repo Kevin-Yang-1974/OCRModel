@@ -38,6 +38,21 @@ class LayoutA100RunnerTests(unittest.TestCase):
         self.addCleanup(temporary.cleanup)
         self.tmp_path = Path(temporary.name)
 
+    def test_formal_ablation_wrapper_declares_supported_presets(self) -> None:
+        script = (
+            Path(__file__).resolve().parents[1]
+            / "tools"
+            / "training"
+            / "run_formal_layout_ablation.sh"
+        )
+        source = script.read_text(encoding="utf-8")
+        self.assertIn("no-direction)", source)
+        self.assertIn("no-bbox)", source)
+        self.assertIn("object-only)", source)
+        self.assertIn("ocr-only-adapter)", source)
+        self.assertIn("--direction-loss-weight", source)
+        self.assertIn("--bbox-l1-loss-weight", source)
+
     def test_smoke_is_fixed_to_one_record_and_one_step(self) -> None:
         settings = runner.resolve_settings(make_args(self.tmp_path))
         self.assertEqual(settings.mode, "smoke")
@@ -264,6 +279,45 @@ class LayoutA100RunnerTests(unittest.TestCase):
                     str(test_manifest),
                 )
             )
+
+    def test_training_command_passes_ablation_loss_weights(self) -> None:
+        settings = runner.resolve_settings(
+            make_args(
+                self.tmp_path,
+                "--mode",
+                "pilot",
+                "--allow-unvalidated-pilot",
+                "--p1-max-steps",
+                "10",
+                "--p2-max-steps",
+                "20",
+                "--object-loss-weight",
+                "0.5",
+                "--bbox-l1-loss-weight",
+                "0",
+                "--bbox-giou-loss-weight",
+                "0",
+                "--direction-loss-weight",
+                "0",
+                "--layout-loss-weight",
+                "0.25",
+                "--p2-ocr-loss-weight",
+                "0.75",
+            )
+        )
+        command = runner.build_training_command(
+            settings,
+            stage="p2",
+            source_model=self.tmp_path / "p1-model",
+            output_dir=self.tmp_path / "p2-model",
+            master_port=23456,
+        )
+        self.assertEqual(option_value(command, "--object_loss_weight"), "0.5")
+        self.assertEqual(option_value(command, "--bbox_l1_loss_weight"), "0")
+        self.assertEqual(option_value(command, "--bbox_giou_loss_weight"), "0")
+        self.assertEqual(option_value(command, "--direction_loss_weight"), "0")
+        self.assertEqual(option_value(command, "--layout_loss_weight"), "0.25")
+        self.assertEqual(option_value(command, "--ocr_loss_weight"), "0.75")
 
     def test_overfit_assessment_is_explicit_and_bounded(self) -> None:
         tail_mean = {

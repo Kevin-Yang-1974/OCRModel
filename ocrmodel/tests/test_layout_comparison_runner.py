@@ -113,6 +113,22 @@ class LayoutComparisonRunnerTests(unittest.TestCase):
         self.assertIn('"--model-kind",', source)
         self.assertIn('"baseline"', source)
 
+    def test_post_analysis_wrapper_runs_expected_pipeline(self) -> None:
+        script = (
+            Path(__file__).resolve().parents[1]
+            / "tools"
+            / "evaluation"
+            / "run_formal_layout_post_analysis.sh"
+        )
+        source = script.read_text(encoding="utf-8")
+        self.assertIn("run_formal_layout_comparison.sh", source)
+        self.assertIn("analyze_layout_comparison_errors.py", source)
+        self.assertIn("analyze_layout_threshold_sweep.py", source)
+        self.assertIn("analyze_layout_slot_alignment.py", source)
+        self.assertIn("summarize_layout_analysis_bundle.py", source)
+        self.assertIn("comparison run already exists", source)
+        self.assertIn("exit 74", source)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -35,7 +35,7 @@ A100 run `layout_overfit_20260811_113817` 已确认初始化修复有效：首�
 
 当前 validation 入口为 `--mode validate`。它只执行环境/manifest/component preflight 和 prompt-only 整页评测，不启动 DeepSpeed 训练；必须通过 `--source-model` 指向包含 VLQA 权重的 checkpoint，并可用 `--tokenizer-model` 指向原始 GOT tokenizer。评测输出统一写入 run 目录，布局 metadata 只用于离线指标。
 
-首轮 run `layout_validate_20260812_012924` 在模型加载前被 evaluator 的 tokenizer 文件名白名单错误拦截。当前 loader 已改为直接让 Transformers 离线验证本地 GOT/Qwen tokenizer；修复后的 `layout_validate_20260812_014816` 已在两页 `train` split 上通过 prompt-only checkpoint 重载和指标链路。该结果只属于同页 P1 overfit 诊断，正式 held-out validation 仍待执行。
+首轮 run `layout_validate_20260812_012924` 在模型加载前被 evaluator 的 tokenizer 文件名白名单错误拦截。当前 loader 已改为直接让 Transformers 离线验证本地 GOT/Qwen tokenizer；修复后的 `layout_validate_20260812_014816` 已在两页 `train` split 上通过 prompt-only checkpoint 重载和指标链路。该结果只属于同页 P1 overfit 诊断。
 
 `pilot` 没有默认训练步数，必须同时提供 `--allow-unvalidated-pilot`、`--p1-max-steps` 和 `--p2-max-steps`。在真实 validation 和统一实验协议锁定前，不应启动 pilot。
 
@@ -61,6 +61,110 @@ bash tools/training/run_formal_layout_p1p2.sh joint-train formal_pdf_short_seed2
 
 尖括号中的训练步数必须替换为预注册预算。P2 只能在 P1 held-out validation、审计和 checkpoint reload 均通过后运行。
 
-正式入口尚未在 A100 上执行大规模训练。当前已有的 `layout_overfit_20260812_002747` 是两页、1000 steps 的实现诊断，不是正式预训练结果；`layout_validate_20260812_014816` 是同页 P1 checkpoint 的链路验证，也不是泛化性能。
+`formal_pdf_short_seed20260812` 的首轮正式合成训练已在 A100 上完成：P1 run `layout_pretrain_20260813_003142` 为 `1000` steps，P2 run `layout_joint-train_20260813_012356` 为 `2000` steps，二者均完成 300 页 validation。P2 的合成 validation OCR CER 相比 P1 明显下降，但布局完整 F1 和有序槽位 bbox IoU 未改善。
+
+首轮 test 对照 `got2_vlqa_compare_20260813_020251` 已完成：P2 VLQA 相对原始 GOT2 的页面 CER delta 为 `-0.087047`，去空白 CER delta 为 `-0.058194`，页面 exact match rate delta 为 `+0.19`。该结果说明合成 test 同协议 OCR 对照优于原始 GOT2，但尚不能直接归因到 VLQA，也不是真实跨域泛化性能。
+
+长程训练 `layout_pretrain_4000_20260813` 与 `layout_joint-train_8000_20260813` 已完成。P2 8000 validation 页面 CER 为 `0.139487`，布局完整 F1 为 `0.762183`，有序槽位 bbox mean IoU 为 `0.652210`，相对 P2 2000 显著继续收敛。P2 8000 test comparison `got2_vlqa_compare_p2_8000_20260813` 也已完成：相对原始 GOT2 的页面 CER delta 为 `-0.260725`，布局完整 F1 为 `0.787056`，有序槽位 bbox mean IoU 为 `0.647827`。后续合成数据主 checkpoint 应暂以 P2 8000 为准，但仍需消融和真实跨域验证。
+
+P2 完成后，可使用 `tools/evaluation/run_formal_layout_comparison.sh` 在同一 test split 上比较原始 GOT2 与 P2 VLQA。当前合成数据主 checkpoint 使用 P2 8000：
+
+```bash
+bash tools/evaluation/run_formal_layout_comparison.sh \
+  formal_pdf_short_seed20260812 \
+  --vlqa-model "$GOT_TRAINING_RUNS/layout_joint-train_8000_20260813/p2/model" \
+  --run-id got2_vlqa_compare_p2_8000_20260813
+```
+
+comparison 完成后，使用离线 CPU 脚本做可重复错误分析：
+
+```bash
+python3 tools/evaluation/analyze_layout_comparison_errors.py \
+  --comparison-root "$GOT_EVALUATION_RUNS/got2_vlqa_compare_p2_8000_20260813" \
+  --manifest "$GOT_LAYOUT_DATA/formal_pdf_short_seed20260812/test/manifest.jsonl"
+```
+
+该脚本不加载模型、不占用 GPU，默认输出每页 CSV、分组 CSV、Markdown 和紧凑 JSON，按 tier、区域数、方向、文本长度和 layout failure type 汇总 OCR delta 与布局失败类型。
+
+`got2_vlqa_compare_p2_8000_20260813/analysis` 已完成 P2 8000 离线错误分析：300 页中 VLQA 有 `264` 页 OCR 改善、`16` 页持平、`20` 页变差，exact match 增加 `64` 页；layout failure type 中 `layout_ok=124`、`miss_and_extra=169`。相对 P2 2000 的 `layout_ok=3` 和 `miss_and_extra=285`，长程训练已显著减少布局失败。
+
+object threshold 先用离线 sweep 检查，不重新推理：
+
+```bash
+python3 tools/evaluation/analyze_layout_threshold_sweep.py \
+  --comparison-root "$GOT_EVALUATION_RUNS/got2_vlqa_compare_p2_8000_20260813" \
+  --manifest "$GOT_LAYOUT_DATA/formal_pdf_short_seed20260812/test/manifest.jsonl"
+```
+
+P2 8000 的最佳 threshold 为 `object_threshold=0.3`，complete region F1 为 `0.789143`，只比默认 `0.787056` 略高；预测区域数 `1748` 与真值区域数 `1752` 基本匹配，因此剩余误差不主要来自阈值或区域数量偏差。
+
+若阈值不能显著提升 F1，再运行 slot alignment 诊断：
+
+```bash
+python3 tools/evaluation/analyze_layout_slot_alignment.py \
+  --comparison-root "$GOT_EVALUATION_RUNS/got2_vlqa_compare_p2_8000_20260813" \
+  --manifest "$GOT_LAYOUT_DATA/formal_pdf_short_seed20260812/test/manifest.jsonl"
+```
+
+P2 8000 的 slot alignment 已显示 ordered hit rate `0.769977`、best hit rate `0.805936`、slot-misaligned hit rate `0.035959`，best query offset 以 `0=1494` 为主，说明 P2 2000 阶段明显的槽位错配在 P2 8000 已基本收敛。
+
+三项诊断完成后，可用 bundle 入口汇总现有 analysis JSON：
+
+```bash
+python3 tools/evaluation/summarize_layout_analysis_bundle.py \
+  --comparison-root "$GOT_EVALUATION_RUNS/got2_vlqa_compare_p2_8000_20260813"
+```
+
+该入口输出 `analysis/analysis_bundle/analysis_bundle_summary.json` 和 `analysis_bundle.md`，并在最后一条 `layout_analysis_bundle_completed` JSON 中返回 OCR、threshold、slot alignment 和剩余错误判断，便于低噪声回传。
+
+## P2 loss-supervision 消融入口
+
+`tools/training/run_formal_layout_ablation.sh` 用于从同一个 P1 checkpoint 启动单个 P2 loss-supervision 消融。它只封装现有 `train_GOT_layout.py` 已支持的 loss weight，不实现等参数普通 adaptor 或无 VLQA 结构对照。
+
+可用 preset：
+
+| preset | 含义 |
+|---|---|
+| `full` | 完整 P2 VLQA：object + bbox L1/GIoU + direction + OCR |
+| `no-direction` | 去除方向监督，保留 object + bbox + OCR |
+| `no-bbox` | 去除 bbox L1/GIoU 监督，保留 object + direction + OCR |
+| `object-only` | 只保留 object 监督 + OCR，去除 bbox 和 direction |
+| `ocr-only-adapter` | VLQA adapter 只通过 OCR 训练，关闭全部 layout losses |
+
+示例：
+
+```bash
+bash tools/training/run_formal_layout_ablation.sh \
+  no-direction \
+  formal_pdf_short_seed20260812 \
+  --p1-model "$GOT_TRAINING_RUNS/layout_pretrain_4000_20260813/p1/model" \
+  --p2-steps 8000 \
+  --run-id layout_ablate_no_direction_8000_20260813
+```
+
+每个 ablation 结束后仍使用同一个 formal comparison 入口做 test 对照，再运行 error analysis、threshold sweep、slot alignment 和 analysis bundle。不能只用 validation loss 判断消融结果。
+
+如果希望减少手工步骤，可用 post-analysis 入口串行完成 comparison 和三项离线诊断：
+
+```bash
+bash tools/evaluation/run_formal_layout_post_analysis.sh \
+  formal_pdf_short_seed20260812 \
+  --vlqa-model "$GOT_TRAINING_RUNS/layout_ablate_no_direction_8000_20260813/p2/model" \
+  --run-id got2_vlqa_compare_ablate_no_direction_8000_20260813
+```
+
+该脚本最后只输出 `layout_analysis_bundle_completed` JSON；若指定的 comparison run 目录已存在会直接退出，避免重复 test 查询。
+
+等参数量视觉 adaptor、无布局监督 queries 或旧 oracle/pseudo-layout region-token adapter 属于结构消融，需要单独实现或确认已有结构开关后再跑；不能用 `ocr-only-adapter` 冒充等参数结构对照。
+
+如果新 run 的 slot alignment 显示固定偏移，再运行 fixed offset sweep：
+
+```bash
+python3 tools/evaluation/analyze_layout_slot_offset_sweep.py \
+  --comparison-root "$GOT_EVALUATION_RUNS/<comparison_run_id>" \
+  --manifest "$GOT_LAYOUT_DATA/formal_pdf_short_seed20260812/test/manifest.jsonl"
+```
+
+该脚本同时输出 `slot_offset_page_oracle.csv`，用于判断是否存在页面级动态 offset。
 
 对应命令、数据隔离要求和回传格式见 [SYNC_AND_RUN.md](../../docs/SYNC_AND_RUN.md)。
