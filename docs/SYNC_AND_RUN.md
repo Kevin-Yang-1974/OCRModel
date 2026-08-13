@@ -159,7 +159,7 @@ bash "$OCRMODEL_ROOT/tools/environment/run_got2.sh" \
 
 ## 8. 正式 P1/P2 训练入口
 
-`overfit`、`smoke` 和 `pilot` 只是工程诊断，不是正式训练预算。正式入口已经实现，但截至本手册更新时尚未在 A100 上运行正式大规模实验。正式数据必须是已经按来源组隔离并通过同一次 train/validation/test 联合审计的 HTML 整页 manifest；训练、验证和推理都只读取整页图像与 `OCR: ` prompt，bbox、顺序和方向只进入训练标签或离线指标。
+`overfit`、`smoke` 和 `pilot` 只是工程诊断，不是正式训练预算。正式数据必须是已经按来源组隔离并通过同一次 train/validation/test 联合审计的 HTML 整页 manifest；训练、验证和推理都只读取整页图像与 `OCR: ` prompt，bbox、顺序和方向只进入训练标签或离线指标。
 
 正式 P1 使用原始 GOT2 权重，布局损失预训练 queries 和辅助头，OCR 标签全部 mask，写回门保持为 0。P1 只用于检验布局泛化，不能作为 OCR 性能比较 checkpoint。P1 held-out validation 通过后，再以同一 P1 checkpoint 启动 P2 `joint-train`；P2 才打开 OCR 损失和零门控写回，并可进入 baseline/VLQA OCR 对照。
 
@@ -229,25 +229,189 @@ bash tools/training/run_formal_layout_p1p2.sh \
 
 P2 的 validation 自动使用 P2 checkpoint，并要求 `layout_stage=p2`。P2 运行成功后才可以把该 checkpoint 用于 OCR 性能对照；P1 checkpoint 的 OCR 数字不应写入正式结果表。
 
+`formal_pdf_short_seed20260812` 的首轮正式合成训练已完成：P1 run `layout_pretrain_20260813_003142` 为 `1000` steps，P2 run `layout_joint-train_20260813_012356` 为 `2000` steps。后续 test 对照 run `got2_vlqa_compare_20260813_020251` 显示，P2 VLQA 相对原始 GOT2 的页面 CER delta 为 `-0.087047`，去空白 CER delta 为 `-0.058194`，页面 exact match rate delta 为 `+0.19`。该结果只代表合成 test 同协议 OCR 对照优于原始 GOT2；布局完整 F1 和有序槽位 bbox IoU 仍低，且尚未完成消融，不能直接归因到 VLQA 或外推真实跨域。
+
+长程训练也已完成：P1 run `layout_pretrain_4000_20260813` 为 `4000` steps，P2 run `layout_joint-train_8000_20260813` 为 `8000` steps。P2 8000 在 validation 上明显优于 P2 2000：页面 CER `0.139487`，布局完整 F1 `0.762183`，有序槽位 bbox mean IoU `0.652210`。P2 8000 的 test 对照 `got2_vlqa_compare_p2_8000_20260813` 已完成，相对原始 GOT2 的页面 CER delta 为 `-0.260725`，布局完整 F1 为 `0.787056`，有序槽位 bbox mean IoU 为 `0.647827`。
+
 ## 9. 原始 GOT2 与 VLQA 对照测试
 
 `tools/evaluation/compare_got2_vlqa.py` 在同一 test manifest 上串行启动两个独立 evaluator：baseline 必须是未包含 VLQA 的原始 GOT2，VLQA 必须是 `layout_stage=p2` 的完整 checkpoint。两个模型共享整页图像、`OCR: ` prompt、tokenizer、贪心解码、`max_new_tokens`、`no_repeat_ngram_size`、图像预处理和 test split；bbox、阅读顺序和方向不作为输入。正式 test 必须同时传 train/validation manifest 做一次跨 split 审计，不能使用 `--skip-audit` 或 `--allow-non-test-split`。
 
+短入口固定使用 `$GOT_LAYOUT_DATA/<dataset-id>/train|validation|test`，并自动把 train/validation/test manifest 纳入同一次审计：
+
 ```bash
-bash /data3/yky/yangky_ocr_models/ocrmodel/tools/environment/run_got2.sh \
-  /data3/yky/yangky_ocr_models/ocrmodel/tools/evaluation/compare_got2_vlqa.py \
-  --baseline-model /data3/yky/yangky_ocr_models/models/GOT-OCR2_0 \
-  --vlqa-model /data3/yky/yangky_ocr_models/training_runs/GOT/<P2_RUN_ID>/p2/model \
-  --tokenizer-model /data3/yky/yangky_ocr_models/models/GOT-OCR2_0 \
-  --train-manifest /data3/yky/yangky_ocr_models/training_data/got_layout_pages/<TRAIN_DATASET_ID>/manifest.jsonl \
-  --validation-manifest /data3/yky/yangky_ocr_models/training_data/got_layout_pages/<VALIDATION_DATASET_ID>/manifest.jsonl \
-  --layout-manifest /data3/yky/yangky_ocr_models/training_data/got_layout_pages/<TEST_DATASET_ID>/manifest.jsonl \
-  --layout-split test
+cd /data3/yky/yangky_ocr_models/ocrmodel
+source config/paths.env
+bash tools/evaluation/run_formal_layout_comparison.sh \
+  formal_pdf_short_seed20260812 \
+  --vlqa-model "$GOT_TRAINING_RUNS/layout_joint-train_20260813_012356/p2/model"
 ```
+
+P2 8000 的正式 test 对照命令如下；该 run 已完成，除非明确说明复跑原因，不要重复查询 test：
+
+```bash
+cd /data3/yky/yangky_ocr_models/ocrmodel
+source config/paths.env
+bash tools/evaluation/run_formal_layout_comparison.sh \
+  formal_pdf_short_seed20260812 \
+  --vlqa-model "$GOT_TRAINING_RUNS/layout_joint-train_8000_20260813/p2/model" \
+  --run-id got2_vlqa_compare_p2_8000_20260813
+```
+
+如需限制调试页数，可追加 `--max-records <N>`，但正式 test 结果不要使用该限制。
+
+`got2_vlqa_compare_20260813_020251` 已完成 P2 2000 正式 test 对照，`got2_vlqa_compare_p2_8000_20260813` 已完成 P2 8000 正式 test 对照。后续若复跑，必须使用新的 run 目录，并说明复跑原因，避免把多次 test 查询当作调参反馈。
 
 终端只回传最后一条 `layout_comparison_completed` JSON。完整 OCR/layout 预测、审计和日志留在 comparison run 目录。汇总中的 CER、去空白 CER、exact-match 差值是 `VLQA - baseline`；VLQA 的布局指标和可选解释 forward 时间单独报告。由于 evaluator 会先做一次布局 forward 再做 OCR generation，`ocr_generation_seconds` 才是两模型可直接比较的 OCR 推理时间，`total_inference_seconds` 包含额外解释 forward，不能混作纯 OCR 延迟。
 
-## 10. line-level 兼容诊断
+## 10. test 错误分析入口
+
+`tools/evaluation/analyze_layout_comparison_errors.py` 是离线、只读、CPU 分析脚本，不加载模型、不占用 GPU。它读取 comparison run 下的 baseline/VLQA predictions 和 test manifest，输出每页 CSV、分组 CSV、Markdown 摘要和紧凑 JSON。默认按 tier、区域数量、方向组合、文本长度和 layout failure type 分组，用于回答：
+
+1. VLQA 的 OCR 收益主要来自哪些页面；
+2. layout F1 低主要来自漏检、多检、bbox/slot 低 IoU，还是混合问题。
+
+服务器上运行：
+
+```bash
+cd /data3/yky/yangky_ocr_models/ocrmodel
+source config/paths.env
+python3 tools/evaluation/analyze_layout_comparison_errors.py \
+  --comparison-root /data3/yky/yangky_ocr_models/evaluation_runs/GOT/got2_vlqa_compare_p2_8000_20260813 \
+  --manifest "$GOT_LAYOUT_DATA/formal_pdf_short_seed20260812/test/manifest.jsonl"
+```
+
+正常结束只回传最后一条 `layout_comparison_error_analysis_completed` JSON。详细文件默认写入：
+
+```text
+<comparison_root>/analysis/error_analysis_summary.json
+<comparison_root>/analysis/page_error_analysis.csv
+<comparison_root>/analysis/group_error_analysis.csv
+<comparison_root>/analysis/error_analysis.md
+```
+
+进一步判断 `miss_and_extra` 是否主要由 object threshold 导致时，运行 threshold sweep。该脚本同样只读、不加载模型、不占 GPU：
+
+```bash
+cd /data3/yky/yangky_ocr_models/ocrmodel
+source config/paths.env
+python3 tools/evaluation/analyze_layout_threshold_sweep.py \
+  --comparison-root /data3/yky/yangky_ocr_models/evaluation_runs/GOT/got2_vlqa_compare_p2_8000_20260813 \
+  --manifest "$GOT_LAYOUT_DATA/formal_pdf_short_seed20260812/test/manifest.jsonl"
+```
+
+默认评估 object threshold `0.1` 到 `0.9`。正常结束只回传最后一条 `layout_threshold_sweep_completed` JSON。详细文件默认写入：
+
+```text
+<comparison_root>/analysis/threshold_sweep/threshold_sweep_summary.json
+<comparison_root>/analysis/threshold_sweep/threshold_sweep.csv
+<comparison_root>/analysis/threshold_sweep/threshold_sweep.md
+```
+
+若 threshold sweep 不能显著提升 F1，再检查 query 槽位是否错配。slot alignment 脚本会比较“阅读顺序第 k 个真值区域与 query k 的 IoU”和“该真值区域与所有 query 的最高 IoU”：
+
+```bash
+cd /data3/yky/yangky_ocr_models/ocrmodel
+source config/paths.env
+python3 tools/evaluation/analyze_layout_slot_alignment.py \
+  --comparison-root /data3/yky/yangky_ocr_models/evaluation_runs/GOT/got2_vlqa_compare_p2_8000_20260813 \
+  --manifest "$GOT_LAYOUT_DATA/formal_pdf_short_seed20260812/test/manifest.jsonl"
+```
+
+正常结束只回传最后一条 `layout_slot_alignment_completed` JSON。若 `best_hit_rate` 明显高于 `ordered_hit_rate`，或 `slot_misaligned_hit_rate` 较高，说明模型能用某些 query 找到区域，但 query index 与阅读顺序槽位错配。
+
+P2 8000 的三项离线诊断已完成：错误分析显示 OCR 改善/持平/变差为 `264/16/20`，exact match 从 `11` 增至 `75` 页，layout failure 为 `layout_ok=124`、`miss_and_extra=169`；threshold sweep 最佳 F1 为 `0.789143`，仅略高于默认 `0.787056`；slot alignment 的 ordered hit rate 为 `0.769977`，best hit rate 为 `0.805936`，slot-misaligned hit rate 为 `0.035959`，best query offset 以 `0=1494` 为主。当前不需要重复运行上述三个诊断，除非 comparison 输出丢失或换了 checkpoint。
+
+三项诊断完成后，可用 bundle 汇总入口把已有 JSON 压成一条紧凑结论和一份 Markdown，不重新推理、不读取大 prediction：
+
+```bash
+cd /data3/yky/yangky_ocr_models/ocrmodel
+source config/paths.env
+python3 tools/evaluation/summarize_layout_analysis_bundle.py \
+  --comparison-root /data3/yky/yangky_ocr_models/evaluation_runs/GOT/got2_vlqa_compare_p2_8000_20260813
+```
+
+正常结束只回传最后一条 `layout_analysis_bundle_completed` JSON。详细文件默认写入：
+
+```text
+<comparison_root>/analysis/analysis_bundle/analysis_bundle_summary.json
+<comparison_root>/analysis/analysis_bundle/analysis_bundle.md
+```
+
+该入口会同时汇总 OCR delta、layout failure type、threshold 最优点相对默认 F1 的增量、slot alignment gap、主要 query offset、最差 group 和最差 page，用于决定是否继续看 hard pages、做消融或改结构。
+
+若 offset 计数提示存在固定偏移，例如大量 best query offset 为 `+1`，再运行 fixed slot-offset sweep：
+
+```bash
+cd /data3/yky/yangky_ocr_models/ocrmodel
+source config/paths.env
+python3 tools/evaluation/analyze_layout_slot_offset_sweep.py \
+  --comparison-root /data3/yky/yangky_ocr_models/evaluation_runs/GOT/<comparison_run_id> \
+  --manifest "$GOT_LAYOUT_DATA/formal_pdf_short_seed20260812/test/manifest.jsonl"
+```
+
+正常结束只回传最后一条 `layout_slot_offset_sweep_completed` JSON。若 `offset=+1` 的 hit rate 或 mean IoU 明显优于 `offset=0`，优先检查训练目标分配、背景/空槽处理和 query 0 是否被系统性占用。
+
+该脚本同时输出每页最佳固定 offset oracle：
+
+```text
+<comparison_root>/analysis/slot_offset_sweep/slot_offset_page_oracle.csv
+```
+
+如果全局 `+1` 提升有限，但 page oracle 提升明显，说明错配更可能是页面级动态 offset，不是简单 off-by-one。
+
+## 11. P2 loss-supervision 消融入口
+
+当前已可重复运行的消融是 loss-supervision 消融，不是等参数结构消融。入口为 `tools/training/run_formal_layout_ablation.sh`，从同一个 P1 checkpoint 启动单个 P2 formal joint-train，并固定 train/validation/test 三 split 审计。
+
+可用 preset：
+
+| preset | 作用 |
+|---|---|
+| `full` | 完整 P2 VLQA，作为复跑对照 |
+| `no-direction` | 关闭 direction loss |
+| `no-bbox` | 关闭 bbox L1/GIoU loss |
+| `object-only` | 只保留 object loss 和 OCR loss |
+| `ocr-only-adapter` | 关闭全部 layout losses，只让 adapter 经 OCR loss 学习 |
+
+示例只启动一个 ablation；不要一次性在终端里连续启动多个长任务：
+
+```bash
+cd /data3/yky/yangky_ocr_models/ocrmodel
+source config/paths.env
+bash tools/training/run_formal_layout_ablation.sh \
+  no-direction \
+  formal_pdf_short_seed20260812 \
+  --p1-model "$GOT_TRAINING_RUNS/layout_pretrain_4000_20260813/p1/model" \
+  --p2-steps 8000 \
+  --run-id layout_ablate_no_direction_8000_20260813
+```
+
+每个 ablation 完成后，使用同一 comparison 和离线 analysis 链路：
+
+```bash
+bash tools/evaluation/run_formal_layout_comparison.sh \
+  formal_pdf_short_seed20260812 \
+  --vlqa-model "$GOT_TRAINING_RUNS/<ablation_run_id>/p2/model" \
+  --run-id got2_vlqa_compare_<ablation_run_id>
+```
+
+然后依次运行 error analysis、threshold sweep、slot alignment 和 analysis bundle。回传只取最后一条 JSON。等参数普通 adaptor、无布局监督 query 结构对照和旧 oracle/pseudo-layout region-token adapter 仍需要单独结构实现或明确已有开关，不能用 `ocr-only-adapter` 冒充。
+
+也可以直接使用 post-analysis 短入口，在一个命令中串行完成 comparison、三项离线诊断和 bundle 汇总：
+
+```bash
+cd /data3/yky/yangky_ocr_models/ocrmodel
+source config/paths.env
+bash tools/evaluation/run_formal_layout_post_analysis.sh \
+  formal_pdf_short_seed20260812 \
+  --vlqa-model "$GOT_TRAINING_RUNS/layout_ablate_no_direction_8000_20260813/p2/model" \
+  --run-id got2_vlqa_compare_ablate_no_direction_8000_20260813
+```
+
+该脚本会拒绝已存在的 comparison run 目录，避免无意中重复 test 查询或覆盖结果。正常结束时只回传最后一条 `layout_analysis_bundle_completed` JSON。
+
+## 12. line-level 兼容诊断
 
 以下入口只检查既有单行/单列数据链路，不属于正式整页协议：
 
@@ -265,7 +429,7 @@ GOT_RUN_ID="linelevel_smoke_$(date +%Y%m%d_%H%M%S)" \
 
 单步 line-level smoke 只验证加载、反向传播、保存和重载，不验证布局 queries，也不能与页面 CER 直接比较。
 
-## 11. AncientDoc 历史兼容入口
+## 13. AncientDoc 历史兼容入口
 
 AncientDoc 旧 split 存在书籍级重叠。这些命令只用于复现历史页面兼容链路，不属于小样本或 VLQA 正式实验。
 
@@ -290,7 +454,7 @@ GOT_EVAL_MODEL="$GOT_SOURCE_MODEL" \
 
 该入口复用 `references/legacy-ancientdoc-eval/GOT/eval/myeval.py` 的历史解码参数，并将预测、日志和指标写入 `$GOT_EVALUATION_RUNS`。输出字段 `metrics_page_macro_legacy_editops` 只代表该兼容口径。
 
-## 12. 回传与协作
+## 14. 回传与协作
 
 不要复制完整 `train.log`、`trainer_state.json` 或 `predictions.json`。布局 run 正常结束时优先回传终端最后一条完成 JSON。需要补充核对时只选择紧凑字段：
 

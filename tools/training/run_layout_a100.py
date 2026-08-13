@@ -91,6 +91,12 @@ class Settings:
     p2_max_records: int
     p1_learning_rate: float
     p2_learning_rate: float
+    object_loss_weight: float
+    bbox_l1_loss_weight: float
+    bbox_giou_loss_weight: float
+    direction_loss_weight: float
+    layout_loss_weight: float
+    p2_ocr_loss_weight: float
     validation_max_records: int
     validation_max_new_tokens: int
     validation_no_repeat_ngram_size: int
@@ -158,6 +164,13 @@ def positive_float(value: str) -> float:
     parsed = float(value)
     if not math.isfinite(parsed) or parsed <= 0.0:
         raise argparse.ArgumentTypeError("must be a positive finite number")
+    return parsed
+
+
+def nonnegative_float(value: str) -> float:
+    parsed = float(value)
+    if not math.isfinite(parsed) or parsed < 0.0:
+        raise argparse.ArgumentTypeError("must be a non-negative finite number")
     return parsed
 
 
@@ -263,6 +276,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--p2-max-records", type=nonnegative_int)
     parser.add_argument("--p1-learning-rate", type=positive_float, default=1e-4)
     parser.add_argument("--p2-learning-rate", type=positive_float, default=5e-5)
+    parser.add_argument("--object-loss-weight", type=nonnegative_float, default=1.0)
+    parser.add_argument("--bbox-l1-loss-weight", type=nonnegative_float, default=5.0)
+    parser.add_argument("--bbox-giou-loss-weight", type=nonnegative_float, default=2.0)
+    parser.add_argument("--direction-loss-weight", type=nonnegative_float, default=1.0)
+    parser.add_argument("--layout-loss-weight", type=nonnegative_float, default=1.0)
+    parser.add_argument("--p2-ocr-loss-weight", type=positive_float, default=1.0)
     parser.add_argument("--validation-max-records", type=nonnegative_int, default=0)
     parser.add_argument("--validation-max-new-tokens", type=positive_int, default=2048)
     parser.add_argument("--validation-no-repeat-ngram-size", type=nonnegative_int, default=20)
@@ -512,6 +531,12 @@ def resolve_settings(args: argparse.Namespace) -> Settings:
         p2_max_records=p2_records,
         p1_learning_rate=args.p1_learning_rate,
         p2_learning_rate=args.p2_learning_rate,
+        object_loss_weight=args.object_loss_weight,
+        bbox_l1_loss_weight=args.bbox_l1_loss_weight,
+        bbox_giou_loss_weight=args.bbox_giou_loss_weight,
+        direction_loss_weight=args.direction_loss_weight,
+        layout_loss_weight=args.layout_loss_weight,
+        p2_ocr_loss_weight=args.p2_ocr_loss_weight,
         validation_max_records=args.validation_max_records,
         validation_max_new_tokens=args.validation_max_new_tokens,
         validation_no_repeat_ngram_size=args.validation_no_repeat_ngram_size,
@@ -1049,7 +1074,7 @@ def build_training_command(
     learning_rate = (
         settings.p1_learning_rate if stage == "p1" else settings.p2_learning_rate
     )
-    ocr_loss_weight = "0" if stage == "p1" else "1"
+    ocr_loss_weight = "0" if stage == "p1" else f"{settings.p2_ocr_loss_weight:g}"
     deepspeed = Path(sys.executable).with_name("deepspeed")
     return [
         str(deepspeed),
@@ -1116,8 +1141,16 @@ def build_training_command(
         str(steps),
         "--learning_rate",
         str(learning_rate),
+        "--object_loss_weight",
+        f"{settings.object_loss_weight:g}",
+        "--bbox_l1_loss_weight",
+        f"{settings.bbox_l1_loss_weight:g}",
+        "--bbox_giou_loss_weight",
+        f"{settings.bbox_giou_loss_weight:g}",
+        "--direction_loss_weight",
+        f"{settings.direction_loss_weight:g}",
         "--layout_loss_weight",
-        "1",
+        f"{settings.layout_loss_weight:g}",
         "--ocr_loss_weight",
         ocr_loss_weight,
         "--seed",
