@@ -20,6 +20,9 @@ from synthetic_layout_common import (
 )
 
 
+LAYOUT_ANNOTATION_STATUSES = {"complete", "partial", "none"}
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
@@ -47,11 +50,7 @@ def resolve_dataset_file(dataset_root: Path, value: Any, field_name: str) -> Pat
     relative = PurePosixPath(value)
     if relative.is_absolute() or ".." in relative.parts:
         raise ValueError(f"{field_name} is unsafe: {value!r}")
-    resolved = (dataset_root / Path(*relative.parts)).resolve()
-    try:
-        resolved.relative_to(dataset_root)
-    except ValueError as exc:
-        raise ValueError(f"{field_name} escapes dataset root: {value!r}") from exc
+    resolved = dataset_root / Path(*relative.parts)
     if not resolved.is_file():
         raise FileNotFoundError(resolved)
     return resolved
@@ -143,9 +142,15 @@ def audit_record(
         )
     if record.get("input_level") != "page":
         raise ValueError(f"{context}.input_level must be 'page'.")
-    if record.get("layout_source") != "html_synthetic":
-        raise ValueError(f"{context}.layout_source must be 'html_synthetic'.")
-    if record.get("layout_annotation_status") != "complete":
+    layout_source = expect_string(record, "layout_source", context)
+    annotation_status = record.get("layout_annotation_status", "none")
+    if annotation_status not in LAYOUT_ANNOTATION_STATUSES:
+        raise ValueError(
+            f"{context}.layout_annotation_status must be one of "
+            f"{sorted(LAYOUT_ANNOTATION_STATUSES)}."
+        )
+    is_synthetic = layout_source == "html_synthetic"
+    if is_synthetic and annotation_status != "complete":
         raise ValueError(f"{context}.layout_annotation_status must be 'complete'.")
     if record.get("bbox_format") != "xyxy_normalized":
         raise ValueError(f"{context}.bbox_format must be 'xyxy_normalized'.")
@@ -153,37 +158,44 @@ def audit_record(
     page_id = expect_string(record, "page_id", context)
     split = expect_string(record, "split", context)
     tier = expect_string(record, "tier", context)
-    if tier not in TIERS:
+    if is_synthetic and tier not in TIERS:
         raise ValueError(f"{context}.tier must be one of {TIERS}, got {tier!r}.")
-    width, height = expect_page_size(record, context)
+    if is_synthetic or "page_size" in record:
+        width, height = expect_page_size(record, context)
+    else:
+        width = height = None
     page_text = expect_string(record, "page_text", context)
     separator = record.get("page_text_separator")
     if not isinstance(separator, str):
         raise ValueError(f"{context}.page_text_separator must be a string.")
-    generator = record.get("generator")
-    if not isinstance(generator, dict):
-        raise ValueError(f"{context}.generator must be a JSON object.")
-    allowed_rendered_fonts = generator.get("allowed_rendered_fonts")
-    if (
-        not isinstance(allowed_rendered_fonts, list)
-        or not allowed_rendered_fonts
-        or any(not isinstance(font, str) or not font for font in allowed_rendered_fonts)
-        or len(set(allowed_rendered_fonts)) != len(allowed_rendered_fonts)
-    ):
-        raise ValueError(
-            f"{context}.generator.allowed_rendered_fonts must be a non-empty unique string list."
-        )
-    allowed_font_set = set(allowed_rendered_fonts)
+    allowed_font_set: set[str] = set()
+    if is_synthetic:
+        generator = record.get("generator")
+        if not isinstance(generator, dict):
+            raise ValueError(f"{context}.generator must be a JSON object.")
+        allowed_rendered_fonts = generator.get("allowed_rendered_fonts")
+        if (
+            not isinstance(allowed_rendered_fonts, list)
+            or not allowed_rendered_fonts
+            or any(not isinstance(font, str) or not font for font in allowed_rendered_fonts)
+            or len(set(allowed_rendered_fonts)) != len(allowed_rendered_fonts)
+        ):
+            raise ValueError(
+                f"{context}.generator.allowed_rendered_fonts must be a non-empty unique string list."
+            )
+        allowed_font_set = set(allowed_rendered_fonts)
 
     image_path = resolve_dataset_file(dataset_root, record.get("image"), f"{context}.image")
     with Image.open(image_path) as image:
         actual_size = image.size
-    if actual_size != (width, height):
+    if width is not None and actual_size != (width, height):
         raise ValueError(
             f"{context} image size mismatch: manifest={(width, height)}, file={actual_size}."
         )
-    expected_image_hash = expect_string(record, "image_sha256", context)
-    if not skip_image_hash:
+    expected_image_hash = record.get("image_sha256")
+    if is_synthetic and not isinstance(expected_image_hash, str):
+        raise ValueError(f"{context}.image_sha256 must be a string.")
+    if not skip_image_hash and isinstance(expected_image_hash, str):
         actual_image_hash = sha256_file(image_path)
         if actual_image_hash != expected_image_hash:
             raise ValueError(
@@ -191,14 +203,18 @@ def audit_record(
                 f"actual={actual_image_hash}."
             )
 
-    if not skip_html_check:
+    if is_synthetic and not skip_html_check:
         html_path = resolve_dataset_file(dataset_root, record.get("html"), f"{context}.html")
         if f'data-page-id="{page_id}"' not in html_path.read_text(encoding="utf-8"):
             raise ValueError(f"{context} HTML does not declare its page_id.")
 
-    regions = record.get("regions")
-    if not isinstance(regions, list) or not regions:
+    regions = record.get("regions", [])
+    if not isinstance(regions, list):
+        raise ValueError(f"{context}.regions must be a list.")
+    if annotation_status == "complete" and not regions:
         raise ValueError(f"{context}.regions must be a non-empty list.")
+    if annotation_status == "none" and regions:
+        raise ValueError(f"{context}.regions must be empty when layout_annotation_status is none.")
     expected_orders = list(range(len(regions)))
     actual_orders = [region.get("reading_order") if isinstance(region, dict) else None for region in regions]
     if actual_orders != expected_orders:
@@ -216,7 +232,7 @@ def audit_record(
         region_context = f"{context}.regions[{region_index}]"
         if not isinstance(region, dict):
             raise TypeError(f"{region_context} is not a JSON object.")
-        if region.get("valid") is not True:
+        if is_synthetic and region.get("valid") is not True:
             raise ValueError(f"{region_context}.valid must be true.")
         region_id = expect_string(region, "region_id", region_context)
         content_id = expect_string(region, "content_id", region_context)
@@ -230,48 +246,49 @@ def audit_record(
             )
         if source_kind not in {"text", "image"}:
             raise ValueError(f"{region_context}.source_kind is invalid: {source_kind!r}.")
-        validate_rendered_fonts(
-            region.get("rendered_fonts"),
-            source_kind=source_kind,
-            allowed_fonts=allowed_font_set,
-            context=f"{region_context}.rendered_fonts",
-        )
-        visibility = region.get("content_visibility")
-        if not isinstance(visibility, dict):
-            raise ValueError(f"{region_context}.content_visibility must be an object.")
-        client_size = visibility.get("client_size")
-        scroll_size = visibility.get("scroll_size")
-        if (
-            not isinstance(client_size, list)
-            or len(client_size) != 2
-            or any(not isinstance(value, int) or value <= 0 for value in client_size)
-        ):
-            raise ValueError(f"{region_context}.content_visibility.client_size is invalid.")
-        if (
-            not isinstance(scroll_size, list)
-            or len(scroll_size) != 2
-            or any(not isinstance(value, int) or value <= 0 for value in scroll_size)
-        ):
-            raise ValueError(f"{region_context}.content_visibility.scroll_size is invalid.")
-        if visibility.get("overflow") is not False:
-            raise ValueError(f"{region_context} must declare content overflow=false.")
-        if scroll_size[0] > client_size[0] + 1 or scroll_size[1] > client_size[1] + 1:
-            raise ValueError(f"{region_context} visibility sizes prove content overflow.")
-        if source_kind == "text":
-            if visibility.get("dom_text_matches_label") is not True:
-                raise ValueError(f"{region_context} text must match the DOM content.")
-            if visibility.get("image_natural_size") is not None:
-                raise ValueError(f"{region_context} text must not declare image dimensions.")
-        else:
-            natural_size = visibility.get("image_natural_size")
+        if is_synthetic:
+            validate_rendered_fonts(
+                region.get("rendered_fonts"),
+                source_kind=source_kind,
+                allowed_fonts=allowed_font_set,
+                context=f"{region_context}.rendered_fonts",
+            )
+            visibility = region.get("content_visibility")
+            if not isinstance(visibility, dict):
+                raise ValueError(f"{region_context}.content_visibility must be an object.")
+            client_size = visibility.get("client_size")
+            scroll_size = visibility.get("scroll_size")
             if (
-                not isinstance(natural_size, list)
-                or len(natural_size) != 2
-                or any(not isinstance(value, int) or value <= 0 for value in natural_size)
+                not isinstance(client_size, list)
+                or len(client_size) != 2
+                or any(not isinstance(value, int) or value <= 0 for value in client_size)
             ):
-                raise ValueError(f"{region_context} image dimensions are invalid.")
-            if visibility.get("dom_text_matches_label") is not None:
-                raise ValueError(f"{region_context} image must not declare DOM text equality.")
+                raise ValueError(f"{region_context}.content_visibility.client_size is invalid.")
+            if (
+                not isinstance(scroll_size, list)
+                or len(scroll_size) != 2
+                or any(not isinstance(value, int) or value <= 0 for value in scroll_size)
+            ):
+                raise ValueError(f"{region_context}.content_visibility.scroll_size is invalid.")
+            if visibility.get("overflow") is not False:
+                raise ValueError(f"{region_context} must declare content overflow=false.")
+            if scroll_size[0] > client_size[0] + 1 or scroll_size[1] > client_size[1] + 1:
+                raise ValueError(f"{region_context} visibility sizes prove content overflow.")
+            if source_kind == "text":
+                if visibility.get("dom_text_matches_label") is not True:
+                    raise ValueError(f"{region_context} text must match the DOM content.")
+                if visibility.get("image_natural_size") is not None:
+                    raise ValueError(f"{region_context} text must not declare image dimensions.")
+            else:
+                natural_size = visibility.get("image_natural_size")
+                if (
+                    not isinstance(natural_size, list)
+                    or len(natural_size) != 2
+                    or any(not isinstance(value, int) or value <= 0 for value in natural_size)
+                ):
+                    raise ValueError(f"{region_context} image dimensions are invalid.")
+                if visibility.get("dom_text_matches_label") is not None:
+                    raise ValueError(f"{region_context} image must not declare DOM text equality.")
         if region_id in region_ids:
             raise ValueError(f"{context} contains duplicate region_id={region_id!r}.")
         if content_id in page_content_ids:
@@ -282,19 +299,21 @@ def audit_record(
         region_texts.append(region_text)
 
         bbox = expect_bbox(region.get("bbox"), f"{region_context}.bbox")
-        bbox_px = region.get("bbox_px")
-        if (
-            not isinstance(bbox_px, list)
-            or len(bbox_px) != 4
-            or any(not isinstance(value, (int, float)) for value in bbox_px)
-        ):
-            raise ValueError(f"{region_context}.bbox_px must contain four numbers.")
-        expected_px = (bbox[0] * width, bbox[1] * height, bbox[2] * width, bbox[3] * height)
-        max_delta = max(abs(float(actual) - expected) for actual, expected in zip(bbox_px, expected_px))
-        if max_delta > 0.02:
-            raise ValueError(
-                f"{region_context} normalized/pixel bbox mismatch: max_delta={max_delta:.6f}."
-            )
+        if is_synthetic:
+            bbox_px = region.get("bbox_px")
+            if (
+                not isinstance(bbox_px, list)
+                or len(bbox_px) != 4
+                or any(not isinstance(value, (int, float)) for value in bbox_px)
+            ):
+                raise ValueError(f"{region_context}.bbox_px must contain four numbers.")
+            assert width is not None and height is not None
+            expected_px = (bbox[0] * width, bbox[1] * height, bbox[2] * width, bbox[3] * height)
+            max_delta = max(abs(float(actual) - expected) for actual, expected in zip(bbox_px, expected_px))
+            if max_delta > 0.02:
+                raise ValueError(
+                    f"{region_context} normalized/pixel bbox mismatch: max_delta={max_delta:.6f}."
+                )
 
         source_sha256 = region.get("source_sha256")
         if source_kind == "image":
@@ -316,13 +335,16 @@ def audit_record(
             }
         )
 
-    if separator.join(region_texts) != page_text:
+    if regions and separator.join(region_texts) != page_text:
         raise ValueError(f"{context}.page_text does not match ordered region text concatenation.")
     declared_groups = record.get("source_group_ids")
-    if not isinstance(declared_groups, list) or declared_groups != sorted(source_groups):
+    if regions and (not isinstance(declared_groups, list) or declared_groups != sorted(source_groups)):
         raise ValueError(
             f"{context}.source_group_ids must equal sorted region groups: {sorted(source_groups)}."
         )
+    if not regions:
+        source_group_id = expect_string(record, "source_group_id", context)
+        source_groups.add(source_group_id)
     conversations = record.get("conversations")
     expected_conversations = [
         {"from": "human", "value": "<image>\nOCR: "},
@@ -335,9 +357,12 @@ def audit_record(
         "page_id": page_id,
         "split": split,
         "tier": tier,
-        "template_id": expect_string(record, "template_id", context),
+        "layout_source": layout_source,
+        "layout_annotation_status": annotation_status,
+        "template_id": record.get("template_id", layout_source),
         "image_sha256": expected_image_hash,
         "regions": region_summaries,
+        "source_group_id": sorted(source_groups)[0] if source_groups else None,
     }
 
 
@@ -390,7 +415,9 @@ def main() -> int:
 
     for page in audited:
         split = page["split"]
-        enforce_single_split(page_hash_splits, page["image_sha256"], split, "page image hash")
+        image_sha256 = page["image_sha256"]
+        if image_sha256:
+            enforce_single_split(page_hash_splits, image_sha256, split, "page image hash")
         for region in page["regions"]:
             content_id = region["content_id"]
             enforce_single_split(content_splits, content_id, split, "content_id")

@@ -6,19 +6,19 @@
 
 ## 当前状态
 
-更新于 2026 年 8 月 12 日。
+更新于 2026 年 8 月 14 日。
 
 | 模块 | 状态 | 当前结论 |
 |---|---|---|
 | 整页 HTML/Playwright 合成与 manifest 审计 | 已实现并通过本地 smoke | 可生成 `S0-html-text`、`S1-html-crop` 和 `S2-hard` schema v2 数据；正式字体包仍未锁定 |
 | 页面级 dataset/collator 与 VLQA | 已实现首版 | 支持有序 queries、object/bbox/direction 辅助损失和零门控写回 |
-| A100 forward/backward 与 P1→P2 保存重载 | 工程链路已打通 | 只证明代码链路可运行，不构成性能证据 |
-| P1 两样本 overfit | 1000 steps 实现诊断通过 | `layout_overfit_20260812_002747` 的 object/direction、bbox L1/GIoU/IoU 均达到实现门槛；仍不是性能结果 |
-| validation loader 与统一页面指标 | 两页链路验证通过，正式 split 待执行 | `layout_validate_20260812_014816` 确认整页 prompt-only checkpoint 重载、generation 和统一指标；使用 overfit checkpoint/同一 `train` split，不能作为泛化结果 |
-| 正式 P1/P2 训练编排 | 本地实现，A100 正式实跑待执行 | `pretrain` 从原始 GOT2 只跑 P1；`joint-train` 从完整 P1 checkpoint 只跑 P2；两者均要求 train/validation/test 联合审计 |
-| GOT2 baseline 与 VLQA 对照脚本 | 本地实现，A100 实跑待执行 | `compare_got2_vlqa.py` 强制同一 test 页面、OCR prompt、tokenizer 和解码配置；VLQA 必须为 P2 checkpoint |
+| A100 forward/backward 与 P1→P2 保存重载 | 工程链路已打通 | 两样本 overfit、checkpoint 重载和 prompt-only validation 均已通过；这些运行仍只作为工程证据 |
+| 正式合成 P1/P2 | 已完成 P1 4000/P2 8000 | P2 8000 validation 页面 CER `0.139487`、布局 F1 `0.762183`；属于合成数据结果 |
+| 原始 GOT2 与 P2 8000 VLQA 对照 | 已完成 300 页合成 test | VLQA 页面 CER 相对 baseline 下降 `0.260725`，布局 F1 `0.787056`；结构归因仍需消融 |
+| AncientDoc C4/C5/C6 适配 | 已完成 516 页统一 test | C6 页面 CER `0.934099`，当前排名第一；完全正确页面仅 `1/516`，原始 split 尚未完成来源隔离审计 |
+| 等参数量与无布局监督结构对照 | 尚未实现 | 未完成前不能把 P2/C6 收益单独归因于 VLQA 布局结构 |
 
-当前 P1 两样本实现诊断已经通过；随后 `layout_validate_20260812_014816` 在同一个 VLQA checkpoint 和两页 `train` split 上完成了整页 prompt-only validation 链路。布局区域 precision/recall/F1 均为 `1.0`，有序槽位 bbox mean IoU 为 `0.956666`，方向和阅读顺序指标均为 `1.0`；OCR 页面 CER 为 `0.215909`、去空白 CER 为 `0.086420`。这些数字来自 P1 同页 overfit checkpoint，P1 不优化 OCR，不能作为正式性能或泛化结果。下一步是锁定隔离的 held-out split 和原 GOT2 baseline；在正式划分、消融和跨域验证完成前，不启动未解锁的 pilot。完整状态和证据边界见 [PROJECT_STATUS.md](docs/PROJECT_STATUS.md)。
+当前合成数据主 checkpoint 为 `layout_joint-train_8000_20260813/p2/model`。它已经完成同协议合成 validation/test，但等参数量 adaptor、无布局监督 queries 和完整 loss 消融仍未完成。AncientDoc C4/C5/C6 已完成首轮真实页面适配，其中 C6 最优；由于测试划分尚未完成跨书籍、跨版本、跨馆藏和近重复隔离审计，该结果只作为应用适配基线，不作为小样本泛化证据。完整状态见 [PROJECT_STATUS.md](docs/PROJECT_STATUS.md)，AncientDoc 指标和限制见 [ANCIENTDOC_BASELINE_REPORT_20260814.md](docs/ANCIENTDOC_BASELINE_REPORT_20260814.md)。
 
 ## 目录
 
@@ -69,19 +69,22 @@ py -3 -m venv .venv
 |---|---|---|
 | `tools/training/run_layout_a100.py --mode overfit` | 两样本实现正确性检查 | 否 |
 | `tools/training/run_layout_a100.py --mode smoke` | 环境、单步训练与 checkpoint 链路检查 | 否 |
-| `tools/training/run_layout_a100.py --mode validate` | 整页 prompt-only 推理与统一页面指标 | 暂不作为正式性能结论；需明确 VLQA checkpoint 和正式 split |
-| `tools/training/run_layout_a100.py --mode pretrain` | 原始 GOT2 起点的正式 P1 布局预训练 | 入口已实现；需正式 split 和 A100 实跑 |
-| `tools/training/run_layout_a100.py --mode joint-train` | P1 checkpoint 起点的正式 P2 OCR＋布局联合训练 | 入口已实现；仅在 P1 held-out validation 通过后运行 |
-| `tools/evaluation/compare_got2_vlqa.py` | 同一整页 test manifest 上比较原始 GOT2 与 P2 VLQA | 入口已实现；A100 实跑待执行 |
+| `tools/training/run_layout_a100.py --mode validate` | 整页 prompt-only 推理与统一页面指标 | 可用于明确 checkpoint 和 split 的评估；结论范围由数据隔离和对照完整性决定 |
+| `tools/training/run_layout_a100.py --mode pretrain` | 原始 GOT2 起点的正式 P1 布局预训练 | 已完成合成数据 P1 4000；P1 不用于 OCR 改善结论 |
+| `tools/training/run_layout_a100.py --mode joint-train` | P1 checkpoint 起点的正式 P2 OCR＋布局联合训练 | 已完成合成数据 P2 8000；仍需结构消融和真实分组隔离评估 |
+| `tools/evaluation/compare_got2_vlqa.py` | 同一整页 test manifest 上比较原始 GOT2 与 P2 VLQA | 已完成 P2 8000 合成 test 对照 |
+| `tools/training/run_ancientdoc_baseline_suite.sh` | AncientDoc C4/C5/C6 真实页面适配 | 首轮已完成；当前 C6 最优，但原 split 不支持小样本泛化结论 |
+| `tools/evaluation/run_ancientdoc_validation_suite.sh` | 原始 GOT2、C4、C5、C6 的统一页面评估 | 已完成 516 页 test；输出 `summary.json` 与 `report.md` |
 | `src/GOT-OCR-2.0/scripts/run_linelevel_smoke.sh` | 既有单行/单列工程诊断 | 否 |
 | AncientDoc 旧 split 训练与兼容评估 | 历史页面兼容基线 | 否；存在书籍级重叠 |
-| 统一整页划分下的 validation 与 `A0`–`A6` 消融 | 正式实验 | P1/P2 入口与 baseline/VLQA 测试脚本已实现；正式 split、A100 结果和消融待完成 |
+| 统一整页划分下的 `A0`–`A6` 消融 | 正式结构归因实验 | loss 消融已有入口；等参数量 adaptor、无布局监督 queries 和 oracle/pseudo-layout 对照待实现 |
 
 AnandaSky 是 line-level 高分辨率转写基线。双 GOT2 的“先分割、再识别”是独立两阶段系统对照。两者只有在页面输入、数据划分、训练预算和页面级指标一致时才可与本仓库路线比较。
 
 ## 文档
 
 - [PROJECT_STATUS.md](docs/PROJECT_STATUS.md)：已实现、待验证和下一步。
+- [ANCIENTDOC_BASELINE_REPORT_20260814.md](docs/ANCIENTDOC_BASELINE_REPORT_20260814.md)：C4/C5/C6 指标、解释和协议限制。
 - [EXPERIMENT_PROTOCOL.md](docs/EXPERIMENT_PROTOCOL.md)：正式输入、少样本划分、消融和指标。
 - [GOT2_LAYOUT_ENCODING_PLAN.md](docs/GOT2_LAYOUT_ENCODING_PLAN.md)：VLQA 架构、目标函数和接入位置。
 - [SYNTHETIC_LAYOUT_TRAINING_PLAN.md](docs/SYNTHETIC_LAYOUT_TRAINING_PLAN.md)：整页合成与分阶段训练方案。

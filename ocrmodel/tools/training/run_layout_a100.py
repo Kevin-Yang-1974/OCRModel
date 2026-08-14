@@ -69,6 +69,11 @@ class Settings:
     test_manifest: Path | None
     validation_image_root: Path | None
     test_image_root: Path | None
+    replay_manifest: Path | None
+    replay_image_root: Path | None
+    replay_split: str
+    replay_max_records: int
+    primary_per_replay: int
     source_model: Path
     tokenizer_model: Path
     runs_root: Path
@@ -233,6 +238,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
             "pilot",
             "pretrain",
             "joint-train",
+            "adapt",
         ),
         default="smoke",
     )
@@ -254,6 +260,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--validation-image-root", type=Path)
     parser.add_argument("--test-image-root", type=Path)
+    parser.add_argument("--replay-manifest", type=Path)
+    parser.add_argument("--replay-image-root", type=Path)
+    parser.add_argument("--replay-split", default="train")
+    parser.add_argument("--replay-max-records", type=nonnegative_int, default=0)
+    parser.add_argument("--primary-per-replay", type=positive_int, default=3)
     parser.add_argument("--validation-split", default="validation")
     parser.add_argument("--test-split", default="test")
     parser.add_argument(
@@ -306,6 +317,11 @@ def resolve_settings(args: argparse.Namespace) -> Settings:
     if args.validation_model_kind == "baseline" and args.validation_required_stage:
         raise RunFailure(
             "--validation-required-stage is only valid for VLQA validation.",
+            exit_code=EXIT_USAGE,
+        )
+    if args.replay_image_root is not None and args.replay_manifest is None:
+        raise RunFailure(
+            "--replay-image-root requires --replay-manifest.",
             exit_code=EXIT_USAGE,
         )
     if args.mode == "validate":
@@ -410,7 +426,7 @@ def resolve_settings(args: argparse.Namespace) -> Settings:
         p1_records = 0 if args.p1_max_records is None else args.p1_max_records
         p2_steps = p2_records = 0
         stages = ("p1",)
-    else:
+    elif args.mode == "joint-train":
         if args.allow_unvalidated_pilot:
             raise RunFailure(
                 "--allow-unvalidated-pilot is only valid with --mode pilot.",
@@ -438,6 +454,39 @@ def resolve_settings(args: argparse.Namespace) -> Settings:
         ):
             raise RunFailure(
                 "Formal joint-train validation must use a P2 VLQA checkpoint.",
+                exit_code=EXIT_USAGE,
+            )
+        p1_steps = p1_records = 0
+        p2_steps = args.p2_max_steps
+        p2_records = 0 if args.p2_max_records is None else args.p2_max_records
+        stages = ("p2",)
+    else:
+        if args.allow_unvalidated_pilot:
+            raise RunFailure(
+                "--allow-unvalidated-pilot is only valid with --mode pilot.",
+                exit_code=EXIT_USAGE,
+            )
+        if args.p2_max_steps is None:
+            raise RunFailure(
+                "Formal adaptation requires explicit --p2-max-steps.",
+                exit_code=EXIT_USAGE,
+            )
+        if args.p1_max_steps is not None or args.p1_max_records is not None:
+            raise RunFailure(
+                "Formal adaptation is P2-only; remove P1 overrides.",
+                exit_code=EXIT_USAGE,
+            )
+        if args.validation_manifest is None or args.test_manifest is None:
+            raise RunFailure(
+                "Formal adaptation requires --validation-manifest and --test-manifest.",
+                exit_code=EXIT_USAGE,
+            )
+        if args.validation_model_kind != "vlqa" or args.validation_required_stage not in (
+            None,
+            "p2",
+        ):
+            raise RunFailure(
+                "Formal adaptation validation must use a P2 VLQA checkpoint.",
                 exit_code=EXIT_USAGE,
             )
         p1_steps = p1_records = 0
@@ -489,6 +538,16 @@ def resolve_settings(args: argparse.Namespace) -> Settings:
         if args.test_image_root is not None
         else None
     )
+    replay_manifest = (
+        args.replay_manifest.expanduser().resolve()
+        if args.replay_manifest is not None
+        else None
+    )
+    replay_image_root = (
+        args.replay_image_root.expanduser().resolve()
+        if args.replay_image_root is not None
+        else None
+    )
     audit_manifests: list[Path] = [train_manifest]
     for path in (validation_manifest, test_manifest):
         if path is not None and path not in audit_manifests:
@@ -497,6 +556,8 @@ def resolve_settings(args: argparse.Namespace) -> Settings:
         resolved = path.expanduser().resolve()
         if resolved not in audit_manifests:
             audit_manifests.append(resolved)
+    if replay_manifest is not None and replay_manifest not in audit_manifests:
+        audit_manifests.append(replay_manifest)
 
     return Settings(
         workspace=args.workspace.expanduser().resolve(),
@@ -509,6 +570,11 @@ def resolve_settings(args: argparse.Namespace) -> Settings:
         test_manifest=test_manifest,
         validation_image_root=validation_image_root,
         test_image_root=test_image_root,
+        replay_manifest=replay_manifest,
+        replay_image_root=replay_image_root,
+        replay_split=args.replay_split.strip(),
+        replay_max_records=args.replay_max_records,
+        primary_per_replay=args.primary_per_replay,
         source_model=args.source_model.expanduser().resolve(),
         tokenizer_model=args.tokenizer_model.expanduser().resolve(),
         runs_root=args.runs_root.expanduser().resolve(),
@@ -622,6 +688,7 @@ def validate_paths(settings: Settings) -> None:
     for manifest, image_root, label in (
         (settings.validation_manifest, settings.validation_image_root, "validation"),
         (settings.test_manifest, settings.test_image_root, "test"),
+        (settings.replay_manifest, settings.replay_image_root, "replay"),
     ):
         if manifest is None:
             continue
@@ -648,17 +715,22 @@ def validate_paths(settings: Settings) -> None:
             f"Mode {settings.mode!r} must start P1 from original GOT2 without VLQA.",
             exit_code=EXIT_USAGE,
         )
-    if settings.mode == "joint-train":
+    if not settings.replay_split:
+        raise RunFailure("--replay-split must be non-empty.", exit_code=EXIT_USAGE)
+    if settings.primary_per_replay < 1:
+        raise RunFailure("--primary-per-replay must be positive.", exit_code=EXIT_USAGE)
+    if settings.mode in {"joint-train", "adapt"}:
         metrics_path = settings.source_model / "layout_training_metrics.json"
         if not source_has_vlqa or not metrics_path.is_file():
             raise RunFailure(
-                "Formal joint-train must start from a completed P1 VLQA checkpoint.",
+                "Formal adaptation must start from a completed VLQA checkpoint.",
                 exit_code=EXIT_USAGE,
             )
         source_metrics = read_json(metrics_path)
-        if source_metrics.get("layout_stage") != "p1":
+        required_stage = "p1" if settings.mode == "joint-train" else "p2"
+        if source_metrics.get("layout_stage") != required_stage:
             raise RunFailure(
-                "Formal joint-train source checkpoint must report layout_stage='p1'.",
+                f"Source checkpoint must report layout_stage={required_stage!r}.",
                 exit_code=EXIT_USAGE,
             )
     if settings.mode != "validate":
@@ -885,7 +957,7 @@ def run_audit(context: RunContext) -> dict[str, Any]:
             f"records; mode={context.settings.mode!r} requires {required_records}.",
             log_path=log_path,
         )
-    if context.settings.mode in {"pretrain", "joint-train"}:
+    if context.settings.mode in {"pretrain", "joint-train", "adapt"}:
         split_counts = summary.get("split_counts", {})
         for split, label in (
             (context.settings.validation_split, "validation"),
@@ -1076,7 +1148,7 @@ def build_training_command(
     )
     ocr_loss_weight = "0" if stage == "p1" else f"{settings.p2_ocr_loss_weight:g}"
     deepspeed = Path(sys.executable).with_name("deepspeed")
-    return [
+    command = [
         str(deepspeed),
         "--master_port",
         str(master_port),
@@ -1160,6 +1232,22 @@ def build_training_command(
         "--output_dir",
         str(output_dir),
     ]
+    if settings.replay_manifest is not None:
+        command.extend(
+            [
+                "--replay_layout_manifest",
+                str(settings.replay_manifest),
+                "--replay_layout_image_root",
+                str(settings.replay_image_root or settings.replay_manifest.parent),
+                "--replay_layout_split",
+                settings.replay_split,
+                "--replay_max_train_records",
+                str(settings.replay_max_records),
+                "--primary_per_replay",
+                str(settings.primary_per_replay),
+            ]
+        )
+    return command
 
 
 def validate_stage_metrics(
@@ -1895,7 +1983,7 @@ def execute(settings: Settings) -> int:
                     )
 
             validation = None
-            if settings.mode in {"pretrain", "joint-train"}:
+            if settings.mode in {"pretrain", "joint-train", "adapt"}:
                 validation_model = Path(
                     p2["model"] if p2 is not None else p1["model"]  # type: ignore[index]
                 )
@@ -1911,7 +1999,7 @@ def execute(settings: Settings) -> int:
                     split=settings.validation_split,
                     model_kind="vlqa",
                     required_vlqa_stage=(
-                        "p2" if settings.mode == "joint-train" else "p1"
+                    "p2" if settings.mode in {"joint-train", "adapt"} else "p1"
                     ),
                 )
                 context.summary["validation"] = validation

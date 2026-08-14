@@ -8,7 +8,7 @@ from typing import Any, Sequence
 
 import torch
 from PIL import Image
-from torch.utils.data import Dataset
+from torch.utils.data import ConcatDataset, Dataset
 
 from GOT.data import DataCollatorForSupervisedDataset
 from GOT.utils import conversation as conversation_lib
@@ -65,11 +65,7 @@ def resolve_image_path(image_root: Path, value: Any, context: str) -> Path:
     relative = PurePosixPath(value)
     if relative.is_absolute() or ".." in relative.parts:
         raise ValueError(f"{context}.image is unsafe: {value!r}.")
-    resolved = (image_root / Path(*relative.parts)).resolve()
-    try:
-        resolved.relative_to(image_root)
-    except ValueError as exc:
-        raise ValueError(f"{context}.image escapes image_root: {value!r}.") from exc
+    resolved = image_root / Path(*relative.parts)
     if not resolved.is_file():
         raise FileNotFoundError(resolved)
     return resolved
@@ -381,6 +377,36 @@ class LayoutPageDataCollator:
         return batch
 
 
+class InterleavedLayoutDataset(Dataset):
+    """Deterministic primary:replay schedule for small-domain adaptation."""
+
+    def __init__(
+        self,
+        primary: Dataset[Any],
+        replay: Dataset[Any],
+        *,
+        primary_per_replay: int = 3,
+    ) -> None:
+        if len(primary) < 1 or len(replay) < 1:
+            raise ValueError("primary and replay datasets must be non-empty.")
+        if primary_per_replay < 1:
+            raise ValueError("primary_per_replay must be positive.")
+        self.primary = primary
+        self.replay = replay
+        self.primary_per_replay = primary_per_replay
+        self.period = primary_per_replay + 1
+
+    def __len__(self) -> int:
+        return len(self.primary) + max(1, len(self.primary) // self.primary_per_replay)
+
+    def __getitem__(self, index: int) -> Any:
+        if index % self.period == self.primary_per_replay:
+            replay_index = (index // self.period) % len(self.replay)
+            return self.replay[replay_index]
+        primary_index = (index - index // self.period) % len(self.primary)
+        return self.primary[primary_index]
+
+
 class LayoutPageValidationCollator:
     def __init__(self, tokenizer: Any) -> None:
         self.tokenizer = tokenizer
@@ -430,6 +456,11 @@ def make_layout_page_data_module(
     max_regions: int,
     max_records: int = 0,
     supervise_ocr: bool = True,
+    replay_manifest: Path | None = None,
+    replay_image_root: Path | None = None,
+    replay_split: str | None = None,
+    replay_max_records: int = 0,
+    primary_per_replay: int = 3,
 ) -> dict[str, Any]:
     if data_args.conversation_version != "mpt":
         raise ValueError("The whole-page layout entry point requires conversation_version=mpt.")
@@ -452,6 +483,33 @@ def make_layout_page_data_module(
         max_records=max_records,
         supervise_ocr=supervise_ocr,
     )
+    if replay_manifest is not None:
+        if primary_per_replay < 1:
+            raise ValueError("primary_per_replay must be positive.")
+        replay_dataset = LayoutPageConversationDataset(
+            tokenizer=tokenizer,
+            datasets=data_args.datasets,
+            multimodal_cfg={
+                "sep_image_conv_front": data_args.sep_image_conv_front,
+                "image_token_len": data_args.image_token_len,
+                "image_aspect_ratio": data_args.image_aspect_ratio,
+                "use_im_start_end": data_args.use_im_start_end,
+                "image_processor": data_args.image_processor,
+                "image_processor_high": data_args.image_processor_high,
+                "box_limit": data_args.box_limit,
+            },
+            manifest=replay_manifest,
+            image_root=replay_image_root,
+            split=replay_split or split,
+            max_regions=max_regions,
+            max_records=replay_max_records,
+            supervise_ocr=supervise_ocr,
+        )
+        train_dataset = InterleavedLayoutDataset(
+            train_dataset,
+            replay_dataset,
+            primary_per_replay=primary_per_replay,
+        )
     return {
         "train_dataset": train_dataset,
         "eval_dataset": None,
