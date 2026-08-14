@@ -187,7 +187,7 @@ class LayoutTrainingArguments:
     )
     max_regions: int = field(default=16)
     max_train_records: int = field(default=0)
-    min_layout_regions: int = field(default=1)
+    min_layout_regions: int = field(default=0)
     vlqa_adapter_dim: int = field(default=256)
     vlqa_num_heads: int = field(default=8)
     vlqa_ffn_expansion: int = field(default=4)
@@ -198,6 +198,11 @@ class LayoutTrainingArguments:
     direction_loss_weight: float = field(default=1.0)
     layout_loss_weight: float = field(default=1.0)
     ocr_loss_weight: float = field(default=0.0)
+    replay_layout_manifest: Optional[str] = field(default=None)
+    replay_layout_image_root: Optional[str] = field(default=None)
+    replay_layout_split: str = field(default="train")
+    replay_max_train_records: int = field(default=0)
+    primary_per_replay: int = field(default=3)
 
 
 def validate_layout_args(args: LayoutTrainingArguments) -> None:
@@ -209,8 +214,8 @@ def validate_layout_args(args: LayoutTrainingArguments) -> None:
         raise ValueError("--max_regions must be positive.")
     if args.max_train_records < 0:
         raise ValueError("--max_train_records cannot be negative.")
-    if args.min_layout_regions < 1:
-        raise ValueError("--min_layout_regions must be positive.")
+    if args.min_layout_regions < 0:
+        raise ValueError("--min_layout_regions cannot be negative.")
     if args.vlqa_adapter_dim < 1:
         raise ValueError("--vlqa_adapter_dim must be positive.")
     if args.vlqa_num_heads < 1 or args.vlqa_adapter_dim % args.vlqa_num_heads != 0:
@@ -233,6 +238,12 @@ def validate_layout_args(args: LayoutTrainingArguments) -> None:
         raise ValueError("P1 is layout-only; set --ocr_loss_weight 0.")
     if args.layout_stage == "p2" and args.ocr_loss_weight <= 0.0:
         raise ValueError("P2 requires a positive --ocr_loss_weight.")
+    if args.replay_max_train_records < 0:
+        raise ValueError("--replay_max_train_records cannot be negative.")
+    if args.primary_per_replay < 1:
+        raise ValueError("--primary_per_replay must be positive.")
+    if args.replay_layout_image_root and not args.replay_layout_manifest:
+        raise ValueError("--replay_layout_image_root requires --replay_layout_manifest.")
 
 
 def build_layout_config(
@@ -452,18 +463,33 @@ def main() -> None:
         max_regions=layout_args.max_regions,
         max_records=layout_args.max_train_records,
         supervise_ocr=layout_args.layout_stage == "p2",
+        replay_manifest=(
+            Path(layout_args.replay_layout_manifest).resolve()
+            if layout_args.replay_layout_manifest
+            else None
+        ),
+        replay_image_root=(
+            Path(layout_args.replay_layout_image_root).resolve()
+            if layout_args.replay_layout_image_root
+            else None
+        ),
+        replay_split=layout_args.replay_layout_split,
+        replay_max_records=layout_args.replay_max_train_records,
+        primary_per_replay=layout_args.primary_per_replay,
     )
 
     first_sample = data_module["train_dataset"][0]
     layout_regions = int(first_sample["layout_bbox_mask"].sum().item())
     object_slots = int(first_sample["layout_object_mask"].sum().item())
     supervised_tokens = int((first_sample["labels"] != IGNORE_INDEX).sum().item())
+    if layout_args.layout_stage == "p1" and layout_regions < 1:
+        raise RuntimeError("P1 requires at least one supervised layout region.")
     if layout_regions < layout_args.min_layout_regions:
         raise RuntimeError(
             f"First sample has {layout_regions} supervised layout regions; "
             f"minimum is {layout_args.min_layout_regions}."
         )
-    if object_slots != layout_args.max_regions:
+    if layout_args.layout_stage == "p1" and object_slots != layout_args.max_regions:
         raise RuntimeError(
             "Synthetic pages require complete object supervision for every query slot: "
             f"expected={layout_args.max_regions}, actual={object_slots}."

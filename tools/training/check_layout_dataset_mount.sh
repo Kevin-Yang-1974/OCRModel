@@ -85,7 +85,7 @@ for split in ("train", "validation", "test"):
         raise SystemExit(f"empty manifest: {manifest}")
     if not isinstance(first_image, str) or not first_image:
         raise SystemExit(f"manifest has no relative image path: {manifest}")
-    if not (root / split / first_image).is_file():
+    if not (root / split / first_image).exists():
         raise SystemExit(f"first manifest image is missing: {root / split / first_image}")
     summary["splits"][split] = {"manifest_records": count, "image_root": str(root / split)}
 

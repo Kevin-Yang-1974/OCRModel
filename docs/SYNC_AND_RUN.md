@@ -429,7 +429,59 @@ GOT_RUN_ID="linelevel_smoke_$(date +%Y%m%d_%H%M%S)" \
 
 单步 line-level smoke 只验证加载、反向传播、保存和重载，不验证布局 queries，也不能与页面 CER 直接比较。
 
-## 13. AncientDoc 历史兼容入口
+## 13. AncientDoc 当前适配与验证入口
+
+当前入口使用原始整页图像和 OCR prompt。AncientDoc 只提供图像与页面文本真值，因此 C4 关闭布局损失；C5/C6 分别混合 synthetic OCR replay 和 synthetic layout replay。原始数据只读，转换数据写入 `$GOT_LAYOUT_DATA/ancientdoc_layout_260707`。
+
+从 P2 8000 开始训练 C4、C5、C6：
+
+```bash
+cd /data3/yky/yangky_ocr_models/ocrmodel
+source config/paths.env
+
+bash tools/training/run_ancientdoc_baseline_suite.sh \
+  --ancientdoc-root /data4/hyf/backup/GOT-OCR2.0/reference-260707/AncientDoc \
+  --p2-model "$GOT_TRAINING_RUNS/layout_joint-train_8000_20260813/p2/model"
+```
+
+若 C4 已完成，只继续 C5/C6：
+
+```bash
+cd /data3/yky/yangky_ocr_models/ocrmodel
+source config/paths.env
+
+bash tools/training/run_ancientdoc_baseline_suite.sh \
+  --ancientdoc-root /data4/hyf/backup/GOT-OCR2.0/reference-260707/AncientDoc \
+  --p2-model "$GOT_TRAINING_RUNS/layout_joint-train_8000_20260813/p2/model" \
+  --c4-model "$GOT_TRAINING_RUNS/<completed_c4_run>/p2/model" \
+  --start-from c5 \
+  --run-prefix ancientdoc_baseline_resume_$(date +%Y%m%d_%H%M%S)
+```
+
+统一验证原始 GOT2、C4、C5、C6：
+
+```bash
+cd /data3/yky/yangky_ocr_models/ocrmodel
+source config/paths.env
+
+bash tools/evaluation/run_ancientdoc_validation_suite.sh \
+  --baseline-model "$GOT_SOURCE_MODEL" \
+  --c4-model "$GOT_TRAINING_RUNS/<c4_run>/p2/model" \
+  --c5-model "$GOT_TRAINING_RUNS/<c5_run>/p2/model" \
+  --c6-model "$GOT_TRAINING_RUNS/<c6_run>/p2/model" \
+  --run-prefix ancientdoc_validation_$(date +%Y%m%d_%H%M%S)
+```
+
+完成后读取紧凑指标和报告位置：
+
+```bash
+jq -c '{status,suite_root,report,deltas}' \
+  "$GOT_EVALUATION_RUNS/<validation_run>/summary.json"
+```
+
+同一目录中的 `report.md` 是可读报告，`summary.json` 是机器可读汇总。2026-08-14 首轮结果中 C6 页面 CER 为 `0.934099`，当前排名第一；但完全正确页面仅 `1/516`，且原始 split 尚未完成来源隔离审计。详见 `docs/ANCIENTDOC_BASELINE_REPORT_20260814.md`。
+
+## 14. AncientDoc 历史兼容入口
 
 AncientDoc 旧 split 存在书籍级重叠。这些命令只用于复现历史页面兼容链路，不属于小样本或 VLQA 正式实验。
 
@@ -454,7 +506,7 @@ GOT_EVAL_MODEL="$GOT_SOURCE_MODEL" \
 
 该入口复用 `references/legacy-ancientdoc-eval/GOT/eval/myeval.py` 的历史解码参数，并将预测、日志和指标写入 `$GOT_EVALUATION_RUNS`。输出字段 `metrics_page_macro_legacy_editops` 只代表该兼容口径。
 
-## 14. 回传与协作
+## 15. 回传与协作
 
 不要复制完整 `train.log`、`trainer_state.json` 或 `predictions.json`。布局 run 正常结束时优先回传终端最后一条完成 JSON。需要补充核对时只选择紧凑字段：
 
