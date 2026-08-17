@@ -12,12 +12,13 @@ manifest/images under $GOT_LAYOUT_DATA. It does not train or evaluate a model.
 
 Options:
   --ancientdoc-root <path>       Default: /data4/hyf/backup/GOT-OCR2.0/reference-260707/AncientDoc
-  --output-id <id>               Default: ancientdoc_layout_260707_group_isolated_seed20260814
+  --output-id <id>               Default: ancientdoc_layout_260707_group_isolated_seed20260815
   --output-root <path>           Overrides $GOT_LAYOUT_DATA/<output-id>
-  --seed <n>                     Default: 20260814
+  --seed <n>                     Default: 20260815
   --train-ratio <float>          Default: 0.6
   --validation-ratio <float>     Default: 0.2
   --test-ratio <float>           Default: 0.2
+  --max-ratio-deviation <float>  Default: 0.03
   --copy-images                  Copy images instead of symlinking them
   --overwrite                    Remove and recreate output root
 USAGE
@@ -32,12 +33,13 @@ if [[ -f "${paths_env}" ]]; then
 fi
 
 ancientdoc_root="/data4/hyf/backup/GOT-OCR2.0/reference-260707/AncientDoc"
-output_id="ancientdoc_layout_260707_group_isolated_seed20260814"
+output_id="ancientdoc_layout_260707_group_isolated_seed20260815"
 output_root=""
-seed="20260814"
+seed="20260815"
 train_ratio="0.6"
 validation_ratio="0.2"
 test_ratio="0.2"
+max_ratio_deviation="0.03"
 copy_images=0
 overwrite=0
 
@@ -50,6 +52,7 @@ while [[ $# -gt 0 ]]; do
         --train-ratio) train_ratio="${2:-}"; shift 2 ;;
         --validation-ratio) validation_ratio="${2:-}"; shift 2 ;;
         --test-ratio) test_ratio="${2:-}"; shift 2 ;;
+        --max-ratio-deviation) max_ratio_deviation="${2:-}"; shift 2 ;;
         --copy-images) copy_images=1; shift ;;
         --overwrite) overwrite=1; shift ;;
         --help|-h) usage; exit 0 ;;
@@ -73,6 +76,7 @@ args=(
     --train-ratio "${train_ratio}"
     --validation-ratio "${validation_ratio}"
     --test-ratio "${test_ratio}"
+    --max-ratio-deviation "${max_ratio_deviation}"
 )
 if [[ "${copy_images}" -eq 0 ]]; then
     args+=(--symlink-images)
@@ -82,3 +86,12 @@ if [[ "${overwrite}" -eq 1 ]]; then
 fi
 
 python3 "${args[@]}"
+
+python3 "${ocrmodel_root}/tools/preprocessing/audit_ancientdoc_split_leakage.py" \
+    --dataset-root "${output_root}" \
+    --output-dir "${output_root}/audit/ancientdoc_split_leakage"
+
+python3 "${ocrmodel_root}/tools/preprocessing/verify_ancientdoc_group_audit.py" \
+    "${output_root}/audit/ancientdoc_split_leakage/split_leakage_audit.json" \
+    --split-audit "${output_root}/split_audit.json" \
+    --max-ratio-deviation "${max_ratio_deviation}"

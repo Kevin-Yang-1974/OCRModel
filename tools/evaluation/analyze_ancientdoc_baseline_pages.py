@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Offline paired OCR analysis for completed AncientDoc baseline validations.
+"""Offline paired OCR analysis for completed AncientDoc evaluations.
 
-The script is CPU-only and does not load GOT2. It reads an existing validation
-suite produced by ``run_ancientdoc_validation_suite.sh`` and compares two saved
-prediction JSONL files page by page, defaulting to C4 versus C6.
+The script is CPU-only and does not load GOT2. It reads existing evaluation
+outputs and compares two saved prediction JSONL files page by page, defaulting
+to C4 versus C6. Both page-level and source-group-level paired bootstrap
+intervals are reported; source groups are the primary sampling units.
 """
 
 from __future__ import annotations
@@ -507,8 +508,66 @@ def bootstrap_delta_cer(
         ],
         "share_delta_below_zero": sum(delta < 0 for delta in deltas) / len(deltas),
         "note": (
-            "Page-level bootstrap is a diagnostic interval for this split only; "
-            "use group-level bootstrap after source-isolated splits are rebuilt."
+            "Page-level bootstrap treats pages as independent and is diagnostic only; "
+            "use the source-group cluster bootstrap for cross-source uncertainty."
+        ),
+    }
+
+
+def cluster_bootstrap_delta_cer(
+    rows: list[dict[str, Any]],
+    *,
+    samples: int,
+    seed: int,
+    group_key: str = "source_group_id",
+) -> dict[str, Any] | None:
+    if samples <= 0 or not rows:
+        return None
+    grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for row in rows:
+        grouped[str(row.get(group_key, "unknown"))].append(row)
+    group_names = sorted(grouped)
+    if not group_names:
+        return None
+
+    rng = random.Random(seed)
+    deltas: list[float] = []
+    for _ in range(samples):
+        delta_edits = 0
+        ref_chars = 0
+        for _ in range(len(group_names)):
+            sampled_rows = grouped[group_names[rng.randrange(len(group_names))]]
+            delta_edits += sum(
+                int(row["delta_edit_distance_right_minus_left"])
+                for row in sampled_rows
+            )
+            ref_chars += sum(int(row["reference_characters"]) for row in sampled_rows)
+        if ref_chars:
+            deltas.append(delta_edits / ref_chars)
+    if not deltas:
+        return None
+    deltas.sort()
+
+    def quantile(probability: float) -> float:
+        index = min(len(deltas) - 1, max(0, round(probability * (len(deltas) - 1))))
+        return deltas[index]
+
+    return {
+        "method": "source_group_id_paired_cluster_bootstrap",
+        "sampling_unit": group_key,
+        "groups": len(group_names),
+        "pages": len(rows),
+        "samples": samples,
+        "seed": seed,
+        "delta_page_cer_right_minus_left_mean": sum(deltas) / len(deltas),
+        "delta_page_cer_right_minus_left_ci95": [
+            quantile(0.025),
+            quantile(0.975),
+        ],
+        "share_delta_below_zero": sum(delta < 0 for delta in deltas) / len(deltas),
+        "note": (
+            "Paired cluster bootstrap resamples source groups with replacement and "
+            "keeps all pages from each sampled group together."
         ),
     }
 
@@ -611,7 +670,8 @@ def write_worst_pages(path: Path, report: dict[str, Any], top_k: int) -> None:
 
 def write_analysis_summary(path: Path, report: dict[str, Any]) -> None:
     overview = report["overview"]
-    bootstrap = report.get("bootstrap_delta_cer")
+    page_bootstrap = report.get("bootstrap_delta_cer")
+    cluster_bootstrap = report.get("cluster_bootstrap_delta_cer")
     group_fields = (
         "group_by",
         "group",
@@ -631,8 +691,28 @@ def write_analysis_summary(path: Path, report: dict[str, Any]) -> None:
         "```",
         "",
     ]
-    if bootstrap is not None:
-        lines.extend(["## Bootstrap", "", "```json", compact_json(bootstrap), "```", ""])
+    if cluster_bootstrap is not None:
+        lines.extend(
+            [
+                "## Source-group cluster bootstrap",
+                "",
+                "```json",
+                compact_json(cluster_bootstrap),
+                "```",
+                "",
+            ]
+        )
+    if page_bootstrap is not None:
+        lines.extend(
+            [
+                "## Page bootstrap (diagnostic)",
+                "",
+                "```json",
+                compact_json(page_bootstrap),
+                "```",
+                "",
+            ]
+        )
     lines.extend(
         [
             "## Error categories",
@@ -648,8 +728,8 @@ def write_analysis_summary(path: Path, report: dict[str, Any]) -> None:
             "## Notes",
             "",
             "- This is an offline analysis of existing predictions; no model inference or training is run.",
-            "- Current AncientDoc splits are still page-level reference splits, not source-isolated research splits.",
-            "- The bootstrap interval is page-level only and should not be used as final cross-source evidence.",
+            "- The source_group_id cluster bootstrap is the primary uncertainty interval because pages from the same source group are correlated.",
+            "- The page bootstrap is retained only as a within-split diagnostic and must not replace the cluster interval.",
         ]
     )
     path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
@@ -696,7 +776,7 @@ def analyze(args: argparse.Namespace) -> dict[str, Any]:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     report = {
-        "schema_version": 1,
+        "schema_version": 2,
         "status": "ok",
         "suite_root": str(suite_root),
         "left_label": args.left_label,
@@ -708,6 +788,11 @@ def analyze(args: argparse.Namespace) -> dict[str, Any]:
         "manifest": str(manifest_path),
         "overview": summarize_rows(rows, args.left_label, args.right_label),
         "bootstrap_delta_cer": bootstrap_delta_cer(
+            rows,
+            samples=args.bootstrap_samples,
+            seed=args.bootstrap_seed,
+        ),
+        "cluster_bootstrap_delta_cer": cluster_bootstrap_delta_cer(
             rows,
             samples=args.bootstrap_samples,
             seed=args.bootstrap_seed,

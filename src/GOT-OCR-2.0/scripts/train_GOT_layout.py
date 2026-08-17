@@ -12,12 +12,21 @@ import transformers
 from safetensors import safe_open
 
 from GOT.model import GOTConfig, GOTQwenForCausalLM
+from GOT.model.layout_query import VisualLayoutQueryAdapter
 from GOT.train.trainer_vit_fixlr import GOTTrainer
 from GOT.utils.arguments import DataArguments, ModelArguments, TrainingArguments
 from GOT.utils.constants import IGNORE_INDEX
 from GOT.utils.utils import smart_tokenizer_and_embedding_resize
 
-from layout_page_dataset import make_layout_page_data_module
+from layout_page_dataset import make_layout_page_data_module, summarize_training_budget
+from layout_ablation_contract import (
+    ABLATIONS,
+    ABLATION_IDS,
+    LOSS_PRESETS,
+    assert_source_protocol,
+    assert_parameter_report,
+    loss_weights_for,
+)
 
 
 OUTPUT_DIAGNOSTIC_FIELDS = {
@@ -40,6 +49,7 @@ OUTPUT_DIAGNOSTIC_FIELDS = {
 }
 
 LAYOUT_ADAPTER_STATE_PREFIX = "model.layout_adapter."
+GENERIC_ADAPTER_STATE_PREFIX = "model.generic_adapter."
 
 
 def summarize_diagnostic_history(
@@ -176,6 +186,12 @@ class LayoutTrainingArguments:
     layout_manifest: str = field(
         metadata={"help": "Rendered and audited whole-page manifest JSONL."}
     )
+    tokenizer_name_or_path: str = field(
+        default="",
+        metadata={
+            "help": "Fixed GOT tokenizer path; defaults to model_name_or_path."
+        },
+    )
     layout_image_root: Optional[str] = field(
         default=None,
         metadata={"help": "Dataset root; defaults to the manifest directory."},
@@ -185,6 +201,23 @@ class LayoutTrainingArguments:
         default="p1",
         metadata={"help": "p1 (layout-only warm-up) or p2 (joint page OCR/layout)."},
     )
+    ablation_id: str = field(
+        default="",
+        metadata={"help": "Optional strict A0-A5 ablation preset; empty preserves legacy behavior."},
+    )
+    layout_loss_preset: str = field(
+        default="",
+        metadata={"help": "Strict layout loss preset used with --ablation_id."},
+    )
+    p2_train_scope: str = field(
+        default="adapter_projector",
+        metadata={
+            "help": (
+                "P2 trainable modules: adapter_projector or "
+                "decoder_adapter_projector. P1 always uses its fixed layout warm-up scope."
+            )
+        },
+    )
     max_regions: int = field(default=16)
     max_train_records: int = field(default=0)
     min_layout_regions: int = field(default=0)
@@ -192,6 +225,10 @@ class LayoutTrainingArguments:
     vlqa_num_heads: int = field(default=8)
     vlqa_ffn_expansion: int = field(default=4)
     vlqa_dropout: float = field(default=0.0)
+    generic_adapter_dim: int = field(default=256)
+    generic_adapter_num_heads: int = field(default=8)
+    generic_adapter_ffn_expansion: int = field(default=8)
+    generic_adapter_dropout: float = field(default=0.0)
     object_loss_weight: float = field(default=1.0)
     bbox_l1_loss_weight: float = field(default=5.0)
     bbox_giou_loss_weight: float = field(default=2.0)
@@ -208,6 +245,38 @@ class LayoutTrainingArguments:
 def validate_layout_args(args: LayoutTrainingArguments) -> None:
     if args.layout_stage not in {"p1", "p2"}:
         raise ValueError("--layout_stage must be p1 or p2.")
+    if args.p2_train_scope not in {
+        "adapter_projector",
+        "decoder_adapter_projector",
+    }:
+        raise ValueError(
+            "--p2_train_scope must be adapter_projector or "
+            "decoder_adapter_projector."
+        )
+    if args.ablation_id:
+        if args.ablation_id not in ABLATION_IDS:
+            raise ValueError(f"--ablation_id must be one of {ABLATION_IDS}.")
+        if not args.layout_loss_preset:
+            raise ValueError("Strict ablations require --layout_loss_preset.")
+        resolved = loss_weights_for(
+            args.ablation_id, args.layout_stage, args.layout_loss_preset,
+            args.ocr_loss_weight,
+        )
+        observed = {
+            "object": args.object_loss_weight,
+            "bbox_l1": args.bbox_l1_loss_weight,
+            "bbox_giou": args.bbox_giou_loss_weight,
+            "direction_order": args.direction_loss_weight,
+            "layout": args.layout_loss_weight,
+            "ocr": args.ocr_loss_weight,
+        }
+        if observed != resolved:
+            raise ValueError(
+                "Ablation loss weights disagree with its declared preset: "
+                f"observed={observed}, expected={resolved}."
+            )
+    elif args.layout_loss_preset:
+        raise ValueError("--layout_loss_preset requires --ablation_id.")
     if not args.layout_split:
         raise ValueError("--layout_split must be non-empty.")
     if args.max_regions < 1:
@@ -224,6 +293,13 @@ def validate_layout_args(args: LayoutTrainingArguments) -> None:
         raise ValueError("--vlqa_ffn_expansion must be positive.")
     if not 0.0 <= args.vlqa_dropout < 1.0:
         raise ValueError("--vlqa_dropout must be in [0, 1).")
+    if args.generic_adapter_dim < 1:
+        raise ValueError("--generic_adapter_dim must be positive.")
+    if (args.generic_adapter_num_heads < 1 or
+            args.generic_adapter_dim % args.generic_adapter_num_heads != 0):
+        raise ValueError("--generic_adapter_dim must be divisible by --generic_adapter_num_heads.")
+    if args.generic_adapter_ffn_expansion < 1:
+        raise ValueError("--generic_adapter_ffn_expansion must be positive.")
     weights = (
         args.object_loss_weight,
         args.bbox_l1_loss_weight,
@@ -251,7 +327,16 @@ def build_layout_config(
     args: LayoutTrainingArguments,
 ) -> GOTConfig:
     config = GOTConfig.from_pretrained(source_model, local_files_only=True)
-    config.use_vlqa = True
+    if args.ablation_id:
+        config.ablation_id = args.ablation_id
+        config.layout_loss_preset = args.layout_loss_preset
+    spec = ABLATIONS.get(args.ablation_id) if args.ablation_id else None
+    config.use_vlqa = spec.use_vlqa if spec is not None else True
+    config.use_generic_adapter = spec.use_generic_adapter if spec is not None else False
+    config.generic_adapter_dim = args.generic_adapter_dim
+    config.generic_adapter_num_heads = args.generic_adapter_num_heads
+    config.generic_adapter_ffn_expansion = args.generic_adapter_ffn_expansion
+    config.generic_adapter_dropout = args.generic_adapter_dropout
     config.vlqa_num_queries = args.max_regions
     config.vlqa_adapter_dim = args.vlqa_adapter_dim
     config.vlqa_num_heads = args.vlqa_num_heads
@@ -327,17 +412,61 @@ def initialize_layout_adapter_from_source(
     }
 
 
+def initialize_generic_adapter_from_source(
+    model: GOTQwenForCausalLM,
+    source_weights: Path,
+) -> dict[str, Any]:
+    adapter = model.get_model().generic_adapter
+    if adapter is None:
+        return {
+            "generic_adapter_initialization": "disabled",
+            "source_generic_tensor_count": 0,
+            "expected_generic_tensor_count": 0,
+        }
+    expected = {f"{GENERIC_ADAPTER_STATE_PREFIX}{name}" for name in adapter.state_dict()}
+    with safe_open(str(source_weights), framework="pt", device="cpu") as handle:
+        source = {name for name in handle.keys() if "generic_adapter." in name}
+    if source:
+        if source != expected:
+            raise RuntimeError("Source checkpoint contains a partial generic adapter state.")
+        initialization = "checkpoint_loaded"
+    else:
+        adapter.reset_parameters()
+        initialization = "fresh_explicit_reset"
+    return {
+        "generic_adapter_initialization": initialization,
+        "source_generic_tensor_count": len(source),
+        "expected_generic_tensor_count": len(expected),
+    }
+
+
 def configure_trainable_parameters(
     model: GOTQwenForCausalLM,
     stage: str,
+    p2_train_scope: str = "adapter_projector",
+    ablation_id: str = "",
 ) -> tuple[int, int, list[str]]:
     model.requires_grad_(False)
     model_base = model.get_model()
-    if model_base.layout_adapter is None:
-        raise RuntimeError("VLQA was not constructed from the enabled config.")
-    adapter = model_base.layout_adapter
+    if ablation_id in {"projector_only", "generic_adapter_projector"}:
+        if stage != "p2":
+            raise RuntimeError(f"{ablation_id} only supports direct P2.")
+        model_base.mm_projector_vary.requires_grad_(True)
+        if ablation_id == "generic_adapter_projector":
+            if model_base.generic_adapter is None:
+                raise RuntimeError("A2 generic adapter was not constructed.")
+            model_base.generic_adapter.requires_grad_(True)
+        elif model_base.generic_adapter is not None or model_base.layout_adapter is not None:
+            raise RuntimeError("A1 must not construct or train an adapter.")
+        adapter = None
+    else:
+        if model_base.layout_adapter is None:
+            raise RuntimeError("VLQA was not constructed from the enabled config.")
+        adapter = model_base.layout_adapter
 
-    if stage == "p1":
+    if adapter is None:
+        pass
+    elif stage == "p1":
         adapter.requires_grad_(False)
         adapter.query_embeddings.requires_grad_(True)
         for module in (
@@ -356,8 +485,13 @@ def configure_trainable_parameters(
         with torch.no_grad():
             adapter.residual_gate.zero_()
     elif stage == "p2":
-        adapter.requires_grad_(True)
-        model_base.mm_projector_vary.requires_grad_(True)
+        if p2_train_scope == "adapter_projector":
+            adapter.requires_grad_(True)
+            model_base.mm_projector_vary.requires_grad_(True)
+        elif p2_train_scope == "decoder_adapter_projector":
+            model.requires_grad_(True)
+        else:
+            raise ValueError(p2_train_scope)
     else:
         raise ValueError(stage)
     model_base.vision_tower_high.requires_grad_(False)
@@ -370,6 +504,91 @@ def configure_trainable_parameters(
     if trainable == 0:
         raise RuntimeError("No parameters are trainable.")
     return trainable, total, trainable_names
+
+
+def module_parameter_report(model: GOTQwenForCausalLM) -> dict[str, dict[str, Any]]:
+    base = model.get_model()
+    modules = {
+        "vary_vit": base.vision_tower_high,
+        "qwen": model,
+        "mm_projector_vary": base.mm_projector_vary,
+        "generic_adapter": base.generic_adapter,
+        "vlqa": base.layout_adapter,
+    }
+    report: dict[str, dict[str, Any]] = {}
+    for name, module in modules.items():
+        if module is None:
+            report[name] = {"present": False, "total": 0, "trainable": 0}
+            continue
+        parameters = list(module.parameters())
+        report[name] = {
+            "present": True,
+            "total": sum(parameter.numel() for parameter in parameters),
+            "trainable": sum(
+                parameter.numel() for parameter in parameters if parameter.requires_grad
+            ),
+        }
+    # Qwen contains the visual modules; report only parameters outside the three visual paths.
+    visual_ids = {
+        id(parameter)
+        for module in (base.vision_tower_high, base.mm_projector_vary,
+                       base.generic_adapter, base.layout_adapter)
+        if module is not None
+        for parameter in module.parameters()
+    }
+    qwen_parameters = [parameter for parameter in model.parameters() if id(parameter) not in visual_ids]
+    report["qwen"] = {
+        "present": True,
+        "total": sum(parameter.numel() for parameter in qwen_parameters),
+        "trainable": sum(parameter.numel() for parameter in qwen_parameters if parameter.requires_grad),
+    }
+    return report
+
+
+def assert_ablation_trainable_scope(
+    ablation_id: str,
+    stage: str,
+    model: GOTQwenForCausalLM,
+) -> dict[str, dict[str, Any]]:
+    report = module_parameter_report(model)
+    try:
+        assert_parameter_report(ablation_id, stage, report)
+    except ValueError as exc:
+        raise RuntimeError(str(exc)) from exc
+    return report
+
+
+def vlqa_ocr_path_parameter_count(model: GOTQwenForCausalLM) -> int:
+    adapter = model.get_model().layout_adapter
+    if adapter is None:
+        return 0
+    auxiliary_prefixes = ("prediction_norm.", "object_head.", "box_head.", "direction_head.")
+    return sum(
+        parameter.numel()
+        for name, parameter in adapter.named_parameters()
+        if not name.startswith(auxiliary_prefixes)
+    )
+
+
+def vlqa_ocr_path_reference_parameter_count(args: LayoutTrainingArguments) -> int:
+    reference = VisualLayoutQueryAdapter(
+        visual_dim=1024,
+        layout_input_dim=1024,
+        adapter_dim=args.vlqa_adapter_dim,
+        num_queries=args.max_regions,
+        num_heads=args.vlqa_num_heads,
+        ffn_expansion=args.vlqa_ffn_expansion,
+        num_direction_classes=5,
+        dropout=args.vlqa_dropout,
+    )
+    auxiliary_prefixes = ("prediction_norm.", "object_head.", "box_head.", "direction_head.")
+    count = sum(
+        parameter.numel()
+        for name, parameter in reference.named_parameters()
+        if not name.startswith(auxiliary_prefixes)
+    )
+    del reference
+    return count
 
 
 def main() -> None:
@@ -399,9 +618,29 @@ def main() -> None:
         raise FileNotFoundError(manifest)
     if not image_root.is_dir():
         raise FileNotFoundError(image_root)
+    source_config_payload = json.loads(
+        (source_model / "config.json").read_text(encoding="utf-8")
+    )
+    source_metrics_path = source_model / "layout_training_metrics.json"
+    source_metrics_payload = (
+        json.loads(source_metrics_path.read_text(encoding="utf-8"))
+        if source_metrics_path.is_file() else None
+    )
+    if layout_args.ablation_id:
+        assert_source_protocol(
+            layout_args.ablation_id,
+            layout_args.layout_stage,
+            source_config_payload,
+            source_metrics_payload,
+        )
 
+    tokenizer_source = (
+        Path(layout_args.tokenizer_name_or_path).resolve()
+        if layout_args.tokenizer_name_or_path
+        else source_model
+    )
     tokenizer = transformers.AutoTokenizer.from_pretrained(
-        source_model,
+        tokenizer_source,
         trust_remote_code=True,
         local_files_only=True,
         padding_side="right",
@@ -414,10 +653,16 @@ def main() -> None:
         use_safetensors=True,
         local_files_only=True,
     )
-    layout_initialization = initialize_layout_adapter_from_source(
-        model,
-        source_weights,
-    )
+    if model.get_model().layout_adapter is not None:
+        layout_initialization = initialize_layout_adapter_from_source(model, source_weights)
+    else:
+        layout_initialization = {
+            "layout_adapter_initialization": "disabled",
+            "source_layout_tensor_count": 0,
+            "expected_layout_tensor_count": 0,
+            "layout_adapter_parameter_abs_max": 0.0,
+        }
+    generic_initialization = initialize_generic_adapter_from_source(model, source_weights)
     smart_tokenizer_and_embedding_resize(
         special_tokens_dict={"pad_token": "<|endoftext|>"},
         tokenizer=tokenizer,
@@ -448,12 +693,19 @@ def main() -> None:
     trainable, total, trainable_names = configure_trainable_parameters(
         model,
         layout_args.layout_stage,
+        layout_args.p2_train_scope,
+        layout_args.ablation_id,
+    )
+    module_parameters = (
+        assert_ablation_trainable_scope(layout_args.ablation_id, layout_args.layout_stage, model)
+        if layout_args.ablation_id else module_parameter_report(model)
     )
 
     data_args.image_token_len = 256
     data_args.image_processor = vision["image_processor"]
     data_args.image_processor_high = vision["image_processor_high"]
     data_args.use_im_start_end = model_args.use_im_start_end
+    include_layout_targets = model.get_model().layout_adapter is not None
     data_module = make_layout_page_data_module(
         tokenizer=tokenizer,
         data_args=data_args,
@@ -463,6 +715,7 @@ def main() -> None:
         max_regions=layout_args.max_regions,
         max_records=layout_args.max_train_records,
         supervise_ocr=layout_args.layout_stage == "p2",
+        include_layout_targets=include_layout_targets,
         replay_manifest=(
             Path(layout_args.replay_layout_manifest).resolve()
             if layout_args.replay_layout_manifest
@@ -479,12 +732,19 @@ def main() -> None:
     )
 
     first_sample = data_module["train_dataset"][0]
-    layout_regions = int(first_sample["layout_bbox_mask"].sum().item())
-    object_slots = int(first_sample["layout_object_mask"].sum().item())
+    has_layout_targets = (
+        include_layout_targets and "layout_bbox_mask" in first_sample
+    )
+    layout_regions = (
+        int(first_sample["layout_bbox_mask"].sum().item()) if has_layout_targets else 0
+    )
+    object_slots = (
+        int(first_sample["layout_object_mask"].sum().item()) if has_layout_targets else 0
+    )
     supervised_tokens = int((first_sample["labels"] != IGNORE_INDEX).sum().item())
     if layout_args.layout_stage == "p1" and layout_regions < 1:
         raise RuntimeError("P1 requires at least one supervised layout region.")
-    if layout_regions < layout_args.min_layout_regions:
+    if has_layout_targets and layout_regions < layout_args.min_layout_regions:
         raise RuntimeError(
             f"First sample has {layout_regions} supervised layout regions; "
             f"minimum is {layout_args.min_layout_regions}."
@@ -500,16 +760,20 @@ def main() -> None:
         raise RuntimeError("P2 requires at least one OCR-supervised token.")
 
     first_batch = data_module["data_collator"]([first_sample])
-    bbox_batch_shape = list(first_batch["layout_bbox_targets"].shape)
+    bbox_batch_shape = (
+        list(first_batch["layout_bbox_targets"].shape) if has_layout_targets else None
+    )
     expected_bbox_batch_shape = [1, layout_args.max_regions, 4]
-    if bbox_batch_shape != expected_bbox_batch_shape:
+    if has_layout_targets and bbox_batch_shape != expected_bbox_batch_shape:
         raise RuntimeError(
             "Layout collator produced an unexpected bbox batch shape: "
             f"expected={expected_bbox_batch_shape}, actual={bbox_batch_shape}."
         )
-    object_batch_shape = list(first_batch["layout_object_targets"].shape)
+    object_batch_shape = (
+        list(first_batch["layout_object_targets"].shape) if has_layout_targets else None
+    )
     expected_object_batch_shape = [1, layout_args.max_regions]
-    if object_batch_shape != expected_object_batch_shape:
+    if has_layout_targets and object_batch_shape != expected_object_batch_shape:
         raise RuntimeError(
             "Layout collator produced an unexpected object batch shape: "
             f"expected={expected_object_batch_shape}, actual={object_batch_shape}."
@@ -529,10 +793,13 @@ def main() -> None:
         torch.cuda.reset_peak_memory_stats(training_args.device)
 
     print(f"SOURCE_MODEL={source_model}")
+    print(f"TOKENIZER_MODEL={tokenizer_source}")
     print(f"LAYOUT_MANIFEST={manifest}")
     print(f"LAYOUT_IMAGE_ROOT={image_root}")
     print(f"LAYOUT_SPLIT={layout_args.layout_split}")
     print(f"LAYOUT_STAGE={layout_args.layout_stage}")
+    print(f"ABLATION_ID={layout_args.ablation_id or 'legacy_default'}")
+    print(f"P2_TRAIN_SCOPE={layout_args.p2_train_scope}")
     print(
         "LAYOUT_ADAPTER_INITIALIZATION="
         f"{layout_initialization['layout_adapter_initialization']}"
@@ -560,7 +827,11 @@ def main() -> None:
     print(f"FIRST_BATCH_OBJECT_SHAPE={object_batch_shape}")
     print(f"FIRST_BATCH_SUPERVISED_TOKENS={batch_supervised_tokens}")
 
-    trainer = LayoutDiagnosticTrainer(
+    trainer_class = (
+        LayoutDiagnosticTrainer
+        if model.get_model().layout_adapter is not None else GOTTrainer
+    )
+    trainer = trainer_class(
         model=model,
         tokenizer=tokenizer,
         args=training_args,
@@ -574,10 +845,23 @@ def main() -> None:
         tokenizer.save_pretrained(output_dir)
 
     metrics = dict(train_result.metrics)
-    diagnostics = summarize_diagnostic_history(trainer.state.log_history)
+    diagnostics = (
+        summarize_diagnostic_history(trainer.state.log_history)
+        if model.get_model().layout_adapter is not None else {"log_count": 0}
+    )
+    budget = summarize_training_budget(
+        data_module["train_dataset"],
+        optimizer_steps=int(trainer.state.global_step),
+        per_device_batch_size=training_args.per_device_train_batch_size,
+        gradient_accumulation_steps=training_args.gradient_accumulation_steps,
+        world_size=training_args.world_size,
+    )
+    vlqa_ocr_reference = vlqa_ocr_path_reference_parameter_count(layout_args)
+    generic_count = module_parameters["generic_adapter"]["total"]
     metrics.update(
         {
             "global_step": int(trainer.state.global_step),
+            "optimizer_steps": int(trainer.state.global_step),
             "dataset_examples": len(data_module["train_dataset"]),
             "first_sample_layout_regions": layout_regions,
             "first_sample_object_slots": object_slots,
@@ -587,7 +871,84 @@ def main() -> None:
             "first_batch_supervised_tokens": batch_supervised_tokens,
             "trainable_parameters": trainable,
             "total_parameters": total,
+            "module_parameters": module_parameters,
+            "trainable_parameter_prefixes": sorted(
+                {".".join(name.split(".")[:3]) for name in trainable_names}
+            ),
+            "frozen_modules": (
+                ["model.vision_tower_high"]
+                if layout_args.layout_stage == "p2"
+                and layout_args.p2_train_scope == "decoder_adapter_projector"
+                else ["language_model", "model.vision_tower_high"]
+            ),
+            "train_scope": (
+                layout_args.p2_train_scope
+                if layout_args.layout_stage == "p2"
+                else "p1_layout_warmup"
+            ),
+            "optimizer": training_args.optim,
+            "learning_rate": training_args.learning_rate,
+            "lr_scheduler_type": str(training_args.lr_scheduler_type),
+            "weight_decay": training_args.weight_decay,
+            "per_device_train_batch_size": training_args.per_device_train_batch_size,
+            "gradient_accumulation_steps": training_args.gradient_accumulation_steps,
+            "initial_checkpoint": str(source_model),
+            "tokenizer_checkpoint": str(tokenizer_source),
+            "upstream_training_history": (
+                "synthetic_layout_p2_then_ancientdoc_c4"
+                if layout_args.replay_layout_manifest
+                else "synthetic_layout_p2_checkpoint"
+            ),
+            "strict_equal_parameter_control_vs_c1": False,
+            "comparison_role": "vlqa_adaptation_route",
+            "training_budget": budget,
+            "effective_batch_size": (
+                training_args.per_device_train_batch_size
+                * training_args.gradient_accumulation_steps
+                * training_args.world_size
+            ),
             "layout_stage": layout_args.layout_stage,
+            "ablation_id": layout_args.ablation_id or "legacy_default",
+            "layout_loss_preset": layout_args.layout_loss_preset or "legacy_explicit_weights",
+            "loss_weights": {
+                "ocr": layout_args.ocr_loss_weight,
+                "object": layout_args.object_loss_weight,
+                "bbox_l1": layout_args.bbox_l1_loss_weight,
+                "bbox_giou": layout_args.bbox_giou_loss_weight,
+                "direction_order": layout_args.direction_loss_weight,
+                "layout": layout_args.layout_loss_weight,
+            },
+            "projector_trainable": module_parameters["mm_projector_vary"]["trainable"] > 0,
+            "use_vlqa": model.get_model().layout_adapter is not None,
+            "use_generic_adapter": model.get_model().generic_adapter is not None,
+            "residual_writeback_enabled": model.get_model().layout_adapter is not None,
+            "passed_through_p1": (
+                layout_args.ablation_id == "vlqa_layout_p1_p2"
+                and layout_args.layout_stage == "p2"
+            ),
+            "layout_heads_expected_gradient": (
+                model.get_model().layout_adapter is not None
+                and layout_args.layout_loss_weight > 0.0
+            ),
+            "input_granularity": "whole_page_image",
+            "input_protocol": {
+                "model_inputs": ["whole_page_image", "ocr_prompt"],
+                "bbox_as_model_input": False,
+                "direction_as_model_input": False,
+                "order_as_model_input": False,
+                "layout_metadata_as_model_input": False,
+            },
+            "generic_adapter_parameter_match": {
+                "generic_adapter": generic_count,
+                "vlqa_ocr_path": vlqa_ocr_reference,
+                "absolute_error": (
+                    abs(generic_count - vlqa_ocr_reference) if generic_count else None
+                ),
+                "relative_error": (
+                    abs(generic_count - vlqa_ocr_reference) / vlqa_ocr_reference
+                    if generic_count and vlqa_ocr_reference else None
+                ),
+            },
             "max_regions": layout_args.max_regions,
             "source_model": str(source_model),
             "layout_manifest": str(manifest),
@@ -595,6 +956,7 @@ def main() -> None:
             "diagnostics": diagnostics,
             "layout_loss_compute_dtype": "float32",
             **layout_initialization,
+            **generic_initialization,
             "peak_allocated_mib": (
                 torch.cuda.max_memory_allocated(training_args.device) / (1024**2)
                 if torch.cuda.is_available()

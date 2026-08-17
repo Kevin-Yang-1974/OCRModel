@@ -53,6 +53,57 @@ class LayoutA100RunnerTests(unittest.TestCase):
         self.assertIn("--direction-loss-weight", source)
         self.assertIn("--bbox-l1-loss-weight", source)
 
+    def formal_ablation_args(self, ablation: str, *extra: str):
+        return make_args(
+            self.tmp_path,
+            "--mode", "ablation", "--ablation", ablation,
+            "--validation-manifest", str(self.tmp_path / "validation" / "manifest.jsonl"),
+            "--test-manifest", str(self.tmp_path / "test" / "manifest.jsonl"),
+            *extra,
+        )
+
+    def test_a0_to_a5_stage_contracts(self) -> None:
+        a0 = runner.resolve_settings(self.formal_ablation_args("got2_zero_shot"))
+        self.assertEqual(a0.stages, ())
+        self.assertEqual(a0.validation_model_kind, "baseline")
+        for ablation, kind in (
+            ("projector_only", "baseline"),
+            ("generic_adapter_projector", "generic"),
+            ("vlqa_ocr_only", "vlqa"),
+            ("vlqa_layout_direct", "vlqa"),
+        ):
+            settings = runner.resolve_settings(
+                self.formal_ablation_args(ablation, "--p2-max-steps", "8000")
+            )
+            self.assertEqual(settings.stages, ("p2",))
+            self.assertEqual(settings.validation_model_kind, kind)
+        a5 = runner.resolve_settings(self.formal_ablation_args(
+            "vlqa_layout_p1_p2", "--p1-max-steps", "4000", "--p2-max-steps", "8000"
+        ))
+        self.assertEqual(a5.stages, ("p1", "p2"))
+
+    def test_ablation_training_command_carries_strict_contract(self) -> None:
+        settings = runner.resolve_settings(self.formal_ablation_args(
+            "vlqa_ocr_only", "--p2-max-steps", "8000"
+        ))
+        command = runner.build_training_command(
+            settings, stage="p2", source_model=self.tmp_path / "original",
+            output_dir=self.tmp_path / "p2", master_port=23456,
+        )
+        self.assertEqual(option_value(command, "--ablation_id"), "vlqa_ocr_only")
+        self.assertEqual(option_value(command, "--layout_loss_preset"), "layout_none")
+        self.assertEqual(option_value(command, "--layout_loss_weight"), "0")
+
+    def test_direct_groups_reject_p1_and_a5_requires_p1(self) -> None:
+        with self.assertRaisesRegex(runner.RunFailure, "direct P2"):
+            runner.resolve_settings(self.formal_ablation_args(
+                "vlqa_layout_direct", "--p1-max-steps", "1", "--p2-max-steps", "2"
+            ))
+        with self.assertRaisesRegex(runner.RunFailure, "A5 requires"):
+            runner.resolve_settings(self.formal_ablation_args(
+                "vlqa_layout_p1_p2", "--p2-max-steps", "2"
+            ))
+
     def test_smoke_is_fixed_to_one_record_and_one_step(self) -> None:
         settings = runner.resolve_settings(make_args(self.tmp_path))
         self.assertEqual(settings.mode, "smoke")
@@ -75,8 +126,69 @@ class LayoutA100RunnerTests(unittest.TestCase):
             str(self.tmp_path / "p1-model"),
         )
         self.assertEqual(option_value(command, "--ocr_loss_weight"), "1")
+        self.assertEqual(
+            option_value(command, "--tokenizer_name_or_path"),
+            str(settings.tokenizer_model),
+        )
         self.assertEqual(option_value(command, "--max_steps"), "1")
         self.assertEqual(option_value(command, "--max_train_records"), "1")
+
+    def test_selected_physical_gpu_is_exposed_and_recorded(self) -> None:
+        settings = runner.resolve_settings(
+            make_args(self.tmp_path, "--gpu-id", "3")
+        )
+        self.assertEqual(settings.gpu_id, "3")
+        self.assertEqual(settings.physical_gpu_ids, ("3",))
+        self.assertEqual(
+            runner.training_environment(settings)["CUDA_VISIBLE_DEVICES"], "3"
+        )
+
+    def test_multiple_physical_gpus_are_exposed_in_declared_order(self) -> None:
+        settings = runner.resolve_settings(
+            make_args(self.tmp_path, "--gpu-ids", "3,1,4")
+        )
+        self.assertEqual(settings.gpu_id, "3,1,4")
+        self.assertEqual(settings.physical_gpu_ids, ("3", "1", "4"))
+        self.assertEqual(
+            runner.training_environment(settings)["CUDA_VISIBLE_DEVICES"], "3,1,4"
+        )
+
+    def test_gpu_flags_are_mutually_exclusive_and_ids_are_unique(self) -> None:
+        with self.assertRaisesRegex(runner.RunFailure, "mutually exclusive"):
+            runner.resolve_settings(
+                make_args(self.tmp_path, "--gpu-id", "0", "--gpu-ids", "0,1")
+            )
+        with self.assertRaisesRegex(runner.RunFailure, "unique comma-separated"):
+            runner.resolve_settings(make_args(self.tmp_path, "--gpu-ids", "0,0"))
+
+    def test_gpu_locks_are_scoped_per_physical_card(self) -> None:
+        source = Path(runner.__file__).read_text(encoding="utf-8")
+        self.assertIn("def acquire_gpu_locks", source)
+        self.assertIn('.layout_a100.gpu-{gpu_id}.lock', source)
+        self.assertNotIn('(runs_root / ".layout_a100.lock")', source)
+
+    def test_parallel_ablation_launchers_keep_gpu_modes_distinct(self) -> None:
+        tools = Path(__file__).resolve().parents[1] / "tools" / "training"
+        for name in (
+            "run_layout_ablation_suite.sh",
+            "run_layout_ablation_smoke.sh",
+        ):
+            source = (tools / name).read_text(encoding="utf-8")
+            self.assertIn("--parallel-gpu-ids", source)
+            self.assertIn("--gpu-ids", source)
+            self.assertIn("count must equal --ablations count", source)
+            self.assertIn("GPU%s_BUSY", source)
+            self.assertIn("tail -n 20", source)
+        suite = (tools / "run_layout_ablation_suite.sh").read_text(encoding="utf-8")
+        self.assertIn('run_ablation "$group" "$group_gpu"', suite)
+        self.assertIn('--gpu-id "$inference_gpu_id"', suite)
+        smoke = (tools / "run_layout_ablation_smoke.sh").read_text(encoding="utf-8")
+        self.assertIn('run_group "$group" "${selected_gpu_array[$index]}"', smoke)
+        self.assertIn('(metrics.get("training_budget") or {}).get("world_size")', smoke)
+
+    def test_gpu_id_must_be_single_numeric_id(self) -> None:
+        with self.assertRaisesRegex(runner.RunFailure, "one physical numeric GPU"):
+            runner.resolve_settings(make_args(self.tmp_path, "--gpu-id", "0,1"))
 
     def test_smoke_rejects_longer_run(self) -> None:
         with self.assertRaisesRegex(runner.RunFailure, "Smoke is fixed"):

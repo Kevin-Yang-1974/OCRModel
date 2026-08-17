@@ -17,12 +17,15 @@
 当前正式主方案是整页 GOT2＋端到端 Visual Layout Query Adapter（VLQA），详见 `../../../docs/GOT2_LAYOUT_ENCODING_PLAN.md`。首版活动代码包括：
 
 - `layout_page_dataset.py`：整页 manifest dataset 和布局监督 collator；
+- `train_GOT_page_ocr.py`：不启用 VLQA 的原始 GOT2 整页 OCR-only 训练入口，用于 C1；
 - `train_GOT_layout.py`：`P1` 布局预热与 `P2` 联合训练的开发入口；
 - `verify_layout_checkpoint.py`：检查 VLQA/projector 权重、P1 零门控和最终模型重载；
 - `../GOT/model/layout_query.py`：有序 queries、object/bbox/direction 头、零门控写回与损失；
 - `../../../tools/preprocessing`：HTML 页面生成和无泄漏审计。
 
 `../../../tools/training/run_layout_a100.py` 已把环境、数据、GPU、P1/P2、validation 和 checkpoint 检查串成受限入口，并已在 A100 打通 CUDA forward/backward、整页 batch、P1→P2 加载和最终模型重载。`layout_overfit_20260812_002747` 已通过固定 1000 steps 的 P1 两样本实现诊断；`layout_page_dataset.py`、`evaluate_GOT_layout.py` 和 `layout_validation_metrics.py` 已提供 prompt-only validation loader、整页 generation 与统一页面指标。tokenizer 预检修复后的 `layout_validate_20260812_014816` 已在两页 `train` split 上完成链路验证，但使用的是同页 P1 overfit checkpoint；正式 split、held-out 效果验证仍未完成，当前不得报告泛化性能。最短上传与运行命令见 `../../../docs/SYNC_AND_RUN.md`。
+
+C1 通过 `../../../tools/training/run_got2_page_ocr_a100.py` 调用 `train_GOT_page_ocr.py`，只接收原始整页图像、OCR prompt 和页面文本真值，不把 layout metadata 送入模型。其原生 `decoder_projector` 策略与 C4 的 VLQA adapter 策略不等参数，且上游 checkpoint 历史不同，因此只作为完整适配路线对照。
 
 ## 页面兼容入口
 
@@ -35,3 +38,8 @@
 `reference` 默认训练 6 epochs，可通过 `ANCIENTDOC_EPOCHS` 显式覆盖。由于现有 AncientDoc split 存在书籍级泄漏，且该路径没有 VLQA，这条路径只能报告为历史页面兼容基线，不能作为当前小样本、跨书手泛化或布局查询结果。
 
 完整同步、预检、训练和评估命令见 `../../../docs/SYNC_AND_RUN.md`。
+## A0-A5 整页消融
+
+`train_GOT_layout.py --ablation_id ... --layout_loss_preset ...` 是统一训练底层入口。A1 只训练 `mm_projector_vary`；A2 训练 projector 与独立 `GenericVisualTransformerAdapter`；A3/A4 训练 projector 与相同 VLQA；A5 保留原 P1→P2。未指定 `--ablation_id` 时保留原 P1/P2 默认语义。
+
+`evaluate_GOT_layout.py` 的 `--model-kind` 支持 `baseline`、`generic` 和 `vlqa`，所有类型都只接收 `whole_page_image` 与 OCR prompt；布局 metadata 不进入模型。

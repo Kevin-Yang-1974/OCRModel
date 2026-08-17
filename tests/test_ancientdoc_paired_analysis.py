@@ -73,7 +73,7 @@ class AncientDocPairedAnalysisTests(unittest.TestCase):
             [
                 {
                     "page_id": "ancientdoc_split5_000001_imgs_catA_bookA_page_7",
-                    "source_group_id": "ancientdoc_reference_split5",
+                    "source_group_id": "ancientdoc_book_a",
                     "tier": "real-ancientdoc",
                     "original_image": "imgs/catA/bookA/page_7.png",
                     "page_text": "abcd" * 10,
@@ -81,7 +81,7 @@ class AncientDocPairedAnalysisTests(unittest.TestCase):
                 },
                 {
                     "page_id": "ancientdoc_split5_000002_imgs_catB_bookB_page_42",
-                    "source_group_id": "ancientdoc_reference_split5",
+                    "source_group_id": "ancientdoc_book_b",
                     "tier": "real-ancientdoc",
                     "original_image": "imgs/catB/bookB/page_42.png",
                     "page_text": "wxyz" * 10,
@@ -152,7 +152,7 @@ class AncientDocPairedAnalysisTests(unittest.TestCase):
                     "--suite-root",
                     str(self.suite_root),
                     "--bootstrap-samples",
-                    "0",
+                    "100",
                     "--top-k",
                     "2",
                 ]
@@ -171,10 +171,18 @@ class AncientDocPairedAnalysisTests(unittest.TestCase):
         self.assertTrue((output_dir / "worst_pages.md").is_file())
         self.assertTrue((output_dir / "analysis_summary.md").is_file())
         summary = json.loads((output_dir / "summary.json").read_text(encoding="utf-8"))
+        self.assertEqual(summary["schema_version"], 2)
+        self.assertEqual(summary["cluster_bootstrap_delta_cer"]["groups"], 2)
+        self.assertEqual(
+            summary["cluster_bootstrap_delta_cer"]["method"],
+            "source_group_id_paired_cluster_bootstrap",
+        )
         self.assertEqual(summary["error_categories"]["right_error_categories"]["empty_prediction"], 1)
         groups = {(row["group_by"], row["group"]) for row in summary["groups"]}
         self.assertIn(("category", "catA"), groups)
         self.assertIn(("book", "bookB"), groups)
+        analysis_summary = (output_dir / "analysis_summary.md").read_text(encoding="utf-8")
+        self.assertIn("Source-group cluster bootstrap", analysis_summary)
 
 
 if __name__ == "__main__":
