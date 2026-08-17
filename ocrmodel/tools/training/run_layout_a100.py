@@ -17,6 +17,10 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Sequence
 
+TRAINING_TOOLS = Path(__file__).resolve().parent
+sys.path.insert(0, str(TRAINING_TOOLS))
+from c4_selection_contract import load_c4_selection
+
 try:
     import fcntl
 except ImportError:  # pragma: no cover - the launcher itself runs on Linux.
@@ -33,6 +37,17 @@ RUN_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 
 OVERFIT_P1_STEPS = 1000
 OVERFIT_RECORDS = 2
+ABLATION_IDS = (
+    "got2_zero_shot", "projector_only", "generic_adapter_projector",
+    "vlqa_ocr_only", "vlqa_layout_direct", "vlqa_layout_p1_p2",
+)
+LAYOUT_LOSS_PRESETS = {
+    "layout_none": (0.0, 0.0, 0.0, 0.0, 0.0),
+    "object_only": (1.0, 0.0, 0.0, 0.0, 1.0),
+    "object_bbox": (1.0, 5.0, 2.0, 0.0, 1.0),
+    "object_direction_order": (1.0, 0.0, 0.0, 1.0, 1.0),
+    "layout_full": (1.0, 5.0, 2.0, 1.0, 1.0),
+}
 OVERFIT_THRESHOLDS = {
     "object_loss_max": 0.05,
     "bbox_l1_loss_max": 0.05,
@@ -78,7 +93,11 @@ class Settings:
     tokenizer_model: Path
     runs_root: Path
     run_id: str
+    gpu_id: str
+    physical_gpu_ids: tuple[str, ...]
     mode: str
+    ablation_id: str
+    layout_loss_preset: str
     stages: tuple[str, ...]
     layout_split: str
     validation_split: str
@@ -96,6 +115,11 @@ class Settings:
     p2_max_records: int
     p1_learning_rate: float
     p2_learning_rate: float
+    p2_train_scope: str
+    checkpoint_steps: int
+    lr_scheduler_type: str
+    warmup_ratio: float
+    weight_decay: float
     object_loss_weight: float
     bbox_l1_loss_weight: float
     bbox_giou_loss_weight: float
@@ -107,7 +131,15 @@ class Settings:
     validation_no_repeat_ngram_size: int
     validation_object_threshold: float
     validation_iou_threshold: float
+    skip_post_training_validation: bool
     skip_source_hash: bool
+    c4_selection: Path | None
+    c4_selected_step: int | None
+    c4_validation_page_cer: float | None
+    c4_validation_whitespace_page_cer: float | None
+    c4_config_sha256: str | None
+    c4_weights_sha256: str | None
+    c4_run_root: Path | None
 
     @property
     def run_root(self) -> Path:
@@ -230,6 +262,17 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--project-root", type=Path, default=project_root)
     parser.add_argument("--run-id")
     parser.add_argument(
+        "--gpu-id",
+        help="One physical GPU id (backward-compatible shorthand for --gpu-ids).",
+    )
+    parser.add_argument(
+        "--gpu-ids",
+        help=(
+            "Comma-separated physical GPU ids used by one distributed DeepSpeed run, "
+            "for example 0,2,3."
+        ),
+    )
+    parser.add_argument(
         "--mode",
         choices=(
             "smoke",
@@ -239,6 +282,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
             "pretrain",
             "joint-train",
             "adapt",
+            "ablation",
         ),
         default="smoke",
     )
@@ -247,6 +291,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="Required for pilot because pilot does not run validation automatically.",
     )
+    parser.add_argument("--ablation", choices=ABLATION_IDS)
+    parser.add_argument("--layout-loss-preset", choices=tuple(LAYOUT_LOSS_PRESETS))
     parser.add_argument("--layout-split", default="train")
     parser.add_argument(
         "--validation-manifest",
@@ -269,7 +315,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--test-split", default="test")
     parser.add_argument(
         "--validation-model-kind",
-        choices=("baseline", "vlqa"),
+        choices=("baseline", "generic", "vlqa"),
         default="vlqa",
     )
     parser.add_argument(
@@ -287,6 +333,19 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--p2-max-records", type=nonnegative_int)
     parser.add_argument("--p1-learning-rate", type=positive_float, default=1e-4)
     parser.add_argument("--p2-learning-rate", type=positive_float, default=5e-5)
+    parser.add_argument(
+        "--p2-train-scope",
+        choices=("adapter_projector", "decoder_adapter_projector"),
+        default="adapter_projector",
+    )
+    parser.add_argument("--checkpoint-steps", type=nonnegative_int, default=0)
+    parser.add_argument(
+        "--lr-scheduler-type",
+        choices=("constant", "cosine"),
+        default="constant",
+    )
+    parser.add_argument("--warmup-ratio", type=probability, default=0.0)
+    parser.add_argument("--weight-decay", type=nonnegative_float, default=0.0)
     parser.add_argument("--object-loss-weight", type=nonnegative_float, default=1.0)
     parser.add_argument("--bbox-l1-loss-weight", type=nonnegative_float, default=5.0)
     parser.add_argument("--bbox-giou-loss-weight", type=nonnegative_float, default=2.0)
@@ -299,14 +358,60 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--validation-object-threshold", type=probability, default=0.5)
     parser.add_argument("--validation-iou-threshold", type=probability, default=0.5)
     parser.add_argument(
+        "--skip-post-training-validation",
+        action="store_true",
+        help=(
+            "For pretrain/joint-train/adapt modes, skip the automatic validation "
+            "run after training. Formal validation manifests are still used for audit."
+        ),
+    )
+    parser.add_argument(
         "--skip-source-hash",
         action="store_true",
         help="Skip hashing the large original model file; path and size are still recorded.",
+    )
+    parser.add_argument(
+        "--c4-selection",
+        type=Path,
+        help=(
+            "Formal validation-only C4 selection used as the immutable C5/C6 "
+            "branch point. Its selected model must equal --source-model."
+        ),
     )
     return parser.parse_args(argv)
 
 
 def resolve_settings(args: argparse.Namespace) -> Settings:
+    if args.gpu_id is not None and args.gpu_ids is not None:
+        raise RunFailure(
+            "--gpu-id and --gpu-ids are mutually exclusive.", exit_code=EXIT_USAGE
+        )
+    configured_gpu_ids = (
+        args.gpu_ids
+        if args.gpu_ids is not None
+        else args.gpu_id
+        if args.gpu_id is not None
+        else os.environ.get("GOT_PHYSICAL_GPUS")
+        or os.environ.get("GOT_PHYSICAL_GPU", "0")
+    )
+    gpu_id = str(configured_gpu_ids).strip()
+    if args.gpu_id is not None and not re.fullmatch(r"[0-9]+", gpu_id):
+        raise RunFailure(
+            "--gpu-id must be one physical numeric GPU id, for example 0 or 3.",
+            exit_code=EXIT_USAGE,
+        )
+    physical_gpu_ids = tuple(part.strip() for part in gpu_id.split(","))
+    if (
+        not physical_gpu_ids
+        or any(not re.fullmatch(r"[0-9]+", part) for part in physical_gpu_ids)
+        or len(set(physical_gpu_ids)) != len(physical_gpu_ids)
+    ):
+        raise RunFailure(
+            "--gpu-ids must be unique comma-separated physical numeric GPU ids, "
+            "for example 0,2,3.",
+            exit_code=EXIT_USAGE,
+        )
+    gpu_id = ",".join(physical_gpu_ids)
     if not args.layout_split.strip():
         raise RunFailure("--layout-split must be non-empty.", exit_code=EXIT_USAGE)
     if not args.validation_split.strip() or not args.test_split.strip():
@@ -324,7 +429,57 @@ def resolve_settings(args: argparse.Namespace) -> Settings:
             "--replay-image-root requires --replay-manifest.",
             exit_code=EXIT_USAGE,
         )
-    if args.mode == "validate":
+    ablation_id = args.ablation or ""
+    if args.mode == "ablation" and not ablation_id:
+        raise RunFailure("--mode ablation requires --ablation.", exit_code=EXIT_USAGE)
+    if args.mode != "ablation" and ablation_id:
+        raise RunFailure("--ablation requires --mode ablation.", exit_code=EXIT_USAGE)
+    if args.mode == "ablation":
+        if args.p2_train_scope != "adapter_projector":
+            raise RunFailure(
+                "A1-A5 require frozen Qwen and --p2-train-scope adapter_projector.",
+                exit_code=EXIT_USAGE,
+            )
+        if args.validation_manifest is None or args.test_manifest is None:
+            raise RunFailure(
+                "Formal ablation requires validation and test manifests.", exit_code=EXIT_USAGE
+            )
+        if args.allow_unvalidated_pilot:
+            raise RunFailure("Formal ablation cannot use pilot unlock.", exit_code=EXIT_USAGE)
+        default_preset = (
+            "layout_none" if ablation_id in {
+                "got2_zero_shot", "projector_only", "generic_adapter_projector",
+                "vlqa_ocr_only",
+            } else "layout_full"
+        )
+        layout_loss_preset = args.layout_loss_preset or default_preset
+        if ablation_id in {"got2_zero_shot", "projector_only", "generic_adapter_projector", "vlqa_ocr_only"} and layout_loss_preset != "layout_none":
+            raise RunFailure(f"{ablation_id} requires layout_none.", exit_code=EXIT_USAGE)
+        if ablation_id in {"vlqa_layout_direct", "vlqa_layout_p1_p2"} and layout_loss_preset == "layout_none":
+            raise RunFailure(f"{ablation_id} requires an enabled layout loss preset.", exit_code=EXIT_USAGE)
+        if ablation_id == "got2_zero_shot":
+            if any(value is not None for value in (
+                args.p1_max_steps, args.p2_max_steps, args.p1_max_records, args.p2_max_records
+            )):
+                raise RunFailure("A0 does not create a training optimizer.", exit_code=EXIT_USAGE)
+            p1_steps = p2_steps = p1_records = p2_records = 0
+            stages = ()
+        elif ablation_id == "vlqa_layout_p1_p2":
+            if args.p1_max_steps is None or args.p2_max_steps is None:
+                raise RunFailure("A5 requires explicit P1 and P2 steps.", exit_code=EXIT_USAGE)
+            p1_steps, p2_steps = args.p1_max_steps, args.p2_max_steps
+            p1_records = 0 if args.p1_max_records is None else args.p1_max_records
+            p2_records = 0 if args.p2_max_records is None else args.p2_max_records
+            stages = ("p1", "p2")
+        else:
+            if args.p2_max_steps is None or args.p1_max_steps is not None or args.p1_max_records is not None:
+                raise RunFailure(f"{ablation_id} requires direct P2 only.", exit_code=EXIT_USAGE)
+            p1_steps = p1_records = 0
+            p2_steps = args.p2_max_steps
+            p2_records = 0 if args.p2_max_records is None else args.p2_max_records
+            stages = ("p2",)
+    elif args.mode == "validate":
+        layout_loss_preset = ""
         supplied = {
             "--p1-max-steps": args.p1_max_steps,
             "--p2-max-steps": args.p2_max_steps,
@@ -345,6 +500,7 @@ def resolve_settings(args: argparse.Namespace) -> Settings:
         p1_steps = p2_steps = p1_records = p2_records = 0
         stages = ()
     elif args.mode == "smoke":
+        layout_loss_preset = ""
         supplied = {
             "--p1-max-steps": args.p1_max_steps,
             "--p2-max-steps": args.p2_max_steps,
@@ -360,6 +516,7 @@ def resolve_settings(args: argparse.Namespace) -> Settings:
         p1_steps = p2_steps = p1_records = p2_records = 1
         stages = ("p1", "p2")
     elif args.mode == "overfit":
+        layout_loss_preset = ""
         supplied = {
             "--p1-max-steps": args.p1_max_steps,
             "--p2-max-steps": args.p2_max_steps,
@@ -378,6 +535,7 @@ def resolve_settings(args: argparse.Namespace) -> Settings:
         p2_steps = p2_records = 0
         stages = ("p1",)
     elif args.mode == "pilot":
+        layout_loss_preset = ""
         if not args.allow_unvalidated_pilot:
             raise RunFailure(
                 "Pilot requires --allow-unvalidated-pilot because pilot does not run validation automatically.",
@@ -394,6 +552,7 @@ def resolve_settings(args: argparse.Namespace) -> Settings:
         p2_records = 0 if args.p2_max_records is None else args.p2_max_records
         stages = ("p1", "p2")
     elif args.mode == "pretrain":
+        layout_loss_preset = ""
         if args.allow_unvalidated_pilot:
             raise RunFailure(
                 "--allow-unvalidated-pilot is only valid with --mode pilot.",
@@ -427,6 +586,7 @@ def resolve_settings(args: argparse.Namespace) -> Settings:
         p2_steps = p2_records = 0
         stages = ("p1",)
     elif args.mode == "joint-train":
+        layout_loss_preset = ""
         if args.allow_unvalidated_pilot:
             raise RunFailure(
                 "--allow-unvalidated-pilot is only valid with --mode pilot.",
@@ -461,6 +621,7 @@ def resolve_settings(args: argparse.Namespace) -> Settings:
         p2_records = 0 if args.p2_max_records is None else args.p2_max_records
         stages = ("p2",)
     else:
+        layout_loss_preset = ""
         if args.allow_unvalidated_pilot:
             raise RunFailure(
                 "--allow-unvalidated-pilot is only valid with --mode pilot.",
@@ -494,7 +655,7 @@ def resolve_settings(args: argparse.Namespace) -> Settings:
         p2_records = 0 if args.p2_max_records is None else args.p2_max_records
         stages = ("p2",)
 
-    if args.mode in {"pretrain", "joint-train"}:
+    if args.mode in {"pretrain", "joint-train", "ablation"}:
         formal_splits = {
             args.layout_split.strip(),
             args.validation_split.strip(),
@@ -559,6 +720,50 @@ def resolve_settings(args: argparse.Namespace) -> Settings:
     if replay_manifest is not None and replay_manifest not in audit_manifests:
         audit_manifests.append(replay_manifest)
 
+    source_model = args.source_model.expanduser().resolve()
+    validation_model_kind = args.validation_model_kind
+    validation_required_stage = args.validation_required_stage
+    if args.mode == "ablation":
+        validation_model_kind = (
+            "generic" if ablation_id == "generic_adapter_projector"
+            else "vlqa" if ablation_id.startswith("vlqa_")
+            else "baseline"
+        )
+        validation_required_stage = "p2" if validation_model_kind == "vlqa" else None
+    resolved_loss_weights = (
+        LAYOUT_LOSS_PRESETS[layout_loss_preset]
+        if args.mode == "ablation" else (
+            args.object_loss_weight, args.bbox_l1_loss_weight,
+            args.bbox_giou_loss_weight, args.direction_loss_weight,
+            args.layout_loss_weight,
+        )
+    )
+    selection_path = (
+        args.c4_selection.expanduser().resolve()
+        if args.c4_selection is not None
+        else None
+    )
+    selection = None
+    if selection_path is not None:
+        try:
+            selection = load_c4_selection(selection_path)
+        except Exception as exc:
+            raise RunFailure(
+                f"Invalid --c4-selection: {exc}", exit_code=EXIT_USAGE
+            ) from exc
+        selected_model = Path(selection["selected_model_path"]).resolve()
+        if selected_model != source_model:
+            raise RunFailure(
+                "--source-model must exactly match the model selected by "
+                f"--c4-selection: {source_model} != {selected_model}",
+                exit_code=EXIT_USAGE,
+            )
+        if args.mode != "adapt":
+            raise RunFailure(
+                "--c4-selection is only valid for formal adapt branches.",
+                exit_code=EXIT_USAGE,
+            )
+
     return Settings(
         workspace=args.workspace.expanduser().resolve(),
         ocrmodel_root=args.ocrmodel_root.expanduser().resolve(),
@@ -575,17 +780,21 @@ def resolve_settings(args: argparse.Namespace) -> Settings:
         replay_split=args.replay_split.strip(),
         replay_max_records=args.replay_max_records,
         primary_per_replay=args.primary_per_replay,
-        source_model=args.source_model.expanduser().resolve(),
+        source_model=source_model,
         tokenizer_model=args.tokenizer_model.expanduser().resolve(),
         runs_root=args.runs_root.expanduser().resolve(),
         run_id=run_id,
+        gpu_id=gpu_id,
+        physical_gpu_ids=physical_gpu_ids,
         mode=args.mode,
+        ablation_id=ablation_id,
+        layout_loss_preset=layout_loss_preset,
         stages=stages,
         layout_split=args.layout_split.strip(),
         validation_split=args.validation_split.strip(),
         test_split=args.test_split.strip(),
-        validation_model_kind=args.validation_model_kind,
-        validation_required_stage=args.validation_required_stage,
+        validation_model_kind=validation_model_kind,
+        validation_required_stage=validation_required_stage,
         seed=args.seed,
         max_regions=args.max_regions,
         model_max_length=args.model_max_length,
@@ -597,18 +806,35 @@ def resolve_settings(args: argparse.Namespace) -> Settings:
         p2_max_records=p2_records,
         p1_learning_rate=args.p1_learning_rate,
         p2_learning_rate=args.p2_learning_rate,
-        object_loss_weight=args.object_loss_weight,
-        bbox_l1_loss_weight=args.bbox_l1_loss_weight,
-        bbox_giou_loss_weight=args.bbox_giou_loss_weight,
-        direction_loss_weight=args.direction_loss_weight,
-        layout_loss_weight=args.layout_loss_weight,
+        p2_train_scope=args.p2_train_scope,
+        checkpoint_steps=args.checkpoint_steps,
+        lr_scheduler_type=args.lr_scheduler_type,
+        warmup_ratio=args.warmup_ratio,
+        weight_decay=args.weight_decay,
+        object_loss_weight=resolved_loss_weights[0],
+        bbox_l1_loss_weight=resolved_loss_weights[1],
+        bbox_giou_loss_weight=resolved_loss_weights[2],
+        direction_loss_weight=resolved_loss_weights[3],
+        layout_loss_weight=resolved_loss_weights[4],
         p2_ocr_loss_weight=args.p2_ocr_loss_weight,
         validation_max_records=args.validation_max_records,
         validation_max_new_tokens=args.validation_max_new_tokens,
         validation_no_repeat_ngram_size=args.validation_no_repeat_ngram_size,
         validation_object_threshold=args.validation_object_threshold,
         validation_iou_threshold=args.validation_iou_threshold,
+        skip_post_training_validation=args.skip_post_training_validation,
         skip_source_hash=args.skip_source_hash,
+        c4_selection=selection_path,
+        c4_selected_step=(selection["selected_step"] if selection else None),
+        c4_validation_page_cer=(
+            selection["validation_page_cer"] if selection else None
+        ),
+        c4_validation_whitespace_page_cer=(
+            selection["validation_whitespace_page_cer"] if selection else None
+        ),
+        c4_config_sha256=(selection["config_sha256"] if selection else None),
+        c4_weights_sha256=(selection["weights_sha256"] if selection else None),
+        c4_run_root=(Path(selection["c4_run_root"]) if selection else None),
     )
 
 
@@ -680,7 +906,7 @@ def validate_paths(settings: Settings) -> None:
             "paths have one unambiguous root.",
             exit_code=EXIT_USAGE,
         )
-    if settings.mode in {"validate", "pretrain", "joint-train"} and not settings.tokenizer_model.is_dir():
+    if settings.mode in {"validate", "pretrain", "joint-train", "ablation"} and not settings.tokenizer_model.is_dir():
         raise RunFailure(
             f"Validation tokenizer directory does not exist: {settings.tokenizer_model}",
             exit_code=EXIT_MISSING,
@@ -710,6 +936,13 @@ def validate_paths(settings: Settings) -> None:
             exit_code=EXIT_MISSING,
         ) from exc
     source_has_vlqa = source_config.get("use_vlqa") is True
+    source_has_generic = source_config.get("use_generic_adapter") is True
+    if settings.mode == "ablation" and (source_has_vlqa or source_has_generic):
+        raise RunFailure(
+            "A0-A5 formal launcher must receive the original GOT2 checkpoint; "
+            "A5 P1-to-P2 chaining is internal to the same run.",
+            exit_code=EXIT_USAGE,
+        )
     if settings.mode in {"smoke", "overfit", "pilot", "pretrain"} and source_has_vlqa:
         raise RunFailure(
             f"Mode {settings.mode!r} must start P1 from original GOT2 without VLQA.",
@@ -721,18 +954,32 @@ def validate_paths(settings: Settings) -> None:
         raise RunFailure("--primary-per-replay must be positive.", exit_code=EXIT_USAGE)
     if settings.mode in {"joint-train", "adapt"}:
         metrics_path = settings.source_model / "layout_training_metrics.json"
-        if not source_has_vlqa or not metrics_path.is_file():
+        if not source_has_vlqa:
             raise RunFailure(
                 "Formal adaptation must start from a completed VLQA checkpoint.",
                 exit_code=EXIT_USAGE,
             )
-        source_metrics = read_json(metrics_path)
         required_stage = "p1" if settings.mode == "joint-train" else "p2"
-        if source_metrics.get("layout_stage") != required_stage:
-            raise RunFailure(
-                f"Source checkpoint must report layout_stage={required_stage!r}.",
-                exit_code=EXIT_USAGE,
-            )
+        if settings.c4_selection is not None:
+            if required_stage != "p2":
+                raise RunFailure(
+                    "A selected C4 checkpoint is only valid as a P2 adapt source.",
+                    exit_code=EXIT_USAGE,
+                )
+        else:
+            if not metrics_path.is_file():
+                raise RunFailure(
+                    "Formal adaptation source has no layout_training_metrics.json; "
+                    "periodic checkpoints require --c4-selection and must not "
+                    "silently fall back to the final model.",
+                    exit_code=EXIT_USAGE,
+                )
+            source_metrics = read_json(metrics_path)
+            if source_metrics.get("layout_stage") != required_stage:
+                raise RunFailure(
+                    f"Source checkpoint must report layout_stage={required_stage!r}.",
+                    exit_code=EXIT_USAGE,
+                )
     if settings.mode != "validate":
         deepspeed = Path(sys.executable).with_name("deepspeed")
         if not deepspeed.is_file() or not os.access(deepspeed, os.X_OK):
@@ -750,7 +997,8 @@ def training_environment(settings: Settings) -> dict[str, str]:
             "OCRMODEL_ROOT": str(settings.ocrmodel_root),
             "GOT_PROJECT_ROOT": str(settings.project_root),
             "CUDA_DEVICE_ORDER": "PCI_BUS_ID",
-            "CUDA_VISIBLE_DEVICES": "0",
+            # DeepSpeed launches one process per visible physical GPU in this order.
+            "CUDA_VISIBLE_DEVICES": settings.gpu_id,
             "PYTHONNOUSERSITE": "1",
             "TOKENIZERS_PARALLELISM": "false",
             "WANDB_DISABLED": "true",
@@ -763,11 +1011,11 @@ def training_environment(settings: Settings) -> dict[str, str]:
     return environment
 
 
-def gpu_processes() -> list[dict[str, Any]]:
+def gpu_processes(gpu_id: str) -> list[dict[str, Any]]:
     command = [
         "nvidia-smi",
         "-i",
-        "0",
+        gpu_id,
         "--query-compute-apps=pid,process_name,used_memory",
         "--format=csv,noheader,nounits",
     ]
@@ -780,7 +1028,7 @@ def gpu_processes() -> list[dict[str, Any]]:
             timeout=20,
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
-        raise RunFailure(f"Cannot query GPU 0: {exc}", exit_code=EXIT_MISSING) from exc
+        raise RunFailure(f"Cannot query GPU {gpu_id}: {exc}", exit_code=EXIT_MISSING) from exc
     if completed.returncode != 0:
         raise RunFailure(
             f"nvidia-smi failed: {bounded(completed.stderr)}", exit_code=EXIT_MISSING
@@ -801,28 +1049,41 @@ def gpu_processes() -> list[dict[str, Any]]:
     return processes
 
 
-def require_gpu_free() -> None:
-    processes = gpu_processes()
-    if processes:
-        raise RunFailure(
-            f"GPU0_BUSY {compact_json(processes)}",
-            exit_code=EXIT_GPU_BUSY,
-        )
+def require_gpu_free(settings: Settings) -> None:
+    for gpu_id in settings.physical_gpu_ids:
+        processes = gpu_processes(gpu_id)
+        if processes:
+            raise RunFailure(
+                f"GPU{gpu_id}_BUSY {compact_json(processes)}",
+                exit_code=EXIT_GPU_BUSY,
+            )
 
 
-def acquire_lock(runs_root: Path) -> Any:
+def acquire_gpu_locks(runs_root: Path, physical_gpu_ids: Sequence[str]) -> list[Any]:
     if fcntl is None:
         raise RunFailure("The A100 launcher requires Linux file locking.", exit_code=EXIT_MISSING)
     runs_root.mkdir(parents=True, exist_ok=True)
-    handle = (runs_root / ".layout_a100.lock").open("a+", encoding="utf-8")
+    handles: list[Any] = []
     try:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BlockingIOError as exc:
-        handle.close()
-        raise RunFailure(
-            "Another layout A100 launcher holds the run lock.", exit_code=EXIT_LOCKED
-        ) from exc
-    return handle
+        for gpu_id in sorted(physical_gpu_ids, key=int):
+            handle = (runs_root / f".layout_a100.gpu-{gpu_id}.lock").open(
+                "a+", encoding="utf-8"
+            )
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError as exc:
+                handle.close()
+                raise RunFailure(
+                    f"Another layout A100 launcher holds the GPU {gpu_id} lock.",
+                    exit_code=EXIT_LOCKED,
+                ) from exc
+            handles.append(handle)
+    except Exception:
+        for handle in reversed(handles):
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            handle.close()
+        raise
+    return handles
 
 
 def run_environment_check(context: RunContext) -> dict[str, Any]:
@@ -1157,6 +1418,8 @@ def build_training_command(
         str(settings.project_root / "zero_config" / "zero2.json"),
         "--model_name_or_path",
         str(source_model),
+        "--tokenizer_name_or_path",
+        str(settings.tokenizer_model),
         "--layout_manifest",
         str(settings.train_manifest),
         "--layout_image_root",
@@ -1165,6 +1428,8 @@ def build_training_command(
         settings.layout_split,
         "--layout_stage",
         stage,
+        "--p2_train_scope",
+        settings.p2_train_scope,
         "--max_regions",
         str(settings.max_regions),
         "--max_train_records",
@@ -1181,18 +1446,20 @@ def build_training_command(
         "False",
         "--gradient_accumulation_steps",
         str(settings.gradient_accumulation_steps),
+        "--optim",
+        "adamw_torch",
         "--evaluation_strategy",
         "no",
         "--save_strategy",
-        "no",
+        "steps" if settings.checkpoint_steps else "no",
         "--save_safetensors",
         "True",
         "--weight_decay",
-        "0",
+        str(settings.weight_decay),
         "--warmup_ratio",
-        "0",
+        str(settings.warmup_ratio),
         "--lr_scheduler_type",
-        "constant",
+        settings.lr_scheduler_type,
         "--logging_steps",
         "1",
         "--tf32",
@@ -1232,6 +1499,15 @@ def build_training_command(
         "--output_dir",
         str(output_dir),
     ]
+    if settings.ablation_id:
+        command.extend(
+            [
+                "--ablation_id", settings.ablation_id,
+                "--layout_loss_preset", settings.layout_loss_preset,
+            ]
+        )
+    if settings.checkpoint_steps:
+        command.extend(["--save_steps", str(settings.checkpoint_steps)])
     if settings.replay_manifest is not None:
         command.extend(
             [
@@ -1256,6 +1532,7 @@ def validate_stage_metrics(
     stage: str,
     expected_steps: int,
     max_regions: int,
+    ablation_id: str = "",
 ) -> None:
     if metrics.get("layout_stage") != stage:
         raise RunFailure(f"{stage.upper()} metrics contain the wrong layout_stage.")
@@ -1267,7 +1544,8 @@ def validate_stage_metrics(
     train_loss = float(metrics.get("train_loss", float("nan")))
     if not math.isfinite(train_loss) or train_loss <= 0.0:
         raise RunFailure(f"{stage.upper()} train_loss is invalid: {train_loss}.")
-    if metrics.get("first_batch_bbox_shape") != [1, max_regions, 4]:
+    uses_vlqa = not ablation_id or ablation_id.startswith("vlqa_")
+    if uses_vlqa and metrics.get("first_batch_bbox_shape") != [1, max_regions, 4]:
         raise RunFailure(
             f"{stage.upper()} bbox batch shape is invalid: "
             f"{metrics.get('first_batch_bbox_shape')}."
@@ -1277,7 +1555,7 @@ def validate_stage_metrics(
         raise RunFailure(f"P1 retained {supervised} OCR-supervised batch tokens.")
     if stage == "p2" and supervised < 1:
         raise RunFailure("P2 has no OCR-supervised batch tokens.")
-    if metrics.get("layout_loss_compute_dtype") != "float32":
+    if uses_vlqa and metrics.get("layout_loss_compute_dtype") != "float32":
         raise RunFailure(
             f"{stage.upper()} did not report FP32 layout loss computation."
         )
@@ -1290,6 +1568,12 @@ def validate_stage_metrics(
         )
     except (TypeError, ValueError) as exc:
         raise RunFailure(f"{stage.upper()} reported invalid VLQA initialization metadata.") from exc
+    if not uses_vlqa:
+        if expected_layout_count != 0 or initialization != "disabled":
+            raise RunFailure(f"{ablation_id} unexpectedly enabled VLQA.")
+        if metrics.get("ablation_id") != ablation_id:
+            raise RunFailure("Training metrics contain the wrong ablation_id.")
+        return
     if expected_layout_count < 1:
         raise RunFailure(f"{stage.upper()} reported no expected VLQA tensors.")
     if not math.isfinite(parameter_abs_max):
@@ -1304,11 +1588,19 @@ def validate_stage_metrics(
         raise RunFailure(
             f"P1 fresh VLQA parameter scale is invalid: abs_max={parameter_abs_max}."
         )
-    if stage == "p2" and (
-        initialization != "checkpoint_loaded"
-        or source_layout_count != expected_layout_count
-    ):
-        raise RunFailure("P2 did not load a complete VLQA checkpoint from P1.")
+    if stage == "p2":
+        expected_initialization = (
+            "checkpoint_loaded" if ablation_id in {"", "vlqa_layout_p1_p2"}
+            else "fresh_explicit_reset"
+        )
+        if initialization != expected_initialization:
+            raise RunFailure(
+                f"{ablation_id or 'legacy'} P2 initialization mismatch: {initialization}."
+            )
+        if expected_initialization == "checkpoint_loaded" and source_layout_count != expected_layout_count:
+            raise RunFailure("P2 did not load a complete VLQA checkpoint from P1.")
+        if expected_initialization == "fresh_explicit_reset" and source_layout_count != 0:
+            raise RunFailure("Direct P2 unexpectedly loaded P1 VLQA tensors.")
     diagnostics = metrics.get("diagnostics")
     if not isinstance(diagnostics, dict) or int(diagnostics.get("log_count", 0)) < 1:
         raise RunFailure(f"{stage.upper()} did not record layout diagnostics.")
@@ -1455,7 +1747,8 @@ def run_stage(
         "started_at": timestamp(),
         "source_model": str(source_model),
         "output_model": str(output_dir),
-        "physical_gpu": 0,
+        "physical_gpus": list(settings.physical_gpu_ids),
+        "world_size": len(settings.physical_gpu_ids),
         "max_steps": steps,
         "max_train_records": records,
         "learning_rate": learning_rate,
@@ -1478,7 +1771,7 @@ def run_stage(
         max_records=records,
         log=str(log_path),
     )
-    require_gpu_free()
+    require_gpu_free(settings)
     with log_path.open("w", encoding="utf-8") as log:
         completed = subprocess.run(
             command,
@@ -1514,12 +1807,36 @@ def run_stage(
             stage=stage,
             expected_steps=steps,
             max_regions=settings.max_regions,
+            ablation_id=settings.ablation_id,
         )
     except RunFailure as exc:
         status["status"] = "metrics_validation_failed"
         status["metrics_error"] = bounded(str(exc))
         write_status(status_path, status)
         raise RunFailure(str(exc), log_path=log_path) from exc
+    if stage == "p2" and settings.c4_selection is not None:
+        branch_initialization = {
+            "parent_label": "c4_vlqa_ocr_only",
+            "selection_path": str(settings.c4_selection),
+            "selected_c4_step": settings.c4_selected_step,
+            "selected_c4_model_path": str(settings.source_model),
+            "selected_c4_validation_page_cer": settings.c4_validation_page_cer,
+            "selected_c4_validation_whitespace_page_cer": (
+                settings.c4_validation_whitespace_page_cer
+            ),
+            "selected_c4_config_sha256": settings.c4_config_sha256,
+            "selected_c4_weights_sha256": settings.c4_weights_sha256,
+            "c4_run_root": str(settings.c4_run_root),
+            "optimizer_state_initialization": "fresh",
+            "scheduler_state_initialization": "fresh",
+        }
+        metrics["branch_initialization"] = branch_initialization
+        metrics["selected_c4_step"] = settings.c4_selected_step
+        metrics["selected_c4_model_path"] = str(settings.source_model)
+        metrics["c4_selection"] = str(settings.c4_selection)
+        metrics["c4_validation_page_cer"] = settings.c4_validation_page_cer
+        metrics["initial_checkpoint_sha256"] = settings.c4_weights_sha256
+        write_json(metrics_path, metrics)
     status.update(
         {
             "status": "trained",
@@ -1560,6 +1877,8 @@ def verify_stage(
         "--output",
         str(output_path),
     ]
+    if context.settings.ablation_id:
+        command.extend(("--ablation-id", context.settings.ablation_id))
     if skip_model_reload:
         command.append("--skip-model-reload")
     environment = training_environment(context.settings)
@@ -1646,7 +1965,8 @@ def run_validation(
         "started_at": timestamp(),
         "source_model": str(selected_model),
         "output_root": str(validation_root),
-        "physical_gpu": 0,
+        "physical_gpus": list(settings.physical_gpu_ids),
+        "inference_physical_gpu": settings.physical_gpu_ids[0],
         "layout_manifest": str(selected_manifest),
         "layout_image_root": str(selected_image_root),
         "layout_split": selected_split,
@@ -1705,7 +2025,7 @@ def run_validation(
         max_records=settings.validation_max_records,
         log=str(log_path),
     )
-    require_gpu_free()
+    require_gpu_free(settings)
     with log_path.open("w", encoding="utf-8") as log:
         completed = subprocess.run(
             command,
@@ -1798,9 +2118,9 @@ def read_status(path: Path) -> dict[str, Any]:
 
 def execute(settings: Settings) -> int:
     validate_paths(settings)
-    lock_handle = acquire_lock(settings.runs_root)
+    lock_handles = acquire_gpu_locks(settings.runs_root, settings.physical_gpu_ids)
     try:
-        require_gpu_free()
+        require_gpu_free(settings)
         if settings.run_root.exists():
             raise RunFailure(
                 f"Run output already exists: {settings.run_root}", exit_code=EXIT_EXISTS
@@ -1815,7 +2135,8 @@ def execute(settings: Settings) -> int:
             "dataset_root": str(settings.dataset_root),
             "train_manifest": str(settings.train_manifest),
             "source_model": str(settings.source_model),
-            "physical_gpu": 0,
+            "physical_gpus": list(settings.physical_gpu_ids),
+            "world_size": len(settings.physical_gpu_ids),
             "validation_loader": "implemented",
         }
         summary: dict[str, Any] = {
@@ -1862,12 +2183,18 @@ def execute(settings: Settings) -> int:
                 pages=audit["page_count"],
                 regions=audit["region_count"],
             )
-            require_gpu_free()
-            context.update_status(status="component_smoke")
-            emit("layout_component_smoke_started")
-            component = run_component_smoke(context)
-            emit("layout_component_smoke_completed", gpu=component["gpu"])
-            require_gpu_free()
+            if settings.mode == "ablation" and not settings.ablation_id.startswith("vlqa_"):
+                component = {
+                    "status": "not_applicable",
+                    "reason": "No VLQA is constructed for this ablation.",
+                }
+            else:
+                require_gpu_free(settings)
+                context.update_status(status="component_smoke")
+                emit("layout_component_smoke_started")
+                component = run_component_smoke(context)
+                emit("layout_component_smoke_completed", gpu=component["gpu"])
+                require_gpu_free(settings)
             context.summary["preflight"] = {
                 "environment": environment_report,
                 "provenance": provenance,
@@ -1884,11 +2211,11 @@ def execute(settings: Settings) -> int:
                 "layout_preflight_completed",
                 pages=audit["page_count"],
                 regions=audit["region_count"],
-                gpu=component["gpu"],
+                gpu=component.get("gpu"),
             )
 
             if settings.mode == "validate":
-                require_gpu_free()
+                require_gpu_free(settings)
                 validation = run_validation(
                     context,
                     model_kind=settings.validation_model_kind,
@@ -1921,6 +2248,40 @@ def execute(settings: Settings) -> int:
                 )
                 return 0
 
+            if settings.mode == "ablation" and settings.ablation_id == "got2_zero_shot":
+                require_gpu_free(settings)
+                assert settings.validation_manifest is not None
+                validation = run_validation(
+                    context,
+                    model_path=settings.source_model,
+                    manifest=settings.validation_manifest,
+                    image_root=settings.validation_image_root or settings.validation_manifest.parent,
+                    split=settings.validation_split,
+                    model_kind="baseline",
+                    required_vlqa_stage=None,
+                )
+                context.summary.update({
+                    "p1": {"status": "not_applicable"},
+                    "p2": {"status": "not_applicable"},
+                    "validation": validation,
+                    "status": "ok",
+                    "finished_at": timestamp(),
+                })
+                context.update_status(
+                    status="completed", active_stage="none",
+                    finished_at=context.summary["finished_at"],
+                    validation_pages=validation["pages"],
+                )
+                context.write_summary()
+                (settings.run_root / "LAYOUT_A100_FINISHED").touch(exist_ok=False)
+                emit(
+                    "layout_a100_completed", run_id=settings.run_id,
+                    ablation_id=settings.ablation_id,
+                    summary=str(settings.run_root / "summary.json"),
+                    validation={"pages": validation["pages"], "metrics": validation["metrics"]},
+                )
+                return 0
+
             p1 = None
             p1_model = settings.source_model
             assessment_marker: str | None = None
@@ -1949,7 +2310,7 @@ def execute(settings: Settings) -> int:
                 }
 
             if "p2" in settings.stages:
-                require_gpu_free()
+                require_gpu_free(settings)
                 p2 = run_stage(context, stage="p2", source_model=p1_model)
                 context.summary["p2"] = p2
                 context.write_summary()
@@ -1982,8 +2343,37 @@ def execute(settings: Settings) -> int:
                         else "OVERFIT_FAILED"
                     )
 
+            if settings.mode == "ablation":
+                p1_exposures = (
+                    p1["metrics"].get("training_budget", {}).get(
+                        "total_sample_exposures_estimate", 0
+                    ) if p1 is not None else 0
+                )
+                p2_exposures = (
+                    p2["metrics"].get("training_budget", {}).get(
+                        "total_sample_exposures_estimate", 0
+                    ) if p2 is not None else 0
+                )
+                context.summary["ablation_budget"] = {
+                    "ablation_id": settings.ablation_id,
+                    "p1_steps": settings.p1_max_steps,
+                    "p2_steps": settings.p2_max_steps,
+                    "total_steps": settings.p1_max_steps + settings.p2_max_steps,
+                    "p1_page_exposures_estimate": p1_exposures,
+                    "p2_page_exposures_estimate": p2_exposures,
+                    "total_page_exposures_estimate": p1_exposures + p2_exposures,
+                    "effective_batch_size": (
+                        settings.per_device_batch_size
+                        * settings.gradient_accumulation_steps
+                        * len(settings.physical_gpu_ids)
+                    ),
+                }
+
             validation = None
-            if settings.mode in {"pretrain", "joint-train", "adapt"}:
+            if (
+                settings.mode in {"pretrain", "joint-train", "adapt", "ablation"}
+                and not settings.skip_post_training_validation
+            ):
                 validation_model = Path(
                     p2["model"] if p2 is not None else p1["model"]  # type: ignore[index]
                 )
@@ -1997,12 +2387,18 @@ def execute(settings: Settings) -> int:
                         or settings.validation_manifest.parent
                     ),
                     split=settings.validation_split,
-                    model_kind="vlqa",
-                    required_vlqa_stage=(
-                    "p2" if settings.mode in {"joint-train", "adapt"} else "p1"
-                    ),
+                    model_kind=settings.validation_model_kind,
+                    required_vlqa_stage=settings.validation_required_stage,
                 )
                 context.summary["validation"] = validation
+            elif (
+                settings.mode in {"pretrain", "joint-train", "adapt", "ablation"}
+                and settings.skip_post_training_validation
+            ):
+                context.summary["validation"] = {
+                    "status": "skipped",
+                    "reason": "skip_post_training_validation",
+                }
 
             context.summary.update({"status": "ok", "finished_at": timestamp()})
             completion_status = {
@@ -2030,6 +2426,7 @@ def execute(settings: Settings) -> int:
             emit(
                 "layout_a100_completed",
                 run_id=settings.run_id,
+                ablation_id=settings.ablation_id or None,
                 run_root=str(settings.run_root),
                 summary=str(settings.run_root / "summary.json"),
                 overfit_assessment=context.summary.get("overfit_assessment"),
@@ -2085,8 +2482,9 @@ def execute(settings: Settings) -> int:
             return exit_code
     finally:
         assert fcntl is not None
-        fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
-        lock_handle.close()
+        for lock_handle in reversed(lock_handles):
+            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
+            lock_handle.close()
 
 
 def main(argv: Sequence[str] | None = None) -> int:

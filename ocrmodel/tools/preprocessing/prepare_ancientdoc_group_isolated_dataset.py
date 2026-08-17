@@ -176,20 +176,94 @@ def assign_groups(
             key,
         ),
     )
-    split_order = sorted(TARGET_SPLITS, key=lambda split: stable_digest(f"{seed}:split:{split}"))
+    split_order = sorted(
+        TARGET_SPLITS,
+        key=lambda split: stable_digest(f"{seed}:split:{split}"),
+    )
     for group in ordered_groups:
         size = group_sizes[group]
 
-        def score(split: str) -> tuple[float, int, str]:
-            target = targets[split]
-            after = current[split] + size
-            normalized_error = abs(after - target) / max(target, 1.0)
-            overfill = 1 if after > target else 0
-            return normalized_error, overfill, split
+        def score(split: str) -> tuple[float, str]:
+            # Weighted list scheduling: equal projected fill ratios correspond
+            # to page counts in the requested train/validation/test ratio.
+            projected_fill = (current[split] + size) / targets[split]
+            return projected_fill, stable_digest(f"{seed}:{group}:{split}")
 
         best_split = min(split_order, key=score)
         assignments[group] = best_split
         current[best_split] += size
+
+    def objective(counts: dict[str, int]) -> tuple[float, float, float]:
+        errors = [
+            abs(counts[split] - targets[split]) / total
+            for split in TARGET_SPLITS
+        ]
+        return max(errors), sum(error * error for error in errors), sum(errors)
+
+    # Greedy weighted scheduling is already close to the requested ratios.
+    # Deterministic single-group moves and pair swaps remove residual errors
+    # caused by indivisible book groups without ever splitting a book.
+    while True:
+        current_objective = objective(current)
+        best_change: tuple[tuple[float, float, float], tuple[Any, ...]] | None = None
+
+        for group in sorted(assignments):
+            source = assignments[group]
+            size = group_sizes[group]
+            if current[source] == size:
+                continue
+            for destination in split_order:
+                if destination == source:
+                    continue
+                candidate = dict(current)
+                candidate[source] -= size
+                candidate[destination] += size
+                candidate_objective = objective(candidate)
+                change = ("move", group, source, destination)
+                if candidate_objective < current_objective and (
+                    best_change is None
+                    or (candidate_objective, change) < best_change
+                ):
+                    best_change = candidate_objective, change
+
+        groups = sorted(assignments)
+        for left_index, left in enumerate(groups):
+            left_split = assignments[left]
+            left_size = group_sizes[left]
+            for right in groups[left_index + 1 :]:
+                right_split = assignments[right]
+                if left_split == right_split:
+                    continue
+                right_size = group_sizes[right]
+                candidate = dict(current)
+                candidate[left_split] += right_size - left_size
+                candidate[right_split] += left_size - right_size
+                candidate_objective = objective(candidate)
+                change = ("swap", left, right, left_split, right_split)
+                if candidate_objective < current_objective and (
+                    best_change is None
+                    or (candidate_objective, change) < best_change
+                ):
+                    best_change = candidate_objective, change
+
+        if best_change is None:
+            break
+        _, change = best_change
+        if change[0] == "move":
+            _, group, source, destination = change
+            size = group_sizes[group]
+            assignments[group] = destination
+            current[source] -= size
+            current[destination] += size
+        else:
+            _, left, right, left_split, right_split = change
+            left_size = group_sizes[left]
+            right_size = group_sizes[right]
+            assignments[left] = right_split
+            assignments[right] = left_split
+            current[left_split] += right_size - left_size
+            current[right_split] += left_size - right_size
+
     if any(current[split] == 0 for split in TARGET_SPLITS):
         raise RuntimeError(f"At least one target split is empty: {current}")
     return assignments
@@ -252,10 +326,19 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--ancientdoc-root", type=Path, required=True)
     parser.add_argument("--output-root", type=Path, required=True)
     parser.add_argument("--source-splits", type=parse_split_ids, default=ALL_SOURCE_SPLITS)
-    parser.add_argument("--seed", type=int, default=20260814)
+    parser.add_argument("--seed", type=int, default=20260815)
     parser.add_argument("--train-ratio", type=ratio, default=0.6)
     parser.add_argument("--validation-ratio", type=ratio, default=0.2)
     parser.add_argument("--test-ratio", type=ratio, default=0.2)
+    parser.add_argument(
+        "--max-ratio-deviation",
+        type=ratio,
+        default=0.03,
+        help=(
+            "Maximum absolute difference between requested and actual split ratio; "
+            "formal preparation fails when any split exceeds it."
+        ),
+    )
     parser.add_argument("--symlink-images", action="store_true")
     parser.add_argument("--overwrite", action="store_true")
     return parser.parse_args(argv)
@@ -282,6 +365,30 @@ def build_dataset(args: argparse.Namespace) -> dict[str, Any]:
         validation_ratio=args.validation_ratio,
         test_ratio=args.test_ratio,
     )
+
+    assigned_page_counts = Counter(assignments[page.book_key] for page in pages)
+    requested_ratios = {
+        "train": args.train_ratio,
+        "validation": args.validation_ratio,
+        "test": args.test_ratio,
+    }
+    actual_ratios = {
+        split: assigned_page_counts[split] / len(pages)
+        for split in TARGET_SPLITS
+    }
+    ratio_deviations = {
+        split: actual_ratios[split] - requested_ratios[split]
+        for split in TARGET_SPLITS
+    }
+    if any(
+        abs(ratio_deviations[split]) > args.max_ratio_deviation
+        for split in TARGET_SPLITS
+    ):
+        raise RuntimeError(
+            "Book-isolated allocation is outside --max-ratio-deviation: "
+            f"requested={requested_ratios}, actual={actual_ratios}, "
+            f"deviation={ratio_deviations}, limit={args.max_ratio_deviation}"
+        )
 
     records_by_split = {split: [] for split in TARGET_SPLITS}
     group_split_counts: dict[str, Counter[str]] = {}
@@ -312,6 +419,15 @@ def build_dataset(args: argparse.Namespace) -> dict[str, Any]:
             "train": args.train_ratio,
             "validation": args.validation_ratio,
             "test": args.test_ratio,
+        },
+        "allocation": {
+            "algorithm": "weighted_lpt_with_deterministic_move_swap_refinement",
+            "max_ratio_deviation": args.max_ratio_deviation,
+            "actual_ratios": actual_ratios,
+            "ratio_deviations": ratio_deviations,
+            "max_absolute_ratio_deviation": max(
+                abs(value) for value in ratio_deviations.values()
+            ),
         },
         "layout_annotation_status": "none",
         "total_records": len(pages),

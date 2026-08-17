@@ -59,11 +59,10 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--model-name-or-path", type=Path, required=True)
     parser.add_argument(
         "--model-kind",
-        choices=("baseline", "vlqa"),
+        choices=("baseline", "generic", "vlqa"),
         default="vlqa",
         help=(
-            "Strict checkpoint protocol. baseline rejects VLQA, while vlqa requires "
-            "a complete layout adapter."
+            "Strict checkpoint protocol for baseline, generic adaptor, or VLQA."
         ),
     )
     parser.add_argument(
@@ -78,6 +77,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--max-regions", type=positive_int, default=16)
     parser.add_argument("--max-records", type=nonnegative_int, default=0)
+    parser.add_argument("--batch-size", type=positive_int, default=1)
     parser.add_argument("--model-max-length", type=positive_int, default=2048)
     parser.add_argument("--max-new-tokens", type=positive_int, default=2048)
     parser.add_argument("--no-repeat-ngram-size", type=nonnegative_int, default=20)
@@ -140,10 +140,11 @@ def trim_generation(decoded: str, stop_string: str) -> str:
 
 
 def require_layout_predictions(outputs: Any, max_regions: int) -> None:
+    batch_size = int(outputs.layout_object_logits.shape[0])
     expected_shapes = {
-        "layout_object_logits": (1, max_regions),
-        "layout_bbox_xyxy": (1, max_regions, 4),
-        "layout_direction_logits": (1, max_regions, len(DIRECTION_LABELS)),
+        "layout_object_logits": (batch_size, max_regions),
+        "layout_bbox_xyxy": (batch_size, max_regions, 4),
+        "layout_direction_logits": (batch_size, max_regions, len(DIRECTION_LABELS)),
     }
     for name, expected_shape in expected_shapes.items():
         value = getattr(outputs, name, None)
@@ -166,13 +167,24 @@ def validate_model_protocol(
     required_vlqa_stage: str | None,
 ) -> str | None:
     adapter = model.get_model().layout_adapter
+    generic_adapter = model.get_model().generic_adapter
     use_vlqa = getattr(model.config, "use_vlqa", False) is True
+    use_generic = getattr(model.config, "use_generic_adapter", False) is True
     if model_kind == "baseline":
         if required_vlqa_stage is not None:
             raise ValueError("--require-vlqa-stage is only valid for --model-kind vlqa.")
-        if use_vlqa or adapter is not None:
+        if use_vlqa or adapter is not None or use_generic or generic_adapter is not None:
             raise RuntimeError(
                 "Baseline evaluation requires an original GOT2 checkpoint without VLQA."
+            )
+        return None
+
+    if model_kind == "generic":
+        if required_vlqa_stage is not None:
+            raise ValueError("--require-vlqa-stage is only valid for --model-kind vlqa.")
+        if use_vlqa or adapter is not None or not use_generic or generic_adapter is None:
+            raise RuntimeError(
+                "Generic evaluation requires use_generic_adapter=true without VLQA."
             )
         return None
 
@@ -246,6 +258,7 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
         local_files_only=True,
         padding_side="right",
     )
+    tokenizer.padding_side = "left"
     tokenizer.model_max_length = args.model_max_length
     model = GOTQwenForCausalLM.from_pretrained(
         model_path,
@@ -278,18 +291,28 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
     dataset = data_module["eval_dataset"]
     loader = DataLoader(
         dataset,
-        batch_size=1,
+        batch_size=args.batch_size,
         shuffle=False,
         num_workers=args.num_workers,
         pin_memory=device.type == "cuda",
+        persistent_workers=args.num_workers > 0,
+        prefetch_factor=2 if args.num_workers > 0 else None,
         collate_fn=data_module["data_collator"],
+    )
+    has_layout_annotations = bool(
+        args.model_kind == "vlqa"
+        and any(
+            record.get("layout_annotation_status", "none") != "none"
+            and record.get("regions")
+            for record in dataset.records
+        )
     )
     layout_accumulator = (
         LayoutValidationAccumulator(
             object_threshold=args.object_threshold,
             iou_threshold=args.iou_threshold,
         )
-        if args.model_kind == "vlqa"
+        if has_layout_annotations
         else None
     )
     ocr_accumulator = OCRValidationAccumulator()
@@ -298,13 +321,14 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
         torch.cuda.reset_peak_memory_stats(device)
     total_layout_seconds = 0.0
     total_generation_seconds = 0.0
+    total_generation_token_slots = 0
     completed_pages = 0
     temporary_predictions = predictions_path.with_suffix(predictions_path.suffix + ".tmp")
+    evaluation_loop_started = time.perf_counter()
     try:
         with temporary_predictions.open("x", encoding="utf-8", newline="\n") as handle:
             for batch in loader:
-                if len(batch["page_id"]) != 1:
-                    raise RuntimeError("Layout validation currently requires batch_size=1.")
+                batch_size = len(batch["page_id"])
                 input_ids = batch["input_ids"].to(device=device, non_blocking=True)
                 attention_mask = batch["attention_mask"].to(
                     device=device,
@@ -314,7 +338,7 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
 
                 layout_outputs = None
                 layout_seconds = 0.0
-                if args.model_kind == "vlqa":
+                if has_layout_annotations:
                     synchronize(device)
                     layout_started = time.perf_counter()
                     with torch.inference_mode(), torch.autocast(
@@ -333,20 +357,37 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
                     layout_seconds = time.perf_counter() - layout_started
                     require_layout_predictions(layout_outputs, args.max_regions)
 
+                if len(set(batch["stop_string"])) != 1:
+                    raise RuntimeError("A validation batch must use one stop string.")
                 stop_string = batch["stop_string"][0]
-                stopping_criteria = KeywordsStoppingCriteria(
-                    [stop_string],
-                    tokenizer,
-                    input_ids,
-                )
                 generation_kwargs: dict[str, Any] = {
                     "attention_mask": attention_mask,
                     "images": images,
                     "do_sample": False,
                     "num_beams": 1,
                     "max_new_tokens": args.max_new_tokens,
-                    "stopping_criteria": [stopping_criteria],
                 }
+                stop_token_ids = tokenizer(
+                    stop_string,
+                    add_special_tokens=False,
+                ).input_ids
+                if len(stop_token_ids) == 1:
+                    eos_ids = {int(stop_token_ids[0])}
+                    configured_eos = model.generation_config.eos_token_id
+                    if configured_eos is not None:
+                        eos_ids.update(
+                            int(value)
+                            for value in (
+                                configured_eos
+                                if isinstance(configured_eos, list)
+                                else [configured_eos]
+                            )
+                        )
+                    generation_kwargs["eos_token_id"] = sorted(eos_ids)
+                elif batch_size == 1:
+                    generation_kwargs["stopping_criteria"] = [
+                        KeywordsStoppingCriteria([stop_string], tokenizer, input_ids)
+                    ]
                 if args.no_repeat_ngram_size:
                     generation_kwargs["no_repeat_ngram_size"] = args.no_repeat_ngram_size
 
@@ -360,81 +401,76 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
                     output_ids = model.generate(input_ids, **generation_kwargs)
                 synchronize(device)
                 generation_seconds = time.perf_counter() - generation_started
+                total_generation_token_slots += batch_size * int(
+                    output_ids.shape[1] - input_ids.shape[1]
+                )
 
-                decoded = tokenizer.decode(output_ids[0, input_ids.shape[1] :]).strip()
-                predicted_text = trim_generation(decoded, stop_string)
-                if layout_outputs is not None:
-                    object_scores = (
-                        layout_outputs.layout_object_logits[0]
-                        .float()
-                        .sigmoid()
-                        .detach()
-                        .cpu()
-                        .tolist()
-                    )
-                    predicted_boxes = (
-                        layout_outputs.layout_bbox_xyxy[0]
-                        .float()
-                        .detach()
-                        .cpu()
-                        .tolist()
-                    )
-                    predicted_directions = (
-                        layout_outputs.layout_direction_logits[0]
-                        .float()
-                        .argmax(dim=-1)
-                        .detach()
-                        .cpu()
-                        .tolist()
-                    )
-                    assert layout_accumulator is not None
-                    page_metrics = layout_accumulator.add_page(
-                        reference_text=batch["page_text"][0],
-                        predicted_text=predicted_text,
-                        regions=batch["regions"][0],
-                        annotation_status=batch["layout_annotation_status"][0],
-                        object_scores=object_scores,
-                        predicted_boxes=predicted_boxes,
-                        predicted_directions=predicted_directions,
-                    )
-                    query_predictions = [
-                        {
-                            "query_index": query_index,
-                            "object_probability": object_scores[query_index],
-                            "bbox_xyxy": predicted_boxes[query_index],
-                            "writing_direction": DIRECTION_LABELS[
-                                predicted_directions[query_index]
-                            ],
-                        }
-                        for query_index in range(args.max_regions)
-                    ]
-                else:
-                    page_metrics = {
-                        "ocr": ocr_accumulator.add_page(
-                            batch["page_text"][0],
-                            predicted_text,
+                for row in range(batch_size):
+                    decoded = tokenizer.decode(
+                        output_ids[row, input_ids.shape[1] :],
+                        skip_special_tokens=True,
+                    ).strip()
+                    predicted_text = trim_generation(decoded, stop_string)
+                    if layout_outputs is not None:
+                        object_scores = (
+                            layout_outputs.layout_object_logits[row]
+                            .float().sigmoid().detach().cpu().tolist()
                         )
+                        predicted_boxes = (
+                            layout_outputs.layout_bbox_xyxy[row]
+                            .float().detach().cpu().tolist()
+                        )
+                        predicted_directions = (
+                            layout_outputs.layout_direction_logits[row]
+                            .float().argmax(dim=-1).detach().cpu().tolist()
+                        )
+                        assert layout_accumulator is not None
+                        page_metrics = layout_accumulator.add_page(
+                            reference_text=batch["page_text"][row],
+                            predicted_text=predicted_text,
+                            regions=batch["regions"][row],
+                            annotation_status=batch["layout_annotation_status"][row],
+                            object_scores=object_scores,
+                            predicted_boxes=predicted_boxes,
+                            predicted_directions=predicted_directions,
+                        )
+                        query_predictions = [
+                            {
+                                "query_index": query_index,
+                                "object_probability": object_scores[query_index],
+                                "bbox_xyxy": predicted_boxes[query_index],
+                                "writing_direction": DIRECTION_LABELS[
+                                    predicted_directions[query_index]
+                                ],
+                            }
+                            for query_index in range(args.max_regions)
+                        ]
+                    else:
+                        page_metrics = {
+                            "ocr": ocr_accumulator.add_page(
+                                batch["page_text"][row], predicted_text
+                            )
+                        }
+                        query_predictions = None
+                    prediction_record = {
+                        "page_id": batch["page_id"][row],
+                        "image": batch["image_path"][row],
+                        "reference_text": batch["page_text"][row],
+                        "predicted_text": predicted_text,
+                        "layout_annotation_status": batch["layout_annotation_status"][row],
+                        "regions": batch["regions"][row],
+                        "layout_predictions": query_predictions,
+                        "metrics": page_metrics,
+                        "runtime_seconds": {
+                            "layout_forward": layout_seconds / batch_size,
+                            "ocr_generation": generation_seconds / batch_size,
+                        },
                     }
-                    query_predictions = None
-                prediction_record = {
-                    "page_id": batch["page_id"][0],
-                    "image": batch["image_path"][0],
-                    "reference_text": batch["page_text"][0],
-                    "predicted_text": predicted_text,
-                    "layout_annotation_status": batch["layout_annotation_status"][0],
-                    "regions": batch["regions"][0],
-                    "layout_predictions": query_predictions,
-                    "metrics": page_metrics,
-                    "runtime_seconds": {
-                        "layout_forward": layout_seconds,
-                        "ocr_generation": generation_seconds,
-                    },
-                }
-                handle.write(compact_json(prediction_record) + "\n")
+                    handle.write(compact_json(prediction_record) + "\n")
                 handle.flush()
                 total_layout_seconds += layout_seconds
                 total_generation_seconds += generation_seconds
-                completed_pages += 1
+                completed_pages += batch_size
         temporary_predictions.replace(predictions_path)
     except BaseException:
         temporary_predictions.unlink(missing_ok=True)
@@ -444,6 +480,7 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
         raise RuntimeError(
             f"Validation processed {completed_pages} pages but dataset contains {len(dataset)}."
         )
+    evaluation_loop_seconds = time.perf_counter() - evaluation_loop_started
     total_inference_seconds = total_layout_seconds + total_generation_seconds
     peak_memory_bytes = (
         int(torch.cuda.max_memory_allocated(device)) if device.type == "cuda" else None
@@ -460,6 +497,7 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
         "image_root": str(image_root),
         "split": args.layout_split,
         "pages": completed_pages,
+        "inference_failures": 0,
         "input_protocol": {
             "model_inputs": ["whole_page_image", "ocr_prompt"],
             "ocr_prompt": "OCR: ",
@@ -471,6 +509,13 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
             "num_beams": 1,
             "max_new_tokens": args.max_new_tokens,
             "no_repeat_ngram_size": args.no_repeat_ngram_size,
+        },
+        "batching": {
+            "batch_size": args.batch_size,
+            "num_workers": args.num_workers,
+            "left_padding": True,
+            "layout_forward_executed": has_layout_annotations,
+            "layout_forward_skipped_without_annotations": not has_layout_annotations,
         },
         "layout": {
             "max_regions": args.max_regions,
@@ -496,6 +541,14 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
                 if model.get_model().layout_adapter is not None
                 else 0
             ),
+            "generic_adapter": (
+                sum(
+                    parameter.numel()
+                    for parameter in model.get_model().generic_adapter.parameters()
+                )
+                if model.get_model().generic_adapter is not None
+                else 0
+            ),
         },
         "runtime": {
             "device": str(device),
@@ -503,10 +556,22 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
             "layout_forward_seconds": total_layout_seconds,
             "ocr_generation_seconds": total_generation_seconds,
             "total_inference_seconds": total_inference_seconds,
+            "evaluation_loop_seconds": evaluation_loop_seconds,
             "mean_seconds_per_page": total_inference_seconds / completed_pages,
             "pages_per_second": (
                 completed_pages / total_inference_seconds
                 if total_inference_seconds > 0.0
+                else None
+            ),
+            "end_to_end_pages_per_second": (
+                completed_pages / evaluation_loop_seconds
+                if evaluation_loop_seconds > 0.0
+                else None
+            ),
+            "generation_token_slots": total_generation_token_slots,
+            "generation_token_slots_per_second": (
+                total_generation_token_slots / total_generation_seconds
+                if total_generation_seconds > 0.0
                 else None
             ),
             "peak_cuda_memory_bytes": peak_memory_bytes,

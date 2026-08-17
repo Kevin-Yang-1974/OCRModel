@@ -229,6 +229,23 @@ class LayoutPageConversationDataset(LineLevelConversationDataset):
             max_records,
         )
 
+    def supervised_token_counts(self) -> list[int]:
+        cached = getattr(self, "_supervised_token_counts", None)
+        if cached is not None:
+            return list(cached)
+        counts: list[int] = []
+        for record in self.records:
+            copied = copy.deepcopy(record)
+            image_path = resolve_image_path(
+                self.image_root, copied["image"], copied["page_id"]
+            )
+            conversations = self.multimodal_processor([copied["conversations"]])
+            tokens = self.token_processor(conversations, str(image_path))
+            count = int((tokens["labels"][0] != IGNORE_INDEX).sum().item())
+            counts.append(count if self.supervise_ocr else 0)
+        self._supervised_token_counts = tuple(counts)
+        return counts
+
     def _layout_targets(self, record: dict[str, Any]) -> dict[str, torch.Tensor]:
         boxes = torch.zeros((self.max_regions, 4), dtype=torch.float32)
         bbox_mask = torch.zeros(self.max_regions, dtype=torch.bool)
@@ -407,6 +424,72 @@ class InterleavedLayoutDataset(Dataset):
         return self.primary[primary_index]
 
 
+def summarize_training_budget(
+    dataset: Dataset[Any],
+    *,
+    optimizer_steps: int,
+    per_device_batch_size: int,
+    gradient_accumulation_steps: int,
+    world_size: int,
+) -> dict[str, Any]:
+    if optimizer_steps < 1:
+        raise ValueError("optimizer_steps must be positive.")
+    micro_sample_exposures = (
+        optimizer_steps
+        * per_device_batch_size
+        * gradient_accumulation_steps
+        * world_size
+    )
+
+    def token_summary(values: list[int]) -> dict[str, Any]:
+        return {
+            "dataset_examples": len(values),
+            "supervised_tokens_per_dataset_pass": sum(values),
+            "mean_supervised_tokens_per_sample": (
+                sum(values) / len(values) if values else 0.0
+            ),
+            "min_supervised_tokens_per_sample": min(values) if values else 0,
+            "max_supervised_tokens_per_sample": max(values) if values else 0,
+        }
+
+    if isinstance(dataset, InterleavedLayoutDataset):
+        primary_counts = dataset.primary.supervised_token_counts()  # type: ignore[attr-defined]
+        replay_counts = dataset.replay.supervised_token_counts()  # type: ignore[attr-defined]
+        primary_fraction = dataset.primary_per_replay / dataset.period
+        replay_fraction = 1.0 / dataset.period
+    else:
+        primary_counts = dataset.supervised_token_counts()  # type: ignore[attr-defined]
+        replay_counts = []
+        primary_fraction = 1.0
+        replay_fraction = 0.0
+
+    primary_exposures = micro_sample_exposures * primary_fraction
+    replay_exposures = micro_sample_exposures * replay_fraction
+    primary_mean = sum(primary_counts) / len(primary_counts)
+    replay_mean = sum(replay_counts) / len(replay_counts) if replay_counts else 0.0
+    return {
+        "optimizer_steps": optimizer_steps,
+        "per_device_batch_size": per_device_batch_size,
+        "gradient_accumulation_steps": gradient_accumulation_steps,
+        "world_size": world_size,
+        "effective_batch_size": (
+            per_device_batch_size * gradient_accumulation_steps * world_size
+        ),
+        "total_sample_exposures_estimate": micro_sample_exposures,
+        "ancientdoc_sample_exposures_estimate": primary_exposures,
+        "replay_sample_exposures_estimate": replay_exposures,
+        "supervised_token_exposures_estimate": (
+            primary_exposures * primary_mean + replay_exposures * replay_mean
+        ),
+        "exposure_estimate_note": (
+            "Derived from optimizer steps, effective batch size, and the deterministic "
+            "primary:replay schedule; partial shuffled epochs can change exact per-source counts."
+        ),
+        "ancientdoc_supervision": token_summary(primary_counts),
+        "replay_supervision": token_summary(replay_counts),
+    }
+
+
 class LayoutPageValidationCollator:
     def __init__(self, tokenizer: Any) -> None:
         self.tokenizer = tokenizer
@@ -414,11 +497,17 @@ class LayoutPageValidationCollator:
     def __call__(self, instances: Sequence[dict[str, Any]]) -> dict[str, Any]:
         if not instances:
             raise ValueError("Validation collator received an empty batch.")
-        input_ids = torch.nn.utils.rnn.pad_sequence(
-            [instance["input_ids"] for instance in instances],
-            batch_first=True,
-            padding_value=self.tokenizer.pad_token_id,
+        sequences = [instance["input_ids"] for instance in instances]
+        max_length = max(sequence.numel() for sequence in sequences)
+        input_ids = torch.full(
+            (len(sequences), max_length),
+            self.tokenizer.pad_token_id,
+            dtype=sequences[0].dtype,
         )
+        # Decoder-only generation expects left padding so every continuation
+        # starts at the same position within a batch.
+        for row, sequence in enumerate(sequences):
+            input_ids[row, -sequence.numel() :] = sequence
         images = [torch.stack(instance["image"]) for instance in instances]
         images_high = [torch.stack(instance["image_high"]) for instance in instances]
         batch: dict[str, Any] = {
@@ -461,6 +550,7 @@ def make_layout_page_data_module(
     replay_split: str | None = None,
     replay_max_records: int = 0,
     primary_per_replay: int = 3,
+    include_layout_targets: bool = True,
 ) -> dict[str, Any]:
     if data_args.conversation_version != "mpt":
         raise ValueError("The whole-page layout entry point requires conversation_version=mpt.")
@@ -513,7 +603,11 @@ def make_layout_page_data_module(
     return {
         "train_dataset": train_dataset,
         "eval_dataset": None,
-        "data_collator": LayoutPageDataCollator(tokenizer=tokenizer),
+        "data_collator": (
+            LayoutPageDataCollator(tokenizer=tokenizer)
+            if include_layout_targets
+            else DataCollatorForSupervisedDataset(tokenizer=tokenizer)
+        ),
     }
 
 

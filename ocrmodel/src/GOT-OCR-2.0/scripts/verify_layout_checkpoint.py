@@ -20,6 +20,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--model", type=Path, required=True)
     parser.add_argument("--stage", choices=("p1", "p2"), required=True)
+    parser.add_argument("--ablation-id", default="legacy_default")
     parser.add_argument("--max-regions", type=int, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument(
@@ -50,6 +51,7 @@ def inspect_checkpoint(
     model_dir: Path,
     stage: str,
     max_regions: int,
+    ablation_id: str = "legacy_default",
 ) -> dict[str, Any]:
     config_path = model_dir / "config.json"
     weights_path = model_dir / "model.safetensors"
@@ -60,9 +62,20 @@ def inspect_checkpoint(
 
     config = load_json(config_path)
     metrics = load_json(metrics_path)
-    if config.get("use_vlqa") is not True:
-        raise RuntimeError("Saved config.use_vlqa is not true.")
-    if int(config.get("vlqa_num_queries", -1)) != max_regions:
+    use_vlqa = config.get("use_vlqa") is True
+    use_generic = config.get("use_generic_adapter") is True
+    expected_vlqa = ablation_id in {
+        "legacy_default", "vlqa_ocr_only", "vlqa_layout_direct", "vlqa_layout_p1_p2"
+    }
+    expected_generic = ablation_id == "generic_adapter_projector"
+    if ablation_id != "legacy_default" and config.get("ablation_id") != ablation_id:
+        raise RuntimeError("Saved config ablation_id does not match the requested group.")
+    if use_vlqa != expected_vlqa or use_generic != expected_generic:
+        raise RuntimeError(
+            "Saved adapter flags disagree with ablation: "
+            f"use_vlqa={use_vlqa}, use_generic_adapter={use_generic}."
+        )
+    if use_vlqa and int(config.get("vlqa_num_queries", -1)) != max_regions:
         raise RuntimeError(
             "Saved vlqa_num_queries does not match max_regions: "
             f"{config.get('vlqa_num_queries')} != {max_regions}."
@@ -71,6 +84,8 @@ def inspect_checkpoint(
         raise RuntimeError(
             f"Metrics stage mismatch: {metrics.get('layout_stage')!r} != {stage!r}."
         )
+    if ablation_id != "legacy_default" and metrics.get("ablation_id") != ablation_id:
+        raise RuntimeError("Saved metrics ablation_id does not match the requested group.")
     global_step = int(metrics.get("global_step", 0))
     train_loss = float(metrics.get("train_loss", float("nan")))
     if global_step < 1 or not math.isfinite(train_loss) or train_loss <= 0.0:
@@ -81,13 +96,20 @@ def inspect_checkpoint(
     with safe_open(weights_path, framework="pt", device="cpu") as handle:
         keys = list(handle.keys())
         layout_keys = [key for key in keys if "layout_adapter." in key]
+        generic_keys = [key for key in keys if "generic_adapter." in key]
         projector_keys = [key for key in keys if "mm_projector_vary." in key]
-        if not layout_keys:
+        if expected_vlqa and not layout_keys:
             raise RuntimeError("No layout_adapter tensors were saved.")
+        if not expected_vlqa and layout_keys:
+            raise RuntimeError("Non-VLQA checkpoint unexpectedly saved layout_adapter tensors.")
+        if expected_generic and not generic_keys:
+            raise RuntimeError("A2 checkpoint has no generic_adapter tensors.")
+        if not expected_generic and generic_keys:
+            raise RuntimeError("Checkpoint unexpectedly saved generic_adapter tensors.")
         if stage == "p2" and not projector_keys:
             raise RuntimeError("No mm_projector_vary tensors were saved for P2.")
 
-        checked_keys = layout_keys + (projector_keys if stage == "p2" else [])
+        checked_keys = layout_keys + generic_keys + (projector_keys if stage == "p2" else [])
         nonfinite_keys = [
             key
             for key in checked_keys
@@ -96,17 +118,21 @@ def inspect_checkpoint(
         if nonfinite_keys:
             raise RuntimeError(f"Non-finite tensors in checkpoint: {nonfinite_keys}")
 
-        gate_key = select_unique_key(keys, ".layout_adapter.residual_gate")
-        gate = float(handle.get_tensor(gate_key).float().item())
-        if not math.isfinite(gate):
-            raise RuntimeError("residual_gate is not finite.")
-        if stage == "p1" and gate != 0.0:
-            raise RuntimeError(f"P1 residual_gate must remain exactly zero, got {gate}.")
+        gate = None
+        if expected_vlqa:
+            gate_key = select_unique_key(keys, ".layout_adapter.residual_gate")
+            gate = float(handle.get_tensor(gate_key).float().item())
+            if not math.isfinite(gate):
+                raise RuntimeError("residual_gate is not finite.")
+            if stage == "p1" and gate != 0.0:
+                raise RuntimeError(f"P1 residual_gate must remain exactly zero, got {gate}.")
 
     return {
-        "config_use_vlqa": True,
+        "config_use_vlqa": use_vlqa,
+        "config_use_generic_adapter": use_generic,
         "global_step": global_step,
         "layout_tensor_count": len(layout_keys),
+        "generic_tensor_count": len(generic_keys),
         "projector_tensor_count": len(projector_keys),
         "residual_gate": gate,
         "train_loss": train_loss,
@@ -114,7 +140,7 @@ def inspect_checkpoint(
     }
 
 
-def reload_checkpoint(model_dir: Path, max_regions: int) -> dict[str, Any]:
+def reload_checkpoint(model_dir: Path, max_regions: int, ablation_id: str) -> dict[str, Any]:
     config = GOTConfig.from_pretrained(model_dir, local_files_only=True)
     model = GOTQwenForCausalLM.from_pretrained(
         model_dir,
@@ -125,16 +151,21 @@ def reload_checkpoint(model_dir: Path, max_regions: int) -> dict[str, Any]:
         low_cpu_mem_usage=True,
     )
     adapter = model.get_model().layout_adapter
-    if adapter is None:
+    generic = model.get_model().generic_adapter
+    expects_vlqa = ablation_id in {
+        "legacy_default", "vlqa_ocr_only", "vlqa_layout_direct", "vlqa_layout_p1_p2"
+    }
+    if expects_vlqa and adapter is None:
         raise RuntimeError("Reloaded model does not contain layout_adapter.")
-    if adapter.num_queries != max_regions:
+    if adapter is not None and adapter.num_queries != max_regions:
         raise RuntimeError(
             f"Reloaded adapter query count mismatch: {adapter.num_queries} != {max_regions}."
         )
     result = {
         "model_class": type(model).__name__,
-        "layout_adapter_class": type(adapter).__name__,
-        "max_regions": adapter.num_queries,
+        "layout_adapter_class": type(adapter).__name__ if adapter is not None else None,
+        "generic_adapter_class": type(generic).__name__ if generic is not None else None,
+        "max_regions": adapter.num_queries if adapter is not None else None,
     }
     del model
     gc.collect()
@@ -158,11 +189,16 @@ def main() -> int:
         "status": "ok",
         "stage": args.stage,
         "model": str(model_dir),
-        "safetensors": inspect_checkpoint(model_dir, args.stage, args.max_regions),
+        "ablation_id": args.ablation_id,
+        "safetensors": inspect_checkpoint(
+            model_dir, args.stage, args.max_regions, args.ablation_id
+        ),
         "model_reload": None,
     }
     if not args.skip_model_reload:
-        payload["model_reload"] = reload_checkpoint(model_dir, args.max_regions)
+        payload["model_reload"] = reload_checkpoint(
+            model_dir, args.max_regions, args.ablation_id
+        )
     write_json(args.output.resolve(), payload)
     print(json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
     return 0

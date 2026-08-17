@@ -17,6 +17,7 @@ from GOT.model.layout_query import (
     VisualLayoutQueryAdapter,
     VisualLayoutQueryLoss,
 )
+from GOT.model.generic_adapter import GenericVisualTransformerAdapter
 
 
 @dataclass
@@ -78,7 +79,28 @@ class GOTQwenModel(Qwen2Model):
         self.mm_projector_vary =  nn.Linear(1024, 1024)
 
         self.layout_adapter = None
+        self.generic_adapter = None
         self.layout_criterion = None
+        if getattr(config, "use_vlqa", False) and getattr(config, "use_generic_adapter", False):
+            raise ValueError("VLQA and generic visual adapter are mutually exclusive.")
+        if getattr(config, "use_generic_adapter", False):
+            config.generic_adapter_dim = int(getattr(config, "generic_adapter_dim", 256))
+            config.generic_adapter_num_heads = int(
+                getattr(config, "generic_adapter_num_heads", 8)
+            )
+            config.generic_adapter_ffn_expansion = int(
+                getattr(config, "generic_adapter_ffn_expansion", 8)
+            )
+            config.generic_adapter_dropout = float(
+                getattr(config, "generic_adapter_dropout", 0.0)
+            )
+            self.generic_adapter = GenericVisualTransformerAdapter(
+                visual_dim=1024,
+                adapter_dim=config.generic_adapter_dim,
+                num_heads=config.generic_adapter_num_heads,
+                ffn_expansion=config.generic_adapter_ffn_expansion,
+                dropout=config.generic_adapter_dropout,
+            )
         if getattr(config, "use_vlqa", False):
             config.vlqa_num_queries = int(getattr(config, "vlqa_num_queries", 16))
             config.vlqa_adapter_dim = int(getattr(config, "vlqa_adapter_dim", 256))
@@ -279,6 +301,8 @@ class GOTQwenModel(Qwen2Model):
                         # image_features.append(cnn_feature)
                     # image_features_2.append(cnn_feature)
                     image_feature = self.mm_projector_vary(cnn_feature)
+                    if self.generic_adapter is not None:
+                        image_feature = self.generic_adapter(image_feature)
                     if self.layout_adapter is not None:
                         layout_output = self.layout_adapter(
                             image_feature,
@@ -289,9 +313,9 @@ class GOTQwenModel(Qwen2Model):
                     image_features.append(image_feature)
 
                 else:
-                    if self.layout_adapter is not None:
+                    if self.layout_adapter is not None or self.generic_adapter is not None:
                         raise ValueError(
-                            "VLQA formal training accepts one whole-page image per sample; "
+                            "Formal visual-adapter training accepts one whole-page image per sample; "
                             f"received {P} image patches."
                         )
                     image_patches = torch.unbind(image[1])

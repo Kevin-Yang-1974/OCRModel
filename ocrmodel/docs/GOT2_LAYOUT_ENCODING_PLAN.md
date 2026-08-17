@@ -210,18 +210,16 @@ $$\mathcal L_{\mathrm{total}}=\mathcal L_{\mathrm{ocr}}+\lambda_{\mathrm{obj}}\m
 
 | 编号 | 模型 | 目的 |
 |---|---|---|
-| `A0` | 原始整页 GOT2 | 原生整页 OCR 基线 |
-| `A1` | 等参数量普通视觉 adaptor | 控制新增容量与训练步数 |
-| `A2` | 无布局辅助监督的 visual queries | 判断 query/resampler 本身的贡献 |
-| `A3` | bbox 监督 VLQA | 判断空间定位监督的贡献 |
-| `A4` | bbox＋方向监督＋有序区域槽位的完整 VLQA | 当前主候选 |
-| `A5` | 显式 oracle region-token adapter | 由真值 bbox/方向/顺序生成页面布局 token 的上界对照 |
-| `A6` | 外部轻量检测器＋显式 region-token adapter | 硬两阶段元数据输入对照 |
-| `A7` | 仓库外双 GOT2 两阶段路线 | 独立系统对照，单独报告两次 GOT2 成本与错误传播 |
+| `A0` | `got2_zero_shot` | 原始 GOT2 零样本参考 |
+| `A1` | `projector_only` | 合成域与 projector 适配贡献 |
+| `A2` | `generic_adapter_projector` | 等参数普通 adaptor 容量对照 |
+| `A3` | `vlqa_ocr_only` | VLQA 查询和写回结构贡献 |
+| `A4` | `vlqa_layout_direct` | 不经 P1 的布局辅助监督贡献 |
+| `A5` | `vlqa_layout_p1_p2` | P1 预热贡献，单独报告 P1/P2 与总曝光量 |
 
-`A0`–`A6` 必须使用相同整页输入、数据划分、页面转写、解码设置、有效 batch size 和尽量相同的训练预算。`A1` 与 `A2` 用于防止把额外参数或视觉重采样误判为布局收益。`A5`、`A6` 是旧显式字段方案的对照，不再主导当前实现。
+`A1`–`A4` 必须使用相同原始 checkpoint、整页输入、数据划分、页面转写、解码设置、有效 batch size 和 P2 预算。A5 的 P2 与 A4 相同，但必须额外报告 P1 steps 与页面曝光量。旧显式字段方案仍可作独立扩展对照，不再占用本轮编号。
 
-`A7` 只有在输入页面、数据划分、训练预算和页面级输出指标一致时才能比较最终结果；不得用其单列 CER 直接对比本仓库路线的页面 CER。
+独立双 GOT2 系统只有在输入页面、数据划分、训练预算和页面级输出指标一致时才能比较最终结果；不得用其单列 CER 直接对比本仓库路线的页面 CER。
 
 ### 9.2 评测指标
 
@@ -295,7 +293,7 @@ A100 run `layout_overfit_20260812_002747` 已完成固定 P1、2 条记录、100
 
 当前主候选已从“line crop＋显式 bbox/列序输入的 region-token adapter（旧 PCLA）”修订为“整页 GOT2＋端到端 Visual Layout Query Adapter”。页面视觉 token 提供原页面坐标参考，learnable queries 从视觉特征中产生布局表示；bbox、方向和阅读顺序只作为训练期辅助监督或评测标签，推理时不要求外部 metadata。显式 region-token adapter（旧 PCLA）、外部检测器路线和双 GOT2 路线均只作为独立对照。
 
-该方案已完成设计修订、首版工程链路、加载后初始化修复、1000 steps 两页实现诊断和两页 prompt-only checkpoint 重载验证。后一次验证使用同一 `train` split 的 P1 overfit checkpoint，不能替代正式 held-out validation。能否提高页面 OCR、阅读顺序和小样本跨域泛化，仍必须由正式 split 和统一预算下的 `A0`–`A6` 消融决定。
+该方案已完成设计修订、首版工程链路、加载后初始化修复、1000 steps 两页实现诊断和两页 prompt-only checkpoint 重载验证。后一次验证使用同一 `train` split 的 P1 overfit checkpoint，不能替代正式 held-out validation。能否提高页面 OCR、阅读顺序和小样本跨域泛化，仍必须由正式 split 和新版统一预算 `A0`–`A5` 消融决定。
 
 ## 参考文献
 

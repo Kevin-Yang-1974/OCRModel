@@ -97,12 +97,18 @@ class AncientDocGroupIsolatedPrepareTests(unittest.TestCase):
                     "0.25",
                     "--test-ratio",
                     "0.25",
+                    "--max-ratio-deviation",
+                    "0.2",
                 ]
             )
         )
         self.assertEqual(summary["event"], "ancientdoc_group_isolated_dataset_prepared")
         self.assertEqual(summary["total_records"], 5)
         self.assertEqual(summary["total_groups"], 4)
+        self.assertLessEqual(
+            summary["allocation"]["max_absolute_ratio_deviation"],
+            0.2,
+        )
         for split in ("train", "validation", "test"):
             self.assertTrue((output_root / split / "manifest.jsonl").is_file())
 
@@ -117,6 +123,40 @@ class AncientDocGroupIsolatedPrepareTests(unittest.TestCase):
         )
         self.assertEqual(audit_payload["status"], "ok")
         self.assertEqual(audit_payload["book_key_cross_split"], 0)
+
+    def test_allocator_tracks_requested_page_ratios(self) -> None:
+        pages = []
+        for group_index in range(30):
+            for page_index in range(1 + group_index % 4):
+                pages.append(
+                    prepare.SourcePage(
+                        split_id=1,
+                        index=len(pages),
+                        record={},
+                        image_relative=prepare.PurePosixPath(
+                            f"imgs/cat/book{group_index}/page_{page_index}.png"
+                        ),
+                        image_absolute=self.source_root,
+                        category="cat",
+                        book=f"book{group_index}",
+                        book_key=f"cat/book{group_index}",
+                        page_text="x",
+                    )
+                )
+        assignments = prepare.assign_groups(
+            pages,
+            seed=17,
+            train_ratio=0.6,
+            validation_ratio=0.2,
+            test_ratio=0.2,
+        )
+        counts = {split: 0 for split in prepare.TARGET_SPLITS}
+        for page in pages:
+            counts[assignments[page.book_key]] += 1
+        total = len(pages)
+        self.assertLessEqual(abs(counts["train"] / total - 0.6), 0.03)
+        self.assertLessEqual(abs(counts["validation"] / total - 0.2), 0.03)
+        self.assertLessEqual(abs(counts["test"] / total - 0.2), 0.03)
 
 
 if __name__ == "__main__":

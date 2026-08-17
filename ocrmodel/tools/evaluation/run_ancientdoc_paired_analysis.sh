@@ -6,7 +6,7 @@ usage() {
 Usage:
   run_ancientdoc_paired_analysis.sh --suite-root <validation-suite-root> [options]
 
-Offline paired OCR analysis for completed AncientDoc validation outputs.
+Offline paired OCR analysis for completed AncientDoc evaluation outputs.
 No model is loaded, no GPU is used, and no training or inference is started.
 
 Options:

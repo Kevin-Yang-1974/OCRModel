@@ -38,6 +38,14 @@ def main() -> None:
     parser.add_argument("--source-only", action="store_true")
     parser.add_argument("--metrics-name", default="linelevel_training_metrics.json")
     parser.add_argument("--expected-train-scope")
+    parser.add_argument(
+        "--allow-no-observed-trainable-delta",
+        action="store_true",
+        help=(
+            "Allow a one-step low-learning-rate smoke to complete when sampled BF16 "
+            "weights quantize back to their source values. Formal runs must not use this."
+        ),
+    )
     args = parser.parse_args()
 
     source_file = args.source_model.resolve() / "model.safetensors"
@@ -95,10 +103,19 @@ def main() -> None:
             f"expected {args.expected_train_scope!r}."
         )
     train_scope = args.expected_train_scope or training_metrics.get("train_scope")
-    if comparisons["projector"]["changed_elements"] == 0:
-        raise RuntimeError("The trainable projector tensor did not change.")
-    if train_scope == "decoder_projector" and comparisons["decoder"]["changed_elements"] == 0:
-        raise RuntimeError("The trainable decoder tensor did not change.")
+    required_trainable_components = ["projector"]
+    if train_scope == "decoder_projector":
+        required_trainable_components.append("decoder")
+    missing_trainable_deltas = [
+        name
+        for name in required_trainable_components
+        if comparisons[name]["changed_elements"] == 0
+    ]
+    if missing_trainable_deltas and not args.allow_no_observed_trainable_delta:
+        raise RuntimeError(
+            "Sampled trainable tensors did not change for: "
+            f"{missing_trainable_deltas}; refusing a formal continuation checkpoint."
+        )
     if train_scope == "projector" and comparisons["decoder"]["changed_elements"] != 0:
         raise RuntimeError("A frozen decoder tensor changed during projector-only training.")
     if train_scope not in {"projector", "decoder_projector"}:
@@ -114,6 +131,11 @@ def main() -> None:
             "new_in_trained": new_in_trained,
         },
         "tensor_comparisons": comparisons,
+        "required_trainable_components": required_trainable_components,
+        "missing_trainable_deltas": missing_trainable_deltas,
+        "no_delta_exception_used": bool(
+            args.allow_no_observed_trainable_delta and missing_trainable_deltas
+        ),
         "status": "checkpoint_continuation_verified",
     }
     args.output.parent.mkdir(parents=True, exist_ok=True)

@@ -51,19 +51,18 @@
 
 | 编号 | 配置 | 归因目的 |
 |---|---|---|
-| `A0` | 原始整页 GOT2 | 原生整页 OCR 基线 |
-| `A1` | 等参数量普通视觉 adaptor | 控制新增容量和训练预算 |
-| `A2` | 无布局辅助监督的 visual queries | 控制 query/resampler 本身 |
-| `A3` | bbox 监督 VLQA | 定位监督贡献 |
-| `A4` | bbox、方向和有序槽位监督 VLQA | 当前完整候选 |
-| `A5` | 真值布局的 oracle region-token adapter | 显式布局输入上界 |
-| `A6` | 外部轻量检测器加 region-token adapter | 两阶段显式布局对照 |
+| `A0` | `got2_zero_shot` | 不训练的原始整页 GOT2 参考 |
+| `A1` | `projector_only` | 控制合成域与原始 projector 适配 |
+| `A2` | `generic_adapter_projector` | 以等参数普通 Transformer adaptor 控制新增容量 |
+| `A3` | `vlqa_ocr_only` | 控制 query/cross-attention/write-back 结构本身 |
+| `A4` | `vlqa_layout_direct` | 相对 A3 测量直接 P2 布局监督贡献 |
+| `A5` | `vlqa_layout_p1_p2` | 相对 A4 测量 P1 布局预热贡献，并单独报告总预算 |
 
-独立的双 GOT2 两阶段系统记为系统级对照 `A7`，不与 `A0`–`A6` 共用“单模型模块消融”的表述。只有输入页面、数据划分、训练预算、解码与页面级指标一致时才比较最终结果。
+oracle/pseudo-layout region-token adaptor、外部轻量检测器和双 GOT2 两阶段系统继续作为独立扩展对照，不占用本轮 `A0`–`A5` 编号。只有输入页面、数据划分、训练预算、解码与页面级指标一致时才比较最终结果。
 
 ## 6. 训练公平性
 
-`A0`–`A6` 固定：
+`A0`–`A5` 固定：
 
 - 相同 train/validation/test 页面及 manifest 版本；
 - 相同图像预处理、OCR prompt、tokenizer 和解码参数；
@@ -80,11 +79,11 @@ P1 两样本 overfit 和单步 smoke 是实现门槛，不计入训练预算，�
 
 布局诊断指标：区域召回、bbox IoU/mAP、书写方向准确率、成对阅读顺序准确率和 Kendall's tau。区域级 CER 只用于定位错误，不替代页面指标。
 
-泛化与成本：跨书手、跨版本、跨馆藏、跨符号类型、跨模板表现，以及可训练参数量、峰值显存、吞吐量和单页延迟。`A7` 还需分别报告上游分割与下游识别成本及错误传播。
+泛化与成本：跨书手、跨版本、跨馆藏、跨符号类型、跨模板表现，以及可训练参数量、峰值显存、吞吐量和单页延迟。独立双 GOT2 系统还需分别报告上游分割与下游识别成本及错误传播。
 
 ## 8. 结论门槛
 
-只有 `A4` 在真实整页、小样本划分和统一预算下稳定优于 `A0`、`A1` 与 `A2`，才能把收益归因于布局监督 queries。以下结果不足以支持该结论：
+只有 A4/A5 在真实整页、小样本划分和统一预算下稳定优于 A1、A2 与 A3，才能分别讨论布局监督和 P1 预热贡献；A0 仅为零样本参考。以下结果不足以支持该结论：
 
 - 仅合成训练集 loss 下降；
 - 仅两样本 overfit 通过；

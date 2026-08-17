@@ -1,41 +1,26 @@
 # 项目状态
 
-> 更新日期：2026 年 8 月 14 日
-> 状态依据：当前代码、受限 A100 运行摘要与已完成的本地诊断
+> 更新日期：2026 年 8 月 17 日
 
-## 当前主线
+## 当前状态
 
-当前工作聚焦于单个 GOT2 内的整页布局查询与小样本通用符号识别。推理输入只保留原始整页图像和 OCR prompt；bbox、阅读顺序和书写方向只用于训练辅助监督、可选解释输出或离线评测。
+- 正式数据：`ancientdoc_layout_260707_group_isolated_seed20260815`，train/validation/test=`1548/516/516`，五类跨 split 泄漏均为 0。
+- 正式流程：C1/C4 训练、C4 validation-only 分支点选择、同起点 C5/C6 replay、C1/C5/C6 validation 选优和一次 frozen test 均已完成。
+- C4 分支点：`checkpoint-6000`，validation 页面 CER `0.567493`；C5/C6 的起点路径、step、权重哈希一致，optimizer 和 scheduler 均为 fresh。
+- Frozen test：`ancientdoc_12k_frozen_test_seed20260815_gpu0_retry1`，每项 516 页。C0/C1/C4/C5/C6 页面 CER 为 `1.328217/0.485815/0.457264/0.546852/0.515768`，去空白 CER 为 `1.113916/0.459547/0.438587/0.490939/0.464478`，完整页面 exact match 均为 `0/516`。
+- 当前模型排序：C4、C1、C6、C5、C0；当前 AncientDoc 主 checkpoint 为 C4 `checkpoint-6000`。
+- 离线验证：已对 C4-C1、C5-C4、C6-C4、C6-C5 执行逐页分析和 27 个书籍组、10,000 次 paired cluster bootstrap。只有 C5-C4 的 95% interval `[0.009897, 0.185221]` 排除 0；其余三项均跨 0。完整报告见 `docs/ANCIENTDOC_GROUP_ISOLATED_ANALYSIS_20260816.md`。
+- GOT2 结构消融：A1–A5 已在 `formal_pdf_short_seed20260812` 完成 validation-only 选点和一次 Synthetic-ID frozen test。A1/A2/A3/A4/A5 test page CER 分别为 `0.086320/0.158236/0.069977/0.235795/0.070531`；A4/A5 complete layout F1 为 `0.609785/0.695752`。A3 OCR 最低；A5 OCR 与 A3 接近且布局更完整，但 A5 额外包含 P1 4000 steps，不能视为同总预算。完整记录见 `docs/GOT2_LAYOUT_ABLATION_RESULTS_20260817.md`。
 
-AncientDoc 现在作为真实古籍适配与验证数据源使用，不再作为独立主线口径。line-level 结果仅用于诊断和历史兼容。
+## 已完成的正式流程
 
-## 已有入口
+1. 对全部 C4 周期 checkpoints 运行 validation-only selection，选择 `checkpoint-6000`。
+2. 从该 C4-best 独立训练 C5/C6，并完成分支 provenance 检查。
+3. C1/C5/C6 按 validation 选 best，C4 固定为分支点 C4-best。
+4. 冻结五个模型后，在同一 516 页 test 上统一评估一次。
 
-- `tools/training/run_layout_a100.py`：A100 训练与诊断总编排。
-- `tools/training/run_ancientdoc_baseline_suite.sh`：古籍适配训练总入口。
-- `tools/evaluation/run_ancientdoc_validation_suite.sh`：古籍验证总入口。
-- `tools/preprocessing/prepare_ancientdoc_layout_dataset.py`：把 AncientDoc GOT 标注转成 `layout-page-jsonl`。
+代码已提供 `train-core`、`select-c4`、`train-replay` 三阶段入口。旧 `C4-final→C5/C6` 流程已废弃。正式命令与紧凑回传见 `docs/SYNC_AND_RUN.md`。
 
-## 当前已能直接跑的 baseline
+## 归因边界
 
-- `adapt` + AncientDoc OCR-only。
-- `adapt` + AncientDoc + synthetic OCR replay。
-- `adapt` + AncientDoc + synthetic layout replay。
-- `joint-train` 的 loss 消融对照。
-
-## 已完成的工程验证
-
-- A100 训练链路、checkpoint 保存与重载、整页 validation 链路已经打通。
-- AncientDoc 原始目录结构已经确认，数据文件位于 `/data4/hyf/backup/GOT-OCR2.0/reference-260707/AncientDoc`。
-- `layout_page_dataset.py` 已支持真实 OCR-only 页面与 replay 混合输入。
-- AncientDoc 的 C4/C5/C6 适配与统一 516 页测试已经完成，结果见 `docs/ANCIENTDOC_BASELINE_REPORT_20260814.md`。当前最佳为 C6，页面 CER 为 `0.934099`，但完全正确页面仅 `1/516`。
-
-## 仍需正式完成
-
-- 统一整页训练基线的正式 held-out 验证。
-- AncientDoc 跨书籍、跨版本、跨馆藏及近重复隔离后的正式小样本验证。
-- 结构创新 baseline 的独立实现与公平比较。
-
-## 结果口径
-
-AncientDoc 当前结果可作为页面级真实古籍适配基线：C4 明显优于原始 GOT2，C5 略差于 C4，C6 为当前最优。由于原始 split 尚未完成来源分组与近重复隔离审计，且没有多随机种子或逐页配对显著性检验，该结果不能外推为小样本泛化结论，也不能单独证明布局查询结构有效。
+C5/C6 共享 C4-best 后，C6-C5 的页面 CER 为 `-0.031084`，说明 synthetic layout supervision 相对纯 OCR replay 减轻退化；但 C5-C4 和 C6-C4 分别为 `+0.089588` 和 `+0.058504`，两种 replay 均未超过 C4。C1 与 C4 的结构、可训练参数和上游训练历史仍不同；普通 GOT2 的同上游历史、同数据和近似参数预算 C2 尚未实现，因此不能把 C1-C4 差异完全归因于 VLQA。当前 frozen test 不再用于 replay 配置选择，后续调整只允许使用 validation。
