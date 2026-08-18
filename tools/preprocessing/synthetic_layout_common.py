@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import html
 import json
+import math
 import random
 import re
 import unicodedata
@@ -115,6 +116,7 @@ class ContentItem:
     text: str
     kind: str
     orientation: str
+    language: str = "und"
     source_image: str | None = None
     source_image_path: Path | None = None
     source_sha256: str | None = None
@@ -165,6 +167,12 @@ def load_content_items(manifest: Path, content_root: Path | None = None) -> list
             raise ValueError(
                 f"{prefix}.orientation must be one of {VALID_ORIENTATIONS}, got {orientation!r}."
             )
+
+        language = str(record.get("language", "und")).strip()
+        if not language or len(language) > 35 or not re.fullmatch(r"[A-Za-z0-9-]+", language):
+            raise ValueError(
+                f"{prefix}.language must be a BCP-47-like tag such as zh-Hant or und."
+            )
         if kind == "image" and orientation == "any":
             raise ValueError(
                 f"{prefix}.orientation must be an orientation or exact writing direction "
@@ -190,6 +198,7 @@ def load_content_items(manifest: Path, content_root: Path | None = None) -> list
                 text=text,
                 kind=kind,
                 orientation=orientation,
+                language=language,
                 source_image=source_image,
                 source_image_path=source_image_path,
                 source_sha256=source_sha256,
@@ -213,15 +222,43 @@ class GeneratorConfig:
     font_size_min: int = 28
     font_size_max: int = 46
     region_padding: int = 4
+    dense_gap_probability: float = 0.0
+    dense_gap_min: int = 0
+    dense_gap_max: int = 0
+    region_extent_weight_min: float = 1.0
+    region_extent_weight_max: float = 1.0
+    line_height_min: float = 1.35
+    line_height_max: float = 1.35
+    glyph_extent_safety_factor: float = 1.2
+    letter_spacing_min: float = 0.0
+    letter_spacing_max: float = 0.0
+    ink_opacity_min: float = 1.0
+    ink_opacity_max: float = 1.0
     page_text_separator: str = "\n"
     font_family: str = '"Noto Serif CJK SC", "Source Han Serif SC", SimSun, serif'
+    font_families: list[str] = field(default_factory=list)
+    font_weights: list[int] = field(default_factory=lambda: [400])
+    text_colors: list[str] = field(default_factory=lambda: ["#241d17"])
     allowed_rendered_fonts: list[str] = field(
         default_factory=lambda: ["Noto Serif CJK SC", "Source Han Serif SC", "SimSun"]
     )
     directions: list[str] = field(default_factory=lambda: list(WRITING_DIRECTIONS))
+    direction_weights: dict[str, float] = field(default_factory=dict)
     backgrounds: list[str] = field(
         default_factory=lambda: ["#f5f0e4", "#eee6d5", "#f8f4ea", "#e9dfc8"]
     )
+    s2_contrast_min: float = 0.78
+    s2_contrast_max: float = 1.08
+    s2_bleed_alpha_min: float = 0.025
+    s2_bleed_alpha_max: float = 0.075
+    s2_stain_count_min: int = 2
+    s2_stain_count_max: int = 7
+    s2_blur_radius_min: float = 0.15
+    s2_blur_radius_max: float = 0.85
+    s2_noise_sigma_min: float = 1.5
+    s2_noise_sigma_max: float = 5.0
+    s2_speckle_density_min: float = 0.0
+    s2_speckle_density_max: float = 0.0
 
     @classmethod
     def from_json(cls, path: Path | None) -> "GeneratorConfig":
@@ -258,6 +295,10 @@ class GeneratorConfig:
             "font_size_min",
             "font_size_max",
             "region_padding",
+            "dense_gap_min",
+            "dense_gap_max",
+            "s2_stain_count_min",
+            "s2_stain_count_max",
         )
         for name in integer_fields:
             value = getattr(self, name)
@@ -279,10 +320,65 @@ class GeneratorConfig:
             raise ValueError("Font sizes must satisfy 4 <= font_size_min <= font_size_max.")
         if self.region_padding < 0:
             raise ValueError("region_padding cannot be negative.")
+        if not 0 <= self.dense_gap_min <= self.dense_gap_max:
+            raise ValueError("Dense gaps must be non-negative and ordered.")
+        if not 0 <= self.dense_gap_probability <= 1:
+            raise ValueError("dense_gap_probability must be in [0, 1].")
+        ordered_nonnegative_ranges = (
+            ("region_extent_weight", self.region_extent_weight_min, self.region_extent_weight_max),
+            ("line_height", self.line_height_min, self.line_height_max),
+            ("ink_opacity", self.ink_opacity_min, self.ink_opacity_max),
+            ("s2_bleed_alpha", self.s2_bleed_alpha_min, self.s2_bleed_alpha_max),
+            ("s2_blur_radius", self.s2_blur_radius_min, self.s2_blur_radius_max),
+            ("s2_noise_sigma", self.s2_noise_sigma_min, self.s2_noise_sigma_max),
+            ("s2_speckle_density", self.s2_speckle_density_min, self.s2_speckle_density_max),
+        )
+        for name, lower, upper in ordered_nonnegative_ranges:
+            if not isinstance(lower, (int, float)) or not isinstance(upper, (int, float)):
+                raise TypeError(f"{name}_min/max must be numeric.")
+            if lower < 0 or upper < lower:
+                raise ValueError(f"{name}_min/max must be non-negative and ordered.")
+        if self.region_extent_weight_min <= 0:
+            raise ValueError("region_extent_weight_min must be positive.")
+        if not 0.5 <= self.line_height_min <= self.line_height_max <= 3.0:
+            raise ValueError("line heights must satisfy 0.5 <= min <= max <= 3.0.")
+        if not isinstance(self.glyph_extent_safety_factor, (int, float)) or not (
+            1.0 <= self.glyph_extent_safety_factor <= 3.0
+        ):
+            raise ValueError("glyph_extent_safety_factor must be in [1.0, 3.0].")
+        if self.ink_opacity_max > 1:
+            raise ValueError("ink opacity must not exceed 1.")
+        if not isinstance(self.letter_spacing_min, (int, float)) or not isinstance(
+            self.letter_spacing_max, (int, float)
+        ) or self.letter_spacing_max < self.letter_spacing_min:
+            raise ValueError("letter spacing min/max must be numeric and ordered.")
+        if not 0 < self.s2_contrast_min <= self.s2_contrast_max:
+            raise ValueError("S2 contrast min/max must be positive and ordered.")
+        if not 0 <= self.s2_bleed_alpha_min <= self.s2_bleed_alpha_max <= 1:
+            raise ValueError("S2 bleed alpha min/max must be in [0, 1].")
+        if not 0 <= self.s2_stain_count_min <= self.s2_stain_count_max:
+            raise ValueError("S2 stain counts must be non-negative and ordered.")
+        if self.s2_speckle_density_max > 0.2:
+            raise ValueError("S2 speckle density must not exceed 0.2.")
         if not isinstance(self.page_text_separator, str):
             raise TypeError("page_text_separator must be a string.")
         if not isinstance(self.font_family, str) or not self.font_family.strip():
             raise ValueError("font_family must be a non-empty CSS font-family value.")
+        if not isinstance(self.font_families, list) or any(
+            not isinstance(value, str) or not value.strip() for value in self.font_families
+        ):
+            raise ValueError("font_families must be a list of non-empty CSS font stacks.")
+        if not isinstance(self.font_weights, list) or not self.font_weights or any(
+            not isinstance(value, int) or not 100 <= value <= 900 for value in self.font_weights
+        ):
+            raise ValueError("font_weights must contain CSS weights from 100 to 900.")
+        if not isinstance(self.text_colors, list) or not self.text_colors:
+            raise ValueError("text_colors must be a non-empty list.")
+        invalid_text_colors = [
+            color for color in self.text_colors if not HEX_COLOR_RE.fullmatch(color)
+        ]
+        if invalid_text_colors:
+            raise ValueError(f"Text colors must use #RRGGBB: {invalid_text_colors}")
         if not isinstance(self.allowed_rendered_fonts, list) or not self.allowed_rendered_fonts:
             raise ValueError("allowed_rendered_fonts must be a non-empty list.")
         if any(
@@ -299,6 +395,22 @@ class GeneratorConfig:
         invalid_directions = sorted(set(self.directions) - set(WRITING_DIRECTIONS))
         if invalid_directions:
             raise ValueError(f"Unsupported writing directions: {invalid_directions}")
+        if not isinstance(self.direction_weights, dict):
+            raise TypeError("direction_weights must be an object mapping direction to weight.")
+        invalid_weight_directions = sorted(
+            set(self.direction_weights) - set(self.directions)
+        )
+        if invalid_weight_directions:
+            raise ValueError(
+                f"direction_weights contains disabled directions: {invalid_weight_directions}"
+            )
+        if any(
+            not isinstance(value, (int, float)) or value <= 0
+            for value in self.direction_weights.values()
+        ):
+            raise ValueError("direction_weights values must be positive numbers.")
+        if self.direction_weights and set(self.direction_weights) != set(self.directions):
+            raise ValueError("direction_weights must provide every enabled direction.")
         if not isinstance(self.backgrounds, list) or not self.backgrounds:
             raise ValueError("backgrounds must be a non-empty list.")
         invalid_colors = [color for color in self.backgrounds if not HEX_COLOR_RE.fullmatch(color)]
@@ -316,6 +428,12 @@ class RegionPlan:
     writing_direction: str
     bbox_px: tuple[float, float, float, float]
     font_size: int
+    font_family: str
+    font_weight: int
+    line_height: float
+    letter_spacing: float
+    text_color: str
+    ink_opacity: float
     item: ContentItem
 
 
@@ -360,42 +478,119 @@ def _plan_boxes(
     width, height = config.page_width, config.page_height
     margin_x = rng.randint(config.margin_min, config.margin_max)
     margin_y = rng.randint(config.margin_min, config.margin_max)
-    gap = rng.randint(config.gap_min, config.gap_max)
     boxes_visual_order: list[tuple[float, float, float, float]] = []
 
-    if direction.startswith("vertical"):
-        extent = width - 2 * margin_x - gap * (count - 1)
-        cell = extent / count
-        if cell <= 2 * (config.region_inset_max + config.region_padding) + 4:
+    if config.dense_gap_probability == 0:
+        shared_gap = rng.randint(config.gap_min, config.gap_max)
+        gaps = [shared_gap] * max(0, count - 1)
+    else:
+        gaps = [
+            rng.randint(config.dense_gap_min, config.dense_gap_max)
+            if rng.random() < config.dense_gap_probability
+            else rng.randint(config.gap_min, config.gap_max)
+            for _ in range(max(0, count - 1))
+        ]
+
+    if config.region_extent_weight_min == config.region_extent_weight_max == 1.0:
+        weights = [1.0] * count
+    else:
+        weights = [
+            rng.uniform(config.region_extent_weight_min, config.region_extent_weight_max)
+            for _ in range(count)
+        ]
+
+    def extents_for(available: float) -> list[float]:
+        if available <= 0:
+            raise ValueError("Margins and gaps leave no page content area.")
+        minimum = 2 * (config.region_inset_max + config.region_padding) + 4
+        if available <= minimum * count:
             raise ValueError(
-                f"{count} vertical regions do not fit page width={width}; reduce max_regions."
+                "Margins and sampled gaps leave insufficient space for the requested regions."
             )
-        for visual_index in range(count):
+        total_weight = sum(weights)
+        distributable = available - minimum * count
+        return [minimum + distributable * weight / total_weight for weight in weights]
+
+    if direction.startswith("vertical"):
+        cells = extents_for(width - 2 * margin_x - sum(gaps))
+        cursor = float(margin_x)
+        for visual_index, cell in enumerate(cells):
             inset_left = rng.randint(config.region_inset_min, config.region_inset_max)
             inset_right = rng.randint(config.region_inset_min, config.region_inset_max)
             top_jitter = rng.randint(0, config.region_inset_max)
             bottom_jitter = rng.randint(0, config.region_inset_max)
-            x0 = margin_x + visual_index * (cell + gap) + inset_left
-            x1 = margin_x + visual_index * (cell + gap) + cell - inset_right
+            x0 = cursor + inset_left
+            x1 = cursor + cell - inset_right
             boxes_visual_order.append((x0, margin_y + top_jitter, x1, height - margin_y - bottom_jitter))
+            cursor += cell + (gaps[visual_index] if visual_index < len(gaps) else 0)
         if direction == "vertical_rtl":
             boxes_visual_order.reverse()
     else:
-        extent = height - 2 * margin_y - gap * (count - 1)
-        cell = extent / count
-        if cell <= 2 * (config.region_inset_max + config.region_padding) + 4:
-            raise ValueError(
-                f"{count} horizontal regions do not fit page height={height}; reduce max_regions."
-            )
-        for visual_index in range(count):
+        cells = extents_for(height - 2 * margin_y - sum(gaps))
+        cursor = float(margin_y)
+        for visual_index, cell in enumerate(cells):
             inset_top = rng.randint(config.region_inset_min, config.region_inset_max)
             inset_bottom = rng.randint(config.region_inset_min, config.region_inset_max)
             left_jitter = rng.randint(0, config.region_inset_max)
             right_jitter = rng.randint(0, config.region_inset_max)
-            y0 = margin_y + visual_index * (cell + gap) + inset_top
-            y1 = margin_y + visual_index * (cell + gap) + cell - inset_bottom
+            y0 = cursor + inset_top
+            y1 = cursor + cell - inset_bottom
             boxes_visual_order.append((margin_x + left_jitter, y0, width - margin_x - right_jitter, y1))
+            cursor += cell + (gaps[visual_index] if visual_index < len(gaps) else 0)
     return boxes_visual_order
+
+
+def _sample_float(rng: random.Random, lower: float, upper: float) -> float:
+    return float(lower) if lower == upper else rng.uniform(lower, upper)
+
+
+def _sample_choice(rng: random.Random, values: Sequence[Any]) -> Any:
+    return values[0] if len(values) == 1 else rng.choice(list(values))
+
+
+def _fit_text_font_size(
+    *,
+    text: str,
+    bbox_px: tuple[float, float, float, float],
+    writing_direction: str,
+    sampled_font_size: int,
+    minimum_font_size: int,
+    line_height: float,
+    glyph_extent_safety_factor: float,
+    letter_spacing: float,
+    region_padding: int,
+) -> int:
+    x0, y0, x1, y1 = bbox_px
+    # HTMLElement.clientWidth/clientHeight expose the padded content box as integers.
+    inner_width = float(math.floor(x1 - x0 - 2 * region_padding))
+    inner_height = float(math.floor(y1 - y0 - 2 * region_padding))
+    if min(inner_width, inner_height) <= 0:
+        raise ValueError(f"Text region has no usable content area: {bbox_px}")
+    if writing_direction.startswith("vertical"):
+        inline_extent, block_extent = inner_height, inner_width
+    else:
+        inline_extent, block_extent = inner_width, inner_height
+
+    logical_lines = text.split("\n") or [""]
+    positive_spacing = max(0.0, letter_spacing)
+    for font_size in range(sampled_font_size, minimum_font_size - 1, -1):
+        wrapped_lines = 0
+        for logical_line in logical_lines:
+            characters = max(1, len(logical_line))
+            inline_required = (
+                characters * font_size + max(0, characters - 1) * positive_spacing
+            )
+            wrapped_lines += max(1, math.ceil(inline_required / inline_extent))
+        line_extent = font_size * max(glyph_extent_safety_factor, line_height)
+        required_block_pixels = math.floor(wrapped_lines * line_extent + 0.5)
+        if required_block_pixels <= block_extent:
+            return font_size
+    raise ValueError(
+        "Text cannot fit inside the sampled region at the configured minimum font size: "
+        f"direction={writing_direction}, bbox={bbox_px}, text_length={len(text)}, "
+        f"sampled_font_size={sampled_font_size}, minimum_font_size={minimum_font_size}, "
+        f"line_height={line_height:.4f}, letter_spacing={letter_spacing:.4f}"
+    )
 
 
 def build_page_plan(
@@ -428,25 +623,78 @@ def build_page_plan(
             f"for split={split!r}; split contains {split_count} total records."
         )
 
-    direction = rng.choice(sorted(by_direction))
+    available_directions = sorted(by_direction)
+    if config.direction_weights:
+        direction = rng.choices(
+            available_directions,
+            weights=[config.direction_weights[value] for value in available_directions],
+            k=1,
+        )[0]
+    else:
+        direction = rng.choice(available_directions)
     eligible = by_direction[direction]
-    count = rng.randint(config.min_regions, min(config.max_regions, len(eligible)))
-    selected = rng.sample(eligible, count)
-    boxes = _plan_boxes(config, rng, direction, count)
+    sampled_count = rng.randint(config.min_regions, min(config.max_regions, len(eligible)))
 
     tier_tag = tier.split("-", maxsplit=1)[0]
     page_id = f"{split}_{tier_tag}_seed{base_seed:08d}_p{page_index:06d}"
-    regions = tuple(
-        RegionPlan(
-            region_id=f"{page_id}_r{reading_order:03d}",
-            reading_order=reading_order,
-            writing_direction=direction,
-            bbox_px=boxes[reading_order],
-            font_size=rng.randint(config.font_size_min, config.font_size_max),
-            item=item,
-        )
-        for reading_order, item in enumerate(selected)
-    )
+    font_families = config.font_families or [config.font_family]
+    count = sampled_count
+    last_fit_error: ValueError | None = None
+    for candidate_count in range(sampled_count, config.min_regions - 1, -1):
+        try:
+            selected = rng.sample(eligible, candidate_count)
+            boxes = _plan_boxes(config, rng, direction, candidate_count)
+            candidate_regions: list[RegionPlan] = []
+            for reading_order, item in enumerate(selected):
+                bbox_px = boxes[reading_order]
+                sampled_font_size = rng.randint(config.font_size_min, config.font_size_max)
+                line_height = _sample_float(rng, config.line_height_min, config.line_height_max)
+                letter_spacing = _sample_float(
+                    rng, config.letter_spacing_min, config.letter_spacing_max
+                )
+                font_size = sampled_font_size
+                if item.kind == "text":
+                    font_size = _fit_text_font_size(
+                        text=item.text,
+                        bbox_px=bbox_px,
+                        writing_direction=direction,
+                        sampled_font_size=sampled_font_size,
+                        minimum_font_size=config.font_size_min,
+                        line_height=line_height,
+                        glyph_extent_safety_factor=config.glyph_extent_safety_factor,
+                        letter_spacing=letter_spacing,
+                        region_padding=config.region_padding,
+                    )
+                candidate_regions.append(
+                    RegionPlan(
+                        region_id=f"{page_id}_r{reading_order:03d}",
+                        reading_order=reading_order,
+                        writing_direction=direction,
+                        bbox_px=bbox_px,
+                        font_size=font_size,
+                        font_family=_sample_choice(rng, font_families),
+                        font_weight=_sample_choice(rng, config.font_weights),
+                        line_height=line_height,
+                        letter_spacing=letter_spacing,
+                        text_color=_sample_choice(rng, config.text_colors),
+                        ink_opacity=_sample_float(
+                            rng, config.ink_opacity_min, config.ink_opacity_max
+                        ),
+                        item=item,
+                    )
+                )
+        except ValueError as exc:
+            last_fit_error = exc
+            continue
+        count = candidate_count
+        region_plans = candidate_regions
+        break
+    else:
+        raise ValueError(
+            f"Unable to plan a visible text layout for {page_id} with "
+            f"{config.min_regions}..{sampled_count} regions."
+        ) from last_fit_error
+    regions = tuple(region_plans)
     return PagePlan(
         page_id=page_id,
         split=split,
@@ -454,7 +702,7 @@ def build_page_plan(
         template_id=f"{direction}_{count:02d}region",
         page_seed=page_seed,
         page_size=(config.page_width, config.page_height),
-        background=rng.choice(config.backgrounds),
+        background=_sample_choice(rng, config.backgrounds),
         page_text_separator=config.page_text_separator,
         regions=regions,
     )
@@ -483,12 +731,18 @@ def render_page_html(
             f"left:{x0:.3f}px;top:{y0:.3f}px;width:{x1 - x0:.3f}px;"
             f"height:{y1 - y0:.3f}px;writing-mode:{writing_mode};direction:{direction};"
             f"font-size:{region.font_size}px;padding:{config.region_padding}px;"
+            f"font-family:{region.font_family};font-weight:{region.font_weight};"
+            f"line-height:{region.line_height:.4f};"
+            f"letter-spacing:{region.letter_spacing:.4f}px;color:{region.text_color};"
         )
         if debug_outlines:
             style += "outline:1px solid rgba(190,0,0,.45);"
 
         if region.item.kind == "text":
-            content = f'<div class="text-content">{html.escape(region.item.text)}</div>'
+            content = (
+                f'<div class="text-content" style="opacity:{region.ink_opacity:.4f}">'
+                f"{html.escape(region.item.text)}</div>"
+            )
         else:
             if region.item.source_image_path is None:
                 raise RuntimeError(f"Image content has no resolved path: {region.item.content_id}")
@@ -501,7 +755,10 @@ def render_page_html(
             f'<section class="region" id="{html.escape(region.region_id, quote=True)}" '
             f'data-region-id="{html.escape(region.region_id, quote=True)}" '
             f'data-reading-order="{region.reading_order}" '
-            f'data-writing-direction="{region.writing_direction}" style="{style}">'
+            f'data-writing-direction="{region.writing_direction}" '
+            f'data-language="{html.escape(region.item.language, quote=True)}" '
+            f'lang="{html.escape(region.item.language, quote=True)}" '
+            f'style="{html.escape(style, quote=True)}">'
             f"{content}</section>"
         )
 
@@ -541,7 +798,6 @@ body {{
   position: absolute;
   overflow: hidden;
   text-orientation: mixed;
-  line-height: 1.35;
 }}
 .text-content {{
   width: 100%;
@@ -586,9 +842,17 @@ def plan_to_record(plan: PagePlan) -> dict[str, Any]:
                 "source_kind": region.item.kind,
                 "source_image": region.item.source_image,
                 "source_sha256": region.item.source_sha256,
+                "language": region.item.language,
                 "text": region.item.text,
                 "reading_order": region.reading_order,
                 "writing_direction": region.writing_direction,
+                "font_size": region.font_size,
+                "font_family": region.font_family,
+                "font_weight": region.font_weight,
+                "line_height": round(region.line_height, 6),
+                "letter_spacing": round(region.letter_spacing, 6),
+                "text_color": region.text_color,
+                "ink_opacity": round(region.ink_opacity, 6),
                 "planned_bbox_px": [round(value, 4) for value in region.bbox_px],
                 "valid": True,
             }
@@ -686,10 +950,18 @@ def manifest_record_from_dom(
                 "source_kind": region.item.kind,
                 "source_image": region.item.source_image,
                 "source_sha256": region.item.source_sha256,
+                "language": region.item.language,
                 "bbox": [round(value, 8) for value in bbox_normalized],
                 "bbox_px": [round(value, 4) for value in bbox_px],
                 "reading_order": region.reading_order,
                 "writing_direction": region.writing_direction,
+                "font_size": region.font_size,
+                "font_family": region.font_family,
+                "font_weight": region.font_weight,
+                "line_height": round(region.line_height, 6),
+                "letter_spacing": round(region.letter_spacing, 6),
+                "text_color": region.text_color,
+                "ink_opacity": round(region.ink_opacity, 6),
                 "computed_writing_mode": str(dom.get("writing_mode", "")),
                 "computed_direction": str(dom.get("direction", "")),
                 "computed_font_family": str(dom.get("font_family", "")),

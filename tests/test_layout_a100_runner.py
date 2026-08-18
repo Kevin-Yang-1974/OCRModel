@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 MODULE_PATH = (
     Path(__file__).resolve().parents[1] / "tools" / "training" / "run_layout_a100.py"
@@ -152,6 +154,37 @@ class LayoutA100RunnerTests(unittest.TestCase):
         self.assertEqual(
             runner.training_environment(settings)["CUDA_VISIBLE_DEVICES"], "3,1,4"
         )
+        self.assertEqual(
+            runner.component_smoke_environment(settings)["CUDA_VISIBLE_DEVICES"], "3"
+        )
+
+    def test_component_smoke_subprocess_is_restricted_to_first_selected_gpu(self) -> None:
+        settings = runner.resolve_settings(
+            make_args(
+                self.tmp_path,
+                "--gpu-ids",
+                "3,1",
+                "--run-id",
+                "component-smoke-env-test",
+            )
+        )
+        (settings.run_root / "metadata").mkdir(parents=True)
+        context = runner.RunContext(settings=settings, status={}, summary={})
+        payload = {
+            "status": "ok",
+            "loss_dtype": "torch.float32",
+            "object_logit_abs_max": 0.0,
+            "direction_logit_abs_max": 0.0,
+            "bbox_logit_abs_max": 0.0,
+        }
+        completed = runner.subprocess.CompletedProcess(
+            args=[], returncode=0, stdout=json.dumps(payload), stderr=""
+        )
+        with mock.patch.object(
+            runner.subprocess, "run", return_value=completed
+        ) as run:
+            self.assertEqual(runner.run_component_smoke(context), payload)
+        self.assertEqual(run.call_args.kwargs["env"]["CUDA_VISIBLE_DEVICES"], "3")
 
     def test_gpu_flags_are_mutually_exclusive_and_ids_are_unique(self) -> None:
         with self.assertRaisesRegex(runner.RunFailure, "mutually exclusive"):
@@ -530,6 +563,55 @@ class LayoutA100RunnerTests(unittest.TestCase):
         self.assertIn('losses.loss.dtype != torch.float32', runner.COMPONENT_SMOKE)
         self.assertIn('value >= 10.0', runner.COMPONENT_SMOKE)
         self.assertIn('"bbox_logit_abs_max"', runner.COMPONENT_SMOKE)
+
+    def test_synthetic_source_selection_verifies_validation_path_and_hashes(self) -> None:
+        model = self.tmp_path / "synthetic" / "checkpoint-2000"
+        model.mkdir(parents=True)
+        (model / "config.json").write_text(
+            json.dumps({"use_vlqa": True}), encoding="utf-8"
+        )
+        (model / "model.safetensors").write_bytes(b"selected-weights")
+        selection = self.tmp_path / "selection.json"
+        selection.write_text(
+            json.dumps(
+                {
+                    "status": "ok",
+                    "purpose": "layout_ablation_validation_selection",
+                    "ablation_id": "vlqa_layout_p1_p2",
+                    "selection_split": "validation",
+                    "test_used_for_selection": False,
+                    "selected": {
+                        "optimizer_step": 2000,
+                        "model_path": str(model.resolve()),
+                        "config_sha256": runner.file_sha256(model / "config.json"),
+                        "weights_sha256": runner.file_sha256(
+                            model / "model.safetensors"
+                        ),
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        payload = runner.load_source_selection(selection, expected_model=model)
+        self.assertEqual(payload["optimizer_step"], 2000)
+        self.assertEqual(payload["ablation_id"], "vlqa_layout_p1_p2")
+
+        (model / "model.safetensors").write_bytes(b"mutated")
+        with self.assertRaisesRegex(ValueError, "weights SHA-256"):
+            runner.load_source_selection(selection, expected_model=model)
+
+    def test_diverse_protocol_launcher_keeps_selection_and_test_separate(self) -> None:
+        launcher = (
+            Path(__file__).resolve().parents[1]
+            / "tools"
+            / "training"
+            / "run_diverse_synthetic_ancientdoc.sh"
+        ).read_text(encoding="utf-8")
+        self.assertIn("--source-selection", Path(runner.__file__).read_text(encoding="utf-8"))
+        self.assertIn("--selection-only", launcher)
+        self.assertIn("--primary-per-replay 7", launcher)
+        self.assertIn("--phase select", launcher)
+        self.assertIn("--phase test", launcher)
 
 
 if __name__ == "__main__":

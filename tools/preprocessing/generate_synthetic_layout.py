@@ -6,6 +6,7 @@ import json
 import platform
 import random
 import sys
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -169,22 +170,25 @@ def prepare_empty_output(output_dir: Path) -> Path:
     return resolved
 
 
-def apply_s2_degradation(image_path: Path, seed: int) -> dict[str, Any]:
+def apply_s2_degradation(
+    image_path: Path, seed: int, config: GeneratorConfig | None = None
+) -> dict[str, Any]:
+    config = config or GeneratorConfig()
     rng = random.Random(seed ^ 0xA5A55A5A)
     np_rng = np.random.default_rng(seed ^ 0x5A5AA5A5)
     with Image.open(image_path) as source:
         image = source.convert("RGB")
 
-    contrast = rng.uniform(0.78, 1.08)
+    contrast = rng.uniform(config.s2_contrast_min, config.s2_contrast_max)
     image = ImageEnhance.Contrast(image).enhance(contrast)
 
-    bleed_alpha = rng.uniform(0.025, 0.075)
+    bleed_alpha = rng.uniform(config.s2_bleed_alpha_min, config.s2_bleed_alpha_max)
     ghost = image.transpose(Image.Transpose.FLIP_LEFT_RIGHT).convert("L")
     ghost = ImageEnhance.Contrast(ghost).enhance(rng.uniform(0.45, 0.75))
     ghost_rgb = Image.merge("RGB", (ghost, ghost, ghost))
     image = Image.blend(image, ghost_rgb, bleed_alpha)
 
-    stain_count = rng.randint(2, 7)
+    stain_count = rng.randint(config.s2_stain_count_min, config.s2_stain_count_max)
     overlay = Image.new("RGBA", image.size, (0, 0, 0, 0))
     draw = ImageDraw.Draw(overlay, "RGBA")
     for _ in range(stain_count):
@@ -204,11 +208,20 @@ def apply_s2_degradation(image_path: Path, seed: int) -> dict[str, Any]:
         )
     image = Image.alpha_composite(image.convert("RGBA"), overlay).convert("RGB")
 
-    blur_radius = rng.uniform(0.15, 0.85)
+    blur_radius = rng.uniform(config.s2_blur_radius_min, config.s2_blur_radius_max)
     image = image.filter(ImageFilter.GaussianBlur(radius=blur_radius))
-    noise_sigma = rng.uniform(1.5, 5.0)
+    noise_sigma = rng.uniform(config.s2_noise_sigma_min, config.s2_noise_sigma_max)
     pixels = np.asarray(image, dtype=np.float32)
     pixels += np_rng.normal(0.0, noise_sigma, size=pixels.shape)
+    speckle_density = rng.uniform(
+        config.s2_speckle_density_min, config.s2_speckle_density_max
+    )
+    speckle_count = round(image.width * image.height * speckle_density)
+    if speckle_count:
+        rows = np_rng.integers(0, image.height, size=speckle_count)
+        columns = np_rng.integers(0, image.width, size=speckle_count)
+        values = np_rng.integers(35, 175, size=(speckle_count, 1))
+        pixels[rows, columns] = values
     pixels = np.clip(pixels, 0, 255).astype(np.uint8)
     Image.fromarray(pixels, mode="RGB").save(image_path)
 
@@ -221,6 +234,8 @@ def apply_s2_degradation(image_path: Path, seed: int) -> dict[str, Any]:
             "stain_count": stain_count,
             "gaussian_blur_radius": round(blur_radius, 6),
             "gaussian_noise_sigma": round(noise_sigma, 6),
+            "speckle_density": round(speckle_density, 8),
+            "speckle_count": speckle_count,
         },
     }
 
@@ -269,6 +284,62 @@ def collect_dom_regions(page: Any) -> list[dict[str, Any]]:
           };
         })
         """,
+    )
+
+
+def fit_text_regions_to_dom(page: Any, minimum_font_size: int) -> list[dict[str, Any]]:
+    results = page.eval_on_selector_all(
+        ".region",
+        """
+        (elements, minimumFontSize) => elements.flatMap((element) => {
+          const content = element.querySelector(".text-content");
+          if (!content) return [];
+          const overflows = () => (
+            content.scrollWidth > content.clientWidth + 1 ||
+            content.scrollHeight > content.clientHeight + 1
+          );
+          const sampledFontSize = Math.round(parseFloat(getComputedStyle(element).fontSize));
+          let effectiveFontSize = sampledFontSize;
+          while (overflows() && effectiveFontSize > minimumFontSize) {
+            effectiveFontSize -= 1;
+            element.style.fontSize = `${effectiveFontSize}px`;
+            void content.offsetWidth;
+          }
+          element.dataset.sampledFontSize = String(sampledFontSize);
+          element.dataset.effectiveFontSize = String(effectiveFontSize);
+          return [{
+            region_id: element.dataset.regionId,
+            sampled_font_size: sampledFontSize,
+            effective_font_size: effectiveFontSize,
+            adjusted: effectiveFontSize !== sampledFontSize,
+            overflow: overflows(),
+            client_size: [content.clientWidth, content.clientHeight],
+            scroll_size: [content.scrollWidth, content.scrollHeight],
+          }];
+        })
+        """,
+        minimum_font_size,
+    )
+    unresolved = [result for result in results if result.get("overflow")]
+    if unresolved:
+        raise ValueError(
+            "Text remains clipped at the configured minimum font size: "
+            + json.dumps(unresolved, ensure_ascii=False, separators=(",", ":"))
+        )
+    return results
+
+
+def apply_effective_font_sizes(plan: Any, fit_results: list[dict[str, Any]]) -> Any:
+    effective_by_id = {
+        str(result["region_id"]): int(result["effective_font_size"])
+        for result in fit_results
+    }
+    return replace(
+        plan,
+        regions=tuple(
+            replace(region, font_size=effective_by_id.get(region.region_id, region.font_size))
+            for region in plan.regions
+        ),
     )
 
 
@@ -414,6 +485,38 @@ def main() -> None:
         "num_pages": len(plans),
         "base_seed": args.seed,
         "generator_config": config.to_dict(),
+        "planned_distribution": {
+            "languages": sorted(
+                {
+                    region.item.language
+                    for plan in plans
+                    for region in plan.regions
+                }
+            ),
+            "writing_directions": sorted(
+                {
+                    region.writing_direction
+                    for plan in plans
+                    for region in plan.regions
+                }
+            ),
+            "font_families": sorted(
+                {region.font_family for plan in plans for region in plan.regions}
+            ),
+            "backgrounds": sorted({plan.background for plan in plans}),
+            "font_size_range": [
+                min(region.font_size for plan in plans for region in plan.regions),
+                max(region.font_size for plan in plans for region in plan.regions),
+            ],
+            "line_height_range": [
+                min(region.line_height for plan in plans for region in plan.regions),
+                max(region.line_height for plan in plans for region in plan.regions),
+            ],
+            "letter_spacing_range": [
+                min(region.letter_spacing for plan in plans for region in plan.regions),
+                max(region.letter_spacing for plan in plans for region in plan.regions),
+            ],
+        },
         "python_version": platform.python_version(),
         "platform": platform.platform(),
         "browser_executable": str(args.chromium_executable) if args.chromium_executable else None,
@@ -496,6 +599,14 @@ def main() -> None:
                             "() => Array.from(document.images).every((image) => "
                             "image.complete && image.naturalWidth > 0 && image.naturalHeight > 0)"
                         )
+                        font_fit_results = fit_text_regions_to_dom(
+                            page, config.font_size_min
+                        )
+                        plan = apply_effective_font_sizes(plan, font_fit_results)
+                        if any(result["adjusted"] for result in font_fit_results):
+                            html_path.write_text(
+                                page.content(), encoding="utf-8", newline="\n"
+                            )
                         metrics = page.evaluate(
                             """
                             () => ({
@@ -528,7 +639,9 @@ def main() -> None:
                                 )
                         degradation: dict[str, Any]
                         if plan.tier == "s2-hard":
-                            degradation = apply_s2_degradation(image_path, plan.page_seed)
+                            degradation = apply_s2_degradation(
+                                image_path, plan.page_seed, config
+                            )
                         else:
                             degradation = {
                                 "tier": plan.tier,
@@ -564,6 +677,11 @@ def main() -> None:
                                     for path, digest in zip(
                                         args.font_file, args.expected_font_sha256
                                     )
+                                ],
+                                "font_size_adaptations": [
+                                    result
+                                    for result in font_fit_results
+                                    if result["adjusted"]
                                 ],
                             },
                             degradation=degradation,

@@ -8,7 +8,7 @@ Usage:
     --p2-steps N --checkpoint-steps N [--p1-steps N] [--seed N] \
     [--gpu-id ID | --gpu-ids ID[,ID...] | --parallel-gpu-ids ID[,ID...]] \
     [--layout-loss-preset PRESET] [--ocr-loss-weight FLOAT] \
-    [--run-prefix NAME] [--test-set Category:dataset-id] [--resume]
+    [--run-prefix NAME] [--test-set Category:dataset-id] [--selection-only] [--resume]
 
 --gpu-ids gives every ablation one distributed DeepSpeed run on all listed GPUs.
 --parallel-gpu-ids maps one physical GPU to each ablation by list order.
@@ -22,9 +22,11 @@ ablations=""
 p1_steps=""
 p2_steps=""
 checkpoint_steps=""
+gpu_utilization_limit="50"
 seed="42"
 run_prefix="layout_ablation"
 resume="0"
+selection_only="0"
 layout_loss_preset=""
 ocr_loss_weight="1"
 gpu_id=""
@@ -38,6 +40,7 @@ while [[ $# -gt 0 ]]; do
         --p1-steps) p1_steps="${2:-}"; shift 2 ;;
         --p2-steps) p2_steps="${2:-}"; shift 2 ;;
         --checkpoint-steps) checkpoint_steps="${2:-}"; shift 2 ;;
+        --gpu-utilization-limit) gpu_utilization_limit="${2:-}"; shift 2 ;;
         --seed) seed="${2:-}"; shift 2 ;;
         --run-prefix) run_prefix="${2:-}"; shift 2 ;;
         --layout-loss-preset) layout_loss_preset="${2:-}"; shift 2 ;;
@@ -46,6 +49,7 @@ while [[ $# -gt 0 ]]; do
         --gpu-ids) gpu_ids="${2:-}"; shift 2 ;;
         --parallel-gpu-ids) parallel_gpu_ids="${2:-}"; shift 2 ;;
         --test-set) test_sets+=("${2:-}"); shift 2 ;;
+        --selection-only) selection_only="1"; shift ;;
         --resume) resume="1"; shift ;;
         --help|-h) usage; exit 0 ;;
         *) printf 'ERROR: unknown option: %s\n' "$1" >&2; usage; exit 64 ;;
@@ -53,6 +57,10 @@ while [[ $# -gt 0 ]]; do
 done
 if [[ -z "$dataset_id" || -z "$ablations" || -z "$p2_steps" || -z "$checkpoint_steps" ]]; then
     usage; exit 64
+fi
+if [[ ! "$gpu_utilization_limit" =~ ^[1-9][0-9]*$ ]] || (( gpu_utilization_limit > 100 )); then
+    printf 'ERROR: --gpu-utilization-limit must be an integer in 1..100.\n' >&2
+    exit 64
 fi
 gpu_mode_count=0
 [[ -n "$gpu_id" ]] && ((gpu_mode_count+=1))
@@ -96,14 +104,19 @@ if [[ -n "$parallel_gpu_ids" && ${#selected_gpu_array[@]} -ne ${#groups[@]} ]]; 
 fi
 
 require_gpus_free() {
-    local target_gpu output
+    local target_gpu output utilization
     for target_gpu in "$@"; do
-        if ! output="$(nvidia-smi -i "$target_gpu" --query-compute-apps=pid --format=csv,noheader,nounits 2>&1)"; then
+        if ! output="$(nvidia-smi -i "$target_gpu" --query-gpu=utilization.gpu --format=csv,noheader,nounits 2>&1)"; then
             printf 'ERROR: cannot query physical GPU %s: %s\n' "$target_gpu" "$output" >&2
             exit 66
         fi
-        if [[ -n "${output//[[:space:]]/}" ]]; then
-            printf 'ERROR: GPU%s_BUSY\n' "$target_gpu" >&2
+        utilization="${output//[[:space:]]/}"
+        if [[ ! "$utilization" =~ ^[0-9]+$ ]]; then
+            printf 'ERROR: GPU%s utilization is not numeric: %s\n' "$target_gpu" "$output" >&2
+            exit 66
+        fi
+        if (( utilization >= gpu_utilization_limit )); then
+            printf 'ERROR: GPU%s_BUSY utilization=%s limit=%s\n' "$target_gpu" "$utilization" "$gpu_utilization_limit" >&2
             exit 75
         fi
     done
@@ -161,6 +174,7 @@ run_ablation() (
                 --source-model "$GOT_SOURCE_MODEL"
                 --tokenizer-model "${GOT_TOKENIZER_MODEL:-$GOT_SOURCE_MODEL}"
                 --p2-max-steps "$p2_steps" --checkpoint-steps "$checkpoint_steps"
+                --gpu-utilization-limit "$gpu_utilization_limit"
                 --seed "$seed" --run-id "$run_id" --gpu-ids "$assigned_gpu_ids"
                 --p2-ocr-loss-weight "$ocr_loss_weight"
                 --skip-post-training-validation
@@ -188,10 +202,17 @@ run_ablation() (
         --project-root "$ocrmodel_root/src/GOT-OCR-2.0"
         --output-dir "$selection_root"
         --gpu-id "$inference_gpu_id"
+        --gpu-utilization-limit "$gpu_utilization_limit"
     )
     [[ "$resume" == "1" ]] && select_args+=(--resume)
     bash "${ocrmodel_root}/tools/environment/run_got2.sh" \
         "${ocrmodel_root}/tools/evaluation/select_layout_ablation_checkpoint.py" "${select_args[@]}"
+
+    if [[ "$selection_only" == "1" ]]; then
+        printf '{"event":"layout_ablation_group_selected","ablation":"%s","selection":"%s","physical_gpu_ids":"%s"}\n' \
+            "$ablation" "$selection_root/selection.json" "$assigned_gpu_ids"
+        exit 0
+    fi
 
     local test_set category test_dataset_id test_root test_dataset_root output_root
     for test_set in "${test_sets[@]}"; do

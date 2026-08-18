@@ -20,11 +20,13 @@ Common options:
   --gpu-id <id>                   Explicit physical GPU (default: 0)
   --max-train-records <n>         Default: 0 (all)
   --synthetic-replay-records <n>  Default: 0 (all)
+  --primary-per-replay <n>        Default: 7 (12.5% synthetic replay)
   --run-prefix <prefix>           Required for formal runs
   --prepare-only                  Verify data and exit
 
 Core options:
   --p2-model <path>               Synthetic P2 initialization for C4
+  --p2-selection <path>           Validation selection authorizing --p2-model
 
 Replay options:
   --c4-selection <path>           Required formal C4 validation selection
@@ -42,6 +44,7 @@ phase=""
 ancient_dataset_id="ancientdoc_layout_260707_group_isolated_seed20260815"
 synthetic_dataset_id="formal_pdf_short_seed20260812"
 p2_model="${GOT_TRAINING_RUNS:-}/layout_joint-train_8000_20260813/p2/model"
+p2_selection=""
 c4_selection=""
 steps="12000"
 checkpoint_steps="2000"
@@ -49,6 +52,7 @@ learning_rate="2e-5"
 gpu_id="${GOT_PHYSICAL_GPU:-0}"
 max_train_records="0"
 synthetic_replay_records="0"
+primary_per_replay="7"
 run_prefix=""
 prepare_only="0"
 
@@ -58,6 +62,7 @@ while [[ $# -gt 0 ]]; do
         --ancient-dataset-id) ancient_dataset_id="${2:-}"; shift 2 ;;
         --synthetic-dataset-id) synthetic_dataset_id="${2:-}"; shift 2 ;;
         --p2-model) p2_model="${2:-}"; shift 2 ;;
+        --p2-selection) p2_selection="${2:-}"; shift 2 ;;
         --c4-selection) c4_selection="${2:-}"; shift 2 ;;
         --steps) steps="${2:-}"; shift 2 ;;
         --checkpoint-steps) checkpoint_steps="${2:-}"; shift 2 ;;
@@ -65,6 +70,7 @@ while [[ $# -gt 0 ]]; do
         --gpu-id) gpu_id="${2:-}"; shift 2 ;;
         --max-train-records) max_train_records="${2:-}"; shift 2 ;;
         --synthetic-replay-records) synthetic_replay_records="${2:-}"; shift 2 ;;
+        --primary-per-replay) primary_per_replay="${2:-}"; shift 2 ;;
         --run-prefix) run_prefix="${2:-}"; shift 2 ;;
         --prepare-only) prepare_only="1"; shift ;;
         --help|-h) usage; exit 0 ;;
@@ -78,6 +84,10 @@ if [[ "${phase}" != "core" && "${phase}" != "replay" ]]; then
 fi
 if [[ ! "${gpu_id}" =~ ^[0-9]+$ ]]; then
     printf 'ERROR: --gpu-id must be one numeric physical GPU id.\n' >&2
+    exit 64
+fi
+if [[ ! "${primary_per_replay}" =~ ^[1-9][0-9]*$ ]]; then
+    printf 'ERROR: --primary-per-replay must be a positive integer.\n' >&2
     exit 64
 fi
 if [[ -z "${GOT_LAYOUT_DATA:-}" || -z "${GOT_TRAINING_RUNS:-}" ]]; then
@@ -167,6 +177,8 @@ if [[ "${phase}" == "core" ]]; then
         printf 'ERROR: synthetic P2 model is missing: %s\n' "${p2_model}" >&2
         exit 66
     fi
+    source_selection_args=()
+    [[ -n "${p2_selection}" ]] && source_selection_args+=(--source-selection "${p2_selection}")
 
     c1_id="${run_prefix}_c1_got2_ocr_only"
     record_event baseline_started c1_got2_ocr_only "${c1_id}" ""
@@ -196,6 +208,7 @@ if [[ "${phase}" == "core" ]]; then
         "${ocrmodel_root}/tools/training/run_layout_a100.py" \
         "${common_layout_args[@]}" \
         --source-model "${p2_model}" \
+        "${source_selection_args[@]}" \
         --layout-loss-weight 0 \
         --run-id "${c4_id}"
     c4_model="${GOT_TRAINING_RUNS}/${c4_id}/p2/model"
@@ -225,13 +238,16 @@ if [[ ! -d "${c4_model}" ]]; then
     exit 66
 fi
 
-branch_extra="$(python3 - "${c4_selection_resolved}" "${c4_step}" "${c4_cer}" "${c4_weights_sha}" <<'PY'
+branch_extra="$(python3 - "${c4_selection_resolved}" "${c4_step}" "${c4_cer}" "${c4_weights_sha}" "${primary_per_replay}" <<'PY'
 import json, sys
+primary_per_replay = int(sys.argv[5])
 print(json.dumps({
     "c4_selection": sys.argv[1],
     "selected_c4_step": int(sys.argv[2]),
     "selected_c4_validation_page_cer": float(sys.argv[3]),
     "selected_c4_weights_sha256": sys.argv[4],
+    "primary_per_replay": primary_per_replay,
+    "requested_replay_fraction": 1.0 / (primary_per_replay + 1),
 }, separators=(",", ":")))
 PY
 )"
@@ -251,7 +267,7 @@ run_replay_branch() {
         --replay-image-root "${synthetic_dataset_root}/train" \
         --replay-split train \
         --replay-max-records "${synthetic_replay_records}" \
-        --primary-per-replay 3 \
+        --primary-per-replay "${primary_per_replay}" \
         --run-id "${run_id}"
     local model="${GOT_TRAINING_RUNS}/${run_id}/p2/model"
     record_event baseline_finished "${baseline}" "${run_id}" "${model}" "${branch_extra}"
@@ -264,11 +280,20 @@ python3 - "${GOT_TRAINING_RUNS}/${run_prefix}_c5_vlqa_ocr_replay/p2/model/layout
     "${GOT_TRAINING_RUNS}/${run_prefix}_c6_vlqa_layout_replay/p2/model/layout_training_metrics.json" <<'PY'
 from __future__ import annotations
 import json, sys
-left, right = (json.load(open(path, encoding="utf-8"))["branch_initialization"] for path in sys.argv[1:3])
+payloads = [json.load(open(path, encoding="utf-8")) for path in sys.argv[1:3]]
+left, right = (payload["branch_initialization"] for payload in payloads)
 keys = ("selection_path", "selected_c4_step", "selected_c4_model_path", "selected_c4_weights_sha256")
 if any(left.get(key) != right.get(key) for key in keys):
     raise SystemExit("C5/C6 initial C4 checkpoint provenance differs")
 if left.get("optimizer_state_initialization") != "fresh" or right.get("optimizer_state_initialization") != "fresh":
     raise SystemExit("C5/C6 optimizer state was not initialized fresh")
-print(json.dumps({"event":"ancientdoc_train_replay_completed","shared_c4":{key:left[key] for key in keys}}, separators=(",", ":")))
+budgets = [payload.get("training_budget", {}) for payload in payloads]
+ratio_keys = ("primary_per_replay", "requested_replay_fraction")
+if any(budgets[0].get(key) != budgets[1].get(key) for key in ratio_keys):
+    raise SystemExit("C5/C6 replay ratios differ")
+print(json.dumps({
+    "event":"ancientdoc_train_replay_completed",
+    "shared_c4":{key:left[key] for key in keys},
+    "replay":{key:budgets[0].get(key) for key in ratio_keys},
+}, separators=(",", ":")))
 PY

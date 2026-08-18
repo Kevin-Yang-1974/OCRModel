@@ -18,7 +18,7 @@ python -m pip install -r tools/environment/requirements-layout-synthesis.lock.tx
 内容清单支持 JSON 数组、带 `records` 的 JSON object 或 JSONL。所有内容必须先划分 split。纯 HTML 文本记录为：
 
 ```json
-{"content_id":"text_001","source_group_id":"book_001","split":"train","kind":"text","orientation":"any","text":"待排版文字或符号"}
+{"content_id":"text_001","source_group_id":"book_001","split":"train","kind":"text","orientation":"any","language":"zh-Hant","text":"待排版文字或符号"}
 ```
 
 真实 crop 记录为：
@@ -28,6 +28,8 @@ python -m pip install -r tools/environment/requirements-layout-synthesis.lock.tx
 ```
 
 `image` 必须相对 `--content-root`，并且 `orientation` 必须显式为 `horizontal`、`vertical` 或更严格的 `horizontal_ltr`、`horizontal_rtl`、`vertical_ltr`、`vertical_rtl`。对文本方向已知的真实 crop 应使用严格值，防止把 LTR 图像作为 RTL 监督。同一 `source_group_id` 不得跨 split；相同 `content_id` 不得重复。
+
+`language` 为可选 BCP-47 风格标签，缺省为 `und`。多语言正式数据必须由内容清单提供真实转写，可混合 `zh-Hans`、`zh-Hant`、`ja`、`ko`、`en` 或 `mixed-symbols`；生成器只负责采样和记录，不下载、不翻译也不虚构语料。
 
 配置中的 `font_family` 控制 CSS 字体栈，`allowed_rendered_fonts` 列出允许实际绘制字形的字体族。正式渲染会通过浏览器 CDP 逐文本区域读取平台字体；没有实际 glyph、出现未声明 fallback，或审计时字体证据缺失都会报错。若确需符号字体 fallback，必须把其实际 family name 显式加入允许列表并保存同一字体包版本。
 
@@ -93,6 +95,20 @@ python tools/preprocessing/generate_synthetic_layout.py `
 ```
 
 上述命令总计生成 3000 页。内容清单必须为每个所选 tier 提供足够且方向兼容的记录；联合 manifest 中的 `page_id` 包含 `s0`、`s1` 或 `s2` 标记。
+
+面向古籍照片域的多样化 preset 为 `config/synthetic_layout.ancient_photo_diverse_v1.json`。它在不改变 bbox 几何真值的前提下覆盖：非均匀行/列宽、普通与 0–6 px 密集间距、18–52 px 字号、紧凑行高、负字距、逐区域 CJK/衬线字体栈、墨色/透明度、十种纸张底色，以及更宽的对比度、透印、污渍、模糊、高斯噪声和离散噪点范围。该 preset 只是更接近古籍照片退化分布的合成近似，不等同于真实古籍。
+
+统一生成 train/validation/test 的入口如下；默认每个 tier 生成 `8000/1000/1000` 页，即三 tier 合计 30000 页。先用 `--plan-only` 小规模检查内容、字体与版式，再执行正式浏览器渲染：
+
+```powershell
+& .\.venv\Scripts\python.exe tools\preprocessing\prepare_diverse_synthetic_layout.py `
+  --content-manifest D:\layout_source\content.jsonl `
+  --content-root D:\layout_source `
+  --output-root D:\layout_data\ancient_photo_diverse_v1_seed20260817 `
+  --browser-channel msedge
+```
+
+正式字体文件必须成对传入 `--font-file` 和 `--expected-font-sha256`；所有实际渲染字体 family 仍必须出现在 `allowed_rendered_fonts`，否则立即失败。联合 `dataset_protocol.json` 记录 content/config 哈希、seed、split/tier 页数、输入粒度和 metadata 不进模型的协议。
 
 输出目录必须不存在或为空，工具不会覆盖、删除或混入既有数据。输出包括：
 

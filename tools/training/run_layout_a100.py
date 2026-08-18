@@ -33,6 +33,7 @@ EXIT_MISSING = 66
 EXIT_LOCKED = 73
 EXIT_EXISTS = 74
 EXIT_GPU_BUSY = 75
+DEFAULT_GPU_UTILIZATION_LIMIT = 50
 RUN_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 
 OVERFIT_P1_STEPS = 1000
@@ -95,6 +96,7 @@ class Settings:
     run_id: str
     gpu_id: str
     physical_gpu_ids: tuple[str, ...]
+    gpu_utilization_limit: int
     mode: str
     ablation_id: str
     layout_loss_preset: str
@@ -133,6 +135,11 @@ class Settings:
     validation_iou_threshold: float
     skip_post_training_validation: bool
     skip_source_hash: bool
+    source_selection: Path | None
+    source_selected_step: int | None
+    source_selection_ablation: str | None
+    source_selection_config_sha256: str | None
+    source_selection_weights_sha256: str | None
     c4_selection: Path | None
     c4_selected_step: int | None
     c4_validation_page_cer: float | None
@@ -273,6 +280,15 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--gpu-utilization-limit",
+        type=positive_int,
+        default=DEFAULT_GPU_UTILIZATION_LIMIT,
+        help=(
+            "Allow sharing a selected GPU only when instantaneous utilization is "
+            "strictly below this percentage."
+        ),
+    )
+    parser.add_argument(
         "--mode",
         choices=(
             "smoke",
@@ -371,6 +387,14 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="Skip hashing the large original model file; path and size are still recorded.",
     )
     parser.add_argument(
+        "--source-selection",
+        type=Path,
+        help=(
+            "Validation-only selection.json authorizing a periodic synthetic P2 "
+            "checkpoint as --source-model for formal adaptation."
+        ),
+    )
+    parser.add_argument(
         "--c4-selection",
         type=Path,
         help=(
@@ -409,6 +433,11 @@ def resolve_settings(args: argparse.Namespace) -> Settings:
         raise RunFailure(
             "--gpu-ids must be unique comma-separated physical numeric GPU ids, "
             "for example 0,2,3.",
+            exit_code=EXIT_USAGE,
+        )
+    if args.gpu_utilization_limit > 100:
+        raise RunFailure(
+            "--gpu-utilization-limit must be an integer in 1..100.",
             exit_code=EXIT_USAGE,
         )
     gpu_id = ",".join(physical_gpu_ids)
@@ -743,6 +772,32 @@ def resolve_settings(args: argparse.Namespace) -> Settings:
         if args.c4_selection is not None
         else None
     )
+    source_selection_path = (
+        args.source_selection.expanduser().resolve()
+        if args.source_selection is not None
+        else None
+    )
+    if source_selection_path is not None and selection_path is not None:
+        raise RunFailure(
+            "--source-selection and --c4-selection describe different branch boundaries "
+            "and are mutually exclusive.",
+            exit_code=EXIT_USAGE,
+        )
+    source_selection = None
+    if source_selection_path is not None:
+        try:
+            source_selection = load_source_selection(
+                source_selection_path, expected_model=source_model
+            )
+        except Exception as exc:
+            raise RunFailure(
+                f"Invalid --source-selection: {exc}", exit_code=EXIT_USAGE
+            ) from exc
+        if args.mode != "adapt":
+            raise RunFailure(
+                "--source-selection is only valid for formal adapt runs.",
+                exit_code=EXIT_USAGE,
+            )
     selection = None
     if selection_path is not None:
         try:
@@ -786,6 +841,7 @@ def resolve_settings(args: argparse.Namespace) -> Settings:
         run_id=run_id,
         gpu_id=gpu_id,
         physical_gpu_ids=physical_gpu_ids,
+        gpu_utilization_limit=args.gpu_utilization_limit,
         mode=args.mode,
         ablation_id=ablation_id,
         layout_loss_preset=layout_loss_preset,
@@ -824,6 +880,19 @@ def resolve_settings(args: argparse.Namespace) -> Settings:
         validation_iou_threshold=args.validation_iou_threshold,
         skip_post_training_validation=args.skip_post_training_validation,
         skip_source_hash=args.skip_source_hash,
+        source_selection=source_selection_path,
+        source_selected_step=(
+            source_selection["optimizer_step"] if source_selection else None
+        ),
+        source_selection_ablation=(
+            source_selection["ablation_id"] if source_selection else None
+        ),
+        source_selection_config_sha256=(
+            source_selection["config_sha256"] if source_selection else None
+        ),
+        source_selection_weights_sha256=(
+            source_selection["weights_sha256"] if source_selection else None
+        ),
         c4_selection=selection_path,
         c4_selected_step=(selection["selected_step"] if selection else None),
         c4_validation_page_cer=(
@@ -872,6 +941,45 @@ def file_sha256(path: Path) -> str:
         for block in iter(lambda: handle.read(8 * 1024 * 1024), b""):
             digest.update(block)
     return digest.hexdigest()
+
+
+def load_source_selection(path: Path, *, expected_model: Path) -> dict[str, Any]:
+    payload = read_json(path)
+    if payload.get("status") != "ok":
+        raise ValueError("selection status must be ok")
+    if payload.get("purpose") != "layout_ablation_validation_selection":
+        raise ValueError("selection purpose must be layout_ablation_validation_selection")
+    if payload.get("selection_split") != "validation":
+        raise ValueError("selection_split must be validation")
+    if payload.get("test_used_for_selection") is not False:
+        raise ValueError("test must not be used for source checkpoint selection")
+    selected = payload.get("selected")
+    if not isinstance(selected, dict):
+        raise ValueError("selection has no selected checkpoint object")
+    selected_model = Path(str(selected.get("model_path", ""))).resolve()
+    if selected_model != expected_model.resolve():
+        raise ValueError(
+            f"selected model differs from --source-model: {selected_model} != {expected_model}"
+        )
+    config = selected_model / "config.json"
+    weights = selected_model / "model.safetensors"
+    if not config.is_file() or not weights.is_file():
+        raise FileNotFoundError("selected source checkpoint is incomplete")
+    expected_config = str(selected.get("config_sha256", ""))
+    expected_weights = str(selected.get("weights_sha256", ""))
+    if file_sha256(config) != expected_config:
+        raise ValueError("selected source config SHA-256 mismatch")
+    if file_sha256(weights) != expected_weights:
+        raise ValueError("selected source weights SHA-256 mismatch")
+    ablation_id = str(payload.get("ablation_id", ""))
+    if not ablation_id.startswith("vlqa_"):
+        raise ValueError("selected synthetic source must be a VLQA ablation")
+    return {
+        "ablation_id": ablation_id,
+        "optimizer_step": int(selected["optimizer_step"]),
+        "config_sha256": expected_config,
+        "weights_sha256": expected_weights,
+    }
 
 
 def tail_lines(path: Path | None, count: int = 20) -> list[str]:
@@ -966,6 +1074,12 @@ def validate_paths(settings: Settings) -> None:
                     "A selected C4 checkpoint is only valid as a P2 adapt source.",
                     exit_code=EXIT_USAGE,
                 )
+        elif settings.source_selection is not None:
+            if required_stage != "p2":
+                raise RunFailure(
+                    "A selected synthetic source checkpoint must initialize P2 adaptation.",
+                    exit_code=EXIT_USAGE,
+                )
         else:
             if not metrics_path.is_file():
                 raise RunFailure(
@@ -1011,6 +1125,14 @@ def training_environment(settings: Settings) -> dict[str, str]:
     return environment
 
 
+def component_smoke_environment(settings: Settings) -> dict[str, str]:
+    environment = training_environment(settings)
+    # The component check is intentionally one process on one selected physical GPU.
+    # DeepSpeed receives the full list later when the actual training stage launches.
+    environment["CUDA_VISIBLE_DEVICES"] = settings.physical_gpu_ids[0]
+    return environment
+
+
 def gpu_processes(gpu_id: str) -> list[dict[str, Any]]:
     command = [
         "nvidia-smi",
@@ -1049,12 +1171,52 @@ def gpu_processes(gpu_id: str) -> list[dict[str, Any]]:
     return processes
 
 
+def gpu_utilization(gpu_id: str) -> int:
+    command = [
+        "nvidia-smi",
+        "-i",
+        gpu_id,
+        "--query-gpu=utilization.gpu",
+        "--format=csv,noheader,nounits",
+    ]
+    try:
+        completed = subprocess.run(
+            command,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise RunFailure(f"Cannot query GPU {gpu_id} utilization: {exc}", exit_code=EXIT_MISSING) from exc
+    if completed.returncode != 0:
+        raise RunFailure(
+            f"nvidia-smi utilization query failed for GPU {gpu_id}: {bounded(completed.stderr)}",
+            exit_code=EXIT_MISSING,
+        )
+    value = completed.stdout.strip()
+    if not re.fullmatch(r"[0-9]+", value):
+        raise RunFailure(
+            f"GPU{gpu_id} utilization is not numeric: {bounded(value)}",
+            exit_code=EXIT_MISSING,
+        )
+    utilization = int(value)
+    if utilization > 100:
+        raise RunFailure(
+            f"GPU{gpu_id} utilization is outside 0..100: {utilization}",
+            exit_code=EXIT_MISSING,
+        )
+    return utilization
+
+
 def require_gpu_free(settings: Settings) -> None:
     for gpu_id in settings.physical_gpu_ids:
-        processes = gpu_processes(gpu_id)
-        if processes:
+        utilization = gpu_utilization(gpu_id)
+        if utilization >= settings.gpu_utilization_limit:
+            processes = gpu_processes(gpu_id)
             raise RunFailure(
-                f"GPU{gpu_id}_BUSY {compact_json(processes)}",
+                f"GPU{gpu_id}_BUSY utilization={utilization} "
+                f"limit={settings.gpu_utilization_limit} {compact_json(processes)}",
                 exit_code=EXIT_GPU_BUSY,
             )
 
@@ -1350,7 +1512,7 @@ def run_component_smoke(context: RunContext) -> dict[str, Any]:
                 str(context.settings.seed),
             ],
             cwd=context.settings.project_root,
-            env=training_environment(context.settings),
+            env=component_smoke_environment(context.settings),
             capture_output=True,
             text=True,
             timeout=180,
@@ -1836,6 +1998,23 @@ def run_stage(
         metrics["c4_selection"] = str(settings.c4_selection)
         metrics["c4_validation_page_cer"] = settings.c4_validation_page_cer
         metrics["initial_checkpoint_sha256"] = settings.c4_weights_sha256
+        write_json(metrics_path, metrics)
+    elif stage == "p2" and settings.source_selection is not None:
+        source_initialization = {
+            "selection_path": str(settings.source_selection),
+            "selection_purpose": "layout_ablation_validation_selection",
+            "selection_split": "validation",
+            "test_used_for_selection": False,
+            "selected_ablation_id": settings.source_selection_ablation,
+            "selected_optimizer_step": settings.source_selected_step,
+            "selected_model_path": str(settings.source_model),
+            "selected_config_sha256": settings.source_selection_config_sha256,
+            "selected_weights_sha256": settings.source_selection_weights_sha256,
+            "optimizer_state_initialization": "fresh",
+            "scheduler_state_initialization": "fresh",
+        }
+        metrics["source_selection_initialization"] = source_initialization
+        metrics["initial_checkpoint_sha256"] = settings.source_selection_weights_sha256
         write_json(metrics_path, metrics)
     status.update(
         {

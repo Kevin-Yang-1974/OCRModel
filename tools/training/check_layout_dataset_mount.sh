@@ -40,7 +40,6 @@ required_files=(
     "train/manifest.jsonl"
     "validation/manifest.jsonl"
     "test/manifest.jsonl"
-    "split_audit.json"
 )
 for relative in "${required_files[@]}"; do
     if [[ ! -f "${dataset_root}/${relative}" ]]; then
@@ -48,6 +47,17 @@ for relative in "${required_files[@]}"; do
         exit 66
     fi
 done
+audit_file=""
+if [[ -f "${dataset_root}/split_audit.json" ]]; then
+    audit_file="${dataset_root}/split_audit.json"
+elif [[ -f "${dataset_root}/audit_summary.json" ]]; then
+    # Diverse synthetic generation emits audit_summary.json; preserve compatibility
+    # with the older AncientDoc mount contract without duplicating the large report.
+    audit_file="${dataset_root}/audit_summary.json"
+else
+    printf 'ERROR: missing split_audit.json or audit_summary.json in %s\n' "${dataset_root}" >&2
+    exit 66
+fi
 for split in train validation test; do
     if [[ ! -d "${dataset_root}/${split}/images" ]]; then
         printf 'ERROR: missing image directory: %s\n' "${dataset_root}/${split}/images" >&2
@@ -89,7 +99,11 @@ for split in ("train", "validation", "test"):
         raise SystemExit(f"first manifest image is missing: {root / split / first_image}")
     summary["splits"][split] = {"manifest_records": count, "image_root": str(root / split)}
 
-audit = json.loads((root / "split_audit.json").read_text(encoding="utf-8"))
+audit_path = root / "split_audit.json"
+if not audit_path.is_file():
+    audit_path = root / "audit_summary.json"
+audit = json.loads(audit_path.read_text(encoding="utf-8"))
 summary["audit_status"] = audit.get("status") or audit.get("event")
+summary["audit_file"] = str(audit_path)
 print(json.dumps(summary, ensure_ascii=False, separators=(",", ":")))
 PY
