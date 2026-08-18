@@ -250,6 +250,7 @@ def validate_replay_branch_consistency(
         "selected_c4_weights_sha256": c4_branch["weights_sha256"],
     }
     observed: dict[str, Any] = {}
+    replay_protocols: dict[str, dict[str, Any]] = {}
     for label in ("c5", "c6"):
         metrics = training_metrics_for_model(model_paths[label])
         branch = metrics.get("branch_initialization")
@@ -267,8 +268,29 @@ def validate_replay_branch_consistency(
             raise ValueError(f"{label} did not start with a fresh optimizer.")
         if branch.get("scheduler_state_initialization") != "fresh":
             raise ValueError(f"{label} did not start with a fresh scheduler.")
+        budget = metrics.get("training_budget")
+        if not isinstance(budget, dict):
+            raise ValueError(f"{label} has no training_budget replay provenance.")
+        replay_protocols[label] = {
+            "primary_per_replay": budget.get("primary_per_replay"),
+            "requested_replay_fraction": budget.get("requested_replay_fraction"),
+            "replay_sample_exposures_estimate": budget.get(
+                "replay_sample_exposures_estimate"
+            ),
+            "ancientdoc_sample_exposures_estimate": budget.get(
+                "ancientdoc_sample_exposures_estimate"
+            ),
+        }
         observed[label] = branch
-    return {"expected": expected, "observed": observed, "status": "consistent"}
+    for key in ("primary_per_replay", "requested_replay_fraction"):
+        if replay_protocols["c5"].get(key) != replay_protocols["c6"].get(key):
+            raise ValueError(f"C5/C6 replay protocol differs for {key}.")
+    return {
+        "expected": expected,
+        "observed": observed,
+        "replay_protocols": replay_protocols,
+        "status": "consistent",
+    }
 
 
 def evaluator_command(args: argparse.Namespace, job: EvaluationJob, dataset_root: Path) -> list[str]:
@@ -463,6 +485,8 @@ def training_provenance(label: str, model_path: Path, selected_step: int | None)
         "upstream_training_history": payload.get("upstream_training_history"),
         "ancientdoc_sample_exposures_estimate_at_max_steps": budget.get("ancientdoc_sample_exposures_estimate"),
         "replay_sample_exposures_estimate_at_max_steps": budget.get("replay_sample_exposures_estimate"),
+        "primary_per_replay": budget.get("primary_per_replay"),
+        "requested_replay_fraction": budget.get("requested_replay_fraction"),
         "supervised_token_exposures_estimate_at_max_steps": budget.get("supervised_token_exposures_estimate"),
         "metrics_path": str(metrics_path),
     }

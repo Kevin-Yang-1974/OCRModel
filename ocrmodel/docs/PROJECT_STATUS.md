@@ -11,6 +11,7 @@
 - 当前模型排序：C4、C1、C6、C5、C0；当前 AncientDoc 主 checkpoint 为 C4 `checkpoint-6000`。
 - 离线验证：已对 C4-C1、C5-C4、C6-C4、C6-C5 执行逐页分析和 27 个书籍组、10,000 次 paired cluster bootstrap。只有 C5-C4 的 95% interval `[0.009897, 0.185221]` 排除 0；其余三项均跨 0。完整报告见 `docs/ANCIENTDOC_GROUP_ISOLATED_ANALYSIS_20260816.md`。
 - GOT2 结构消融：A1–A5 已在 `formal_pdf_short_seed20260812` 完成 validation-only 选点和一次 Synthetic-ID frozen test。A1/A2/A3/A4/A5 test page CER 分别为 `0.086320/0.158236/0.069977/0.235795/0.070531`；A4/A5 complete layout F1 为 `0.609785/0.695752`。A3 OCR 最低；A5 OCR 与 A3 接近且布局更完整，但 A5 额外包含 P1 4000 steps，不能视为同总预算。完整记录见 `docs/GOT2_LAYOUT_ABLATION_RESULTS_20260817.md`。
+- 多样化 synthetic→AncientDoc 新协议：已实现 ancient-photo-diverse preset、跨 split 生成/审计入口、synthetic A5 P1/P2 validation-only 选点、selection-locked C4 初始化，以及 C0/C1/C4/C5/C6 分阶段 selection/test。新 C5/C6 默认 AncientDoc:synthetic=`7:1`（12.5% replay），旧 frozen run 的 `3:1`（25%）结果不改写。代码已同步 A100；`layout_ablation_smoke_20260817_114133` 在 GPU 0 通过 1-step P1/P2、checkpoint 与 7:1 schedule smoke。正式多样化数据、长程训练和新 AncientDoc test 尚未运行。
 
 ## 已完成的正式流程
 

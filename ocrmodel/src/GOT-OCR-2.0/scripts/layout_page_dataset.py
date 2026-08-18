@@ -457,11 +457,13 @@ def summarize_training_budget(
         replay_counts = dataset.replay.supervised_token_counts()  # type: ignore[attr-defined]
         primary_fraction = dataset.primary_per_replay / dataset.period
         replay_fraction = 1.0 / dataset.period
+        primary_per_replay: int | None = dataset.primary_per_replay
     else:
         primary_counts = dataset.supervised_token_counts()  # type: ignore[attr-defined]
         replay_counts = []
         primary_fraction = 1.0
         replay_fraction = 0.0
+        primary_per_replay = None
 
     primary_exposures = micro_sample_exposures * primary_fraction
     replay_exposures = micro_sample_exposures * replay_fraction
@@ -476,6 +478,9 @@ def summarize_training_budget(
             per_device_batch_size * gradient_accumulation_steps * world_size
         ),
         "total_sample_exposures_estimate": micro_sample_exposures,
+        "primary_per_replay": primary_per_replay,
+        "requested_replay_fraction": replay_fraction,
+        "requested_primary_fraction": primary_fraction,
         "ancientdoc_sample_exposures_estimate": primary_exposures,
         "replay_sample_exposures_estimate": replay_exposures,
         "supervised_token_exposures_estimate": (

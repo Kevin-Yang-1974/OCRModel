@@ -13,6 +13,10 @@ PREPROCESSING_DIR = Path(__file__).resolve().parents[1] / "tools" / "preprocessi
 sys.path.insert(0, str(PREPROCESSING_DIR))
 
 from audit_synthetic_layout import audit_record  # noqa: E402
+from generate_synthetic_layout import (  # noqa: E402
+    apply_effective_font_sizes,
+    apply_s2_degradation,
+)
 from prepare_pdf_layout_content import (  # noqa: E402
     PdfSource,
     assign_splits,
@@ -229,6 +233,64 @@ def test_html_escapes_content_and_declares_vertical_writing(tmp_path: Path) -> N
     assert "＆&lt;符号&gt;" in rendered
     assert f'data-page-id="{plan.page_id}"' in rendered
     assert rendered.count('class="region"') == 4
+
+
+def test_quoted_font_stack_is_escaped_and_text_font_is_fitted(tmp_path: Path) -> None:
+    content_manifest = tmp_path / "content.jsonl"
+    write_text_content_manifest(content_manifest, count=4)
+    config = GeneratorConfig(
+        page_width=256,
+        page_height=256,
+        min_regions=4,
+        max_regions=4,
+        margin_min=16,
+        margin_max=16,
+        gap_min=2,
+        gap_max=2,
+        font_size_min=12,
+        font_size_max=40,
+        region_padding=1,
+        line_height_min=1.4,
+        line_height_max=1.4,
+        font_family='"Noto Serif CJK SC", serif',
+        font_families=['"Noto Serif CJK SC", serif'],
+        directions=["horizontal_ltr"],
+    )
+    config.validate()
+    plan = build_page_plan(
+        load_content_items(content_manifest), config, "train", "s0-html-text", 20260817, 0
+    )
+    rendered = render_page_html(plan, config)
+    assert "font-family:&quot;Noto Serif CJK SC&quot;, serif" in rendered
+    assert 'font-family:"Noto Serif CJK SC", serif' not in rendered
+    assert all(config.font_size_min <= region.font_size <= config.font_size_max for region in plan.regions)
+    assert any(region.font_size < config.font_size_max for region in plan.regions)
+
+
+def test_effective_browser_font_sizes_are_written_back_to_plan(tmp_path: Path) -> None:
+    content_manifest = tmp_path / "content.jsonl"
+    write_text_content_manifest(content_manifest)
+    plan = build_page_plan(
+        load_content_items(content_manifest),
+        small_vertical_config(),
+        "train",
+        "s0-html-text",
+        20260817,
+        0,
+    )
+    first = plan.regions[0]
+    fitted = apply_effective_font_sizes(
+        plan,
+        [
+            {
+                "region_id": first.region_id,
+                "effective_font_size": first.font_size - 1,
+            }
+        ],
+    )
+    assert fitted.regions[0].font_size == first.font_size - 1
+    assert fitted.regions[1:] == plan.regions[1:]
+    assert plan.regions[0].font_size == first.font_size
 
 
 def test_manifest_from_dom_passes_formal_audit(tmp_path: Path) -> None:
@@ -472,3 +534,200 @@ def test_plan_only_cli_can_emit_a_mixed_tier_manifest(tmp_path: Path) -> None:
     assert metadata["tiers"] == ["s0-html-text", "s2-hard"]
     assert metadata["num_pages_per_tier"] == 1
     assert metadata["num_pages"] == 2
+
+
+def test_diverse_dense_layout_records_language_font_and_nonuniform_widths(
+    tmp_path: Path,
+) -> None:
+    manifest = tmp_path / "multilingual.jsonl"
+    languages = ("zh-Hant", "ja", "ko", "en", "mixed-symbols")
+    records = [
+        {
+            "content_id": f"dense_{index:03d}",
+            "source_group_id": f"source_{index:03d}",
+            "split": "train",
+            "kind": "text",
+            "orientation": "vertical",
+            "language": languages[index % len(languages)],
+            "text": f"密集古籍文字{index}ABC※",
+        }
+        for index in range(20)
+    ]
+    manifest.write_text(
+        "".join(json.dumps(record, ensure_ascii=False) + "\n" for record in records),
+        encoding="utf-8",
+    )
+    config = GeneratorConfig(
+        page_width=512,
+        page_height=512,
+        min_regions=8,
+        max_regions=8,
+        margin_min=16,
+        margin_max=16,
+        gap_min=12,
+        gap_max=12,
+        dense_gap_probability=1.0,
+        dense_gap_min=0,
+        dense_gap_max=2,
+        region_inset_min=0,
+        region_inset_max=1,
+        region_extent_weight_min=0.7,
+        region_extent_weight_max=1.5,
+        font_size_min=18,
+        font_size_max=34,
+        region_padding=0,
+        line_height_min=0.9,
+        line_height_max=1.1,
+        letter_spacing_min=-1.0,
+        letter_spacing_max=0.25,
+        ink_opacity_min=0.7,
+        ink_opacity_max=0.95,
+        font_families=["Dense Serif A, serif", "Dense Serif B, serif"],
+        font_weights=[400, 600],
+        text_colors=["#17110e", "#49382c"],
+        allowed_rendered_fonts=["Dense Serif A", "Dense Serif B"],
+        directions=["vertical_rtl"],
+    )
+    config.validate()
+    plan = build_page_plan(
+        load_content_items(manifest), config, "train", "s0-html-text", 29, 0
+    )
+    visual = sorted(plan.regions, key=lambda region: region.bbox_px[0])
+    widths = [region.bbox_px[2] - region.bbox_px[0] for region in visual]
+    gaps = [visual[index + 1].bbox_px[0] - visual[index].bbox_px[2] for index in range(7)]
+    assert max(widths) - min(widths) > 8
+    assert max(gaps) <= 4
+    assert {region.item.language for region in plan.regions}.issubset(set(languages))
+    assert all(0.9 <= region.line_height <= 1.1 for region in plan.regions)
+    assert all(-1.0 <= region.letter_spacing <= 0.25 for region in plan.regions)
+    rendered = render_page_html(plan, config)
+    assert "letter-spacing:" in rendered
+    assert "data-language=" in rendered
+    record = plan_to_record(plan)
+    assert all(region["language"] for region in record["regions"])
+    assert all("font_family" in region for region in record["regions"])
+
+
+def test_s2_diverse_degradation_is_deterministic_and_preserves_geometry(
+    tmp_path: Path,
+) -> None:
+    first = tmp_path / "first.png"
+    second = tmp_path / "second.png"
+    Image.new("RGB", (128, 128), (226, 210, 172)).save(first)
+    Image.new("RGB", (128, 128), (226, 210, 172)).save(second)
+    config = GeneratorConfig(
+        s2_stain_count_min=3,
+        s2_stain_count_max=3,
+        s2_speckle_density_min=0.01,
+        s2_speckle_density_max=0.01,
+    )
+    config.validate()
+    first_meta = apply_s2_degradation(first, 20260817, config)
+    second_meta = apply_s2_degradation(second, 20260817, config)
+    assert sha256_file(first) == sha256_file(second)
+    assert first_meta == second_meta
+    assert first_meta["geometry_preserved"] is True
+    assert first_meta["operations"]["speckle_count"] > 0
+    with Image.open(first) as degraded:
+        assert degraded.size == (128, 128)
+
+
+def test_language_tag_and_diverse_range_validation_are_strict(tmp_path: Path) -> None:
+    manifest = tmp_path / "bad_language.jsonl"
+    manifest.write_text(
+        json.dumps(
+            {
+                "content_id": "bad",
+                "source_group_id": "source",
+                "split": "train",
+                "text": "文本",
+                "language": "zh Hant",
+            },
+            ensure_ascii=False,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="language"):
+        load_content_items(manifest)
+    with pytest.raises(ValueError, match="line heights"):
+        GeneratorConfig(line_height_min=0.2).validate()
+    with pytest.raises(ValueError, match="glyph_extent_safety_factor"):
+        GeneratorConfig(glyph_extent_safety_factor=0.9).validate()
+    with pytest.raises(ValueError, match="speckle density"):
+        GeneratorConfig(s2_speckle_density_max=0.5).validate()
+
+
+def test_diverse_split_launcher_writes_reproducible_plan_protocol(tmp_path: Path) -> None:
+    manifest = tmp_path / "all_splits.jsonl"
+    records = [
+        {
+            "content_id": f"{split}_{index}",
+            "source_group_id": f"{split}_source_{index}",
+            "split": split,
+            "kind": "text",
+            "orientation": "any",
+            "language": "zh-Hant" if index % 2 == 0 else "ja",
+            "text": f"{split} 多語言內容 {index}",
+        }
+        for split in ("train", "validation", "test")
+        for index in range(6)
+    ]
+    manifest.write_text(
+        "".join(json.dumps(record, ensure_ascii=False) + "\n" for record in records),
+        encoding="utf-8",
+    )
+    output = tmp_path / "diverse_plan"
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(PREPROCESSING_DIR / "prepare_diverse_synthetic_layout.py"),
+            "--content-manifest",
+            str(manifest),
+            "--output-root",
+            str(output),
+            "--tier",
+            "s0-html-text",
+            "--tier",
+            "s2-hard",
+            "--train-pages-per-tier",
+            "2",
+            "--validation-pages-per-tier",
+            "1",
+            "--test-pages-per-tier",
+            "1",
+            "--plan-only",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    protocol = json.loads(
+        (output / "dataset_protocol.json").read_text(encoding="utf-8")
+    )
+    assert protocol["status"] == "plan_only"
+    assert protocol["total_pages"] == 8
+    assert protocol["input_level"] == "whole_page_image"
+    assert protocol["layout_metadata_as_model_input"] is False
+    assert len(load_json_records(output / "train" / "plans.jsonl")) == 4
+    assert "diverse_synthetic_dataset_prepared" in completed.stdout
+
+
+def test_direction_weights_make_ancient_vertical_dominant(tmp_path: Path) -> None:
+    manifest = tmp_path / "directions.jsonl"
+    write_text_content_manifest(manifest, count=12)
+    config = small_vertical_config()
+    config.directions = ["vertical_rtl", "horizontal_ltr"]
+    config.direction_weights = {"vertical_rtl": 0.95, "horizontal_ltr": 0.05}
+    config.validate()
+    items = load_content_items(manifest)
+    directions = [
+        build_page_plan(items, config, "train", "s0-html-text", 91, index)
+        .regions[0]
+        .writing_direction
+        for index in range(500)
+    ]
+    assert directions.count("vertical_rtl") > 440
+    with pytest.raises(ValueError, match="every enabled direction"):
+        config.direction_weights = {"vertical_rtl": 1.0}
+        config.validate()

@@ -131,7 +131,7 @@ jq -c '{status,deltas,fairness,c4_branch_selection,replay_branch_consistency}' \
 
 ## 9. GOT2 整页结构消融
 
-本轮 A0–A5 使用统一入口，输入固定为 whole-page image 与 OCR prompt。训练用 `--gpu-id ID` 选择单张物理卡，或用 `--gpu-ids ID[,ID...]` 选择一次 DeepSpeed 数据并行任务使用的多张物理卡；任一指定卡忙碌时立即退出。validation/test 使用该组绑定列表中的第一张物理卡。validation 只选择 checkpoint，test 只加载 `selection.json` 中锁定的 checkpoint。A1–A4 的 P2 steps 和优化配置相同；A5 另外执行 P1，因此总 steps 与总页面曝光量更高，不能写成同总预算。
+本轮 A0–A5 使用统一入口，输入固定为 whole-page image 与 OCR prompt。训练用 `--gpu-id ID` 选择单张物理卡，或用 `--gpu-ids ID[,ID...]` 选择一次 DeepSpeed 数据并行任务使用的多张物理卡；默认允许与其他进程共享瞬时 `utilization.gpu < 50` 的目标卡，达到或超过 50% 或查询失败时立即退出。阈值可用 `--gpu-utilization-limit` 调整。validation/test 使用该组绑定列表中的第一张物理卡。validation 只选择 checkpoint，test 只加载 `selection.json` 中锁定的 checkpoint。A1–A4 的 P2 steps 和优化配置相同；A5 另外执行 P1，因此总 steps 与总页面曝光量更高，不能写成同总预算。
 
 多个消融也可以各绑定一张卡并发训练。下面按列表顺序将 A2、A3、A4、A5 分别绑定到物理 GPU 1、2、3、4；这与单个实验的 `--gpu-ids` 多卡数据并行不同：
 
@@ -147,7 +147,7 @@ bash tools/training/run_layout_ablation_suite.sh \
   --run-prefix layout_ablation_formal_v1
 ```
 
-启动器在创建任何子任务前检查全部目标 GPU。任一卡忙碌即整体退出；通过预检后每组使用独立 run、GPU 锁和 launcher log。并发失败时不会终止其他已经启动的组，而是等待它们结束后汇总失败状态。
+启动器在创建任何子任务前检查全部目标 GPU 的瞬时利用率。低于共享阈值时允许继续并保留 GPU 锁、独立 run 和 launcher log；达到或超过阈值、查询失败或参数非法时整体退出。并发失败时不会终止其他已经启动的组，而是等待它们结束后汇总失败状态。
 
 单组训练、选点和 Synthetic-ID test：
 
@@ -211,3 +211,92 @@ bash tools/evaluation/run_layout_ablation_selection_smoke.sh \
 ```
 
 成功时最后一行事件为 `layout_ablation_selection_resume_smoke_completed`，且 `evaluator_log_unchanged=true`。正式 run 的 candidate 目录、`selection.json` 和 test 结果不得用该 1 页 smoke 替代。
+
+## 10. 多样化合成数据到 AncientDoc
+
+新协议固定入口为 `tools/training/run_diverse_synthetic_ancientdoc.sh`。历史正式组只有 C0、C1、C4、C5、C6；不存在可直接复跑的 C2/C3。新 synthetic 数据不是 AncientDoc test 的替代品，AncientDoc 的 validation/test 仍使用书籍隔离整页数据。
+
+先在本机用真实内容 manifest 和锁定字体生成数据。默认三 tier 合计 train/validation/test 为 `24000/3000/3000` 页；正式渲染前可把页数改小并加 `--plan-only`：
+
+```powershell
+Set-Location 'D:\yangky\学推计划\ocrmodel'
+& .\.venv\Scripts\python.exe tools\preprocessing\prepare_diverse_synthetic_layout.py `
+  --content-manifest D:\layout_source\content.jsonl `
+  --content-root D:\layout_source `
+  --output-root D:\layout_data\ancient_photo_diverse_v1_seed20260817 `
+  --browser-channel msedge
+```
+
+该总入口在 Windows 当前 `.venv` 中分 split 调用现有生成器并复用系统 Edge。正式运行必须传入锁定字体文件及 SHA-256，并保留 `dataset_protocol.json`、三个 split 的 `dataset_meta.json` 和联合 `audit_summary.json`。A100 不生成页面。
+
+代码仍使用第 1 节的白名单同步命令。数据目录单独上传到 `$GOT_LAYOUT_DATA/ancient_photo_diverse_v1_seed20260817`，不得放入源码树。确认服务器 `train/validation/test/manifest.jsonl` 及对应 `images/`、`html/` 完整后，按以下阶段运行。
+
+1. 更长 synthetic A5 P1/P2，并只在 synthetic validation 选择 P2-best；该命令不运行 synthetic test：
+
+```bash
+cd /data3/yky/yangky_ocr_models/ocrmodel
+source config/paths.env
+bash tools/training/run_diverse_synthetic_ancientdoc.sh train-synthetic \
+  --dataset-id ancient_photo_diverse_v1_seed20260817 \
+  --run-prefix ancient_photo_diverse_v1 \
+  --gpu-ids 0,1
+```
+
+默认 P1/P2 为 `12000/24000` optimizer steps，每 `2000` steps 保存。`selection.json` 的主指标为 synthetic validation page CER，去空白 CER 和较早 step 依次作为 tie-breaker；不是按 final step 或 test 选择。
+
+2. 用被选中的 synthetic P2 checkpoint 启动 AncientDoc C1/C4：
+
+```bash
+bash tools/training/run_diverse_synthetic_ancientdoc.sh train-ancient-core \
+  --synthetic-selection "$GOT_EVALUATION_RUNS/ancient_photo_diverse_v1_vlqa_layout_p1_p2_seed42_selection/selection.json" \
+  --ancient-dataset-id ancientdoc_layout_260707_group_isolated_seed20260815 \
+  --gpu-id 2 \
+  --run-prefix ancient_photo_diverse_v1_ancient
+```
+
+入口通过 `--source-selection` 校验 selected model、config/weights SHA-256、validation-only 标志与 A5 ablation ID；不能手工替换为 synthetic final model。
+
+3. 只在 AncientDoc validation 选择 C4-best：
+
+```bash
+bash tools/training/run_diverse_synthetic_ancientdoc.sh select-c4 \
+  --c4-run "$GOT_TRAINING_RUNS/ancient_photo_diverse_v1_ancient_c4_vlqa_ocr_only" \
+  --ancient-dataset-id ancientdoc_layout_260707_group_isolated_seed20260815 \
+  --gpu-ids 0,1,2,3,4 \
+  --output-dir "$GOT_EVALUATION_RUNS/ancient_photo_diverse_v1_ancient_c4_selection"
+```
+
+4. 从同一个 C4-best 独立训练 C5/C6。新协议默认 AncientDoc:synthetic 为 `7:1`，即请求 replay fraction 12.5%，低于旧实验的 25%：
+
+```bash
+bash tools/training/run_diverse_synthetic_ancientdoc.sh train-replay \
+  --c4-selection "$GOT_EVALUATION_RUNS/ancient_photo_diverse_v1_ancient_c4_selection/selection.json" \
+  --ancient-dataset-id ancientdoc_layout_260707_group_isolated_seed20260815 \
+  --synthetic-dataset-id ancient_photo_diverse_v1_seed20260817 \
+  --gpu-id 3 \
+  --run-prefix ancient_photo_diverse_v1_ancient_replay
+```
+
+5. 选择 C1/C5/C6 checkpoints，C4 固定为第 3 步选择结果；只运行 validation：
+
+```bash
+bash tools/training/run_diverse_synthetic_ancientdoc.sh select-ancient \
+  --c4-selection "$GOT_EVALUATION_RUNS/ancient_photo_diverse_v1_ancient_c4_selection/selection.json" \
+  --c1-model "$GOT_TRAINING_RUNS/ancient_photo_diverse_v1_ancient_c1_got2_ocr_only/model" \
+  --training-suite "$GOT_TRAINING_RUNS/ancient_photo_diverse_v1_ancient_replay" \
+  --gpu-ids 0,1,2,3,4 \
+  --run-prefix ancient_photo_diverse_v1_ancient_selection
+```
+
+6. 只有 validation selection 冻结后才执行一次正式 AncientDoc test：
+
+```bash
+bash tools/training/run_diverse_synthetic_ancientdoc.sh test-ancient \
+  --c4-selection "$GOT_EVALUATION_RUNS/ancient_photo_diverse_v1_ancient_c4_selection/selection.json" \
+  --selection "$GOT_EVALUATION_RUNS/ancient_photo_diverse_v1_ancient_selection/selection.json" \
+  --suite-root "$GOT_EVALUATION_RUNS/ancient_photo_diverse_v1_ancient_selection" \
+  --gpu-ids 0,1,2,3,4 \
+  --resume
+```
+
+旧 AncientDoc test 已被查询过；新模型再次运行同一 test 属于重复 test 查询，不能再用其结果调 synthetic 分布、replay 比例或 checkpoint。后续超参数迭代只能看 validation，并应在新 seed 或新的 Real-OOD 集合上预注册复验。
