@@ -21,16 +21,21 @@ def sha256(path: Path) -> str:
 def compact(payload: Any) -> str:
     return json.dumps(payload, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
 
-def require_gpu_free(gpu_id: str) -> None:
+def require_gpu_below_limit(gpu_id: str, utilization_limit: int) -> None:
     completed = subprocess.run(
-        ["nvidia-smi", "-i", gpu_id, "--query-compute-apps=pid,process_name,used_memory",
+        ["nvidia-smi", "-i", gpu_id, "--query-gpu=utilization.gpu",
          "--format=csv,noheader,nounits"], capture_output=True, text=True, timeout=20
     )
     if completed.returncode != 0:
-        raise RuntimeError(f"Cannot query physical GPU {gpu_id}.")
-    if any(line.strip() and "no running processes" not in line.lower()
-           for line in completed.stdout.splitlines()):
-        raise RuntimeError(f"GPU{gpu_id}_BUSY")
+        raise RuntimeError(f"Cannot query GPU {gpu_id} utilization.")
+    value = completed.stdout.strip()
+    if not re.fullmatch(r"[0-9]+", value):
+        raise RuntimeError(f"GPU{gpu_id} utilization is not numeric: {value!r}")
+    utilization = int(value)
+    if utilization >= utilization_limit:
+        raise RuntimeError(
+            f"GPU{gpu_id}_BUSY utilization={utilization} limit={utilization_limit}"
+        )
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run one frozen test from a validation selection.")
@@ -47,6 +52,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--max-new-tokens", type=int, default=2048)
     parser.add_argument("--no-repeat-ngram-size", type=int, default=20)
     parser.add_argument("--gpu-id", default="0")
+    parser.add_argument("--gpu-utilization-limit", type=int, default=50)
     parser.add_argument("--resume", action="store_true")
     return parser.parse_args(argv)
 
@@ -54,6 +60,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
     if not re.fullmatch(r"[0-9]+", args.gpu_id):
         raise ValueError("--gpu-id must be one physical numeric GPU id.")
+    if not 1 <= args.gpu_utilization_limit <= 100:
+        raise ValueError("--gpu-utilization-limit must be an integer in 1..100.")
     selection = json.loads(args.selection.read_text(encoding="utf-8"))
     if selection.get("purpose") != "layout_ablation_validation_selection" or selection.get("test_used_for_selection") is not False:
         raise RuntimeError("Invalid validation-only selection contract.")
@@ -85,7 +93,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "--no-repeat-ngram-size", str(args.no_repeat_ngram_size),
     ]
     log_path = output / "evaluator.log"
-    require_gpu_free(args.gpu_id)
+    require_gpu_below_limit(args.gpu_id, args.gpu_utilization_limit)
     environment = dict(os.environ)
     environment["CUDA_VISIBLE_DEVICES"] = args.gpu_id
     with log_path.open("w", encoding="utf-8") as log:

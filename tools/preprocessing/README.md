@@ -154,3 +154,25 @@ python tools/preprocessing/audit_synthetic_layout.py `
 `P1` 只训练 layout queries、query cross-attention 和辅助头，OCR 标签全部 mask，残差 gate 固定为 0。`P2` 打开完整 VLQA 与 `mm_projector_vary`，联合优化页面 OCR 和布局损失。A100 上不需要安装 Playwright，也不重新渲染页面；应先在本机生成完整的 `manifest.jsonl`、`images/` 和 `html/`，再整体上传数据目录。
 
 `tools/training/run_layout_a100.py` 已在 A100 打通 manifest 复审、CUDA 组件检查、P1/P2 训练衔接和 checkpoint 重载；`layout_overfit_20260812_002747` 已通过固定 1000 steps 的 P1 两样本实现诊断，`layout_validate_20260812_014816` 已完成同两页 P1 checkpoint 的 prompt-only 评测链路。正式入口 `--mode pretrain` 和 `--mode joint-train` 已在 `formal_pdf_short_seed20260812` 上完成首轮合成训练：P1 `1000` steps，P2 `2000` steps，均完成 300 页 validation。`tools/evaluation/compare_got2_vlqa.py` 和 `tools/evaluation/run_formal_layout_comparison.sh` 用于同一 test manifest 下比较原始 GOT2 与 P2 VLQA。现有结果只代表合成数据首轮训练链路已跑通，尚不能作为真实跨域泛化或 VLQA 结构收益结论。具体命令见 `../../docs/SYNC_AND_RUN.md`。
+
+## 6. MTHv2 整页布局转换
+
+`prepare_mthv2_layout_dataset.py` 将 MTHv2 的 `label_textline` 转为保持原始阅读顺序的 textline regions，并把 `label_char` 与 `label_table` 边界线保存在逐页 sidecar JSON 中。模型输入仍为整页图像与 OCR prompt；布局标注仅用于训练监督。官方 test 保持不变，validation 只从官方 train 内按子集和稳定哈希确定性抽取。官方未提供书籍、版本或馆藏分组，因此该转换不能提供来源组隔离保证。
+
+A100 默认入口：
+
+```bash
+bash tools/preprocessing/run_mthv2_layout_prepare.sh
+```
+
+默认读取 `/data3/yky/yangky_ocr_models/datasets/MTHv2/raw/TKHMTH2200` 和同级 `official_splits/train.txt`、`test.txt`，输出到 `converted/mthv2_layout_page_v1`。图像默认使用指向 raw 数据的绝对符号链接，不复制原始图像。
+
+## 7. MTHv2 固定 query 分块
+
+当单页 textline 区域数超过 GOT2 当前的 `max_regions=16` 时，可在已转换的整页数据上运行：
+
+```bash
+bash tools/preprocessing/run_mthv2_layout_chunks.sh
+```
+
+该入口按官方 textline `reading_order` 连续分组，每组最多 16 个区域。竖排页面按所选区域的横向联合范围裁剪并保留整页高度；横排页面按纵向联合范围裁剪并保留整页宽度。输出为新的 `mthv2_layout_column_chunks16_v1` 数据集，原始整页数据不变。每个 chunk 都重新计算像素坐标和归一化 bbox，并记录 `source_page_id`、`chunk_index`、`chunk_count` 和 `source_region_indices`，便于将识别结果还原到原页顺序。
