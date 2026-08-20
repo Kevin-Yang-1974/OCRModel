@@ -1,0 +1,22 @@
+{
+  "layout_architecture": "Prompted Variable-Length Layout Decoder",
+  "layout_candidate_name": "PVLD-32",
+  "num_layout_prompt_queries": 32,
+  "prompt_queries_are_region_slots": false,
+  "max_layout_tokens": 2048,
+  "max_layout_records": 64,
+  "layout_decoder_layers": 2,
+  "layout_decoder_hidden_size": 256,
+  "layout_prompt_mode": "global_prompt_full_page",
+  "layout_bbox_loss_weight": 5.0,
+  "layout_type_loss_weight": 1.0,
+  "layout_direction_loss_weight": 1.0,
+  "layout_count_loss_weight": 0.1,
+  "layout_prompt_diversity_loss_weight": 0.0,
+  "layout_stage": "p1",
+  "ocr_loss_weight": 0.0,
+  "input_protocol": "whole_page_image_plus_ocr_prompt",
+  "bbox_direction_order_as_model_input": false,
+  "fixed_slot_comparators": ["Fixed-Slot VLQA-K16", "Fixed-Slot VLQA-K32"],
+  "mthv2_layout_source_policy": "ordered_textline_oracle_chunk_separate_from_whole_page"
+}

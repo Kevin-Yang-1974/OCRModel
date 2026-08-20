@@ -173,10 +173,6 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
-    if not re.fullmatch(r"[0-9]+", args.gpu_id):
-        raise ValueError("--gpu-id must be one physical numeric GPU id.")
-    if not 1 <= args.gpu_utilization_limit <= 100:
-        raise ValueError("--gpu-utilization-limit must be an integer in 1..100.")
     output = args.output_dir.resolve()
     selection_path = output / "selection.json"
     if selection_path.is_file():

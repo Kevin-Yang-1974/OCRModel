@@ -1,6 +1,202 @@
 # GOT2 整页端到端布局查询方案
 
-> 更新日期：2026 年 8 月 12 日
+> 方案备案（2026-08-20）：本文同时保留 Fixed-Slot VLQA baseline，并记录独立的 Prompted Variable-Length Layout Decoder（PVLD-32）工程候选。PVLD-32 不覆盖、替换或改写既有 Fixed-Slot 代码和结果。
+
+## 0. 方案备案与命名边界
+
+### 0.1 Fixed-Slot VLQA baseline
+
+原有方案统一称为 **Fixed-Slot VLQA baseline**，并分为两个容量配置：
+
+- **Fixed-Slot VLQA-K16**：原始 `max_regions=16`，作为既有主基线；
+- **Fixed-Slot VLQA-K32**：仅将固定槽位上限提高到 `max_regions=32`，作为容量控制对照。
+
+两者都遵循同一协议：输入为 `whole_page_image` 与 OCR prompt；Vary ViT 输出页面视觉 token；固定数量的 layout queries 读取页面视觉特征；`query_i` 在训练期按阅读顺序对应第 `i` 个区域；每个 query 输出 objectness/region existence、bbox、writing direction，以及可选的区域类型和阅读顺序。P1/P2 使用 object、bbox、direction 等布局辅助监督；推理时 bbox、方向和顺序不作为模型输入，只用于训练监督、解释性输出或离线评测真值。
+
+当区域数量超过固定上限时，当前 Fixed-Slot 协议采用 oracle chunk 或截断。因此 K16/K32 都不能声称能够自适应输出任意数量区域；K32 只是容量对照，不能包装为变量长度解码创新。
+
+### 0.2 Prompted Variable-Length Layout Decoder（工程候选）
+
+新方案暂称 **Prompted Variable-Length Layout Decoder（PVLD-32）**。该名称只是工程候选名称，不能直接作为最终创新结论。它必须在相同 whole-page 输入、数据划分、seed、有效 batch size、optimizer steps、OCR prompt、解码参数和 validation-only checkpoint 选择协议下，与 Fixed-Slot VLQA-K32、普通 adaptor 和无布局监督 VLQA 统一消融比较。
+
+PVLD-32 的 `32` 表示 32 个全局 layout prompt tokens，而不是 32 个区域槽位：
+
+| 配置 | “32”的含义 | 是否一一对应区域 |
+|---|---|---|
+| Fixed-Slot VLQA-K32 | 最多 32 个固定布局槽位 | 是 |
+| PVLD-32 | 32 个全局 layout prompt tokens | 否 |
+
+PVLD-32 的区域数量由 decoder 生成的 `REGION` 记录数和 `EOS` 决定。prompt bank 共同表达“请从当前页面中解析所有布局区域”，不绑定第一列、第二列或固定区域编号。decoder 始终保留对完整页面视觉 token 的 cross-attention 访问，不能只压缩成 32 个 prompt 后丢弃页面视觉 token。
+
+设页面视觉 token 经投影后为 $\widetilde{\mathbf V}\in\mathbb R^{B\times L\times D_p}$，全局 prompt 为 $\mathbf P\in\mathbb R^{B\times K_p\times D_p}$，其中 $K_p=32$。令 $d_h$ 为注意力头维度，则 prompt cross-attention 的简式为：
+
+$$\mathbf Q_p=\mathbf P\mathbf W_Q^p,\quad \mathbf K_v=\widetilde{\mathbf V}\mathbf W_K^p,\quad \mathbf U_v=\widetilde{\mathbf V}\mathbf W_V^p,$$
+
+$$\mathbf A_p=\mathrm{softmax}\left(\frac{\mathbf Q_p\mathbf K_v^\top+\mathrm{Mask}_v}{\sqrt{d_h}}\right)\mathbf U_v,\quad \mathbf H_p=\mathrm{LayerNorm}(\mathbf P+\mathbf A_p),$$
+
+其中 $\mathrm{Mask}_v$ 在 padding 位置取 $-\infty$、有效视觉 token 位置取 $0$。$\mathbf H_p$ 是布局 decoder 的 prompt context，不解释为 32 个区域；decoder 仍同时访问完整的 $\widetilde{\mathbf V}$。
+
+为避免与 Fixed-Slot VLQA 的槽位符号混用，PVLD-32 单独采用以下记号：$B$ 为 batch size，$L$ 为页面视觉 token 数，$D_v$ 为视觉 token 维度（当前 GOT2 为 $1024$），$K_p=32$ 为全局 layout prompt 数，$D_p$ 为 prompt/decoder 隐藏维度，$R_i$ 为第 $i$ 页真实布局区域数，$\widehat R_i$ 为预测区域数，$T_i$ 为布局 token 序列长度，$T_{\max}$ 为 `max_layout_tokens`，$M$ 为训练允许的最大真实区域数，$S$ 为布局结构词表大小。PVLD 中 $K_p$ 与 $R_i$ 没有一一对应关系，且不要求 $\widehat R_i\le K_p$。
+
+#### 0.2.1 全局 prompt bank 与整页视觉记忆
+
+设第 $i$ 个 batch 页面经 Vary ViT 与 `mm_projector_vary` 得到：
+
+$$\mathbf V_i\in\mathbb R^{L_i\times D_v},\qquad \mathbf V=\mathrm{pad}(\mathbf V_1,\ldots,\mathbf V_B)\in\mathbb R^{B\times L\times D_v},$$
+
+其中 $L=\max_i L_i$，padding 位置由 $\mathbf m_v\in\{0,1\}^{B\times L}$ 标记，$m_{v,il}=1$ 表示有效视觉 token。可学习 prompt bank 为：
+
+$$\mathbf P_0\in\mathbb R^{1\times K_p\times D_p},\qquad K_p=32,$$
+
+对 batch 内每个页面复制为 $\mathbf P=\mathrm{expand}(\mathbf P_0,B)\in\mathbb R^{B\times K_p\times D_p}$。$\mathbf P_0$ 的第 $k$ 行只是注意力 bank 的参数索引，不代表第 $k$ 个区域、列或行。
+
+当 $D_v\ne D_p$ 时，先将视觉 token 投影到 decoder 维度：
+
+$$\widetilde{\mathbf V}=\mathrm{LN}_v(\mathbf V\mathbf W_{v\rightarrow d}+\mathbf b_{v\rightarrow d})\in\mathbb R^{B\times L\times D_p},\qquad \mathbf W_{v\rightarrow d}\in\mathbb R^{D_v\times D_p}.$$
+
+定义 prompt cross-attention 的投影矩阵 $\mathbf W_Q^p,\mathbf W_K^p,\mathbf W_V^p\in\mathbb R^{D_p\times D_p}$，$d_h=D_p/H_p$ 为每个注意力头的维度，$H_p$ 为 prompt attention head 数。则：
+
+$$\mathbf Q_p=\mathrm{LN}_p(\mathbf P)\mathbf W_Q^p,\qquad \mathbf K_v=\widetilde{\mathbf V}\mathbf W_K^p,\qquad \mathbf U_v=\widetilde{\mathbf V}\mathbf W_V^p.$$
+
+对 batch 样本 $i$、prompt $k$ 和视觉位置 $l$：
+
+$$\ell^p_{ikl}=\frac{(\mathbf q^p_{ik})^\top\mathbf k^p_{il}}{\sqrt{d_h}},\qquad \widetilde\ell^p_{ikl}=\begin{cases}\ell^p_{ikl},&m_{v,il}=1,\\-\infty,&m_{v,il}=0,\end{cases}$$
+
+$$a^p_{ikl}=\frac{\exp\left(\widetilde\ell^p_{ikl}\right)}{\sum_{l'=1}^{L}\exp\left(\widetilde\ell^p_{ikl'}\right)}.$$
+
+也就是说，$m_{v,il}=0$ 的 padding 位置在 softmax 前被屏蔽为 attention logit $-\infty$，不会参与分母；实现中不得把数值零直接乘到 softmax 后的概率上。多头结果拼接并经过输出投影 $\mathbf W_O^p$ 后得到：
+
+$$\mathbf A_p=\mathrm{MHA}(\mathrm{LN}_p(\mathbf P),\widetilde{\mathbf V},\widetilde{\mathbf V})\in\mathbb R^{B\times K_p\times D_p},$$
+
+$$\mathbf H_p=\mathrm{LN}_{p,o}\left(\mathbf P+\mathbf A_p\right)\in\mathbb R^{B\times K_p\times D_p}.$$
+
+因此 $\mathbf H_p$ 是全局布局提示上下文，而不是 $K_p$ 个候选区域。保留完整 $\widetilde{\mathbf V}$ 作为后续 decoder memory，避免密集小区域在 prompt 压缩后丢失。
+
+#### 0.2.2 布局结构词表与 teacher forcing 序列
+
+令布局结构词表为 $\mathcal S$，其大小为 $|\mathcal S|=S$，至少包含：`<PAD>`、`<LAYOUT>`、`<REGION>`、`</REGION>`、`<TYPE>`、`</TYPE>`、`<EOS>` 以及区域类型 token `COLUMN`、`ROW`、`REGION`。其中带尖括号的 `<REGION>` 是序列结构标记，裸的 `REGION` 是一个可选的区域类型类别；二者在 tokenizer 中必须使用不同 token ID，避免结构解析歧义。第 $i$ 页按 canonical reading order 得到真实区域序列 $\mathcal R_i=(r_{i1},\ldots,r_{iR_i})$，其中 $0\le R_i\le M$。第 $j$ 个区域具有：
+
+$$r_{ij}=\left(\mathbf b^*_{ij},c^*_{ij},d^*_{ij},o^*_{ij}\right),$$
+
+其中 $\mathbf b^*_{ij}=(x^*_{0},y^*_{0},x^*_{1},y^*_{1})\in[0,1]^4$ 为归一化角点 bbox，$c^*_{ij}\in\mathcal C$ 为区域类型，$d^*_{ij}\in\mathcal D$ 为书写方向，$o^*_{ij}$ 为唯一阅读顺序索引。序列化函数 $\sigma$ 输出：
+
+$$\mathbf y_i^*=\sigma(\mathcal R_i)=\left[\texttt{<LAYOUT>},\ \texttt{<REGION>},\ \texttt{<TYPE>},\ c^*_{i1},\texttt{</TYPE>},\texttt{</REGION>},\ldots,\texttt{<REGION>},\texttt{<TYPE>},c^*_{iR_i},\texttt{</TYPE>},\texttt{</REGION>},\texttt{<EOS>}\right].$$
+
+记 $y^*_{it}\in\mathcal S$ 为第 $t$ 个 token，真实序列长度为 $T_i=|\mathbf y_i^*|$。训练 batch 对齐到 $T_{\max}$，超出位置填充 `<PAD>`；$m^y_{it}=1$ 表示非 padding target token。每个 `<REGION>` 的 token 位置记为 $\tau_{ij}$，对应 hidden state $\mathbf h_{ij}=\mathbf Z_{i,\tau_{ij}}$。`TYPE` 只表达平面区域类别；首版不生成 `parent_region_id` 或嵌套 column-row tree。
+
+#### 0.2.3 因果变量长度 decoder
+
+布局 decoder 的输入 embedding 为 $\mathbf E(y^*_{it})$，位置 embedding 为 $\mathbf e^{pos}_t$，目标序列表示为：
+
+$$\mathbf X_i^*=\left[\mathbf E(y^*_{i1})+\mathbf e^{pos}_1,\ldots,\mathbf E(y^*_{iT_i})+\mathbf e^{pos}_{T_i}\right]\in\mathbb R^{T_i\times D_p}.$$
+
+decoder memory 同时包含完整视觉 token 和 prompt context：
+
+$$\mathbf C_i=\mathrm{concat}\left(\widetilde{\mathbf V}_i,\mathbf H_{p,i}\right)\in\mathbb R^{(L_i+K_p)\times D_p}.$$
+
+以 $\mathbf M^{causal}\in\{0,1\}^{T_i\times T_i}$ 表示因果 mask，$M^{causal}_{tt'}=1$ 当且仅当 $t'>t$，decoder 第 $\ell$ 层计算：
+
+$$\mathbf Z_i^{(\ell)}=\mathrm{DecoderLayer}_{\ell}\left(\mathbf Z_i^{(\ell-1)},\mathbf C_i;\mathbf M^{causal}\right),\qquad \mathbf Z_i=\mathrm{LN}_d(\mathbf Z_i^{(L_d)}).$$
+
+其中 $L_d$ 为 decoder layer 数。结构 token logits 为：
+
+$$\mathbf l_{it}=\mathbf W_s\mathbf z_{it}+\mathbf b_s\in\mathbb R^{S},\qquad p_\theta(y_{it}=s\mid y_{i,<t},\mathbf V_i,\mathbf H_{p,i})=\mathrm{softmax}(\mathbf l_{it})_s.$$
+
+自回归概率为：
+
+$$p_\theta(\mathbf y_i\mid\mathbf V_i,\mathbf H_{p,i})=\prod_{t=1}^{T_i}p_\theta(y_{it}\mid y_{i,<t},\mathbf V_i,\mathbf H_{p,i}).$$
+
+推理从 `<LAYOUT>` 开始逐 token 解码；当生成 `<EOS>` 时停止，预测区域数定义为：
+
+$$\widehat R_i=\#\left\{t:\widehat y_{it}=\texttt{<REGION>},\ t<\tau_{EOS,i}\right\}.$$
+
+若在 $T_{\max}$ 内没有生成 `<EOS>`，则令 `generated_eos=false`、`max_length_truncation=true`，不把达到最大长度当作正常停止。
+
+#### 0.2.4 REGION hidden state 的连续辅助头
+
+对第 $j$ 个生成区域的 hidden state $\mathbf h_{ij}=\mathbf z_{i,\tau_{ij}}\in\mathbb R^{D_p}$，bbox 使用连续回归而不是文本小数：
+
+$$\widehat{\mathbf b}_{ij}=\mathrm{sigmoid}\left(\mathbf W_{bbox}\mathbf h_{ij}+\mathbf b_{bbox}\right)\in[0,1]^4,\qquad \mathbf W_{bbox}\in\mathbb R^{4\times D_p}.$$
+
+区域类型和书写方向分别为：
+
+$$\widehat{\mathbf p}^{type}_{ij}=\mathrm{softmax}\left(\mathbf W_{type}\mathbf h_{ij}+\mathbf b_{type}\right)\in[0,1]^{|\mathcal C|}.$$
+
+$$\widehat{\mathbf p}^{dir}_{ij}=\mathrm{softmax}\left(\mathbf W_{dir}\mathbf h_{ij}+\mathbf b_{dir}\right)\in[0,1]^{|\mathcal D|}.$$
+
+其中 $\mathcal C$ 为区域类型集合，首版至少包含 `COLUMN`、`ROW`、`REGION`；$\mathcal D=\{\texttt{horizontal_ltr},\texttt{horizontal_rtl},\texttt{vertical_rtl},\texttt{vertical_ltr},\texttt{unknown}\}$。页面 count head 使用 `<LAYOUT>` hidden state $\mathbf h_{i0}=\mathbf z_{i,1}$（或实现中等价的页面 prompt state）：
+
+$$\widehat n_i=\mathbf w_{count}^{\top}\mathbf h_{i0}+b_{count}\in\mathbb R.$$
+
+count head 只提供低权重的数量回归辅助项；最终区域数仍由 `<REGION>` 记录和 `<EOS>` 决定。
+
+#### 0.2.5 PVLD 目标函数及 mask
+
+布局序列交叉熵只在非 padding token 上计算：
+
+$$\mathcal L_{seq}= -\frac{1}{\sum_{i,t}m^y_{it}}\sum_{i=1}^{B}\sum_{t=1}^{T_{\max}}m^y_{it}\log p_\theta\left(y^*_{it}\mid y^*_{i,<t},\mathbf V_i,\mathbf H_{p,i}\right).$$
+
+令 $m^r_{ij}=1$ 表示第 $j$ 个区域存在有效 bbox/type/direction 标签，否则为 0。bbox 回归项为：
+
+$$\mathcal L_{bbox}=\frac{1}{\max(1,\sum_{i,j}m^r_{ij})}\sum_{i=1}^{B}\sum_{j=1}^{M}m^r_{ij}\left(\left\|\widehat{\mathbf b}_{ij}-\mathbf b^*_{ij}\right\|_1+\lambda_{giou}\mathcal L_{GIoU}\left(\widehat{\mathbf b}_{ij},\mathbf b^*_{ij}\right)\right).$$
+
+类型和方向损失只对有效区域计算：
+
+$$\mathcal L_{type}= -\frac{1}{\max(1,\sum_{i,j}m^r_{ij})}\sum_{i,j}m^r_{ij}\log\widehat p^{type}_{ij,c^*_{ij}}.$$
+
+$$\mathcal L_{direction}= -\frac{1}{\max(1,\sum_{i,j}m^r_{ij})}\sum_{i,j}m^r_{ij}\log\widehat p^{dir}_{ij,d^*_{ij}}.$$
+
+count loss 使用真实区域数 $R_i$，但不取代 EOS：
+
+$$\mathcal L_{count}=\frac{1}{B}\sum_{i=1}^{B}\mathrm{SmoothL1}\left(\widehat n_i,R_i\right).$$
+
+可选 prompt diversity 正则定义为不同 prompt context 余弦相似度的平方均值：
+
+$$\mathcal L_{prompt\_div}=\frac{1}{B K_p(K_p-1)}\sum_i\sum_{k\ne k'}\left(\frac{\mathbf h^p_{ik}\cdot\mathbf h^p_{ik'}}{\|\mathbf h^p_{ik}\|_2\|\mathbf h^p_{ik'}\|_2}\right)^2.$$
+
+首版默认 $\lambda_{prompt\_div}=0$；没有重复框诊断证据时不加入重复框正则。PVLD 布局损失为：
+
+$$\mathcal L_{layout}=\mathcal L_{seq}+\lambda_{bbox}\mathcal L_{bbox}+\lambda_{type}\mathcal L_{type}+\lambda_{direction}\mathcal L_{direction}+\lambda_{count}\mathcal L_{count}+\lambda_{prompt\_div}\mathcal L_{prompt\_div}.$$
+
+P1 阶段冻结 Vary ViT、Qwen OCR 主干、`mm_projector_vary` 和写回门，只优化 prompt bank、prompt cross-attention、layout decoder 与连续辅助头：
+
+$$\mathcal L_{P1}=\mathcal L_{layout},\qquad \nabla_{\mathrm{ViT},\mathrm{Qwen},\mathrm{Projector},\mathrm{Writeback}}\mathcal L_{P1}=0.$$
+
+P2 阶段打开布局 decoder 与 projector 的联合训练，页面 OCR 交叉熵为 $\mathcal L_{ocr}$，总损失为：
+
+$$\mathcal L_{P2}=\lambda_{ocr}\mathcal L_{ocr}+\lambda_{layout}\mathcal L_{layout},$$
+
+其中 $\lambda_{ocr}>0$，Qwen decoder 默认冻结或只训练低学习率 adapter，不一开始解冻整个 Qwen。布局损失下降不能替代页面 CER、编辑距离、exact match 和 EOS/区域指标。
+
+#### 0.2.6 变量长度评估量
+
+对页面 $i$，区域数量误差和 exact count 为：
+
+$$e^{count}_i=\left|\widehat R_i-R_i\right|,\qquad \mathrm{MAE}_{count}=\frac{1}{B}\sum_i e^{count}_i,\qquad \mathrm{Acc}_{count}=\frac{1}{B}\sum_i\mathbb 1[\widehat R_i=R_i].$$
+
+EOS 成功率、提前 EOS 率和最大长度截断率分别为：
+
+$$\mathrm{EOS\_success}=\frac{\#\{i:\text{在 }T_{\max}\text{ 前生成 EOS}\}}{B}.$$
+
+$$\mathrm{premature\_EOS}=\frac{\#\{i:\widehat R_i<R_i\ \land\ \text{生成 EOS}\}}{B},\qquad \mathrm{truncation}=\frac{\#\{i:\text{未生成 EOS}\}}{B}.$$
+
+区域 precision/recall/F1、bbox IoU、duplicate region rate 和 OCR CER 必须在页面级评估，并按真实区域数量分桶：$0$–$8$、$9$–$16$、$17$–$32$、$>32$。其中 >32 页面用于检验 PVLD 是否能超过 K32 容量边界；Fixed-Slot K16/K32 对这些页面必须明确记录 oracle chunk、截断或未评估状态。
+
+#### 0.2.7 计算量边界
+
+prompt bank 读取完整视觉序列的额外 attention score 元素数量约为 $B K_p L$，对应计算量量级 $O(BK_pLD_p)$；自回归 decoder 的 cross-attention memory 长度为 $L+K_p$，不因 prompt 压缩而删除 $L$ 个视觉 token。布局 token 数 $T_i$ 随页面区域数和结构字段变化，推理成本应报告平均/分位数布局 token 数、单页延迟和峰值显存，而不能只报告固定 $K_p=32$。
+
+第一版采用平面区域列表，使用 `<LAYOUT>`、`<REGION>`、`<TYPE>`、`</REGION>` 和 `<EOS>` 等结构 token；如需同时表达列和行，先通过 `TYPE` 区分，不一开始引入 column-row 层级树。`REGION` 时间步 hidden state 接连续 bbox、type、direction heads，bbox 不强制作为自然语言小数生成。count head 只作为低权重辅助项，不能替代 EOS 停止机制；重复框先记录比例，不在缺少诊断证据时加入复杂重复正则。
+
+PVLD-32 的自回归概率、连续 bbox/type/direction 头、各项 mask、总布局损失及 P1/P2 目标均以上述 0.2.1–0.2.5 的定义为准，避免在文档不同位置维护两套不一致的简式公式。canonical reading order 采用确定性规则：`vertical_rtl` 按列中心从右到左，`vertical_ltr` 按列中心从左到右，`horizontal_ltr` 按行中心从上到下，`horizontal_rtl` 按行中心从上到下并以横向坐标作次序。该规则用于 teacher forcing 序列化，不表示固定 query 与区域一一对应；推理后可按 bbox 与 direction 再排序。
+
+### 0.3 当前实现边界
+
+`GOT/model/layout_prompt_decoder.py`、`scripts/serialize_layout_targets.py`、`scripts/train_GOT_variable_layout.py`、`scripts/evaluate_GOT_variable_layout.py` 和 `tools/training/run_variable_layout_a100.py` 是独立 PVLD 原型。首版支持模块级 forward/backward、target 序列化、结构化 preflight、可选预计算视觉 feature tensor smoke 和评估产物契约；尚未把 PVLD 接入 GOT2 的视觉塔与 `GOTQwenModel.forward`，也未产生正式 A100 训练或性能结果。该边界必须保留，不能把 standalone preflight/smoke 写成 GOT2 whole-page 效果。
+
+MTHv2 的 `label_textline` 仍只能标记为 ordered textline/region candidate，不改写为严格 column ground truth；whole-page 与 oracle-chunk 数据必须分开输出，oracle-chunk 结果不得与 whole-page PVLD 结果直接比较。
+
+> 历史状态记录（2026 年 8 月 12 日；当前备案见文首 2026-08-20）
 >
 > 文档性质：单模型 VLQA 路线的架构、目标函数与消融执行依据
 >

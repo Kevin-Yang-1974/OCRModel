@@ -72,15 +72,20 @@ if [[ -n "$parallel_gpu_ids" && ${#selected_gpu_array[@]} -ne ${#groups[@]} ]]; 
     printf 'ERROR: --parallel-gpu-ids count must equal --ablations count.\n' >&2; exit 64
 fi
 
-require_gpus_free() {
-    local target_gpu output
+require_gpus_below_limit() {
+    local target_gpu output utilization
     for target_gpu in "$@"; do
-        if ! output="$(nvidia-smi -i "$target_gpu" --query-compute-apps=pid --format=csv,noheader,nounits 2>&1)"; then
+        if ! output="$(nvidia-smi -i "$target_gpu" --query-gpu=utilization.gpu --format=csv,noheader,nounits 2>&1)"; then
             printf 'ERROR: cannot query physical GPU %s: %s\n' "$target_gpu" "$output" >&2
             exit 66
         fi
-        if [[ -n "${output//[[:space:]]/}" ]]; then
-            printf 'ERROR: GPU%s_BUSY\n' "$target_gpu" >&2
+        utilization="${output//[[:space:]]/}"
+        if [[ ! "$utilization" =~ ^[0-9]+$ ]]; then
+            printf 'ERROR: GPU%s utilization is not numeric: %s\n' "$target_gpu" "$output" >&2
+            exit 66
+        fi
+        if (( utilization >= 50 )); then
+            printf 'ERROR: GPU%s_BUSY utilization=%s limit=50\n' "$target_gpu" "$utilization" >&2
             exit 75
         fi
     done
@@ -91,7 +96,7 @@ ocrmodel_root="${OCRMODEL_ROOT:-$(cd -- "${script_dir}/../.." && pwd -P)}"
 source "${ocrmodel_root}/config/paths.env"
 dataset_root="${GOT_LAYOUT_DATA}/${dataset_id}"
 bash "${script_dir}/check_layout_dataset_mount.sh" --dataset-root "$dataset_root" >/dev/null
-require_gpus_free "${selected_gpu_array[@]}"
+require_gpus_below_limit "${selected_gpu_array[@]}"
 
 stamp="$(date +%Y%m%d_%H%M%S)"
 prefix="layout_ablation_smoke_${stamp}"

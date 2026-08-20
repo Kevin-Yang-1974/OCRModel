@@ -25,7 +25,7 @@ from run_layout_a100 import (
     bounded,
     compact_json,
     file_sha256,
-    gpu_processes,
+    gpu_utilization,
     tail_lines,
     timestamp,
     write_json,
@@ -204,10 +204,10 @@ def environment(settings: Settings, *, cuda: bool = True) -> dict[str, str]:
 
 
 def require_gpu_free(settings: Settings) -> None:
-    processes = gpu_processes(settings.gpu_id)
-    if processes:
+    utilization = gpu_utilization(settings.gpu_id)
+    if utilization >= 50:
         raise RunFailure(
-            f"GPU{settings.gpu_id}_BUSY {compact_json(processes)}",
+            f"GPU{settings.gpu_id}_BUSY utilization={utilization} limit=50",
             exit_code=EXIT_GPU_BUSY,
         )
 

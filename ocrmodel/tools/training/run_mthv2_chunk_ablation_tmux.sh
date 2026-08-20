@@ -6,14 +6,16 @@ usage() {
 Usage:
   run_mthv2_chunk_ablation_tmux.sh --session NAME \
     [--gpu-id ID | --parallel-gpu-ids ID[,ID...]] \
-    [--dataset-root PATH] [--run-prefix NAME] [--ablations C1,C2,C3,C4,C5]
+    [--dataset-root PATH] [--run-prefix NAME] [--ablations C1,C2,C3,C4,C5] \
+    [--max-regions N]
 
 Train the MTHv2 oracle-chunk ablation controls in one tmux session. C0-page
 and C0-chunk are zero-shot references and are recorded, not optimized here.
 The default budget is C1-C4 direct P2=42000 steps and C5 P1=12000 -> P2=30000;
 all checkpoints are saved every 3000 steps. This launcher intentionally does
-not run the synthetic-layout audit because MTHv2 chunk manifests use a real-
-data schema. Results are interim chunk-level runs until grouped evaluation is run.
+not run the synthetic-layout audit because MTHv2 manifests use a real-data
+schema. Set --max-regions high enough for whole-page manifests; results retain
+the input granularity recorded by the manifest.
 USAGE
 }
 
@@ -36,6 +38,7 @@ p2_steps="30000"
 checkpoint_steps="3000"
 gpu_utilization_limit="50"
 seed="42"
+max_regions="16"
 session_inner=0
 
 while [[ $# -gt 0 ]]; do
@@ -51,6 +54,7 @@ while [[ $# -gt 0 ]]; do
         --checkpoint-steps) checkpoint_steps="${2:-}"; shift 2 ;;
         --gpu-utilization-limit) gpu_utilization_limit="${2:-}"; shift 2 ;;
         --seed) seed="${2:-}"; shift 2 ;;
+        --max-regions) max_regions="${2:-}"; shift 2 ;;
         --session-inner) session_inner=1; shift ;;
         --help|-h) usage; exit 0 ;;
         *) printf 'ERROR: unknown argument: %s\n' "$1" >&2; usage; exit 64 ;;
@@ -73,11 +77,14 @@ gpu_mode_count=0
 [[ "${p1_steps}" =~ ^[1-9][0-9]*$ && "${p2_steps}" =~ ^[1-9][0-9]*$ && "${checkpoint_steps}" =~ ^[1-9][0-9]*$ ]] || {
     printf 'ERROR: step values must be positive integers.\n' >&2; exit 64;
 }
+[[ "${max_regions}" =~ ^[1-9][0-9]*$ ]] || {
+    printf 'ERROR: max-regions must be a positive integer.\n' >&2; exit 64;
+}
 [[ "${gpu_utilization_limit}" =~ ^[1-9][0-9]*$ ]] && (( gpu_utilization_limit <= 100 )) || {
     printf 'ERROR: GPU utilization limit must be 1..100.\n' >&2; exit 64;
 }
 [[ -d "${dataset_root}/train" && -f "${dataset_root}/train/manifest.jsonl" ]] || {
-    printf 'ERROR: MTHv2 chunk dataset is missing: %s\n' "${dataset_root}" >&2; exit 66;
+    printf 'ERROR: MTHv2 dataset is missing: %s\n' "${dataset_root}" >&2; exit 66;
 }
 if [[ "${session_inner}" -eq 0 ]]; then
     command -v tmux >/dev/null 2>&1 || { printf 'ERROR: tmux is unavailable.\n' >&2; exit 69; }
@@ -144,7 +151,7 @@ train_one() {
         --checkpoint-steps "${checkpoint_steps}"
         --gpu-utilization-limit "${gpu_utilization_limit}"
         --seed "${seed}" --run-id "${run_id}" --gpu-ids "${assigned_gpu}"
-        --max-regions 16 --layout-loss-preset "${layout_preset}"
+        --max-regions "${max_regions}" --layout-loss-preset "${layout_preset}"
         --skip-post-training-validation
     )
     if [[ "${control}" == "C5" ]]; then
@@ -191,7 +198,7 @@ else
         inner_gpu_args="--gpu-id '${gpu_id}'"
     fi
     tmux new-session -d -s "${session}" \
-        "cd ${quoted_root} && exec bash ${quoted_script} --session-inner --dataset-root '${dataset_root}' --run-prefix '${run_prefix}' ${inner_gpu_args} --ablations '${ablations}' --p1-steps '${p1_steps}' --p2-steps '${p2_steps}' --checkpoint-steps '${checkpoint_steps}' --gpu-utilization-limit '${gpu_utilization_limit}' --seed '${seed}' >${quoted_log} 2>&1"
+        "cd ${quoted_root} && exec bash ${quoted_script} --session-inner --dataset-root '${dataset_root}' --run-prefix '${run_prefix}' ${inner_gpu_args} --ablations '${ablations}' --p1-steps '${p1_steps}' --p2-steps '${p2_steps}' --checkpoint-steps '${checkpoint_steps}' --gpu-utilization-limit '${gpu_utilization_limit}' --seed '${seed}' --max-regions '${max_regions}' >${quoted_log} 2>&1"
 
     sleep 5
     if ! tmux has-session -t "${session}" 2>/dev/null; then

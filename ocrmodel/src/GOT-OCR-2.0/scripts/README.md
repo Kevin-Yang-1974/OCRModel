@@ -43,3 +43,9 @@ C1 通过 `../../../tools/training/run_got2_page_ocr_a100.py` 调用 `train_GOT_
 `train_GOT_layout.py --ablation_id ... --layout_loss_preset ...` 是统一训练底层入口。A1 只训练 `mm_projector_vary`；A2 训练 projector 与独立 `GenericVisualTransformerAdapter`；A3/A4 训练 projector 与相同 VLQA；A5 保留原 P1→P2。未指定 `--ablation_id` 时保留原 P1/P2 默认语义。
 
 `evaluate_GOT_layout.py` 的 `--model-kind` 支持 `baseline`、`generic` 和 `vlqa`，所有类型都只接收 `whole_page_image` 与 OCR prompt；布局 metadata 不进入模型。
+
+## PVLD-32 独立原型
+
+原有 `layout_query.py` 是 **Fixed-Slot VLQA baseline**：K16 使用 `max_regions=16`，K32 仅把固定槽位容量提高到 32，二者都按训练期 query 顺序对应区域；超过上限时使用 oracle chunk 或截断。K32 只是容量对照，不是变量长度创新。
+
+`../GOT/model/layout_prompt_decoder.py`、`serialize_layout_targets.py`、`train_GOT_variable_layout.py` 和 `evaluate_GOT_variable_layout.py` 提供独立的 **Prompted Variable-Length Layout Decoder（PVLD-32）** 原型。PVLD 的 32 个 prompt token 不绑定区域编号，区域数量由结构 token 序列中的 `REGION` 记录和 `EOS` 决定；decoder 保留对完整页面视觉 token 的访问。`train_GOT_variable_layout.py` 在没有预计算 `visual_features` 时只执行 manifest/config preflight，不伪造 GOT2 训练或效果；正式接入 GOT2 视觉塔和 `GOTQwenModel.forward` 仍是后续任务。MTHv2 ordered textline 与 oracle-chunk 结果必须和 whole-page 结果分开。

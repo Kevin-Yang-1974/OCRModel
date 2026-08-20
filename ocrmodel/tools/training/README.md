@@ -42,6 +42,10 @@ C5/C6 metrics、summary 和 suite JSONL 均记录 selected C4 step、model path�
 
 统一结构消融入口为 `run_layout_ablation_suite.sh`。它支持 `got2_zero_shot`、`projector_only`、`generic_adapter_projector`、`vlqa_ocr_only`、`vlqa_layout_direct` 和 `vlqa_layout_p1_p2`，按组执行训练、validation checkpoint 选点和 selection-locked test。训练可用 `--gpu-id 2` 选择单张物理卡，或用 `--gpu-ids 0,2,3` 在一次 DeepSpeed 任务中进行数据并行多卡训练。`--parallel-gpu-ids 1,2,3,4` 则按 `--ablations` 的顺序把不同消融分别绑定到一张物理卡并发执行，例如 A2、A3、A4、A5 分别使用 GPU 1、2、3、4；每组后续 validation/test 继续使用自己的绑定卡。三种 GPU 模式互斥，默认允许与其他进程共享瞬时 `utilization.gpu < 50` 的目标卡；达到或超过 50% 或查询失败时退出。阈值可用 `--gpu-utilization-limit` 调整。未指定 `--resume` 时，已有 run 或 test 会退出，避免重复正式评测。
 
+## PVLD-32 原型入口
+
+`run_variable_layout_a100.py` 是独立的 Prompted Variable-Length Layout Decoder 编排器，不修改 `run_layout_a100.py` 或 Fixed-Slot K16/K32 结果。它复用目标 GPU 利用率准入、显式 `--gpu-id/--gpu-ids`、单 run 防重复启动和 `metadata/status.txt`、`layout_training_metrics.json`、`summary.json`、完成标志等产物。没有 `visual_features` 的 manifest 时，PVLD 入口只做严格 preflight；带预计算视觉 feature 时可执行 bounded tensor smoke。该入口当前不代表 GOT2 视觉塔已经接入 PVLD，也不产生正式 whole-page 性能结论。
+
 selection 的 `--resume` 只复用通过模型路径、manifest、split、解码参数和 whole-page prompt-only 输入协议校验的既有 candidate summary；不一致时拒绝继续。指标兼容层把 evaluator 的 `character_edits`、`reference_characters`、`page_exact_matches` 规范化为 selection/test 的稳定总量字段。用 `tools/evaluation/run_layout_ablation_selection_smoke.sh <training-run-id> <dataset-id> <checkpoint-step>` 做 1 页断点续跑工程验证；该结果不能代替正式 validation 选点。
 
 多样化 synthetic A5 到 AncientDoc C0/C1/C4/C5/C6 的阶段化入口为 `run_diverse_synthetic_ancientdoc.sh`。默认 synthetic P1/P2 为 12000/24000 steps、每 2000 steps 保存并在 synthetic validation 选 P2-best；C4 必须通过 `--source-selection` 从该 selected checkpoint 启动。AncientDoc 继续先选 C4-best，再独立训练 C5/C6，最后分开执行 Ancient validation selection 与 frozen test。

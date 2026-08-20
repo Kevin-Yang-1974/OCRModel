@@ -1133,44 +1133,6 @@ def component_smoke_environment(settings: Settings) -> dict[str, str]:
     return environment
 
 
-def gpu_processes(gpu_id: str) -> list[dict[str, Any]]:
-    command = [
-        "nvidia-smi",
-        "-i",
-        gpu_id,
-        "--query-compute-apps=pid,process_name,used_memory",
-        "--format=csv,noheader,nounits",
-    ]
-    try:
-        completed = subprocess.run(
-            command,
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=20,
-        )
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        raise RunFailure(f"Cannot query GPU {gpu_id}: {exc}", exit_code=EXIT_MISSING) from exc
-    if completed.returncode != 0:
-        raise RunFailure(
-            f"nvidia-smi failed: {bounded(completed.stderr)}", exit_code=EXIT_MISSING
-        )
-    processes: list[dict[str, Any]] = []
-    for line in completed.stdout.splitlines():
-        line = line.strip()
-        if not line or "no running processes" in line.lower():
-            continue
-        parts = [part.strip() for part in line.split(",", maxsplit=2)]
-        processes.append(
-            {
-                "pid": parts[0] if parts else "unknown",
-                "process_name": parts[1] if len(parts) > 1 else "unknown",
-                "used_memory_mib": parts[2] if len(parts) > 2 else "unknown",
-            }
-        )
-    return processes
-
-
 def gpu_utilization(gpu_id: str) -> int:
     command = [
         "nvidia-smi",
@@ -1200,23 +1162,16 @@ def gpu_utilization(gpu_id: str) -> int:
             f"GPU{gpu_id} utilization is not numeric: {bounded(value)}",
             exit_code=EXIT_MISSING,
         )
-    utilization = int(value)
-    if utilization > 100:
-        raise RunFailure(
-            f"GPU{gpu_id} utilization is outside 0..100: {utilization}",
-            exit_code=EXIT_MISSING,
-        )
-    return utilization
+    return int(value)
 
 
 def require_gpu_free(settings: Settings) -> None:
     for gpu_id in settings.physical_gpu_ids:
         utilization = gpu_utilization(gpu_id)
         if utilization >= settings.gpu_utilization_limit:
-            processes = gpu_processes(gpu_id)
             raise RunFailure(
                 f"GPU{gpu_id}_BUSY utilization={utilization} "
-                f"limit={settings.gpu_utilization_limit} {compact_json(processes)}",
+                f"limit={settings.gpu_utilization_limit}",
                 exit_code=EXIT_GPU_BUSY,
             )
 
@@ -1357,7 +1312,10 @@ def run_audit(context: RunContext) -> dict[str, Any]:
         if line.strip()
     )
     layout_source = str(first_record.get("layout_source", ""))
-    if layout_source.startswith("mthv2_") or layout_source == "text_ordered_chunk_v1":
+    if (
+        layout_source.startswith("mthv2_")
+        or layout_source in {"real_mthv2_official", "text_ordered_chunk_v1"}
+    ):
         split_counts: dict[str, int] = {}
         page_count = 0
         region_count = 0

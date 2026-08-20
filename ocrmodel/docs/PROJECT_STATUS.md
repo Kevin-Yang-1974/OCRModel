@@ -1,6 +1,6 @@
 # 项目状态
 
-> 更新日期：2026 年 8 月 19 日
+> 更新日期：2026 年 8 月 20 日
 
 ## 当前状态
 
@@ -14,7 +14,13 @@
 - 多样化 synthetic→AncientDoc 新协议：已实现 ancient-photo-diverse preset、跨 split 生成/审计入口、synthetic A5 P1/P2 validation-only 选点、selection-locked C4 初始化，以及 C0/C1/C4/C5/C6 分阶段 selection/test。新 C5/C6 默认 AncientDoc:synthetic=`7:1`（12.5% replay），旧 frozen run 的 `3:1`（25%）结果不改写。代码已同步 A100；`layout_ablation_smoke_20260817_114133` 在 GPU 0 通过 1-step P1/P2、checkpoint 与 7:1 schedule smoke。正式多样化数据、长程训练和新 AncientDoc test 尚未运行。
 - MTHv2 数据转换：已将官方 `label_textline` 转为有序区域标注，并把超过 `max_regions=16` 的页面按连续阅读顺序转换为 oracle chunks。当前数据为 train 2159 源页/5589 chunks、validation 240 源页/593 chunks、test 800 源页/1968 chunks；该输入协议不是 whole-page 端到端列发现，不能与 whole-page 指标直接比较。
 - MTHv2 当前运行：A100 正在对 C1–C5 执行 chunk-level validation checkpoint 选择和 selection-locked test，run prefix 为 `mthv2_chunk_ablation_20260819_multi`。截至 2026-08-19 本次检查，五组日志均已记录 `validation_started`，但 `selection.json` 和 test `summary.json` 均未生成，尚无性能结果。
+- MTHv2 chunk test 更新（2026-08-20）：五组 validation selection 已完成且均为 `selection_split=validation`、`test_used_for_selection=false`。C1 `projector_only` 选择 step 30000，validation page CER `0.621899`；C2 `generic_adapter_projector` 选择 step 42000，validation page CER `0.632319`；C3 `vlqa_ocr_only` 选择 step 42000，validation page CER `0.599550`；C4 `vlqa_layout_direct` 选择 step 39000，validation page CER `0.677042`；C5 `vlqa_layout_p1_p2` 选择 step 30000，validation page CER `0.642191`。C1、C3 和 C5 的 selection-locked test 已完成：C1 page CER `0.647299`、page exact match `3/1968`；C3 page CER `0.587229`、page exact match `1/1968`，但 complete region precision/recall/F1 仅 `0.000159/0.000198/0.000176`，matched direction accuracy `0`，说明无布局监督对照不具备有效布局预测；C5 page CER `0.660571`、page exact match `2/1968`，complete region precision/recall/F1 `0.416397/0.418375/0.417384`，matched bbox mean IoU `0.749395`，matched direction accuracy `1.0`，reading-order pair accuracy `0.999492`，Kendall tau `0.998984`。C2、C4 已进入 test 但尚无完成事件或 summary，不能写成 suite 已结束。
+- 该轮 test 的 selection/test manifest 路径仍为 `mthv2_layout_column_chunks16_v1`，所以全部结果只能称为 oracle-chunk 中间诊断，不能与 whole-page 训练或整页 PVLD 直接比较。C1/C5 summary 中的 `input_granularity=whole_page_image` 与实际 chunk manifest 路径不一致，已按 manifest 证据保守记录为 chunk-level，后续需修复 evaluator 元数据字段。
+- 当前可做的有限比较是：C5 相对 C1 的 chunk page CER 高 `0.013272`（`0.660571-0.647299`），exact match 少 1 个，尚无 OCR 收益；C5 同时给出 complete layout F1 `0.417384`，但不能用布局指标替代 OCR。validation 上 C3 的 page CER 暂时最低，但其 frozen test 尚未完成；在 C2–C4 test 和源页面聚合完成前，不形成 C1–C5 最终排序。
 - MTHv2 报告边界：当前 evaluator 产出 chunk-level `layout_validation_metrics.json` 和 predictions；正式报告还需按 `source_page_id`、`chunk_index` 合并为 240 个 validation 源页和 800 个 test 源页。现有脚本明确标记 `grouped_source_page_evaluation=pending`，因此当前 chunk 结果只能作为中间诊断。
+- MTHv2 whole-page 训练：已启动独立 tmux 会话 `mthv2_page_train_20260820_r2`，使用原始页面 manifest `mthv2_layout_page_v1`（train/validation/test=`2159/240/800`），不是 oracle-chunk 图像；C1–C5 在 GPU 0 串行执行，`max_regions=512` 覆盖整页最多 407 个区域。C1 已进入 P2 optimizer steps，暂无性能结果。此前 `mthv2_page_ablation_20260820` 因审计条件未识别 `real_mthv2_official` 失败，`mthv2_page_ablation_20260820_r1` 因 `max_regions=64` 不足以容纳 71 区域页面失败；两个失败 run 均保留，不得复用。
+- 方案备案：原有布局结构现统一称为 Fixed-Slot VLQA baseline，保留 `Fixed-Slot VLQA-K16`（原始 `max_regions=16`）和 `Fixed-Slot VLQA-K32`（仅提高固定槽位容量到 32）两个对照。两者的 query 在训练期按阅读顺序对应固定区域，超过上限时仍需 oracle chunk 或截断；K32 不是变量长度解码创新。
+- PVLD-32 原型：新增独立的 Prompted Variable-Length Layout Decoder 工程候选。32 表示全局 layout prompt tokens，不表示 32 个区域槽位；区域数量由 decoder 的 `REGION` 记录和 `EOS` 决定。新增模块、target 序列化、评估契约和 A100 编排器均不覆盖 Fixed-Slot 代码；当前尚未接入 GOT2 视觉塔/`forward`，也未产生正式训练或性能结果，只有 standalone feature tensor smoke/preflight 能力。
 
 ## 已完成的正式流程
 
@@ -28,3 +34,5 @@
 ## 归因边界
 
 C5/C6 共享 C4-best 后，C6-C5 的页面 CER 为 `-0.031084`，说明 synthetic layout supervision 相对纯 OCR replay 减轻退化；但 C5-C4 和 C6-C4 分别为 `+0.089588` 和 `+0.058504`，两种 replay 均未超过 C4。C1 与 C4 的结构、可训练参数和上游训练历史仍不同；普通 GOT2 的同上游历史、同数据和近似参数预算 C2 尚未实现，因此不能把 C1-C4 差异完全归因于 VLQA。当前 frozen test 不再用于 replay 配置选择，后续调整只允许使用 validation。
+
+PVLD-32 必须与 Fixed-Slot VLQA-K16、Fixed-Slot VLQA-K32、无布局监督 query、等参数量普通 adaptor 在统一 whole-page 数据协议和统一 optimizer budget 下比较。PVLD-32 的评估必须额外报告 EOS 成功率、提前 EOS、max-length 截断、区域数量 MAE、按真实区域数量分桶的区域召回率/bbox IoU 和 OCR CER；在这些消融完成前，不把 PVLD-32 称为已成立的结构创新。

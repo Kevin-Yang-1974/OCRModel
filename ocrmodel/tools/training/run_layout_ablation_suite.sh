@@ -103,7 +103,7 @@ if [[ -n "$parallel_gpu_ids" && ${#selected_gpu_array[@]} -ne ${#groups[@]} ]]; 
     printf 'ERROR: --parallel-gpu-ids count must equal --ablations count.\n' >&2; exit 64
 fi
 
-require_gpus_free() {
+require_gpus_below_limit() {
     local target_gpu output utilization
     for target_gpu in "$@"; do
         if ! output="$(nvidia-smi -i "$target_gpu" --query-gpu=utilization.gpu --format=csv,noheader,nounits 2>&1)"; then
@@ -127,7 +127,7 @@ ocrmodel_root="${OCRMODEL_ROOT:-$(cd -- "${script_dir}/../.." && pwd -P)}"
 source "${ocrmodel_root}/config/paths.env"
 dataset_root="${GOT_LAYOUT_DATA}/${dataset_id}"
 bash "${script_dir}/check_layout_dataset_mount.sh" --dataset-root "$dataset_root" >/dev/null
-require_gpus_free "${selected_gpu_array[@]}"
+require_gpus_below_limit "${selected_gpu_array[@]}"
 audit_root="${GOT_EVALUATION_RUNS}/${run_prefix}_dataset_audits"
 mkdir -p "$audit_root"
 bash "${ocrmodel_root}/tools/environment/run_got2.sh" \
