@@ -6,3 +6,11 @@ from .layout_query import (
     VisualLayoutQueryAdapter,
     VisualLayoutQueryLoss,
 )
+from .layout_prompt_decoder import (
+    LayoutPromptBank,
+    LayoutPromptCrossAttention,
+    LayoutRecordHeads,
+    LayoutVocabulary,
+    VariableLayoutDecoder,
+    VariableLayoutLoss,
+)

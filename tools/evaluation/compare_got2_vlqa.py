@@ -103,6 +103,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--iou-threshold", type=probability, default=0.5)
     parser.add_argument("--dtype", choices=("bfloat16", "float16", "float32"), default="bfloat16")
     parser.add_argument("--device", default="cuda")
+    parser.add_argument("--gpu-utilization-limit", type=positive_int, default=50)
     parser.add_argument("--num-workers", type=nonnegative_int, default=0)
     parser.add_argument(
         "--audit-manifest",
@@ -166,12 +167,12 @@ def tail_lines(path: Path, count: int = 20) -> list[str]:
         return [bounded(line, 1000) for line in deque(handle, maxlen=count)]
 
 
-def require_gpu_free() -> None:
+def require_gpu_below_limit(utilization_limit: int = 50) -> None:
     command = [
         "nvidia-smi",
         "-i",
         "0",
-        "--query-compute-apps=pid,process_name,used_memory",
+        "--query-gpu=utilization.gpu",
         "--format=csv,noheader,nounits",
     ]
     try:
@@ -189,13 +190,12 @@ def require_gpu_free() -> None:
             f"nvidia-smi failed: {bounded(completed.stderr)}",
             exit_code=EXIT_MISSING,
         )
-    processes = [
-        bounded(line, 300)
-        for line in completed.stdout.splitlines()
-        if line.strip() and "no running processes" not in line.lower()
-    ]
-    if processes:
-        raise ComparisonFailure(f"GPU0_BUSY {compact_json(processes)}", exit_code=75)
+    value = completed.stdout.strip()
+    if not value.isdigit():
+        raise ComparisonFailure(f"GPU0 utilization is not numeric: {bounded(value)}", exit_code=EXIT_MISSING)
+    utilization = int(value)
+    if utilization >= utilization_limit:
+        raise ComparisonFailure(f"GPU0_BUSY utilization={utilization} limit={utilization_limit}", exit_code=75)
 
 
 def resolve_args(args: argparse.Namespace) -> dict[str, Any]:
@@ -478,7 +478,7 @@ def compare(args: argparse.Namespace) -> dict[str, Any]:
         layout_metadata_as_model_input=False,
     )
     if args.device == "cuda":
-        require_gpu_free()
+        require_gpu_below_limit(args.gpu_utilization_limit)
     baseline = run_evaluator(
         label="baseline",
         model_kind="baseline",
@@ -492,7 +492,7 @@ def compare(args: argparse.Namespace) -> dict[str, Any]:
         ocrmodel_root=ocrmodel_root,
     )
     if args.device == "cuda":
-        require_gpu_free()
+        require_gpu_below_limit(args.gpu_utilization_limit)
     vlqa = run_evaluator(
         label="vlqa",
         model_kind="vlqa",

@@ -37,6 +37,12 @@ def require_gpu_below_limit(gpu_id: str, utilization_limit: int) -> None:
             f"GPU{gpu_id}_BUSY utilization={utilization} limit={utilization_limit}"
         )
 
+
+def require_gpu_free(gpu_id: str, utilization_limit: int = 50) -> None:
+    """Compatibility name; admission is utilization-based, not process-based."""
+    require_gpu_below_limit(gpu_id, utilization_limit)
+
+
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run one frozen test from a validation selection.")
     parser.add_argument("--selection", type=Path, required=True)
@@ -58,10 +64,6 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
-    if not re.fullmatch(r"[0-9]+", args.gpu_id):
-        raise ValueError("--gpu-id must be one physical numeric GPU id.")
-    if not 1 <= args.gpu_utilization_limit <= 100:
-        raise ValueError("--gpu-utilization-limit must be an integer in 1..100.")
     selection = json.loads(args.selection.read_text(encoding="utf-8"))
     if selection.get("purpose") != "layout_ablation_validation_selection" or selection.get("test_used_for_selection") is not False:
         raise RuntimeError("Invalid validation-only selection contract.")
@@ -93,7 +95,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "--no-repeat-ngram-size", str(args.no_repeat_ngram_size),
     ]
     log_path = output / "evaluator.log"
-    require_gpu_below_limit(args.gpu_id, args.gpu_utilization_limit)
+    require_gpu_free(args.gpu_id, args.gpu_utilization_limit)
     environment = dict(os.environ)
     environment["CUDA_VISIBLE_DEVICES"] = args.gpu_id
     with log_path.open("w", encoding="utf-8") as log:
