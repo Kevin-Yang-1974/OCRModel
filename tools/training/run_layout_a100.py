@@ -108,6 +108,11 @@ class Settings:
     validation_required_stage: str | None
     seed: int
     max_regions: int
+    layout_writeback_mode: str
+    layout_writeback_source: str
+    layout_writeback_num_heads: int
+    layout_writeback_dropout: float
+    layout_writeback_gate_init: float
     model_max_length: int
     per_device_batch_size: int
     gradient_accumulation_steps: int
@@ -340,6 +345,15 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--max-regions", type=positive_int, default=16)
+    parser.add_argument(
+        "--layout-writeback-mode",
+        choices=("layout_value", "vqlca", "visual_value_layout_routing"),
+        default="layout_value",
+    )
+    parser.add_argument("--layout-writeback-source", choices=("layout_evidence",), default="layout_evidence")
+    parser.add_argument("--layout-writeback-num-heads", type=positive_int, default=8)
+    parser.add_argument("--layout-writeback-dropout", type=probability, default=0.0)
+    parser.add_argument("--layout-writeback-gate-init", type=float, default=0.0)
     parser.add_argument("--model-max-length", type=positive_int, default=2048)
     parser.add_argument("--per-device-batch-size", type=positive_int, default=1)
     parser.add_argument("--gradient-accumulation-steps", type=positive_int, default=1)
@@ -853,6 +867,11 @@ def resolve_settings(args: argparse.Namespace) -> Settings:
         validation_required_stage=validation_required_stage,
         seed=args.seed,
         max_regions=args.max_regions,
+        layout_writeback_mode=args.layout_writeback_mode,
+        layout_writeback_source=args.layout_writeback_source,
+        layout_writeback_num_heads=args.layout_writeback_num_heads,
+        layout_writeback_dropout=args.layout_writeback_dropout,
+        layout_writeback_gate_init=args.layout_writeback_gate_init,
         model_max_length=args.model_max_length,
         per_device_batch_size=args.per_device_batch_size,
         gradient_accumulation_steps=args.gradient_accumulation_steps,
@@ -1397,6 +1416,7 @@ import torch
 
 module_path = sys.argv[1]
 seed = int(sys.argv[2])
+writeback_mode = sys.argv[3]
 if not torch.cuda.is_available():
     raise RuntimeError("CUDA is not available")
 if torch.cuda.device_count() != 1:
@@ -1415,6 +1435,8 @@ adapter = module.VisualLayoutQueryAdapter(
     num_queries=4,
     num_heads=4,
     ffn_expansion=2,
+    writeback_mode=writeback_mode,
+    writeback_num_heads=4,
 ).to(device=device, dtype=torch.bfloat16)
 visual = torch.randn(2, 16, 64, device=device, dtype=torch.bfloat16) * 1_000_000.0
 output = adapter(visual, memory_grid_size=(4, 4), return_attention=True)
@@ -1469,6 +1491,38 @@ losses.loss.backward()
 gradient = adapter.query_embeddings.grad
 if gradient is None or not torch.isfinite(gradient).all():
     raise RuntimeError("VLQA query gradient is missing or non-finite")
+writeback_gradients = {}
+if writeback_mode == "vqlca":
+    adapter.zero_grad(set_to_none=True)
+    with torch.no_grad():
+        adapter.residual_gate.fill_(0.5)
+    routed_visual = torch.randn(
+        2, 16, 64, device=device, dtype=torch.bfloat16, requires_grad=True
+    )
+    routed_output = adapter(routed_visual, memory_grid_size=(4, 4))
+    routed_loss = routed_output.visual_tokens.float().square().mean()
+    if not torch.isfinite(routed_loss):
+        raise RuntimeError("VQLCA routed loss is not finite")
+    routed_loss.backward()
+    required = {
+        "visual_query": adapter.vqlca_writeback.visual_query.weight,
+        "visual_key": adapter.vqlca_writeback.visual_key.weight,
+        "visual_value": adapter.vqlca_writeback.visual_value.weight,
+        "context_key": adapter.vqlca_writeback.context_key.weight,
+        "layout_condition": adapter.vqlca_writeback.layout_condition_attention.in_proj_weight,
+        "output": adapter.vqlca_writeback.output.weight,
+        "layout_queries": adapter.query_embeddings,
+    }
+    for name, parameter in required.items():
+        parameter_gradient = parameter.grad
+        if (parameter_gradient is None or not torch.isfinite(parameter_gradient).all()
+                or parameter_gradient.detach().float().abs().sum() == 0):
+            raise RuntimeError(f"VQLCA {name} gradient is missing, zero, or non-finite")
+        writeback_gradients[name] = float(
+            parameter_gradient.detach().float().norm().cpu()
+        )
+else:
+    routed_loss = torch.zeros((), device=device)
 print(json.dumps({
     "status": "ok",
     "torch": torch.__version__,
@@ -1485,6 +1539,10 @@ print(json.dumps({
     "direction_accuracy": float(losses.direction_accuracy.detach().cpu()),
     **initial_scales,
     "query_gradient_norm": float(gradient.norm().detach().cpu()),
+    "writeback_mode": writeback_mode,
+    "zero_gate_exact": True,
+    "routed_loss": float(routed_loss.detach().cpu()),
+    "writeback_gradient_norms": writeback_gradients,
     "visual_shape": list(output.visual_tokens.shape),
     "query_shape": list(output.layout_queries.shape),
 }, separators=(",", ":")))
@@ -1503,6 +1561,7 @@ def run_component_smoke(context: RunContext) -> dict[str, Any]:
                 COMPONENT_SMOKE,
                 str(context.settings.project_root / "GOT" / "model" / "layout_query.py"),
                 str(context.settings.seed),
+                context.settings.layout_writeback_mode,
             ],
             cwd=context.settings.project_root,
             env=component_smoke_environment(context.settings),
@@ -1587,6 +1646,16 @@ def build_training_command(
         settings.p2_train_scope,
         "--max_regions",
         str(settings.max_regions),
+        "--layout_writeback_mode",
+        settings.layout_writeback_mode,
+        "--layout_writeback_source",
+        settings.layout_writeback_source,
+        "--layout_writeback_num_heads",
+        str(settings.layout_writeback_num_heads),
+        "--layout_writeback_dropout",
+        str(settings.layout_writeback_dropout),
+        "--layout_writeback_gate_init",
+        str(settings.layout_writeback_gate_init),
         "--max_train_records",
         str(records),
         "--datasets",
@@ -2290,7 +2359,10 @@ def read_status(path: Path) -> dict[str, Any]:
 
 def execute(settings: Settings) -> int:
     validate_paths(settings)
-    lock_handles = acquire_gpu_locks(settings.runs_root, settings.physical_gpu_ids)
+    # GPU sharing is admitted solely by instantaneous utilization.gpu < limit.
+    # Run-directory uniqueness prevents duplicate experiment launches; a legacy
+    # per-GPU exclusive lock would incorrectly reject eligible shared cards.
+    lock_handles: list[Any] = []
     try:
         require_gpu_free(settings)
         if settings.run_root.exists():

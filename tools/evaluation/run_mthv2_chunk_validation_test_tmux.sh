@@ -23,6 +23,7 @@ gpu_ids="0,1,2,3,4"
 run_prefix="mthv2_chunk_ablation_20260819_multi"
 dataset_root="/data3/yky/yangky_ocr_models/datasets/MTHv2/converted/mthv2_layout_column_chunks16_v1"
 utilization_limit="50"
+max_regions="16"
 session_inner=0
 
 while [[ $# -gt 0 ]]; do
@@ -32,6 +33,7 @@ while [[ $# -gt 0 ]]; do
         --run-prefix) run_prefix="${2:-}"; shift 2 ;;
         --dataset-root) dataset_root="${2:-}"; shift 2 ;;
         --gpu-utilization-limit) utilization_limit="${2:-}"; shift 2 ;;
+        --max-regions) max_regions="${2:-}"; shift 2 ;;
         --session-inner) session_inner=1; shift ;;
         --help|-h) usage; exit 0 ;;
         *) printf 'ERROR: unknown argument: %s\n' "$1" >&2; usage; exit 64 ;;
@@ -88,7 +90,7 @@ run_control() {
       --tokenizer-model "${GOT_TOKENIZER_MODEL:-${GOT_SOURCE_MODEL}}" \
       --validation-manifest "${dataset_root}/validation/manifest.jsonl" \
       --validation-image-root "${dataset_root}/validation" --output-dir "${eval_root}" \
-      --project-root "${ocrmodel_root}/src/GOT-OCR-2.0" --max-regions 16 \
+      --project-root "${ocrmodel_root}/src/GOT-OCR-2.0" --max-regions "${max_regions}" \
       --gpu-id "${gpu}" --gpu-utilization-limit "${utilization_limit}"
     echo "{\"event\":\"mthv2_chunk_test_started\",\"control\":\"${control}\",\"gpu\":\"${gpu}\"}"
     bash "${ocrmodel_root}/tools/environment/run_got2.sh" \
@@ -97,7 +99,7 @@ run_control() {
       --test-image-root "${dataset_root}/test" --model-kind "${kind}" \
       --tokenizer-model "${GOT_TOKENIZER_MODEL:-${GOT_SOURCE_MODEL}}" \
       --project-root "${ocrmodel_root}/src/GOT-OCR-2.0" --output-dir "${test_root}" \
-      --max-regions 16 --gpu-id "${gpu}" --gpu-utilization-limit "${utilization_limit}"
+      --max-regions "${max_regions}" --gpu-id "${gpu}" --gpu-utilization-limit "${utilization_limit}"
     echo "{\"event\":\"mthv2_chunk_test_completed\",\"control\":\"${control}\"}"
 }
 
@@ -118,7 +120,7 @@ if [[ "${session_inner}" -eq 1 ]]; then
     run_all >"${log_path}" 2>&1
 else
     script_path="$(realpath "${BASH_SOURCE[0]}")"
-    tmux new-session -d -s "${session}" "cd '${ocrmodel_root}' && exec bash '${script_path}' --session-inner --gpu-ids '${gpu_ids}' --run-prefix '${run_prefix}' --dataset-root '${dataset_root}' --gpu-utilization-limit '${utilization_limit}'"
+    tmux new-session -d -s "${session}" "cd '${ocrmodel_root}' && exec bash '${script_path}' --session-inner --gpu-ids '${gpu_ids}' --run-prefix '${run_prefix}' --dataset-root '${dataset_root}' --gpu-utilization-limit '${utilization_limit}' --max-regions '${max_regions}'"
     sleep 5
     tmux has-session -t "${session}" 2>/dev/null || { tail -n 20 "${log_path}" >&2 || true; exit 1; }
     echo "{\"event\":\"mthv2_chunk_validation_test_tmux_started\",\"session\":\"${session}\",\"log\":\"${log_path}\"}"

@@ -20,8 +20,10 @@ class VLQAOutput:
     bbox_xyxy: torch.Tensor
     direction_logits: torch.Tensor
     layout_residual: torch.Tensor
+    layout_evidence: Optional[torch.Tensor] = None
+    layout_memory_source: str = "visual_tokens"
     query_attention: Optional[torch.Tensor] = None
-    writeback_attention: Optional[torch.Tensor] = None
+    writeback_attention: Optional[object] = None
 
 
 @dataclass
@@ -57,6 +59,199 @@ class FeedForward(nn.Module):
 
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
         return self.net(inputs)
+
+
+class VisualQVLayoutConditionedAttention(nn.Module):
+    """Route visual values with keys conditioned by layout context."""
+
+    def __init__(
+        self,
+        dim: int,
+        num_heads: int,
+        dropout: float = 0.0,
+    ) -> None:
+        super().__init__()
+        if dim < 1 or num_heads < 1 or dim % num_heads != 0:
+            raise ValueError("dim must be positive and divisible by num_heads.")
+        self.dim = dim
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+        self.dropout = dropout
+
+        self.layout_query_norm = nn.LayerNorm(dim)
+        self.layout_key_norm = nn.LayerNorm(dim)
+        self.layout_condition_attention = nn.MultiheadAttention(
+            embed_dim=dim,
+            num_heads=num_heads,
+            dropout=dropout,
+            batch_first=True,
+        )
+        self.visual_norm = nn.LayerNorm(dim)
+        self.context_norm = nn.LayerNorm(dim)
+        self.visual_query = nn.Linear(dim, dim)
+        self.visual_key = nn.Linear(dim, dim)
+        self.context_key = nn.Linear(dim, dim, bias=False)
+        self.visual_value = nn.Linear(dim, dim)
+        self.output = nn.Linear(dim, dim)
+
+    def reset_parameters(self) -> None:
+        for module in self.modules():
+            if module is self:
+                continue
+            if isinstance(module, nn.MultiheadAttention):
+                module._reset_parameters()
+            elif isinstance(module, nn.LayerNorm):
+                nn.init.ones_(module.weight)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+            elif isinstance(module, nn.Linear):
+                nn.init.normal_(module.weight, mean=0.0, std=0.02)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+
+    def _split_heads(self, tensor: torch.Tensor) -> torch.Tensor:
+        batch, tokens, _ = tensor.shape
+        return tensor.reshape(batch, tokens, self.num_heads, self.head_dim).transpose(1, 2)
+
+    def forward(
+        self,
+        visual_tokens: torch.Tensor,
+        layout_vectors: torch.Tensor,
+        visual_padding_mask: Optional[torch.Tensor] = None,
+        layout_padding_mask: Optional[torch.Tensor] = None,
+        return_attention: bool = False,
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+        if visual_tokens.ndim != 3 or layout_vectors.ndim != 3:
+            raise ValueError("visual_tokens and layout_vectors must be batch-first 3D tensors.")
+        if visual_tokens.shape[0] != layout_vectors.shape[0]:
+            raise ValueError("visual_tokens and layout_vectors batch sizes do not match.")
+        if visual_tokens.shape[-1] != self.dim or layout_vectors.shape[-1] != self.dim:
+            raise ValueError(f"VQLCA inputs must use hidden dimension {self.dim}.")
+
+        layout_context, _ = self.layout_condition_attention(
+            query=self.layout_query_norm(visual_tokens),
+            key=self.layout_key_norm(layout_vectors),
+            value=self.layout_key_norm(layout_vectors),
+            key_padding_mask=layout_padding_mask,
+            need_weights=False,
+        )
+        normalized_visual = self.visual_norm(visual_tokens)
+        query = self._split_heads(self.visual_query(normalized_visual))
+        key = self._split_heads(
+            self.visual_key(normalized_visual)
+            + self.context_key(self.context_norm(layout_context))
+        )
+        value = self._split_heads(self.visual_value(normalized_visual))
+        logits = torch.matmul(query, key.transpose(-2, -1)) / math.sqrt(self.head_dim)
+        if visual_padding_mask is not None:
+            if visual_padding_mask.shape != visual_tokens.shape[:2]:
+                raise ValueError("visual_padding_mask must have shape [B,N].")
+            logits = logits.masked_fill(
+                visual_padding_mask[:, None, None, :],
+                torch.finfo(logits.dtype).min,
+            )
+        attention = logits.softmax(dim=-1)
+        attention = F.dropout(attention, p=self.dropout, training=self.training)
+        routed = torch.matmul(attention, value)
+        routed = routed.transpose(1, 2).reshape(visual_tokens.shape)
+        routed = self.output(routed)
+        if visual_padding_mask is not None:
+            routed = routed.masked_fill(visual_padding_mask.unsqueeze(-1), 0.0)
+        return routed, attention if return_attention else None
+
+
+class VisualValueLayoutRouting(nn.Module):
+    """Factorized visual-value routing conditioned on layout evidence.
+
+    A conventional attention product requires the key and value sequence
+    lengths to match.  The requested ``Q=V_i, K=A, V=V_i`` therefore cannot
+    be written as one matrix product when ``L_v != K_p``.  This module keeps
+    the intended semantics with two routing factors:
+
+    ``R_va = softmax(Q(V_i) K(A)^T)`` has shape ``[B,H,L_v,K_p]`` and
+    ``R_av = softmax(Q(A) K(V_i)^T)`` has shape ``[B,H,K_p,L_v]``.  Their
+    product is a visual-to-visual route ``[B,H,L_v,L_v]`` which aggregates
+    ``U(V_i)`` only.  Layout evidence is never a content Value.
+    """
+
+    def __init__(self, dim: int, num_heads: int, dropout: float = 0.0) -> None:
+        super().__init__()
+        if dim < 1 or num_heads < 1 or dim % num_heads:
+            raise ValueError("dim must be positive and divisible by num_heads.")
+        self.dim = dim
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+        self.dropout = dropout
+        self.visual_norm = nn.LayerNorm(dim)
+        self.evidence_norm = nn.LayerNorm(dim)
+        self.visual_query = nn.Linear(dim, dim)
+        self.evidence_key = nn.Linear(dim, dim)
+        self.evidence_query = nn.Linear(dim, dim)
+        self.visual_key = nn.Linear(dim, dim)
+        self.visual_value = nn.Linear(dim, dim)
+        self.output = nn.Linear(dim, dim)
+
+    def reset_parameters(self) -> None:
+        for module in self.modules():
+            if module is self:
+                continue
+            if isinstance(module, nn.LayerNorm):
+                nn.init.ones_(module.weight)
+                nn.init.zeros_(module.bias)
+            elif isinstance(module, nn.Linear):
+                nn.init.normal_(module.weight, mean=0.0, std=0.02)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+
+    def _split(self, value: torch.Tensor) -> torch.Tensor:
+        batch, length, _ = value.shape
+        return value.view(batch, length, self.num_heads, self.head_dim).transpose(1, 2)
+
+    @staticmethod
+    def _mask_logits(logits: torch.Tensor, mask: Optional[torch.Tensor]) -> torch.Tensor:
+        if mask is None:
+            return logits
+        return logits.masked_fill(mask[:, None, None, :], torch.finfo(logits.dtype).min)
+
+    def forward(
+        self,
+        visual_tokens: torch.Tensor,
+        layout_evidence: torch.Tensor,
+        visual_padding_mask: Optional[torch.Tensor] = None,
+        layout_padding_mask: Optional[torch.Tensor] = None,
+        return_attention: bool = False,
+    ) -> tuple[torch.Tensor, Optional[dict[str, torch.Tensor]]]:
+        if visual_tokens.shape[0] != layout_evidence.shape[0]:
+            raise ValueError("visual_tokens and layout_evidence batch sizes differ.")
+        visual = self.visual_norm(visual_tokens)
+        evidence = self.evidence_norm(layout_evidence)
+        q_visual = self._split(self.visual_query(visual))
+        k_evidence = self._split(self.evidence_key(evidence))
+        q_evidence = self._split(self.evidence_query(evidence))
+        k_visual = self._split(self.visual_key(visual))
+        visual_value = self._split(self.visual_value(visual))
+
+        visual_to_evidence = torch.matmul(q_visual, k_evidence.transpose(-2, -1)) / math.sqrt(self.head_dim)
+        visual_to_evidence = self._mask_logits(visual_to_evidence, layout_padding_mask)
+        visual_to_evidence = F.softmax(visual_to_evidence, dim=-1)
+        evidence_to_visual = torch.matmul(q_evidence, k_visual.transpose(-2, -1)) / math.sqrt(self.head_dim)
+        evidence_to_visual = self._mask_logits(evidence_to_visual, visual_padding_mask)
+        evidence_to_visual = F.softmax(evidence_to_visual, dim=-1)
+        route = torch.matmul(visual_to_evidence, evidence_to_visual)
+        route = F.dropout(route, p=self.dropout, training=self.training)
+        routed = torch.matmul(route, visual_value)
+        routed = routed.transpose(1, 2).reshape_as(visual_tokens)
+        routed = self.output(routed)
+        if visual_padding_mask is not None:
+            routed = routed.masked_fill(visual_padding_mask.unsqueeze(-1), 0.0)
+        diagnostics = None
+        if return_attention:
+            diagnostics = {
+                "visual_to_evidence": visual_to_evidence,
+                "evidence_to_visual": evidence_to_visual,
+                "visual_route": route,
+            }
+        return routed, diagnostics
 
 
 class BoxHead(nn.Module):
@@ -202,6 +397,10 @@ class VisualLayoutQueryAdapter(nn.Module):
         ffn_expansion: int = 4,
         num_direction_classes: int = 5,
         dropout: float = 0.0,
+        writeback_mode: str = "layout_value",
+        writeback_num_heads: Optional[int] = None,
+        writeback_dropout: Optional[float] = None,
+        writeback_gate_init: float = 0.0,
     ) -> None:
         super().__init__()
         if visual_dim < 1 or layout_input_dim < 1 or adapter_dim < 1:
@@ -216,12 +415,22 @@ class VisualLayoutQueryAdapter(nn.Module):
             raise ValueError("num_direction_classes must be at least 2.")
         if not 0.0 <= dropout < 1.0:
             raise ValueError("dropout must be in [0, 1).")
+        if writeback_mode not in {"layout_value", "vqlca", "visual_value_layout_routing"}:
+            raise ValueError("unsupported layout writeback mode.")
+        writeback_num_heads = num_heads if writeback_num_heads is None else writeback_num_heads
+        writeback_dropout = dropout if writeback_dropout is None else writeback_dropout
+        if writeback_num_heads < 1 or adapter_dim % writeback_num_heads != 0:
+            raise ValueError("adapter_dim must be divisible by writeback_num_heads.")
+        if not 0.0 <= writeback_dropout < 1.0:
+            raise ValueError("writeback_dropout must be in [0, 1).")
 
         self.visual_dim = visual_dim
         self.layout_input_dim = layout_input_dim
         self.adapter_dim = adapter_dim
         self.num_queries = num_queries
         self.num_direction_classes = num_direction_classes
+        self.writeback_mode = writeback_mode
+        self.writeback_gate_init = float(writeback_gate_init)
 
         self.query_embeddings = nn.Parameter(torch.empty(num_queries, adapter_dim))
         self.order_embeddings = nn.Parameter(torch.empty(num_queries, adapter_dim))
@@ -245,14 +454,37 @@ class VisualLayoutQueryAdapter(nn.Module):
 
         self.visual_norm = nn.LayerNorm(visual_dim)
         self.visual_projection = nn.Linear(visual_dim, adapter_dim)
-        self.writeback_query_norm = nn.LayerNorm(adapter_dim)
-        self.writeback_key_norm = nn.LayerNorm(adapter_dim)
-        self.writeback_attention = nn.MultiheadAttention(
-            embed_dim=adapter_dim,
-            num_heads=num_heads,
-            dropout=dropout,
-            batch_first=True,
-        )
+        if writeback_mode == "layout_value":
+            self.writeback_query_norm = nn.LayerNorm(adapter_dim)
+            self.writeback_key_norm = nn.LayerNorm(adapter_dim)
+            self.writeback_attention = nn.MultiheadAttention(
+                embed_dim=adapter_dim,
+                num_heads=writeback_num_heads,
+                dropout=writeback_dropout,
+                batch_first=True,
+            )
+            self.vqlca_writeback = None
+            self.visual_value_layout_routing = None
+        elif writeback_mode == "vqlca":
+            self.writeback_query_norm = None
+            self.writeback_key_norm = None
+            self.writeback_attention = None
+            self.vqlca_writeback = VisualQVLayoutConditionedAttention(
+                dim=adapter_dim,
+                num_heads=writeback_num_heads,
+                dropout=writeback_dropout,
+            )
+            self.visual_value_layout_routing = None
+        else:
+            self.writeback_query_norm = None
+            self.writeback_key_norm = None
+            self.writeback_attention = None
+            self.vqlca_writeback = None
+            self.visual_value_layout_routing = VisualValueLayoutRouting(
+                dim=adapter_dim,
+                num_heads=writeback_num_heads,
+                dropout=writeback_dropout,
+            )
         self.writeback_output = nn.Linear(adapter_dim, visual_dim)
         self.residual_gate = nn.Parameter(torch.zeros(()))
 
@@ -281,7 +513,22 @@ class VisualLayoutQueryAdapter(nn.Module):
         nn.init.normal_(box_output.weight, mean=0.0, std=0.001)
         if box_output.bias is not None:
             nn.init.zeros_(box_output.bias)
-        nn.init.zeros_(self.residual_gate)
+        nn.init.constant_(self.residual_gate, self.writeback_gate_init)
+
+    def reset_writeback_parameters(self) -> None:
+        if self.writeback_mode == "vqlca":
+            assert self.vqlca_writeback is not None
+            self.vqlca_writeback.reset_parameters()
+        elif self.writeback_mode == "layout_value":
+            assert self.writeback_attention is not None
+            self.writeback_attention._reset_parameters()
+        else:
+            assert self.visual_value_layout_routing is not None
+            self.visual_value_layout_routing.reset_parameters()
+        nn.init.normal_(self.writeback_output.weight, mean=0.0, std=0.02)
+        if self.writeback_output.bias is not None:
+            nn.init.zeros_(self.writeback_output.bias)
+        nn.init.constant_(self.residual_gate, self.writeback_gate_init)
 
     @staticmethod
     def _flatten_memory(
@@ -322,6 +569,8 @@ class VisualLayoutQueryAdapter(nn.Module):
         visual_tokens: torch.Tensor,
         layout_memory: Optional[torch.Tensor] = None,
         memory_grid_size: Optional[tuple[int, int]] = None,
+        visual_padding_mask: Optional[torch.Tensor] = None,
+        layout_padding_mask: Optional[torch.Tensor] = None,
         return_attention: bool = False,
     ) -> VLQAOutput:
         if visual_tokens.ndim != 3 or visual_tokens.shape[-1] != self.visual_dim:
@@ -329,6 +578,7 @@ class VisualLayoutQueryAdapter(nn.Module):
                 f"visual_tokens must have shape [B,N,{self.visual_dim}], got "
                 f"{tuple(visual_tokens.shape)}."
             )
+        layout_memory_source = "visual_tokens" if layout_memory is None else "high_resolution_visual_features"
         if layout_memory is None:
             layout_memory = visual_tokens
         memory, grid_size = self._flatten_memory(layout_memory, memory_grid_size)
@@ -371,13 +621,36 @@ class VisualLayoutQueryAdapter(nn.Module):
 
         visual_queries = self.visual_projection(self.visual_norm(visual_tokens))
         ordered_layout_queries = prediction_queries + self.order_embeddings.unsqueeze(0)
-        writeback, writeback_attention = self.writeback_attention(
-            query=self.writeback_query_norm(visual_queries),
-            key=self.writeback_key_norm(ordered_layout_queries),
-            value=ordered_layout_queries,
-            need_weights=return_attention,
-            average_attn_weights=False,
-        )
+        if self.writeback_mode == "layout_value":
+            assert self.writeback_attention is not None
+            assert self.writeback_query_norm is not None
+            assert self.writeback_key_norm is not None
+            writeback, writeback_attention = self.writeback_attention(
+                query=self.writeback_query_norm(visual_queries),
+                key=self.writeback_key_norm(ordered_layout_queries),
+                value=ordered_layout_queries,
+                key_padding_mask=layout_padding_mask,
+                need_weights=return_attention,
+                average_attn_weights=False,
+            )
+        elif self.writeback_mode == "vqlca":
+            assert self.vqlca_writeback is not None
+            writeback, writeback_attention = self.vqlca_writeback(
+                visual_queries,
+                ordered_layout_queries,
+                visual_padding_mask=visual_padding_mask,
+                layout_padding_mask=layout_padding_mask,
+                return_attention=return_attention,
+            )
+        else:
+            assert self.visual_value_layout_routing is not None
+            writeback, writeback_attention = self.visual_value_layout_routing(
+                visual_queries,
+                queries,
+                visual_padding_mask=visual_padding_mask,
+                layout_padding_mask=layout_padding_mask,
+                return_attention=return_attention,
+            )
         layout_residual = self.writeback_output(writeback)
         output_tokens = visual_tokens + torch.tanh(self.residual_gate) * layout_residual
 
@@ -391,6 +664,8 @@ class VisualLayoutQueryAdapter(nn.Module):
             bbox_xyxy=bbox_xyxy,
             direction_logits=direction_logits,
             layout_residual=layout_residual,
+            layout_evidence=queries,
+            layout_memory_source=layout_memory_source,
             query_attention=query_attention if return_attention else None,
             writeback_attention=writeback_attention if return_attention else None,
         )

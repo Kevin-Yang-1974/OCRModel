@@ -24,6 +24,12 @@ DIRECTION_TO_INDEX = {
     "unknown": 4,
 }
 LAYOUT_ANNOTATION_STATUSES = {"complete", "partial", "none"}
+PVLD_TOKENS = (
+    "<PAD>", "<LAYOUT>", "<REGION>", "</REGION>", "<TYPE>", "</TYPE>",
+    "<EOS>", "COLUMN", "ROW", "REGION",
+)
+PVLD_TOKEN_TO_ID = {token: index for index, token in enumerate(PVLD_TOKENS)}
+PVLD_TYPE_TO_INDEX = {"COLUMN": 0, "ROW": 1, "REGION": 2}
 
 
 def load_manifest_records(path: Path) -> list[dict[str, Any]]:
@@ -98,6 +104,9 @@ class LayoutPageConversationDataset(LineLevelConversationDataset):
         max_regions: int,
         max_records: int = 0,
         supervise_ocr: bool = True,
+        layout_target_mode: str = "fixed_slot",
+        max_layout_tokens: int = 2048,
+        max_layout_records: int = 512,
     ) -> None:
         Dataset.__init__(self)
         if datasets != "layout-page-jsonl":
@@ -118,6 +127,9 @@ class LayoutPageConversationDataset(LineLevelConversationDataset):
         self.split = split
         self.max_regions = max_regions
         self.supervise_ocr = supervise_ocr
+        self.layout_target_mode = layout_target_mode
+        self.max_layout_tokens = max_layout_tokens
+        self.max_layout_records = max_layout_records
         conversation_lib.default_conversation = conversation_lib.conv_templates["mpt"]
         if not self.image_root.is_dir():
             raise FileNotFoundError(self.image_root)
@@ -282,6 +294,50 @@ class LayoutPageConversationDataset(LineLevelConversationDataset):
             "layout_direction_targets": direction_targets,
         }
 
+    def _variable_layout_targets(self, record: dict[str, Any]) -> dict[str, torch.Tensor]:
+        regions = record.get("layout_regions", record.get("regions", []))
+        if len(regions) > self.max_layout_records:
+            raise ValueError(
+                f"{record['page_id']} has {len(regions)} records, exceeding "
+                f"max_layout_records={self.max_layout_records}."
+            )
+        tokens = ["<LAYOUT>"]
+        region_positions: list[int] = []
+        boxes: list[tuple[float, float, float, float]] = []
+        type_targets: list[int] = []
+        direction_targets: list[int] = []
+        for index, region in enumerate(regions):
+            region_positions.append(len(tokens))
+            layout_type = str(
+                region.get("layout_type", region.get("type", "REGION"))
+            ).upper()
+            if layout_type not in PVLD_TYPE_TO_INDEX:
+                layout_type = "REGION"
+            tokens.extend(("<REGION>", "<TYPE>", layout_type, "</TYPE>", "</REGION>"))
+            boxes.append(validate_bbox(region.get("bbox"), f"regions[{index}]"))
+            type_targets.append(PVLD_TYPE_TO_INDEX[layout_type])
+            direction_targets.append(
+                DIRECTION_TO_INDEX[region.get("writing_direction", "unknown")]
+            )
+        tokens.append("<EOS>")
+        if len(tokens) > self.max_layout_tokens:
+            raise ValueError(
+                f"{record['page_id']} needs {len(tokens)} layout tokens, exceeding "
+                f"max_layout_tokens={self.max_layout_tokens}."
+            )
+        return {
+            "layout_input_ids": torch.tensor(
+                [PVLD_TOKEN_TO_ID[token] for token in tokens], dtype=torch.long
+            ),
+            "layout_attention_mask": torch.ones(len(tokens), dtype=torch.bool),
+            "layout_region_positions": torch.tensor(region_positions, dtype=torch.long),
+            "layout_record_mask": torch.ones(len(regions), dtype=torch.bool),
+            "layout_bbox_targets": torch.tensor(boxes, dtype=torch.float32).reshape(-1, 4),
+            "layout_type_targets": torch.tensor(type_targets, dtype=torch.long),
+            "layout_direction_targets": torch.tensor(direction_targets, dtype=torch.long),
+            "layout_count_targets": torch.tensor(float(len(regions)), dtype=torch.float32),
+        }
+
     def __getitem__(self, index: int) -> dict[str, torch.Tensor]:
         record = copy.deepcopy(self.records[index])
         image_path = resolve_image_path(self.image_root, record["image"], record["page_id"])
@@ -299,7 +355,10 @@ class LayoutPageConversationDataset(LineLevelConversationDataset):
             "image": [image],
             "image_high": [image],
         }
-        item.update(self._layout_targets(record))
+        if self.layout_target_mode == "fixed_slot":
+            item.update(self._layout_targets(record))
+        elif self.layout_target_mode == "pvld":
+            item.update(self._variable_layout_targets(record))
         return item
 
 
@@ -383,6 +442,46 @@ class LayoutPageDataCollator:
 
     def __call__(self, instances: Sequence[dict[str, Any]]) -> dict[str, Any]:
         batch = self.base(instances)
+        if "layout_input_ids" in instances[0]:
+            token_width = max(instance["layout_input_ids"].numel() for instance in instances)
+            record_width = max(instance["layout_record_mask"].numel() for instance in instances)
+            batch_size = len(instances)
+            batch["layout_input_ids"] = torch.full(
+                (batch_size, token_width), PVLD_TOKEN_TO_ID["<PAD>"], dtype=torch.long
+            )
+            batch["layout_attention_mask"] = torch.zeros(
+                (batch_size, token_width), dtype=torch.bool
+            )
+            batch["layout_region_positions"] = torch.zeros(
+                (batch_size, record_width), dtype=torch.long
+            )
+            batch["layout_record_mask"] = torch.zeros(
+                (batch_size, record_width), dtype=torch.bool
+            )
+            batch["layout_bbox_targets"] = torch.zeros(
+                (batch_size, record_width, 4), dtype=torch.float32
+            )
+            batch["layout_type_targets"] = torch.full(
+                (batch_size, record_width), -100, dtype=torch.long
+            )
+            batch["layout_direction_targets"] = torch.full(
+                (batch_size, record_width), -100, dtype=torch.long
+            )
+            batch["layout_count_targets"] = torch.stack(
+                [instance["layout_count_targets"] for instance in instances]
+            )
+            for row, instance in enumerate(instances):
+                token_count = instance["layout_input_ids"].numel()
+                record_count = instance["layout_record_mask"].numel()
+                batch["layout_input_ids"][row, :token_count] = instance["layout_input_ids"]
+                batch["layout_attention_mask"][row, :token_count] = True
+                if record_count:
+                    batch["layout_region_positions"][row, :record_count] = instance["layout_region_positions"]
+                    batch["layout_record_mask"][row, :record_count] = True
+                    batch["layout_bbox_targets"][row, :record_count] = instance["layout_bbox_targets"]
+                    batch["layout_type_targets"][row, :record_count] = instance["layout_type_targets"]
+                    batch["layout_direction_targets"][row, :record_count] = instance["layout_direction_targets"]
+            return batch
         for key in (
             "layout_bbox_targets",
             "layout_bbox_mask",
@@ -556,6 +655,9 @@ def make_layout_page_data_module(
     replay_max_records: int = 0,
     primary_per_replay: int = 3,
     include_layout_targets: bool = True,
+    layout_target_mode: str = "fixed_slot",
+    max_layout_tokens: int = 2048,
+    max_layout_records: int = 512,
 ) -> dict[str, Any]:
     if data_args.conversation_version != "mpt":
         raise ValueError("The whole-page layout entry point requires conversation_version=mpt.")
@@ -577,6 +679,9 @@ def make_layout_page_data_module(
         max_regions=max_regions,
         max_records=max_records,
         supervise_ocr=supervise_ocr,
+        layout_target_mode=(layout_target_mode if include_layout_targets else "none"),
+        max_layout_tokens=max_layout_tokens,
+        max_layout_records=max_layout_records,
     )
     if replay_manifest is not None:
         if primary_per_replay < 1:
@@ -599,6 +704,9 @@ def make_layout_page_data_module(
             max_regions=max_regions,
             max_records=replay_max_records,
             supervise_ocr=supervise_ocr,
+            layout_target_mode=(layout_target_mode if include_layout_targets else "none"),
+            max_layout_tokens=max_layout_tokens,
+            max_layout_records=max_layout_records,
         )
         train_dataset = InterleavedLayoutDataset(
             train_dataset,

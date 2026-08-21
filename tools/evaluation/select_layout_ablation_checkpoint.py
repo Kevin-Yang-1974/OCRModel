@@ -156,7 +156,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Select one ablation checkpoint using validation only.")
     parser.add_argument("--ablation", required=True)
     parser.add_argument("--model-root", type=Path, required=True)
-    parser.add_argument("--model-kind", choices=("baseline", "generic", "vlqa"), required=True)
+    parser.add_argument("--model-kind", choices=("baseline", "generic", "vlqa", "pvld"), required=True)
     parser.add_argument("--tokenizer-model", type=Path, required=True)
     parser.add_argument("--validation-manifest", type=Path, required=True)
     parser.add_argument("--validation-image-root", type=Path)

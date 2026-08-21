@@ -19,14 +19,38 @@ class LayoutAblationContractTests(unittest.TestCase):
             Path(__file__).resolve().parents[1]
             / "src" / "GOT-OCR-2.0" / "scripts" / "train_GOT_layout.py"
         ).read_text(encoding="utf-8")
+        self.assertIn("or model.get_model().variable_layout_adapter is not None", source)
+        self.assertIn('"layout_bbox_mask" in first_sample or variable_layout', source)
+
+    def test_vqlca_mode_is_persisted_and_training_generation_share_adapter(self) -> None:
+        training_source = (
+            ROOT / "src" / "GOT-OCR-2.0" / "scripts" / "train_GOT_layout.py"
+        ).read_text(encoding="utf-8")
+        model_source = (
+            ROOT / "src" / "GOT-OCR-2.0" / "GOT" / "model" / "GOT_ocr_2_0.py"
+        ).read_text(encoding="utf-8")
         self.assertIn(
-            "include_layout_targets = model.get_model().layout_adapter is not None",
-            source,
+            "config.layout_writeback_mode = args.layout_writeback_mode",
+            training_source,
         )
         self.assertIn(
-            "include_layout_targets and \"layout_bbox_mask\" in first_sample",
-            source,
+            '"legacy_shared_loaded_vqlca_writeback_reset"',
+            training_source,
         )
+        self.assertEqual(model_source.count("layout_output = self.layout_adapter("), 1)
+        self.assertIn("writeback_mode=config.layout_writeback_mode", model_source)
+        self.assertIn("layout_writeback_source", training_source)
+        self.assertIn("visual_value_layout_routing", training_source)
+        self.assertIn("layout_memory=cnn_feature", model_source)
+
+    def test_whole_page_protocol_does_not_pass_layout_metadata_to_adapter(self) -> None:
+        model_source = (
+            ROOT / "src" / "GOT-OCR-2.0" / "GOT" / "model" / "GOT_ocr_2_0.py"
+        ).read_text(encoding="utf-8")
+        call = model_source.split("layout_output = self.layout_adapter(", 1)[1].split(")", 1)[0]
+        self.assertIn("image_feature", call)
+        for forbidden in ("bbox", "direction", "reading_order"):
+            self.assertNotIn(forbidden, call)
 
     def test_all_required_groups_are_declared(self) -> None:
         self.assertEqual(len(contract.ABLATION_IDS), 6)

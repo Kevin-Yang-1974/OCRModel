@@ -49,7 +49,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--test-category", choices=("Synthetic-ID", "Synthetic-OOD", "Real-OOD"), required=True)
     parser.add_argument("--test-manifest", type=Path, required=True)
     parser.add_argument("--test-image-root", type=Path)
-    parser.add_argument("--model-kind", choices=("baseline", "generic", "vlqa"), required=True)
+    parser.add_argument("--model-kind", choices=("baseline", "generic", "vlqa", "pvld"), required=True)
     parser.add_argument("--tokenizer-model", type=Path, required=True)
     parser.add_argument("--project-root", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)

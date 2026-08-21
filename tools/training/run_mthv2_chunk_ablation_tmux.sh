@@ -5,9 +5,9 @@ usage() {
     cat >&2 <<'USAGE'
 Usage:
   run_mthv2_chunk_ablation_tmux.sh --session NAME \
-    [--gpu-id ID | --parallel-gpu-ids ID[,ID...]] \
+    [--gpu-id ID | --parallel-gpu-ids ID[,ID...] | --all-eligible-gpus] \
     [--dataset-root PATH] [--run-prefix NAME] [--ablations C1,C2,C3,C4,C5] \
-    [--max-regions N]
+    [--max-regions N] [--vlqa-writeback-mode layout_value|vqlca|visual_value_layout_routing]
 
 Train the MTHv2 oracle-chunk ablation controls in one tmux session. C0-page
 and C0-chunk are zero-shot references and are recorded, not optimized here.
@@ -32,6 +32,9 @@ dataset_root="/data3/yky/yangky_ocr_models/datasets/MTHv2/converted/mthv2_layout
 run_prefix="mthv2_chunk_ablation_20260819"
 gpu_id=""
 parallel_gpu_ids=""
+all_eligible_gpus=0
+gpu_pool="0,1,2,3,4"
+serial_multi_gpu=0
 ablations="C1,C2,C3,C4,C5"
 p1_steps="12000"
 p2_steps="30000"
@@ -39,6 +42,7 @@ checkpoint_steps="3000"
 gpu_utilization_limit="50"
 seed="42"
 max_regions="16"
+vlqa_writeback_mode="layout_value"
 session_inner=0
 
 while [[ $# -gt 0 ]]; do
@@ -48,6 +52,9 @@ while [[ $# -gt 0 ]]; do
         --run-prefix) run_prefix="${2:-}"; shift 2 ;;
         --gpu-id) gpu_id="${2:-}"; shift 2 ;;
         --parallel-gpu-ids) parallel_gpu_ids="${2:-}"; shift 2 ;;
+        --all-eligible-gpus) all_eligible_gpus=1; shift ;;
+        --gpu-pool) gpu_pool="${2:-}"; shift 2 ;;
+        --serial-multi-gpu) serial_multi_gpu=1; shift ;;
         --ablations) ablations="${2:-}"; shift 2 ;;
         --p1-steps) p1_steps="${2:-}"; shift 2 ;;
         --p2-steps) p2_steps="${2:-}"; shift 2 ;;
@@ -55,6 +62,7 @@ while [[ $# -gt 0 ]]; do
         --gpu-utilization-limit) gpu_utilization_limit="${2:-}"; shift 2 ;;
         --seed) seed="${2:-}"; shift 2 ;;
         --max-regions) max_regions="${2:-}"; shift 2 ;;
+        --vlqa-writeback-mode) vlqa_writeback_mode="${2:-}"; shift 2 ;;
         --session-inner) session_inner=1; shift ;;
         --help|-h) usage; exit 0 ;;
         *) printf 'ERROR: unknown argument: %s\n' "$1" >&2; usage; exit 64 ;;
@@ -71,14 +79,19 @@ fi
 gpu_mode_count=0
 [[ -n "${gpu_id}" ]] && ((gpu_mode_count+=1))
 [[ -n "${parallel_gpu_ids}" ]] && ((gpu_mode_count+=1))
-(( gpu_mode_count == 1 )) || { printf 'ERROR: provide exactly one of --gpu-id or --parallel-gpu-ids.\n' >&2; exit 64; }
-[[ -z "${gpu_id}" || "${gpu_id}" =~ ^[0-9]+$ ]] || { printf 'ERROR: --gpu-id must be numeric.\n' >&2; exit 64; }
+(( all_eligible_gpus == 1 )) && ((gpu_mode_count+=1))
+if (( gpu_mode_count == 0 )); then all_eligible_gpus=1; gpu_mode_count=1; fi
+(( gpu_mode_count == 1 )) || { printf 'ERROR: choose one GPU mode.\n' >&2; exit 64; }
+[[ -z "${gpu_id}" || "${gpu_id}" =~ ^[0-9]+(,[0-9]+)*$ ]] || { printf 'ERROR: --gpu-id must be numeric or comma-separated numeric ids.\n' >&2; exit 64; }
 [[ -z "${parallel_gpu_ids}" || "${parallel_gpu_ids}" =~ ^[0-9]+(,[0-9]+)*$ ]] || { printf 'ERROR: --parallel-gpu-ids must be comma-separated numeric ids.\n' >&2; exit 64; }
 [[ "${p1_steps}" =~ ^[1-9][0-9]*$ && "${p2_steps}" =~ ^[1-9][0-9]*$ && "${checkpoint_steps}" =~ ^[1-9][0-9]*$ ]] || {
     printf 'ERROR: step values must be positive integers.\n' >&2; exit 64;
 }
 [[ "${max_regions}" =~ ^[1-9][0-9]*$ ]] || {
     printf 'ERROR: max-regions must be a positive integer.\n' >&2; exit 64;
+}
+[[ "${vlqa_writeback_mode}" == "layout_value" || "${vlqa_writeback_mode}" == "vqlca" || "${vlqa_writeback_mode}" == "visual_value_layout_routing" ]] || {
+    printf 'ERROR: unsupported vlqa-writeback-mode.\n' >&2; exit 64;
 }
 [[ "${gpu_utilization_limit}" =~ ^[1-9][0-9]*$ ]] && (( gpu_utilization_limit <= 100 )) || {
     printf 'ERROR: GPU utilization limit must be 1..100.\n' >&2; exit 64;
@@ -115,6 +128,26 @@ require_gpu_below_limit() {
     }
 }
 
+IFS=',' read -r -a candidate_gpus <<< "${gpu_pool}"
+if (( all_eligible_gpus == 1 )); then
+    selected_gpus=()
+    for candidate_gpu in "${candidate_gpus[@]}"; do
+        output="$(nvidia-smi -i "${candidate_gpu}" --query-gpu=utilization.gpu --format=csv,noheader,nounits 2>&1)" || {
+            printf 'ERROR: GPU%s query failed: %s\n' "${candidate_gpu}" "${output}" >&2; exit 66;
+        }
+        utilization="${output//[[:space:]]/}"
+        [[ "${utilization}" =~ ^[0-9]+$ ]] || { printf 'ERROR: GPU%s utilization is not numeric: %s\n' "${candidate_gpu}" "${output}" >&2; exit 66; }
+        (( utilization < gpu_utilization_limit )) && selected_gpus+=("${candidate_gpu}")
+    done
+    ((${#selected_gpus[@]} > 0)) || { printf 'ERROR: no eligible GPU has utilization below %s.\n' "${gpu_utilization_limit}" >&2; exit 75; }
+    if ((${#selected_gpus[@]} >= ${#requested[@]})); then
+        parallel_gpu_ids="$(IFS=,; echo "${selected_gpus[*]:0:${#requested[@]}}")"
+    else
+        parallel_gpu_ids=""
+        serial_multi_gpu=1
+        gpu_id="$(IFS=,; echo "${selected_gpus[*]}")"
+    fi
+fi
 IFS=',' read -r -a selected_gpus <<< "${parallel_gpu_ids:-${gpu_id}}"
 declare -A seen_gpus=()
 for selected_gpu in "${selected_gpus[@]}"; do
@@ -136,7 +169,9 @@ train_one() {
         C4) ablation_id="vlqa_layout_direct"; layout_preset="layout_full"; mode="ablation"; run_id="${run_prefix}_C4_vlqa_layout_direct_seed${seed}" ;;
         C5) ablation_id="vlqa_layout_p1_p2"; layout_preset="layout_full"; mode="ablation"; run_id="${run_prefix}_C5_vlqa_p1_p2_seed${seed}" ;;
     esac
-    require_gpu_below_limit "${assigned_gpu}"
+    if [[ "${assigned_gpu}" != *,* ]]; then
+        require_gpu_below_limit "${assigned_gpu}"
+    fi
     local args=(
         --mode "${mode}" --ablation "${ablation_id}"
         --dataset-root "${dataset_root}/train"
@@ -157,6 +192,9 @@ train_one() {
     if [[ "${control}" == "C5" ]]; then
         args+=(--p1-max-steps "${p1_steps}")
     fi
+    if [[ "${control}" == "C3" || "${control}" == "C4" || "${control}" == "C5" ]]; then
+        args+=(--layout-writeback-mode "${vlqa_writeback_mode}" --layout-writeback-source layout_evidence)
+    fi
     printf '{"event":"mthv2_chunk_control_started","control":"%s","run_id":"%s"}\n' "${control}" "${run_id}"
     bash "${ocrmodel_root}/tools/environment/run_got2.sh" \
         "${ocrmodel_root}/tools/training/run_layout_a100.py" "${args[@]}"
@@ -164,8 +202,8 @@ train_one() {
 }
 
 run_all() {
-    printf '{"event":"mthv2_chunk_ablation_started","dataset_root":"%s","controls":"%s","gpu_ids":"%s","p1_steps":%s,"p2_steps":%s,"direct_p2_steps":%s,"checkpoint_steps":%s,"gpu_condition":"utilization<limit"}\n' \
-        "${dataset_root}" "${ablations}" "${parallel_gpu_ids:-${gpu_id}}" "${p1_steps}" "${p2_steps}" "$((p1_steps + p2_steps))" "${checkpoint_steps}"
+    printf '{"event":"mthv2_chunk_ablation_started","dataset_root":"%s","controls":"%s","gpu_ids":"%s","p1_steps":%s,"p2_steps":%s,"direct_p2_steps":%s,"checkpoint_steps":%s,"max_regions":%s,"vlqa_writeback_mode":"%s","gpu_condition":"utilization<limit"}\n' \
+        "${dataset_root}" "${ablations}" "${parallel_gpu_ids:-${gpu_id}}" "${p1_steps}" "${p2_steps}" "$((p1_steps + p2_steps))" "${checkpoint_steps}" "${max_regions}" "${vlqa_writeback_mode}"
     printf '%s\n' '{"event":"zero_shot_references","controls":["C0-page","C0-chunk"],"status":"recorded_only"}'
     if [[ -n "${parallel_gpu_ids}" ]]; then
         pids=()
@@ -197,8 +235,10 @@ else
     else
         inner_gpu_args="--gpu-id '${gpu_id}'"
     fi
+    serial_inner_arg=""
+    (( serial_multi_gpu == 1 )) && serial_inner_arg="--serial-multi-gpu"
     tmux new-session -d -s "${session}" \
-        "cd ${quoted_root} && exec bash ${quoted_script} --session-inner --dataset-root '${dataset_root}' --run-prefix '${run_prefix}' ${inner_gpu_args} --ablations '${ablations}' --p1-steps '${p1_steps}' --p2-steps '${p2_steps}' --checkpoint-steps '${checkpoint_steps}' --gpu-utilization-limit '${gpu_utilization_limit}' --seed '${seed}' --max-regions '${max_regions}' >${quoted_log} 2>&1"
+        "cd ${quoted_root} && exec bash ${quoted_script} --session-inner --dataset-root '${dataset_root}' --run-prefix '${run_prefix}' ${inner_gpu_args} ${serial_inner_arg} --ablations '${ablations}' --p1-steps '${p1_steps}' --p2-steps '${p2_steps}' --checkpoint-steps '${checkpoint_steps}' --gpu-utilization-limit '${gpu_utilization_limit}' --seed '${seed}' --max-regions '${max_regions}' --vlqa-writeback-mode '${vlqa_writeback_mode}' >${quoted_log} 2>&1"
 
     sleep 5
     if ! tmux has-session -t "${session}" 2>/dev/null; then

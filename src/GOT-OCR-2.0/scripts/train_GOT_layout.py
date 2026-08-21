@@ -46,10 +46,16 @@ OUTPUT_DIAGNOSTIC_FIELDS = {
     "query_abs_max": "layout_query_abs_max",
     "prediction_query_abs_max": "layout_prediction_query_abs_max",
     "bbox_logit_abs_max": "layout_bbox_logit_abs_max",
+    "sequence_loss": "layout_sequence_loss",
+    "type_loss": "layout_type_loss",
+    "count_loss": "layout_count_loss",
+    "eos_accuracy": "layout_eos_accuracy",
+    "region_count_mae": "layout_region_count_mae",
 }
 
 LAYOUT_ADAPTER_STATE_PREFIX = "model.layout_adapter."
 GENERIC_ADAPTER_STATE_PREFIX = "model.generic_adapter."
+VARIABLE_LAYOUT_STATE_PREFIX = "model.variable_layout_adapter."
 
 
 def summarize_diagnostic_history(
@@ -108,12 +114,19 @@ class LayoutDiagnosticTrainer(GOTTrainer):
         self._diagnostic_count = 0
         self._latest_gradient_norms: dict[str, torch.Tensor] = {}
         model_base = self.model.get_model()
-        self._layout_adapter = model_base.layout_adapter
+        self._layout_adapter = (
+            model_base.layout_adapter or model_base.variable_layout_adapter
+        )
         if self._layout_adapter is None:
-            raise RuntimeError("LayoutDiagnosticTrainer requires an enabled VLQA adapter.")
+            raise RuntimeError("LayoutDiagnosticTrainer requires an enabled layout adapter.")
+        query_parameter = (
+            self._layout_adapter.query_embeddings
+            if hasattr(self._layout_adapter, "query_embeddings")
+            else self._layout_adapter.decoder.prompt_attention.prompt_bank.prompts
+        )
         self._register_gradient_hook(
             "query_gradient_norm",
-            self._layout_adapter.query_embeddings,
+            query_parameter,
         )
         self._register_gradient_hook(
             "residual_gate_gradient_abs",
@@ -219,12 +232,29 @@ class LayoutTrainingArguments:
         },
     )
     max_regions: int = field(default=16)
+    layout_architecture: str = field(default="fixed_slot")
+    num_layout_prompt_queries: int = field(default=32)
+    max_layout_tokens: int = field(default=2048)
+    max_layout_records: int = field(default=512)
+    layout_decoder_layers: int = field(default=2)
+    layout_decoder_hidden_size: int = field(default=256)
+    layout_decoder_num_heads: int = field(default=8)
+    layout_bbox_loss_weight: float = field(default=5.0)
+    layout_type_loss_weight: float = field(default=1.0)
+    layout_direction_loss_weight: float = field(default=1.0)
+    layout_count_loss_weight: float = field(default=0.1)
+    layout_prompt_diversity_loss_weight: float = field(default=0.0)
     max_train_records: int = field(default=0)
     min_layout_regions: int = field(default=0)
     vlqa_adapter_dim: int = field(default=256)
     vlqa_num_heads: int = field(default=8)
     vlqa_ffn_expansion: int = field(default=4)
     vlqa_dropout: float = field(default=0.0)
+    layout_writeback_mode: str = field(default="layout_value")
+    layout_writeback_source: str = field(default="layout_evidence")
+    layout_writeback_num_heads: int = field(default=8)
+    layout_writeback_dropout: float = field(default=0.0)
+    layout_writeback_gate_init: float = field(default=0.0)
     generic_adapter_dim: int = field(default=256)
     generic_adapter_num_heads: int = field(default=8)
     generic_adapter_ffn_expansion: int = field(default=8)
@@ -243,6 +273,8 @@ class LayoutTrainingArguments:
 
 
 def validate_layout_args(args: LayoutTrainingArguments) -> None:
+    if args.layout_architecture not in {"fixed_slot", "pvld"}:
+        raise ValueError("--layout_architecture must be fixed_slot or pvld.")
     if args.layout_stage not in {"p1", "p2"}:
         raise ValueError("--layout_stage must be p1 or p2.")
     if args.p2_train_scope not in {
@@ -281,6 +313,14 @@ def validate_layout_args(args: LayoutTrainingArguments) -> None:
         raise ValueError("--layout_split must be non-empty.")
     if args.max_regions < 1:
         raise ValueError("--max_regions must be positive.")
+    if args.layout_architecture == "pvld":
+        if args.num_layout_prompt_queries != 32:
+            raise ValueError("Formal PVLD-32 requires 32 global layout prompts.")
+        if args.max_layout_tokens < 2 or args.max_layout_records < 1:
+            raise ValueError("PVLD layout limits must be positive.")
+        if (args.layout_decoder_hidden_size < 1 or args.layout_decoder_num_heads < 1
+                or args.layout_decoder_hidden_size % args.layout_decoder_num_heads):
+            raise ValueError("PVLD hidden size must be divisible by decoder heads.")
     if args.max_train_records < 0:
         raise ValueError("--max_train_records cannot be negative.")
     if args.min_layout_regions < 0:
@@ -293,6 +333,17 @@ def validate_layout_args(args: LayoutTrainingArguments) -> None:
         raise ValueError("--vlqa_ffn_expansion must be positive.")
     if not 0.0 <= args.vlqa_dropout < 1.0:
         raise ValueError("--vlqa_dropout must be in [0, 1).")
+    if args.layout_writeback_mode not in {"layout_value", "vqlca", "visual_value_layout_routing"}:
+        raise ValueError("unsupported --layout_writeback_mode.")
+    if args.layout_writeback_source != "layout_evidence":
+        raise ValueError("--layout_writeback_source must be layout_evidence.")
+    if (args.layout_writeback_num_heads < 1 or
+            args.vlqa_adapter_dim % args.layout_writeback_num_heads != 0):
+        raise ValueError(
+            "--vlqa_adapter_dim must be divisible by --layout_writeback_num_heads."
+        )
+    if not 0.0 <= args.layout_writeback_dropout < 1.0:
+        raise ValueError("--layout_writeback_dropout must be in [0, 1).")
     if args.generic_adapter_dim < 1:
         raise ValueError("--generic_adapter_dim must be positive.")
     if (args.generic_adapter_num_heads < 1 or
@@ -331,7 +382,13 @@ def build_layout_config(
         config.ablation_id = args.ablation_id
         config.layout_loss_preset = args.layout_loss_preset
     spec = ABLATIONS.get(args.ablation_id) if args.ablation_id else None
-    config.use_vlqa = spec.use_vlqa if spec is not None else True
+    requested_layout = spec.use_vlqa if spec is not None else True
+    config.variable_layout_enabled = bool(
+        requested_layout and args.layout_architecture == "pvld"
+    )
+    config.use_vlqa = bool(
+        requested_layout and args.layout_architecture == "fixed_slot"
+    )
     config.use_generic_adapter = spec.use_generic_adapter if spec is not None else False
     config.generic_adapter_dim = args.generic_adapter_dim
     config.generic_adapter_num_heads = args.generic_adapter_num_heads
@@ -342,6 +399,23 @@ def build_layout_config(
     config.vlqa_num_heads = args.vlqa_num_heads
     config.vlqa_ffn_expansion = args.vlqa_ffn_expansion
     config.vlqa_dropout = args.vlqa_dropout
+    config.layout_writeback_mode = args.layout_writeback_mode
+    config.layout_writeback_source = args.layout_writeback_source
+    config.layout_writeback_num_heads = args.layout_writeback_num_heads
+    config.layout_writeback_dropout = args.layout_writeback_dropout
+    config.layout_writeback_gate_init = args.layout_writeback_gate_init
+    config.num_layout_prompt_queries = args.num_layout_prompt_queries
+    config.max_layout_tokens = args.max_layout_tokens
+    config.max_layout_records = args.max_layout_records
+    config.layout_decoder_layers = args.layout_decoder_layers
+    config.layout_decoder_hidden_size = args.layout_decoder_hidden_size
+    config.layout_decoder_num_heads = args.layout_decoder_num_heads
+    config.layout_bbox_loss_weight = args.layout_bbox_loss_weight
+    config.layout_bbox_giou_loss_weight = args.bbox_giou_loss_weight
+    config.layout_type_loss_weight = args.layout_type_loss_weight
+    config.layout_direction_loss_weight = args.layout_direction_loss_weight
+    config.layout_count_loss_weight = args.layout_count_loss_weight
+    config.layout_prompt_diversity_loss_weight = args.layout_prompt_diversity_loss_weight
     config.vlqa_num_direction_classes = 5
     config.vlqa_layout_input_dim = 1024
     config.vlqa_object_weight = args.object_loss_weight
@@ -350,6 +424,8 @@ def build_layout_config(
     config.vlqa_direction_weight = args.direction_loss_weight
     config.layout_loss_weight = args.layout_loss_weight
     config.ocr_loss_weight = args.ocr_loss_weight
+    config.layout_stage = args.layout_stage
+    config.layout_architecture = args.layout_architecture
     config.use_cache = False
     config.return_dict = True
     return config
@@ -373,11 +449,46 @@ def initialize_layout_adapter_from_source(
             name for name in handle.keys() if "layout_adapter." in name
         }
 
+    missing: list[str] = []
+    unexpected: list[str] = []
     if not source_layout_keys:
         adapter.reset_parameters()
         initialization = "fresh_explicit_reset"
     elif source_layout_keys == expected_layout_keys:
         initialization = "checkpoint_loaded"
+    elif adapter.writeback_mode in {"vqlca", "visual_value_layout_routing"}:
+        source_shared = {
+            key for key in source_layout_keys
+            if ".writeback_" not in key and ".vqlca_writeback." not in key
+            and ".visual_value_layout_routing." not in key
+            and not key.endswith(".residual_gate")
+        }
+        expected_shared = {
+            key for key in expected_layout_keys
+            if ".writeback_" not in key and ".vqlca_writeback." not in key
+            and ".visual_value_layout_routing." not in key
+            and not key.endswith(".residual_gate")
+        }
+        source_new_writeback = {
+            key for key in source_layout_keys
+            if ".vqlca_writeback." in key or ".visual_value_layout_routing." in key
+        }
+        if source_shared == expected_shared and not source_new_writeback:
+            missing = sorted(expected_layout_keys - source_layout_keys)
+            unexpected = sorted(source_layout_keys - expected_layout_keys)
+            adapter.reset_writeback_parameters()
+            initialization = (
+                "legacy_shared_loaded_vqlca_writeback_reset"
+                if adapter.writeback_mode == "vqlca"
+                else "legacy_shared_loaded_visual_value_layout_routing_reset"
+            )
+        else:
+            missing = sorted(expected_layout_keys - source_layout_keys)
+            unexpected = sorted(source_layout_keys - expected_layout_keys)
+            raise RuntimeError(
+                "Source checkpoint contains a partial or incompatible VQLCA state. "
+                f"missing_count={len(missing)}; unexpected_count={len(unexpected)}"
+            )
     else:
         missing = sorted(expected_layout_keys - source_layout_keys)
         unexpected = sorted(source_layout_keys - expected_layout_keys)
@@ -409,6 +520,9 @@ def initialize_layout_adapter_from_source(
         "source_layout_tensor_count": len(source_layout_keys),
         "expected_layout_tensor_count": len(expected_layout_keys),
         "layout_adapter_parameter_abs_max": parameter_abs_max,
+        "layout_writeback_mode": adapter.writeback_mode,
+        "layout_adapter_missing_keys": missing,
+        "layout_adapter_unexpected_keys": unexpected,
     }
 
 
@@ -440,6 +554,48 @@ def initialize_generic_adapter_from_source(
     }
 
 
+def initialize_variable_layout_from_source(
+    model: GOTQwenForCausalLM,
+    source_weights: Path,
+) -> dict[str, Any]:
+    adapter = model.get_model().variable_layout_adapter
+    if adapter is None:
+        return {
+            "layout_adapter_initialization": "disabled",
+            "source_layout_tensor_count": 0,
+            "expected_layout_tensor_count": 0,
+            "layout_adapter_parameter_abs_max": 0.0,
+            "layout_adapter_missing_keys": [],
+            "layout_adapter_unexpected_keys": [],
+        }
+    expected = {f"{VARIABLE_LAYOUT_STATE_PREFIX}{name}" for name in adapter.state_dict()}
+    with safe_open(str(source_weights), framework="pt", device="cpu") as handle:
+        source = {
+            name for name in handle.keys() if name.startswith(VARIABLE_LAYOUT_STATE_PREFIX)
+        }
+    if source:
+        if source != expected:
+            raise RuntimeError("Source checkpoint contains a partial incompatible PVLD state.")
+        initialization = "pvld_checkpoint_loaded"
+    else:
+        adapter.reset_parameters()
+        initialization = "pvld_fresh_deterministic_reset"
+    parameter_abs_max = max(
+        float(parameter.detach().float().abs().max().cpu())
+        for parameter in adapter.parameters()
+    )
+    return {
+        "layout_adapter_initialization": initialization,
+        "source_layout_tensor_count": len(source),
+        "expected_layout_tensor_count": len(expected),
+        "layout_adapter_parameter_abs_max": parameter_abs_max,
+        "layout_writeback_mode": "visual_value_layout_routing",
+        "layout_writeback_source": "layout_evidence",
+        "layout_adapter_missing_keys": sorted(expected - source) if not source else [],
+        "layout_adapter_unexpected_keys": [],
+    }
+
+
 def configure_trainable_parameters(
     model: GOTQwenForCausalLM,
     stage: str,
@@ -460,13 +616,26 @@ def configure_trainable_parameters(
             raise RuntimeError("A1 must not construct or train an adapter.")
         adapter = None
     else:
-        if model_base.layout_adapter is None:
-            raise RuntimeError("VLQA was not constructed from the enabled config.")
-        adapter = model_base.layout_adapter
+        adapter = model_base.layout_adapter or model_base.variable_layout_adapter
+        if adapter is None:
+            raise RuntimeError("The requested layout architecture was not constructed.")
 
     if adapter is None:
         pass
     elif stage == "p1":
+        if model_base.variable_layout_adapter is not None:
+            adapter.requires_grad_(True)
+            with torch.no_grad():
+                adapter.residual_gate.zero_()
+            model_base.vision_tower_high.requires_grad_(False)
+            trainable_names = [
+                name for name, parameter in model.named_parameters() if parameter.requires_grad
+            ]
+            trainable = sum(
+                parameter.numel() for parameter in model.parameters() if parameter.requires_grad
+            )
+            total = sum(parameter.numel() for parameter in model.parameters())
+            return trainable, total, trainable_names
         adapter.requires_grad_(False)
         adapter.query_embeddings.requires_grad_(True)
         for module in (
@@ -514,6 +683,7 @@ def module_parameter_report(model: GOTQwenForCausalLM) -> dict[str, dict[str, An
         "mm_projector_vary": base.mm_projector_vary,
         "generic_adapter": base.generic_adapter,
         "vlqa": base.layout_adapter,
+        "pvld": base.variable_layout_adapter,
     }
     report: dict[str, dict[str, Any]] = {}
     for name, module in modules.items():
@@ -532,7 +702,8 @@ def module_parameter_report(model: GOTQwenForCausalLM) -> dict[str, dict[str, An
     visual_ids = {
         id(parameter)
         for module in (base.vision_tower_high, base.mm_projector_vary,
-                       base.generic_adapter, base.layout_adapter)
+                       base.generic_adapter, base.layout_adapter,
+                       base.variable_layout_adapter)
         if module is not None
         for parameter in module.parameters()
     }
@@ -551,6 +722,18 @@ def assert_ablation_trainable_scope(
     model: GOTQwenForCausalLM,
 ) -> dict[str, dict[str, Any]]:
     report = module_parameter_report(model)
+    if model.get_model().variable_layout_adapter is not None:
+        expected = {"pvld"} if stage == "p1" else {"mm_projector_vary", "pvld"}
+        actual = {
+            name for name in ("mm_projector_vary", "generic_adapter", "vlqa", "pvld")
+            if int(report[name]["trainable"]) > 0
+        }
+        if actual != expected or int(report["vary_vit"]["trainable"]) or int(report["qwen"]["trainable"]):
+            raise RuntimeError(
+                f"PVLD {stage.upper()} trainable modules mismatch: "
+                f"actual={sorted(actual)}, expected={sorted(expected)}."
+            )
+        return report
     try:
         assert_parameter_report(ablation_id, stage, report)
     except ValueError as exc:
@@ -580,6 +763,10 @@ def vlqa_ocr_path_reference_parameter_count(args: LayoutTrainingArguments) -> in
         ffn_expansion=args.vlqa_ffn_expansion,
         num_direction_classes=5,
         dropout=args.vlqa_dropout,
+        writeback_mode=args.layout_writeback_mode,
+        writeback_num_heads=args.layout_writeback_num_heads,
+        writeback_dropout=args.layout_writeback_dropout,
+        writeback_gate_init=args.layout_writeback_gate_init,
     )
     auxiliary_prefixes = ("prediction_norm.", "object_head.", "box_head.", "direction_head.")
     count = sum(
@@ -626,13 +813,26 @@ def main() -> None:
         json.loads(source_metrics_path.read_text(encoding="utf-8"))
         if source_metrics_path.is_file() else None
     )
-    if layout_args.ablation_id:
+    if layout_args.ablation_id and layout_args.layout_architecture == "fixed_slot":
         assert_source_protocol(
             layout_args.ablation_id,
             layout_args.layout_stage,
             source_config_payload,
             source_metrics_payload,
         )
+    elif layout_args.ablation_id and layout_args.layout_architecture == "pvld":
+        source_pvld = source_config_payload.get("variable_layout_enabled") is True
+        expects_p1 = (
+            layout_args.ablation_id == "vlqa_layout_p1_p2"
+            and layout_args.layout_stage == "p2"
+        )
+        if expects_p1:
+            if (not source_pvld or not source_metrics_payload
+                    or source_metrics_payload.get("layout_stage") != "p1"
+                    or source_metrics_payload.get("layout_architecture") != "pvld"):
+                raise ValueError("PVLD C5 P2 must initialize from its validation-eligible P1 model.")
+        elif source_pvld:
+            raise ValueError("Direct PVLD stages must initialize from original GOT2.")
 
     tokenizer_source = (
         Path(layout_args.tokenizer_name_or_path).resolve()
@@ -646,6 +846,7 @@ def main() -> None:
         padding_side="right",
         model_max_length=training_args.model_max_length,
     )
+    transformers.set_seed(training_args.seed)
     config = build_layout_config(source_model, layout_args)
     model = GOTQwenForCausalLM.from_pretrained(
         source_model,
@@ -655,6 +856,8 @@ def main() -> None:
     )
     if model.get_model().layout_adapter is not None:
         layout_initialization = initialize_layout_adapter_from_source(model, source_weights)
+    elif model.get_model().variable_layout_adapter is not None:
+        layout_initialization = initialize_variable_layout_from_source(model, source_weights)
     else:
         layout_initialization = {
             "layout_adapter_initialization": "disabled",
@@ -705,7 +908,13 @@ def main() -> None:
     data_args.image_processor = vision["image_processor"]
     data_args.image_processor_high = vision["image_processor_high"]
     data_args.use_im_start_end = model_args.use_im_start_end
-    include_layout_targets = model.get_model().layout_adapter is not None
+    include_layout_targets = (
+        model.get_model().layout_adapter is not None
+        or model.get_model().variable_layout_adapter is not None
+    )
+    layout_target_mode = (
+        "pvld" if model.get_model().variable_layout_adapter is not None else "fixed_slot"
+    )
     data_module = make_layout_page_data_module(
         tokenizer=tokenizer,
         data_args=data_args,
@@ -716,6 +925,9 @@ def main() -> None:
         max_records=layout_args.max_train_records,
         supervise_ocr=layout_args.layout_stage == "p2",
         include_layout_targets=include_layout_targets,
+        layout_target_mode=layout_target_mode,
+        max_layout_tokens=layout_args.max_layout_tokens,
+        max_layout_records=layout_args.max_layout_records,
         replay_manifest=(
             Path(layout_args.replay_layout_manifest).resolve()
             if layout_args.replay_layout_manifest
@@ -732,14 +944,18 @@ def main() -> None:
     )
 
     first_sample = data_module["train_dataset"][0]
-    has_layout_targets = (
-        include_layout_targets and "layout_bbox_mask" in first_sample
+    variable_layout = "layout_input_ids" in first_sample
+    has_layout_targets = include_layout_targets and (
+        "layout_bbox_mask" in first_sample or variable_layout
     )
     layout_regions = (
-        int(first_sample["layout_bbox_mask"].sum().item()) if has_layout_targets else 0
+        int(first_sample[
+            "layout_record_mask" if variable_layout else "layout_bbox_mask"
+        ].sum().item()) if has_layout_targets else 0
     )
     object_slots = (
-        int(first_sample["layout_object_mask"].sum().item()) if has_layout_targets else 0
+        int(first_sample["layout_object_mask"].sum().item())
+        if has_layout_targets and not variable_layout else 0
     )
     supervised_tokens = int((first_sample["labels"] != IGNORE_INDEX).sum().item())
     if layout_args.layout_stage == "p1" and layout_regions < 1:
@@ -749,7 +965,8 @@ def main() -> None:
             f"First sample has {layout_regions} supervised layout regions; "
             f"minimum is {layout_args.min_layout_regions}."
         )
-    if layout_args.layout_stage == "p1" and object_slots != layout_args.max_regions:
+    if (layout_args.layout_stage == "p1" and not variable_layout
+            and object_slots != layout_args.max_regions):
         raise RuntimeError(
             "Synthetic pages require complete object supervision for every query slot: "
             f"expected={layout_args.max_regions}, actual={object_slots}."
@@ -763,7 +980,11 @@ def main() -> None:
     bbox_batch_shape = (
         list(first_batch["layout_bbox_targets"].shape) if has_layout_targets else None
     )
-    expected_bbox_batch_shape = [1, layout_args.max_regions, 4]
+    expected_bbox_batch_shape = [
+        1,
+        layout_regions if variable_layout else layout_args.max_regions,
+        4,
+    ]
     if has_layout_targets and bbox_batch_shape != expected_bbox_batch_shape:
         raise RuntimeError(
             "Layout collator produced an unexpected bbox batch shape: "
@@ -771,9 +992,9 @@ def main() -> None:
         )
     object_batch_shape = (
         list(first_batch["layout_object_targets"].shape) if has_layout_targets else None
-    )
+    ) if not variable_layout else None
     expected_object_batch_shape = [1, layout_args.max_regions]
-    if has_layout_targets and object_batch_shape != expected_object_batch_shape:
+    if has_layout_targets and not variable_layout and object_batch_shape != expected_object_batch_shape:
         raise RuntimeError(
             "Layout collator produced an unexpected object batch shape: "
             f"expected={expected_object_batch_shape}, actual={object_batch_shape}."
@@ -798,6 +1019,7 @@ def main() -> None:
     print(f"LAYOUT_IMAGE_ROOT={image_root}")
     print(f"LAYOUT_SPLIT={layout_args.layout_split}")
     print(f"LAYOUT_STAGE={layout_args.layout_stage}")
+    print(f"LAYOUT_ARCHITECTURE={layout_args.layout_architecture}")
     print(f"ABLATION_ID={layout_args.ablation_id or 'legacy_default'}")
     print(f"P2_TRAIN_SCOPE={layout_args.p2_train_scope}")
     print(
@@ -829,7 +1051,8 @@ def main() -> None:
 
     trainer_class = (
         LayoutDiagnosticTrainer
-        if model.get_model().layout_adapter is not None else GOTTrainer
+        if (model.get_model().layout_adapter is not None
+            or model.get_model().variable_layout_adapter is not None) else GOTTrainer
     )
     trainer = trainer_class(
         model=model,
@@ -847,7 +1070,9 @@ def main() -> None:
     metrics = dict(train_result.metrics)
     diagnostics = (
         summarize_diagnostic_history(trainer.state.log_history)
-        if model.get_model().layout_adapter is not None else {"log_count": 0}
+        if (model.get_model().layout_adapter is not None
+            or model.get_model().variable_layout_adapter is not None)
+        else {"log_count": 0}
     )
     budget = summarize_training_budget(
         data_module["train_dataset"],
@@ -856,8 +1081,21 @@ def main() -> None:
         gradient_accumulation_steps=training_args.gradient_accumulation_steps,
         world_size=training_args.world_size,
     )
-    vlqa_ocr_reference = vlqa_ocr_path_reference_parameter_count(layout_args)
+    vlqa_ocr_reference = (
+        vlqa_ocr_path_reference_parameter_count(layout_args)
+        if layout_args.layout_architecture == "fixed_slot" else 0
+    )
     generic_count = module_parameters["generic_adapter"]["total"]
+    adapter = model.get_model().layout_adapter
+    variable_adapter = model.get_model().variable_layout_adapter
+    vqlca_parameters = (
+        sum(parameter.numel() for parameter in adapter.vqlca_writeback.parameters())
+        if adapter is not None and adapter.vqlca_writeback is not None else 0
+    )
+    pvld_parameters = (
+        sum(parameter.numel() for parameter in variable_adapter.parameters())
+        if variable_adapter is not None else 0
+    )
     metrics.update(
         {
             "global_step": int(trainer.state.global_step),
@@ -908,6 +1146,12 @@ def main() -> None:
                 * training_args.world_size
             ),
             "layout_stage": layout_args.layout_stage,
+            "layout_architecture": layout_args.layout_architecture,
+            "variable_layout_enabled": variable_adapter is not None,
+            "num_layout_prompt_queries": layout_args.num_layout_prompt_queries,
+            "prompt_queries_are_region_slots": False if variable_adapter is not None else True,
+            "max_layout_tokens": layout_args.max_layout_tokens,
+            "max_layout_records": layout_args.max_layout_records,
             "ablation_id": layout_args.ablation_id or "legacy_default",
             "layout_loss_preset": layout_args.layout_loss_preset or "legacy_explicit_weights",
             "loss_weights": {
@@ -920,14 +1164,23 @@ def main() -> None:
             },
             "projector_trainable": module_parameters["mm_projector_vary"]["trainable"] > 0,
             "use_vlqa": model.get_model().layout_adapter is not None,
+            "use_pvld": variable_adapter is not None,
             "use_generic_adapter": model.get_model().generic_adapter is not None,
-            "residual_writeback_enabled": model.get_model().layout_adapter is not None,
+            "residual_writeback_enabled": (
+                model.get_model().layout_adapter is not None or variable_adapter is not None
+            ),
+            "layout_writeback_mode": layout_args.layout_writeback_mode,
+            "layout_writeback_num_heads": layout_args.layout_writeback_num_heads,
+            "layout_writeback_dropout": layout_args.layout_writeback_dropout,
+            "layout_writeback_gate_init": layout_args.layout_writeback_gate_init,
+            "vqlca_parameters": vqlca_parameters,
+            "pvld_parameters": pvld_parameters,
             "passed_through_p1": (
                 layout_args.ablation_id == "vlqa_layout_p1_p2"
                 and layout_args.layout_stage == "p2"
             ),
             "layout_heads_expected_gradient": (
-                model.get_model().layout_adapter is not None
+                (model.get_model().layout_adapter is not None or variable_adapter is not None)
                 and layout_args.layout_loss_weight > 0.0
             ),
             "input_granularity": "whole_page_image",

@@ -310,6 +310,30 @@ $\mathbf E^{\mathrm{ord}}$ 是 query 槽位或预测顺序 embedding，$\alpha$ 
 
 首轮不把 $\mathbf G_i$ 额外拼接到 Qwen 上下文，以免把上下文长度变化与结构收益混在一起。若残差写回无效，再把 query 拼接方案作为后续独立消融。
 
+#### 4.4.1 VQLCA 视觉值写回候选
+
+上述原始写回现备案为 `layout_writeback_mode=layout_value`：最终 attention 的 Query 来自视觉 token，而 Key/Value 都来自布局向量，即 $Q=\mathrm{visual},K/V=\mathrm{layout}$。其残差是 layout vectors 的加权组合。该模式仅保留为历史消融，不能作为 PVLD 主路径；PVLD 的正式定义见第 11 节，最终 OCR Value 必须来自视觉序列。
+
+新增结构候选 **Visual Query-Value Layout-Conditioned Attention（VQLCA）** 使用 `layout_writeback_mode=vqlca`。设投影后的视觉 token 为 $\mathbf X\in\mathbb R^{B\times N_v\times D_a}$，布局向量为 $\mathbf L\in\mathbb R^{B\times K\times D_a}$。第一阶段只读取布局条件：
+
+$$\mathbf C=\operatorname{MHA}_{layout}\left(\mathbf X\mathbf W_Q^c,\mathbf L\mathbf W_K^c,\mathbf L\mathbf W_V^c\right)\in\mathbb R^{B\times N_v\times D_a}.$$
+
+$\mathbf C$ 只生成视觉 Key 的条件偏置，不直接作为最终写回 Value。第二阶段为：
+
+$$\mathbf Q_v=\mathbf X\mathbf W_Q^v,\qquad \mathbf K_v=\mathbf X\mathbf W_K^v+\mathbf C\mathbf W_{K,c},\qquad \mathbf V_v=\mathbf X\mathbf W_V^v.$$
+
+$$\mathbf A_v=\operatorname{softmax}\left(\frac{\mathbf Q_v\mathbf K_v^\top}{\sqrt{d_h}}+\mathbf M_v\right),\qquad \Delta\mathbf X=\mathbf W_O\left(\mathbf A_v\mathbf V_v\right).$$
+
+$$\mathbf X_{out}=\mathbf X+\tanh(\alpha)\Delta\mathbf X.$$
+
+其中 $\mathbf M_v$ 在被 padding 的视觉 Key 位置取 $-\infty$；layout padding/object mask 只屏蔽第一阶段无效布局向量。VQLCA 的最终 $Q_v$ 和 $V_v$ 都来自视觉 token，布局向量只通过 $\mathbf C$ 调制 $\mathbf K_v$。不能把旧路径简单改成 $Q=\mathrm{visual},K=\mathrm{layout},V=\mathrm{visual}$，因为 Key 和 Value 的序列长度分别为 $K$ 和 $N_v$，不满足同一次 attention 的维度契约。
+
+$\alpha$ 默认初始化为 0，因此初始化时 $\mathbf X_{out}=\mathbf X$，严格退化为原始 GOT2 视觉路径。旧 checkpoint 缚定 `layout_value`；加载到 VQLCA 时只允许复用共有 layout query/预测分支，旧 writeback 权重不得映射到 VQLCA。新增 VQLCA 投影采用受控初始化，gate 重置为 0，并在训练 metadata 中记录初始化模式、缺失键和实际新增参数量。
+
+VQLCA 相对 `layout_value` 增加一次 $N_v\times K$ 的 layout-conditioning attention，以及一次 $N_v\times N_v$ 的视觉 self-attention。其 attention score 数量量级为 $O(BHN_vK+BH N_v^2)$，投影和 Value 聚合计算量量级为 $O(B(N_v+K)D_a^2+B(N_vK+N_v^2)D_a)$；额外 attention 工作显存量级为 $O(BH(N_vK+N_v^2))$。训练 metrics 必须报告 `vqlca_parameters`、实际峰值显存和吞吐量，不能仅凭理论量级宣称轻量或有效。
+
+VQLCA 旧候选不作为 PVLD 主路径。当前 PVLD 候选为 `visual_value_layout_routing`，其目的不是增加文本 decoder，而是确保最终 OCR 内容 Value 始终来自视觉 token。它仍是待统一消融验证的结构候选；在 OCR CER、区域召回、bbox IoU、方向/顺序与计算成本完成统一比较前，不称为已验证创新。
+
 ### 4.5 端到端前向路径
 
 主候选可写为：
@@ -502,3 +526,58 @@ A100 run `layout_overfit_20260812_002747` 已完成固定 P1、2 条记录、100
 7. Wang, J., Jin, L., & Ding, K. “LiLT: A Simple yet Effective Language-Independent Layout Transformer for Structured Document Understanding.” *ACL*, 2022. DOI: [10.18653/v1/2022.acl-long.534](https://doi.org/10.18653/v1/2022.acl-long.534)。
 8. Zhu, Z. et al. “A Simple yet Effective Layout Token in Large Language Models for Document Understanding.” *CVPR*, 2025. DOI: [10.1109/CVPR52734.2025.01349](https://doi.org/10.1109/CVPR52734.2025.01349)。
 9. Wang, D. et al. “DocLayout-YOLO: Enhancing Document Layout Analysis through Diverse Synthetic Data and Global-to-Local Adaptive Perception.” arXiv:2410.12628, 2024. [代码](https://github.com/opendatalab/DocLayout-YOLO)。
+## 11. PVLD visual-value layout routing (current formal candidate)
+
+The earlier VQLCA wording is superseded for the PVLD path. The production
+candidate uses these symbols consistently:
+
+```text
+F       = Vary ViT high-resolution intermediate features [B, L_f, D_f]
+P       = global layout prompt bank [1, K_p, D_p], K_p=32 is not a region cap
+A       = layout_evidence, first prompt-to-vision attention output [B, K_p, D_a]
+L       = variable-length layout decoder hidden states [B, T_l, D_l]
+V_i     = GOT2 visual prefix after projector, before Qwen OCR [B, L_v, D_v]
+V_tilde = layout-conditioned visual sequence consumed by Qwen [B, L_v, D_v]
+```
+
+The actual forward path is:
+
+```text
+Vary ViT F -> mm_projector_vary -> V_i
+       |                         |
+       | P queries F keys/values | V_i queries and values
+       v                         v
+ A = layout_evidence -> layout decoder   visual-value layout routing -> V_tilde -> Qwen OCR
+```
+
+The first attention is:
+
+$$Q_A=PW_Q^A,quad K_F=FW_K^A,quad U_F=FW_V^A,$$
+$$S_A=\operatorname{softmax}\left(\frac{Q_AK_F^\top}{\sqrt{d_h}}+M_F\right),$$
+$$A=\operatorname{LN}\left(P+S_AU_FW_O^A\right).$$
+
+`A` is global layout evidence. It is not a fixed region slot, not OCR text,
+and never enters the Qwen decoder as a content Value. The variable layout
+decoder consumes `A` (and optionally read-only `F`) and emits structure tokens
+until EOS. The number of regions is the number of `REGION` records before EOS;
+it is not `K_p`.
+
+The second stage is named **Visual-Value Layout Routing**. A single attention
+operation with `Q=V_i`, `K=A`, and `V=V_i` is dimensionally undefined when
+`L_v != K_p`. The implementation therefore uses a factorized two-hop route:
+
+$$R_{v\to a}=\operatorname{softmax}\left(\frac{Q(V_i)K(A)^\top}{\sqrt{d_h}}+M_A\right)\in\mathbb R^{B\times H\times L_v\times K_p},$$
+$$R_{a\to v}=\operatorname{softmax}\left(\frac{Q(A)K(V_i)^\top}{\sqrt{d_h}}+M_{V_i}\right)\in\mathbb R^{B\times H\times K_p\times L_v},$$
+$$R_v=R_{v\to a}R_{a\to v}\in\mathbb R^{B\times H\times L_v\times L_v},$$
+$$V_{\mathrm{tilde}}=V_i+\tanh(\alpha)W_O^V\left(R_vU(V_i)\right).$$
+
+Thus every final Value is projected from `V_i`; layout evidence only changes
+the visual-to-visual routing matrix. The output length is fixed by visual
+queries (`L_v`) and is directly inserted into the Qwen OCR visual prefix.
+This is not layout-to-visual content writeback.
+
+The old `layout_value` mode (`Q=visual, K/V=layout`) remains only as a
+historical ablation. The old `vqlca` mode remains loadable for provenance but
+is not the PVLD main path. Formal PVLD experiments must explicitly set
+`layout_writeback_mode=visual_value_layout_routing` and
+`layout_writeback_source=layout_evidence`.

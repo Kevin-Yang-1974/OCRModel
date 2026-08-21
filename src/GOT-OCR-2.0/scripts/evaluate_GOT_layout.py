@@ -59,7 +59,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--model-name-or-path", type=Path, required=True)
     parser.add_argument(
         "--model-kind",
-        choices=("baseline", "generic", "vlqa"),
+        choices=("baseline", "generic", "vlqa", "pvld"),
         default="vlqa",
         help=(
             "Strict checkpoint protocol for baseline, generic adaptor, or VLQA."
@@ -158,6 +158,20 @@ def require_layout_predictions(outputs: Any, max_regions: int) -> None:
             raise RuntimeError(f"Model returned non-finite values in {name}.")
 
 
+def require_variable_layout_predictions(outputs: Any) -> None:
+    required = (
+        "layout_generated_ids",
+        "layout_generated_eos",
+        "layout_truncated",
+        "layout_record_mask",
+        "layout_bbox_xyxy",
+        "layout_type_logits",
+        "layout_direction_logits",
+    )
+    if any(getattr(outputs, name, None) is None for name in required):
+        raise RuntimeError("PVLD forward did not return variable layout generation outputs.")
+
+
 def validate_model_protocol(
     *,
     model: GOTQwenForCausalLM,
@@ -167,13 +181,16 @@ def validate_model_protocol(
     required_vlqa_stage: str | None,
 ) -> str | None:
     adapter = model.get_model().layout_adapter
+    variable_adapter = model.get_model().variable_layout_adapter
     generic_adapter = model.get_model().generic_adapter
     use_vlqa = getattr(model.config, "use_vlqa", False) is True
     use_generic = getattr(model.config, "use_generic_adapter", False) is True
+    use_pvld = getattr(model.config, "variable_layout_enabled", False) is True
     if model_kind == "baseline":
         if required_vlqa_stage is not None:
             raise ValueError("--require-vlqa-stage is only valid for --model-kind vlqa.")
-        if use_vlqa or adapter is not None or use_generic or generic_adapter is not None:
+        if (use_vlqa or adapter is not None or use_pvld or variable_adapter is not None
+                or use_generic or generic_adapter is not None):
             raise RuntimeError(
                 "Baseline evaluation requires an original GOT2 checkpoint without VLQA."
             )
@@ -182,12 +199,24 @@ def validate_model_protocol(
     if model_kind == "generic":
         if required_vlqa_stage is not None:
             raise ValueError("--require-vlqa-stage is only valid for --model-kind vlqa.")
-        if use_vlqa or adapter is not None or not use_generic or generic_adapter is None:
+        if (use_vlqa or adapter is not None or use_pvld or variable_adapter is not None
+                or not use_generic or generic_adapter is None):
             raise RuntimeError(
                 "Generic evaluation requires use_generic_adapter=true without VLQA."
             )
         return None
 
+    if model_kind == "pvld":
+        if not use_pvld or variable_adapter is None or use_vlqa or adapter is not None:
+            raise RuntimeError("PVLD evaluation requires variable_layout_enabled=true.")
+        if int(getattr(model.config, "num_layout_prompt_queries", -1)) != 32:
+            raise RuntimeError("PVLD checkpoint must contain 32 global layout prompts.")
+        checkpoint_stage = str(getattr(model.config, "layout_stage", "p2"))
+        if required_vlqa_stage is not None and checkpoint_stage != required_vlqa_stage:
+            raise RuntimeError(
+                f"PVLD checkpoint stage mismatch: {checkpoint_stage!r} != {required_vlqa_stage!r}."
+            )
+        return checkpoint_stage
     if not use_vlqa or adapter is None:
         raise RuntimeError("VLQA evaluation requires config.use_vlqa=true and layout_adapter.")
     model_queries = int(getattr(model.config, "vlqa_num_queries", -1))
@@ -300,7 +329,7 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
         collate_fn=data_module["data_collator"],
     )
     has_layout_annotations = bool(
-        args.model_kind == "vlqa"
+        args.model_kind in {"vlqa", "pvld"}
         and any(
             record.get("layout_annotation_status", "none") != "none"
             and record.get("regions")
@@ -323,6 +352,10 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
     total_generation_seconds = 0.0
     total_generation_token_slots = 0
     completed_pages = 0
+    pvld_eos_pages = 0
+    pvld_truncated_pages = 0
+    pvld_premature_eos_pages = 0
+    pvld_layout_tokens = 0
     temporary_predictions = predictions_path.with_suffix(predictions_path.suffix + ".tmp")
     evaluation_loop_started = time.perf_counter()
     try:
@@ -351,11 +384,15 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
                             attention_mask=attention_mask,
                             images=images,
                             use_cache=False,
+                            generate_variable_layout=args.model_kind == "pvld",
                             return_dict=True,
                         )
                     synchronize(device)
                     layout_seconds = time.perf_counter() - layout_started
-                    require_layout_predictions(layout_outputs, args.max_regions)
+                    if args.model_kind == "pvld":
+                        require_variable_layout_predictions(layout_outputs)
+                    else:
+                        require_layout_predictions(layout_outputs, args.max_regions)
 
                 if len(set(batch["stop_string"])) != 1:
                     raise RuntimeError("A validation batch must use one stop string.")
@@ -411,7 +448,54 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
                         skip_special_tokens=True,
                     ).strip()
                     predicted_text = trim_generation(decoded, stop_string)
-                    if layout_outputs is not None:
+                    if layout_outputs is not None and args.model_kind == "pvld":
+                        valid = layout_outputs.layout_record_mask[row].bool()
+                        predicted_boxes = (
+                            layout_outputs.layout_bbox_xyxy[row][valid]
+                            .float().detach().cpu().tolist()
+                        )
+                        predicted_directions = (
+                            layout_outputs.layout_direction_logits[row][valid]
+                            .float().argmax(dim=-1).detach().cpu().tolist()
+                        )
+                        predicted_types = (
+                            layout_outputs.layout_type_logits[row][valid]
+                            .float().argmax(dim=-1).detach().cpu().tolist()
+                        )
+                        object_scores = [1.0] * len(predicted_boxes)
+                        assert layout_accumulator is not None
+                        page_metrics = layout_accumulator.add_page(
+                            reference_text=batch["page_text"][row],
+                            predicted_text=predicted_text,
+                            regions=batch["regions"][row],
+                            annotation_status=batch["layout_annotation_status"][row],
+                            object_scores=object_scores,
+                            predicted_boxes=predicted_boxes,
+                            predicted_directions=predicted_directions,
+                        )
+                        eos = bool(layout_outputs.layout_generated_eos[row].item())
+                        truncated = bool(layout_outputs.layout_truncated[row].item())
+                        layout_tokens = int(
+                            layout_outputs.layout_generated_ids[row].ne(0).sum().item()
+                        )
+                        pvld_eos_pages += int(eos)
+                        pvld_truncated_pages += int(truncated)
+                        pvld_layout_tokens += layout_tokens
+                        pvld_premature_eos_pages += int(
+                            eos and len(predicted_boxes) < len(batch["regions"][row])
+                        )
+                        type_names = ("column", "row", "region")
+                        query_predictions = [
+                            {
+                                "region_index": index,
+                                "type": type_names[predicted_types[index]],
+                                "bbox": predicted_boxes[index],
+                                "direction": DIRECTION_LABELS[predicted_directions[index]],
+                                "score": 1.0,
+                            }
+                            for index in range(len(predicted_boxes))
+                        ]
+                    elif layout_outputs is not None:
                         object_scores = (
                             layout_outputs.layout_object_logits[row]
                             .float().sigmoid().detach().cpu().tolist()
@@ -460,6 +544,18 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
                         "layout_annotation_status": batch["layout_annotation_status"][row],
                         "regions": batch["regions"][row],
                         "layout_predictions": query_predictions,
+                        "num_predicted_regions": (
+                            len(query_predictions) if args.model_kind == "pvld" and query_predictions is not None
+                            else None
+                        ),
+                        "generated_eos": (
+                            bool(layout_outputs.layout_generated_eos[row].item())
+                            if args.model_kind == "pvld" and layout_outputs is not None else None
+                        ),
+                        "layout_tokens": (
+                            int(layout_outputs.layout_generated_ids[row].ne(0).sum().item())
+                            if args.model_kind == "pvld" and layout_outputs is not None else None
+                        ),
                         "metrics": page_metrics,
                         "runtime_seconds": {
                             "layout_forward": layout_seconds / batch_size,
@@ -525,6 +621,21 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
                 if args.model_kind == "vlqa"
                 else "not_available_for_original_got2"
             ),
+            "architecture": "PVLD-32" if args.model_kind == "pvld" else "fixed_slot",
+            "prompt_query_count": 32 if args.model_kind == "pvld" else None,
+            "prompt_queries_are_region_slots": False if args.model_kind == "pvld" else None,
+            "eos_success_rate": (
+                pvld_eos_pages / completed_pages if args.model_kind == "pvld" else None
+            ),
+            "premature_eos_rate": (
+                pvld_premature_eos_pages / completed_pages if args.model_kind == "pvld" else None
+            ),
+            "max_length_truncation_rate": (
+                pvld_truncated_pages / completed_pages if args.model_kind == "pvld" else None
+            ),
+            "mean_layout_tokens": (
+                pvld_layout_tokens / completed_pages if args.model_kind == "pvld" else None
+            ),
         },
         "metrics": (
             layout_accumulator.summary()
@@ -579,6 +690,19 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
         "predictions": str(predictions_path),
     }
     write_json(summary_path, summary)
+    if args.model_kind == "pvld":
+        write_json(output_dir / "layout_generation_summary.json", summary)
+        (output_dir / "layout_predictions.jsonl").write_text(
+            predictions_path.read_text(encoding="utf-8"), encoding="utf-8"
+        )
+        (output_dir / "layout_report.md").write_text(
+            "# PVLD-32 whole-page layout report\n\n"
+            f"- pages: `{completed_pages}`\n"
+            f"- EOS success rate: `{summary['layout']['eos_success_rate']}`\n"
+            f"- max-length truncation rate: `{summary['layout']['max_length_truncation_rate']}`\n"
+            "- input: `whole_page_image + ocr_prompt`\n",
+            encoding="utf-8",
+        )
     print(
         compact_json(
             {

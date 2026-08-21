@@ -212,7 +212,23 @@ bash tools/evaluation/run_layout_ablation_selection_smoke.sh \
 
 成功时最后一行事件为 `layout_ablation_selection_resume_smoke_completed`，且 `evaluator_log_unchanged=true`。正式 run 的 candidate 目录、`selection.json` 和 test 结果不得用该 1 页 smoke 替代。
 
-## 10. 多样化合成数据到 AncientDoc
+## 10. MTHv2 原始整页 VQLCA C1–C5
+
+该入口固定读取 `/data3/yky/yangky_ocr_models/datasets/MTHv2/converted/mthv2_layout_page_v1` 的 train/validation/test 原始整页 manifest，不读取 `mthv2_layout_column_chunks16_v1`。C1/C2 保持 projector/普通 adaptor 对照；C3/C4/C5 显式使用 `layout_writeback_mode=vqlca`。`max_regions=512` 只是覆盖当前最多约 407 个 ordered textline/region candidates 的 Fixed-Slot K512 容量设置，不是 PVLD。
+
+```bash
+cd /data3/yky/yangky_ocr_models/ocrmodel
+source config/paths.env
+bash tools/training/run_mthv2_page_vqlca_ablation_tmux.sh \
+  --session mthv2_page_vqlca_train_20260820 \
+  --run-prefix mthv2_page_vqlca_ablation_20260820 \
+  --gpu-id 0 \
+  --ablations C1,C2,C3,C4,C5
+```
+
+启动前只查询实际指定 GPU 的瞬时利用率并要求 `<50%`。训练入口不自动启动 frozen test；训练结束后必须另行执行 validation-only checkpoint selection，再由锁定 selection 启动一次 test。
+
+## 11. 多样化合成数据到 AncientDoc
 
 新协议固定入口为 `tools/training/run_diverse_synthetic_ancientdoc.sh`。历史正式组只有 C0、C1、C4、C5、C6；不存在可直接复跑的 C2/C3。新 synthetic 数据不是 AncientDoc test 的替代品，AncientDoc 的 validation/test 仍使用书籍隔离整页数据。
 
@@ -300,3 +316,12 @@ bash tools/training/run_diverse_synthetic_ancientdoc.sh test-ancient \
 ```
 
 旧 AncientDoc test 已被查询过；新模型再次运行同一 test 属于重复 test 查询，不能再用其结果调 synthetic 分布、replay 比例或 checkpoint。后续超参数迭代只能看 validation，并应在新 seed 或新的 Real-OOD 集合上预注册复验。
+### PVLD routing mode (2026-08-20)
+
+Existing C1-C5 VQLCA runs retain their historical `layout_writeback_mode=vqlca`
+identity and must not be relabeled as PVLD. A new PVLD run must explicitly set
+`layout_writeback_mode=visual_value_layout_routing` and
+`layout_writeback_source=layout_evidence`. This mode consumes high-resolution
+Vary ViT features for `A=layout_evidence`, then applies factorized `V_i -> A -> V_i`
+routing; the final OCR Value is always projected from `V_i` and the output
+length remains `L_v`.
