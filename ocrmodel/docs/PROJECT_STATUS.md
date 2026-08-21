@@ -21,6 +21,12 @@
 - MTHv2 whole-page 训练：已启动独立 tmux 会话 `mthv2_page_train_20260820_r2`，使用原始页面 manifest `mthv2_layout_page_v1`（train/validation/test=`2159/240/800`），不是 oracle-chunk 图像；C1–C5 在 GPU 0 串行执行，`max_regions=512` 覆盖整页最多 407 个区域。C1 已进入 P2 optimizer steps，暂无性能结果。此前 `mthv2_page_ablation_20260820` 因审计条件未识别 `real_mthv2_official` 失败，`mthv2_page_ablation_20260820_r1` 因 `max_regions=64` 不足以容纳 71 区域页面失败；两个失败 run 均保留，不得复用。
 - 方案备案：原有布局结构现统一称为 Fixed-Slot VLQA baseline，保留 `Fixed-Slot VLQA-K16`（原始 `max_regions=16`）和 `Fixed-Slot VLQA-K32`（仅提高固定槽位容量到 32）两个对照。两者的 query 在训练期按阅读顺序对应固定区域，超过上限时仍需 oracle chunk 或截断；K32 不是变量长度解码创新。
 - PVLD-32 原型：新增独立的 Prompted Variable-Length Layout Decoder 工程候选。32 表示全局 layout prompt tokens，不表示 32 个区域槽位；区域数量由 decoder 的 `REGION` 记录和 `EOS` 决定。新增模块、target 序列化、评估契约和 A100 编排器均不覆盖 Fixed-Slot 代码；当前尚未接入 GOT2 视觉塔/`forward`，也未产生正式训练或性能结果，只有 standalone feature tensor smoke/preflight 能力。
+- PVLD 路径修订（2026-08-20）：`GOTQwenModel.forward` 现将 `vision_tower_high(image[1])` 的高分辨率中间特征作为 `F`/第一阶段 Key-Value，将 `mm_projector_vary` 输出作为 `V_i`。全局 prompt 读取 `F` 得到命名为 `layout_evidence=A` 的布局证据；A 只进入布局分支和第二阶段视觉路由。新增显式 `layout_writeback_mode=visual_value_layout_routing`，用两跳 `V_i→A→V_i` 因子化路由保证最终 Value 只来自视觉 token，输出保持 `[B,L_v,D_v]` 后再送入 Qwen OCR。旧 `layout_value` 与 `vqlca` 保留为历史对照，不改写既有 VQLCA 训练结果。
+- A100 VQLCA smoke：`vqlca_wholepage_smoke_20260820_r1` 已在 GPU 2、MTHv2 原始整页 train manifest 上通过 `2159` 页/`72688` 区域审计、CUDA component forward/backward、gate=0 原路径等价、gate 打开后的 visual Q/K/V、layout-conditioning、context-key、output 与 layout-query finite/nonzero gradient 检查，以及 P1 1 step→checkpoint 重载→P2 1 step。P1/P2 train loss 为 `9.048427/9.792988`，只证明工程链路。
+- GPU 默认策略已写入根目录和 `ocrmodel/AGENTS.md`：训练、验证与评估默认在命令允许的 GPU 池中使用全部瞬时 `utilization.gpu < 50` 的卡；合格卡足够时按控制一一绑定，不足时全部合格卡组成多卡作业并按控制串行运行。
+- 原 VQLCA 会话 `mthv2_page_vqlca_train_20260820` 按用户要求在 C1 P2 约第 `4245/42000` 步停止。第一次重启 `_r1` 因 GPU0 在子任务启动前升至 `72%` 而按准入规则退出，未启动控制任务且保留诊断日志。
+- 当前 VQLCA whole-page C1–C5 会话为 tmux `mthv2_page_vqlca_train_20260820_r2`，run prefix `mthv2_page_vqlca_ablation_20260820_r2`，使用 GPU `1,2,3,4` 四卡；C1 已通过 `3199` 页/`105579` 区域审计并进入真实 P2，`physical_gpus=["1","2","3","4"]`、`world_size=4`。数据固定为原始整页 `mthv2_layout_page_v1`，不是 chunk，`max_regions=512` 仍是 Fixed-Slot K512 工程容量。旧 `mthv2_page_train_20260820_r2` 未停止或覆盖；尚无 VQLCA 性能结论，也未启动新的 frozen test。
+- 训练状态与未来报告从 `/data3/yky/yangky_ocr_models/training_runs/GOT/mthv2_page_vqlca_ablation_20260820_r2*` 提取；总启动日志为对应 `_tmux_logs/launcher.log`，单项状态和汇总分别看 `metadata/status.txt` 与 `summary.json`。
 
 ## 已完成的正式流程
 

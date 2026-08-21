@@ -17,6 +17,7 @@ from GOT.model.layout_query import (
     VisualLayoutQueryAdapter,
     VisualLayoutQueryLoss,
 )
+from GOT.model.layout_prompt_decoder import PromptedVariableLayoutAdapter
 from GOT.model.generic_adapter import GenericVisualTransformerAdapter
 
 
@@ -40,6 +41,16 @@ class GOTBaseModelOutputWithPast(BaseModelOutputWithPast):
     layout_object_logits: Optional[torch.FloatTensor] = None
     layout_bbox_xyxy: Optional[torch.FloatTensor] = None
     layout_direction_logits: Optional[torch.FloatTensor] = None
+    layout_sequence_loss: Optional[torch.FloatTensor] = None
+    layout_type_loss: Optional[torch.FloatTensor] = None
+    layout_count_loss: Optional[torch.FloatTensor] = None
+    layout_eos_accuracy: Optional[torch.FloatTensor] = None
+    layout_region_count_mae: Optional[torch.FloatTensor] = None
+    layout_generated_ids: Optional[torch.LongTensor] = None
+    layout_generated_eos: Optional[torch.BoolTensor] = None
+    layout_truncated: Optional[torch.BoolTensor] = None
+    layout_record_mask: Optional[torch.BoolTensor] = None
+    layout_type_logits: Optional[torch.FloatTensor] = None
 
 
 @dataclass
@@ -63,6 +74,16 @@ class GOTCausalLMOutputWithPast(CausalLMOutputWithPast):
     layout_object_logits: Optional[torch.FloatTensor] = None
     layout_bbox_xyxy: Optional[torch.FloatTensor] = None
     layout_direction_logits: Optional[torch.FloatTensor] = None
+    layout_sequence_loss: Optional[torch.FloatTensor] = None
+    layout_type_loss: Optional[torch.FloatTensor] = None
+    layout_count_loss: Optional[torch.FloatTensor] = None
+    layout_eos_accuracy: Optional[torch.FloatTensor] = None
+    layout_region_count_mae: Optional[torch.FloatTensor] = None
+    layout_generated_ids: Optional[torch.LongTensor] = None
+    layout_generated_eos: Optional[torch.BoolTensor] = None
+    layout_truncated: Optional[torch.BoolTensor] = None
+    layout_record_mask: Optional[torch.BoolTensor] = None
+    layout_type_logits: Optional[torch.FloatTensor] = None
 
 class GOTConfig(Qwen2Config):
     model_type = "GOT"
@@ -79,10 +100,14 @@ class GOTQwenModel(Qwen2Model):
         self.mm_projector_vary =  nn.Linear(1024, 1024)
 
         self.layout_adapter = None
+        self.variable_layout_adapter = None
         self.generic_adapter = None
         self.layout_criterion = None
-        if getattr(config, "use_vlqa", False) and getattr(config, "use_generic_adapter", False):
-            raise ValueError("VLQA and generic visual adapter are mutually exclusive.")
+        enabled_paths = sum(bool(getattr(config, name, False)) for name in (
+            "use_vlqa", "use_generic_adapter", "variable_layout_enabled"
+        ))
+        if enabled_paths > 1:
+            raise ValueError("Fixed-Slot VLQA, PVLD, and generic adapter are mutually exclusive.")
         if getattr(config, "use_generic_adapter", False):
             config.generic_adapter_dim = int(getattr(config, "generic_adapter_dim", 256))
             config.generic_adapter_num_heads = int(
@@ -107,6 +132,21 @@ class GOTQwenModel(Qwen2Model):
             config.vlqa_num_heads = int(getattr(config, "vlqa_num_heads", 8))
             config.vlqa_ffn_expansion = int(getattr(config, "vlqa_ffn_expansion", 4))
             config.vlqa_dropout = float(getattr(config, "vlqa_dropout", 0.0))
+            config.layout_writeback_mode = str(
+                getattr(config, "layout_writeback_mode", "layout_value")
+            )
+            config.layout_writeback_source = str(
+                getattr(config, "layout_writeback_source", "layout_evidence")
+            )
+            config.layout_writeback_num_heads = int(
+                getattr(config, "layout_writeback_num_heads", config.vlqa_num_heads)
+            )
+            config.layout_writeback_dropout = float(
+                getattr(config, "layout_writeback_dropout", config.vlqa_dropout)
+            )
+            config.layout_writeback_gate_init = float(
+                getattr(config, "layout_writeback_gate_init", 0.0)
+            )
             config.vlqa_num_direction_classes = int(
                 getattr(config, "vlqa_num_direction_classes", 5)
             )
@@ -138,12 +178,54 @@ class GOTQwenModel(Qwen2Model):
                 ffn_expansion=config.vlqa_ffn_expansion,
                 num_direction_classes=config.vlqa_num_direction_classes,
                 dropout=config.vlqa_dropout,
+                writeback_mode=config.layout_writeback_mode,
+                writeback_num_heads=config.layout_writeback_num_heads,
+                writeback_dropout=config.layout_writeback_dropout,
+                writeback_gate_init=config.layout_writeback_gate_init,
             )
             self.layout_criterion = VisualLayoutQueryLoss(
                 object_weight=config.vlqa_object_weight,
                 bbox_l1_weight=config.vlqa_bbox_l1_weight,
                 bbox_giou_weight=config.vlqa_bbox_giou_weight,
                 direction_weight=config.vlqa_direction_weight,
+            )
+        if getattr(config, "variable_layout_enabled", False):
+            config.num_layout_prompt_queries = int(
+                getattr(config, "num_layout_prompt_queries", 32)
+            )
+            config.max_layout_tokens = int(getattr(config, "max_layout_tokens", 2048))
+            config.max_layout_records = int(getattr(config, "max_layout_records", 512))
+            config.layout_decoder_layers = int(getattr(config, "layout_decoder_layers", 2))
+            config.layout_decoder_hidden_size = int(
+                getattr(config, "layout_decoder_hidden_size", 256)
+            )
+            config.layout_decoder_num_heads = int(
+                getattr(config, "layout_decoder_num_heads", 8)
+            )
+            config.layout_writeback_mode = "visual_value_layout_routing"
+            config.layout_writeback_source = "layout_evidence"
+            self.variable_layout_adapter = PromptedVariableLayoutAdapter(
+                visual_dim=1024,
+                high_resolution_dim=1024,
+                hidden_size=config.layout_decoder_hidden_size,
+                num_prompt_queries=config.num_layout_prompt_queries,
+                decoder_layers=config.layout_decoder_layers,
+                num_heads=config.layout_decoder_num_heads,
+                max_layout_tokens=config.max_layout_tokens,
+                max_layout_records=config.max_layout_records,
+                num_directions=int(getattr(config, "vlqa_num_direction_classes", 5)),
+                dropout=float(getattr(config, "layout_writeback_dropout", 0.0)),
+                gate_init=float(getattr(config, "layout_writeback_gate_init", 0.0)),
+                bbox_weight=float(getattr(config, "layout_bbox_loss_weight", 5.0)),
+                bbox_giou_weight=float(
+                    getattr(config, "layout_bbox_giou_loss_weight", 2.0)
+                ),
+                type_weight=float(getattr(config, "layout_type_loss_weight", 1.0)),
+                direction_weight=float(getattr(config, "layout_direction_loss_weight", 1.0)),
+                count_weight=float(getattr(config, "layout_count_loss_weight", 0.1)),
+                prompt_diversity_weight=float(
+                    getattr(config, "layout_prompt_diversity_loss_weight", 0.0)
+                ),
             )
 
     @staticmethod
@@ -228,6 +310,13 @@ class GOTQwenModel(Qwen2Model):
         layout_object_targets: Optional[torch.FloatTensor] = None,
         layout_object_mask: Optional[torch.BoolTensor] = None,
         layout_direction_targets: Optional[torch.LongTensor] = None,
+        layout_input_ids: Optional[torch.LongTensor] = None,
+        layout_attention_mask: Optional[torch.BoolTensor] = None,
+        layout_region_positions: Optional[torch.LongTensor] = None,
+        layout_record_mask: Optional[torch.BoolTensor] = None,
+        layout_type_targets: Optional[torch.LongTensor] = None,
+        layout_count_targets: Optional[torch.FloatTensor] = None,
+        generate_variable_layout: bool = False,
         return_dict: Optional[bool] = None,
     ) -> Union[Tuple, BaseModelOutputWithPast]:
 
@@ -241,25 +330,41 @@ class GOTQwenModel(Qwen2Model):
             inputs_embeds = self.embed_tokens(input_ids)
 
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
-        layout_targets = (
+        fixed_layout_targets = (
             layout_bbox_targets,
             layout_bbox_mask,
             layout_object_targets,
             layout_object_mask,
             layout_direction_targets,
         )
-        if any(target is not None for target in layout_targets) and not all(
-            target is not None for target in layout_targets
+        if self.layout_adapter is not None and any(target is not None for target in fixed_layout_targets) and not all(
+            target is not None for target in fixed_layout_targets
         ):
             raise ValueError("All VLQA target tensors must be supplied together.")
-        has_layout_targets = all(target is not None for target in layout_targets)
+        has_layout_targets = self.layout_adapter is not None and all(
+            target is not None for target in fixed_layout_targets
+        )
         if has_layout_targets and self.layout_adapter is None:
             raise ValueError("Layout targets were supplied but config.use_vlqa is disabled.")
         if has_layout_targets and not return_dict:
             raise ValueError("VLQA supervision requires return_dict=True.")
+        variable_targets = (
+            layout_input_ids,
+            layout_attention_mask,
+            layout_region_positions,
+            layout_record_mask,
+            layout_bbox_targets,
+            layout_type_targets,
+            layout_direction_targets,
+            layout_count_targets,
+        )
+        has_variable_targets = self.variable_layout_adapter is not None and all(
+            target is not None for target in variable_targets
+        )
 
         vision_tower_high = getattr(self, 'vision_tower_high', None)
         layout_outputs = []
+        variable_layout_outputs = []
 
 
         if vision_tower_high is not None and (input_ids.shape[1] != 1 or self.training) and images is not None:
@@ -285,7 +390,7 @@ class GOTQwenModel(Qwen2Model):
             image_features = []
             
 
-            for image in images:
+            for image_index, image in enumerate(images):
                 P, C, H, W = image[1].shape
                 # with torch.set_grad_enabled(True):
                 #     # print(image[1].shape)
@@ -306,14 +411,56 @@ class GOTQwenModel(Qwen2Model):
                     if self.layout_adapter is not None:
                         layout_output = self.layout_adapter(
                             image_feature,
+                            layout_memory=cnn_feature,
                             memory_grid_size=(16, 16),
                         )
                         image_feature = layout_output.visual_tokens
                         layout_outputs.append(layout_output)
+                    elif self.variable_layout_adapter is not None:
+                        variable_output = self.variable_layout_adapter(
+                            image_feature,
+                            cnn_feature,
+                            layout_input_ids=(
+                                layout_input_ids[image_index : image_index + 1]
+                                if has_variable_targets else None
+                            ),
+                            layout_attention_mask=(
+                                layout_attention_mask[image_index : image_index + 1]
+                                if has_variable_targets else None
+                            ),
+                            layout_region_positions=(
+                                layout_region_positions[image_index : image_index + 1]
+                                if has_variable_targets else None
+                            ),
+                            layout_record_mask=(
+                                layout_record_mask[image_index : image_index + 1]
+                                if has_variable_targets else None
+                            ),
+                            layout_bbox_targets=(
+                                layout_bbox_targets[image_index : image_index + 1]
+                                if has_variable_targets else None
+                            ),
+                            layout_type_targets=(
+                                layout_type_targets[image_index : image_index + 1]
+                                if has_variable_targets else None
+                            ),
+                            layout_direction_targets=(
+                                layout_direction_targets[image_index : image_index + 1]
+                                if has_variable_targets else None
+                            ),
+                            layout_count_targets=(
+                                layout_count_targets[image_index : image_index + 1]
+                                if has_variable_targets else None
+                            ),
+                            generate_layout=generate_variable_layout,
+                        )
+                        image_feature = variable_output.visual_tokens
+                        variable_layout_outputs.append(variable_output)
                     image_features.append(image_feature)
 
                 else:
-                    if self.layout_adapter is not None or self.generic_adapter is not None:
+                    if (self.layout_adapter is not None or self.variable_layout_adapter is not None
+                            or self.generic_adapter is not None):
                         raise ValueError(
                             "Formal visual-adapter training accepts one whole-page image per sample; "
                             f"received {P} image patches."
@@ -393,6 +540,44 @@ class GOTQwenModel(Qwen2Model):
                 object_mask=layout_object_mask,
                 direction_targets=layout_direction_targets,
             )
+        variable_losses = [
+            output.losses for output in variable_layout_outputs if output.losses is not None
+        ]
+        if has_variable_targets and len(variable_losses) != layout_input_ids.shape[0]:
+            raise ValueError("PVLD output/target batch mismatch.")
+
+        def mean_variable(name):
+            values = [getattr(loss, name) for loss in variable_losses]
+            return torch.stack(values).mean() if values else None
+
+        generated_outputs = [
+            output for output in variable_layout_outputs if output.decoder_output is not None
+        ]
+        generated_ids = None
+        generated_eos = None
+        generated_truncated = None
+        record_mask = None
+        record_bbox = None
+        record_type_logits = None
+        record_direction_logits = None
+        if generate_variable_layout and generated_outputs:
+            generated_ids = torch.cat(
+                [output.decoder_output.generated_ids for output in generated_outputs], dim=0
+            )
+            generated_eos = torch.cat(
+                [output.decoder_output.generated_eos for output in generated_outputs], dim=0
+            )
+            generated_truncated = torch.cat(
+                [output.decoder_output.truncated for output in generated_outputs], dim=0
+            )
+            record_mask = torch.cat([output.record_mask for output in generated_outputs], dim=0)
+            record_bbox = torch.cat([output.record_output.bbox for output in generated_outputs], dim=0)
+            record_type_logits = torch.cat(
+                [output.record_output.type_logits for output in generated_outputs], dim=0
+            )
+            record_direction_logits = torch.cat(
+                [output.record_output.direction_logits for output in generated_outputs], dim=0
+            )
 
         base_output = super(GOTQwenModel, self).forward(
             input_ids=None, attention_mask=attention_mask, past_key_values=past_key_values,
@@ -407,18 +592,23 @@ class GOTQwenModel(Qwen2Model):
             past_key_values=base_output.past_key_values,
             hidden_states=base_output.hidden_states,
             attentions=base_output.attentions,
-            layout_loss=layout_losses.loss if layout_losses is not None else None,
+            layout_loss=(
+                layout_losses.loss if layout_losses is not None else mean_variable("loss")
+            ),
             layout_object_loss=(
                 layout_losses.object_loss if layout_losses is not None else None
             ),
             layout_bbox_l1_loss=(
-                layout_losses.bbox_l1_loss if layout_losses is not None else None
+                layout_losses.bbox_l1_loss if layout_losses is not None
+                else mean_variable("bbox_l1_loss")
             ),
             layout_bbox_giou_loss=(
-                layout_losses.bbox_giou_loss if layout_losses is not None else None
+                layout_losses.bbox_giou_loss if layout_losses is not None
+                else mean_variable("bbox_giou_loss")
             ),
             layout_direction_loss=(
-                layout_losses.direction_loss if layout_losses is not None else None
+                layout_losses.direction_loss if layout_losses is not None
+                else mean_variable("direction_loss")
             ),
             layout_object_accuracy=(
                 layout_losses.object_accuracy if layout_losses is not None else None
@@ -462,13 +652,23 @@ class GOTQwenModel(Qwen2Model):
             layout_bbox_xyxy=(
                 combined_layout_output.bbox_xyxy
                 if combined_layout_output is not None
-                else None
+                else record_bbox
             ),
             layout_direction_logits=(
                 combined_layout_output.direction_logits
                 if combined_layout_output is not None
-                else None
+                else record_direction_logits
             ),
+            layout_sequence_loss=mean_variable("sequence_loss"),
+            layout_type_loss=mean_variable("type_loss"),
+            layout_count_loss=mean_variable("count_loss"),
+            layout_eos_accuracy=mean_variable("eos_accuracy"),
+            layout_region_count_mae=mean_variable("region_count_mae"),
+            layout_generated_ids=generated_ids,
+            layout_generated_eos=generated_eos,
+            layout_truncated=generated_truncated,
+            layout_record_mask=record_mask,
+            layout_type_logits=record_type_logits,
         )
 
 
@@ -512,6 +712,13 @@ class GOTQwenForCausalLM(Qwen2ForCausalLM):
         layout_object_targets: Optional[torch.FloatTensor] = None,
         layout_object_mask: Optional[torch.BoolTensor] = None,
         layout_direction_targets: Optional[torch.LongTensor] = None,
+        layout_input_ids: Optional[torch.LongTensor] = None,
+        layout_attention_mask: Optional[torch.BoolTensor] = None,
+        layout_region_positions: Optional[torch.LongTensor] = None,
+        layout_record_mask: Optional[torch.BoolTensor] = None,
+        layout_type_targets: Optional[torch.LongTensor] = None,
+        layout_count_targets: Optional[torch.FloatTensor] = None,
+        generate_variable_layout: bool = False,
         return_dict: Optional[bool] = None,
         
     ) -> Union[Tuple, CausalLMOutputWithPast]:
@@ -542,6 +749,13 @@ class GOTQwenForCausalLM(Qwen2ForCausalLM):
             layout_object_targets=layout_object_targets,
             layout_object_mask=layout_object_mask,
             layout_direction_targets=layout_direction_targets,
+            layout_input_ids=layout_input_ids,
+            layout_attention_mask=layout_attention_mask,
+            layout_region_positions=layout_region_positions,
+            layout_record_mask=layout_record_mask,
+            layout_type_targets=layout_type_targets,
+            layout_count_targets=layout_count_targets,
+            generate_variable_layout=generate_variable_layout,
             return_dict=return_dict
             
         )
@@ -608,6 +822,16 @@ class GOTQwenForCausalLM(Qwen2ForCausalLM):
             layout_object_logits=outputs.layout_object_logits,
             layout_bbox_xyxy=outputs.layout_bbox_xyxy,
             layout_direction_logits=outputs.layout_direction_logits,
+            layout_sequence_loss=outputs.layout_sequence_loss,
+            layout_type_loss=outputs.layout_type_loss,
+            layout_count_loss=outputs.layout_count_loss,
+            layout_eos_accuracy=outputs.layout_eos_accuracy,
+            layout_region_count_mae=outputs.layout_region_count_mae,
+            layout_generated_ids=outputs.layout_generated_ids,
+            layout_generated_eos=outputs.layout_generated_eos,
+            layout_truncated=outputs.layout_truncated,
+            layout_record_mask=outputs.layout_record_mask,
+            layout_type_logits=outputs.layout_type_logits,
         )
 
 
@@ -665,6 +889,7 @@ class GOTQwenForCausalLM(Qwen2ForCausalLM):
                 "use_cache": kwargs.get("use_cache"),
                 "attention_mask": attention_mask,
                 "images": kwargs.get("images", None),
+                "generate_variable_layout": kwargs.get("generate_variable_layout", False),
             }
         )
         return model_inputs

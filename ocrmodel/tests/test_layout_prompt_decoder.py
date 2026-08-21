@@ -51,7 +51,8 @@ def test_decoder_supports_batch_padding_and_full_visual_memory() -> None:
     )
     output = decoder(input_ids, visual)
     assert output.logits.shape == (2, 3, vocabulary.vocab_size)
-    assert output.prompt_context.shape == (2, 32, 32)
+    assert output.layout_evidence.shape == (2, 32, 32)
+    assert output.prompt_context is output.layout_evidence
     assert output.hidden_states.shape == (2, 3, 32)
 
 
@@ -117,3 +118,53 @@ def test_variable_generation_can_finish_with_eos_and_marks_truncation() -> None:
     assert output.truncated is not None
     assert output.generated_ids is not None
     assert output.generated_ids.shape[0] == 2
+
+
+def test_integrated_pvld_routes_only_visual_values_and_blocks_teacher_forcing_leakage() -> None:
+    project_root = MODULE_PATH.parents[2]
+    sys.path.insert(0, str(project_root))
+    try:
+        adapter = module.PromptedVariableLayoutAdapter(
+            visual_dim=16,
+            high_resolution_dim=12,
+            hidden_size=16,
+            num_prompt_queries=32,
+            decoder_layers=1,
+            num_heads=4,
+            max_layout_tokens=32,
+            max_layout_records=8,
+        )
+        visual = torch.randn(2, 9, 16, requires_grad=True)
+        high_resolution = torch.randn(2, 25, 12, requires_grad=True)
+        vocabulary = module.LayoutVocabulary()
+        first = torch.tensor([
+            vocabulary.encode(["<LAYOUT>", "<REGION>", "<TYPE>", "REGION", "</TYPE>", "</REGION>", "<EOS>"]),
+            vocabulary.encode(["<LAYOUT>", "<EOS>", "<PAD>", "<PAD>", "<PAD>", "<PAD>", "<PAD>"]),
+        ])
+        second = first.clone()
+        second[0, 2] = vocabulary.eos_id
+        common = {
+            "layout_attention_mask": first.ne(vocabulary.pad_id),
+            "layout_region_positions": torch.tensor([[1], [0]]),
+            "layout_record_mask": torch.tensor([[True], [False]]),
+            "layout_bbox_targets": torch.zeros(2, 1, 4),
+            "layout_type_targets": torch.tensor([[2], [-100]]),
+            "layout_direction_targets": torch.tensor([[4], [-100]]),
+            "layout_count_targets": torch.tensor([1.0, 0.0]),
+        }
+        output_a = adapter(visual, high_resolution, layout_input_ids=first, **common)
+        output_b = adapter(visual, high_resolution, layout_input_ids=second, **common)
+        assert output_a.layout_evidence.shape == (2, 32, 16)
+        assert torch.equal(output_a.visual_tokens, visual)
+        assert torch.equal(output_a.visual_tokens, output_b.visual_tokens)
+        adapter.residual_gate.data.fill_(0.5)
+        routed = adapter(visual, high_resolution, layout_input_ids=first, **common)
+        assert routed.visual_tokens.shape == visual.shape
+        assert not torch.equal(routed.visual_tokens, visual)
+        assert routed.losses is not None and torch.isfinite(routed.losses.loss)
+        (routed.losses.loss + routed.visual_tokens.square().mean()).backward()
+        assert adapter.decoder.prompt_attention.prompt_bank.prompts.grad is not None
+        assert adapter.visual_routing.visual_value.weight.grad is not None
+        assert visual.grad is not None and torch.isfinite(visual.grad).all()
+    finally:
+        sys.path.remove(str(project_root))
