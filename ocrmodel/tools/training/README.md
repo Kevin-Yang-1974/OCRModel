@@ -46,7 +46,11 @@ MTHv2 原始整页 VQLCA C1–C5 使用 `run_mthv2_page_vqlca_ablation_tmux.sh`�
 
 ## PVLD-32 原型入口
 
-`run_variable_layout_a100.py` 是独立的 Prompted Variable-Length Layout Decoder 编排器，不修改 `run_layout_a100.py` 或 Fixed-Slot K16/K32 结果。它复用目标 GPU 利用率准入、显式 `--gpu-id/--gpu-ids`、单 run 防重复启动和 `metadata/status.txt`、`layout_training_metrics.json`、`summary.json`、完成标志等产物。没有 `visual_features` 的 manifest 时，PVLD 入口只做严格 preflight；带预计算视觉 feature 时可执行 bounded tensor smoke。该入口当前不代表 GOT2 视觉塔已经接入 PVLD，也不产生正式 whole-page 性能结论。
+`run_variable_layout_a100.py` 是 GOT2 whole-page Prompted Variable-Length Layout Decoder 编排器，不修改 `run_layout_a100.py` 或 Fixed-Slot K16/K32 历史结果。PVLD 已接入 GOT2 视觉塔和 `GOTQwenModel.forward`，输入只包含 `whole_page_image + ocr_prompt`。修复版 decoder 为 causal self-attention＋`layout_evidence=A` cross-attention＋FFN，并带真实 vocabulary FSM、previous-REGION coverage、生成期 record cap 和真实 REGION probability；OCR Value 继续只来自视觉 token。
+
+P1 默认每 `2000` steps 保存 checkpoint，全部 P1 checkpoints 作为 validation 队列保留。P1 selection 不读取 OCR CER 或 test，固定按停止错误总和、count MAE、region F1、matched/ordered bbox IoU、duplicate rate、count exact accuracy和较早 step排序；P2 从 `selection.json` 的 selected P1 启动。`P1-9000` 优于 `P1-12000` 只说明不能默认采用 final step，不代表 9000 已是最佳。
+
+有界 CUDA smoke 使用 `run_pvld_causal_cuda_smoke.sh <gpu-id> <new-run-id>`；正式 MTHv2 C3–C5 新流程使用 `run_mthv2_page_pvld_c3_c5_tmux.sh`。后者训练完成后先做 validation-only P2 checkpoint selection，再执行 selection-locked test；test 锁定 validation 的 object threshold，结果不得反向调整训练、阈值或 P1 ranking。两者都只查询命令指定 GPU 的瞬时 utilization，任一卡达到 50% 即在启动子任务前退出。
 
 selection 的 `--resume` 只复用通过模型路径、manifest、split、解码参数和 whole-page prompt-only 输入协议校验的既有 candidate summary；不一致时拒绝继续。指标兼容层把 evaluator 的 `character_edits`、`reference_characters`、`page_exact_matches` 规范化为 selection/test 的稳定总量字段。用 `tools/evaluation/run_layout_ablation_selection_smoke.sh <training-run-id> <dataset-id> <checkpoint-step>` 做 1 页断点续跑工程验证；该结果不能代替正式 validation 选点。
 

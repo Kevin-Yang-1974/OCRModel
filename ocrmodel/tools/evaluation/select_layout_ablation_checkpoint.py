@@ -73,12 +73,83 @@ def discover_candidates(model_root: Path, *, zero_shot: bool = False,
         unique.setdefault(digest, (step, path.resolve()))
     return sorted(unique.values())
 
-def select_best(candidates: list[dict[str, Any]]) -> dict[str, Any]:
+def p1_layout_rank(item: dict[str, Any]) -> tuple[float, ...]:
+    metrics = item["validation_metrics"]
+    stopping_error = (
+        1.0 - float(metrics["eos_success_rate"])
+        + float(metrics["premature_eos_rate"])
+        + float(metrics["token_cap_rate"])
+        + float(metrics["record_cap_rate"])
+    )
+    return (
+        stopping_error,
+        float(metrics["region_count_mae"]),
+        -float(metrics["complete_region_f1"]),
+        -float(metrics["matched_bbox_mean_iou"]),
+        -float(metrics["ordered_bbox_mean_iou"]),
+        float(metrics["duplicate_region_rate_iou_0_9"]),
+        -float(metrics["region_count_exact_accuracy"]),
+        float(item["optimizer_step"]),
+    )
+
+
+def select_best(
+    candidates: list[dict[str, Any]], selection_purpose: str = "ocr"
+) -> dict[str, Any]:
+    if selection_purpose == "p1_layout":
+        return min(candidates, key=p1_layout_rank)
     return min(candidates, key=lambda item: (
         float(item["validation_metrics"]["page_cer"]),
         float(item["validation_metrics"]["whitespace_normalized_page_cer"]),
         int(item["optimizer_step"]),
     ))
+
+
+def required_float(
+    mapping: dict[str, Any], name: str, *, default_if_none: float | None = None
+) -> float:
+    value = mapping.get(name)
+    if value is None:
+        if default_if_none is not None:
+            return default_if_none
+        raise KeyError(f"Missing required P1 validation metric: {name}")
+    return float(value)
+
+
+def normalize_p1_layout_metrics(summary: dict[str, Any]) -> dict[str, Any]:
+    generation = summary["layout"]
+    layout = summary["metrics"]["layout"]
+    return {
+        "eos_success_rate": required_float(generation, "eos_success_rate"),
+        "premature_eos_rate": required_float(generation, "premature_eos_rate"),
+        "token_cap_rate": required_float(generation, "max_length_truncation_rate"),
+        "record_cap_rate": required_float(
+            generation, "stopped_by_max_layout_records_rate"
+        ),
+        "region_count_mae": required_float(layout, "region_count_mae"),
+        "region_count_exact_accuracy": required_float(
+            layout, "region_count_exact_accuracy"
+        ),
+        "complete_region_precision": required_float(
+            layout, "complete_region_precision", default_if_none=0.0
+        ),
+        "complete_region_recall": required_float(
+            layout, "complete_region_recall", default_if_none=0.0
+        ),
+        "complete_region_f1": required_float(
+            layout, "complete_region_f1", default_if_none=0.0
+        ),
+        "ordered_bbox_mean_iou": required_float(
+            layout, "ordered_slot_bbox_mean_iou", default_if_none=0.0
+        ),
+        "matched_bbox_mean_iou": required_float(
+            layout, "matched_bbox_mean_iou", default_if_none=0.0
+        ),
+        "duplicate_region_rate_iou_0_9": required_float(
+            layout, "duplicate_region_rate_iou_0_9", default_if_none=0.0
+        ),
+        "true_region_count_buckets": layout["true_region_count_buckets"],
+    }
 
 def metric_value(metrics: dict[str, Any], canonical: str, legacy: str) -> Any:
     if canonical in metrics:
@@ -169,6 +240,9 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--gpu-id", default="0")
     parser.add_argument("--gpu-utilization-limit", type=int, default=DEFAULT_GPU_UTILIZATION_LIMIT)
     parser.add_argument("--resume", action="store_true")
+    parser.add_argument(
+        "--selection-purpose", choices=("ocr", "p1_layout"), default="ocr"
+    )
     return parser.parse_args(argv)
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -200,6 +274,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             "--max-new-tokens", str(args.max_new_tokens),
             "--no-repeat-ngram-size", str(args.no_repeat_ngram_size),
         ]
+        if args.selection_purpose == "p1_layout":
+            command.extend(["--require-vlqa-stage", "p1"])
         log_path = candidate_dir / "evaluator.log"
         if summary_path.is_file():
             if not args.resume:
@@ -224,23 +300,47 @@ def main(argv: Sequence[str] | None = None) -> int:
             if completed.returncode != 0 or not summary_path.is_file():
                 raise RuntimeError(f"Validation failed for checkpoint step {step}; see {log_path}.")
             summary = json.loads(summary_path.read_text(encoding="utf-8"))
-        ocr = summary["metrics"]["ocr"]
+        validation_metrics = (
+            normalize_p1_layout_metrics(summary)
+            if args.selection_purpose == "p1_layout"
+            else normalize_ocr_metrics(summary["metrics"]["ocr"])
+        )
         candidate_results.append({
             "optimizer_step": step, "model_path": str(model),
             "config_sha256": sha256(model / "config.json"),
             "weights_sha256": sha256(model / "model.safetensors"),
             "validation_summary": str(summary_path),
-            "validation_metrics": normalize_ocr_metrics(ocr),
+            "validation_metrics": validation_metrics,
+            "validation_object_threshold": summary["metrics"]["thresholds"][
+                "object_probability"
+            ],
         })
-    selected = select_best(candidate_results)
+    selected = select_best(candidate_results, args.selection_purpose)
+    if args.selection_purpose == "p1_layout":
+        primary_metric = "pre_registered_p1_layout_lexicographic_rank"
+        tie_breakers = [
+            "stopping_error_sum",
+            "region_count_mae",
+            "negative_region_f1",
+            "negative_matched_bbox_iou",
+            "negative_ordered_bbox_iou",
+            "duplicate_region_rate_iou_0_9",
+            "negative_count_exact_accuracy",
+            "earlier_optimizer_step",
+        ]
+    else:
+        primary_metric = "page_cer"
+        tie_breakers = ["whitespace_normalized_page_cer", "earlier_optimizer_step"]
     payload = {
         "status": "ok", "purpose": "layout_ablation_validation_selection",
         "ablation_id": args.ablation, "selection_split": "validation",
         "test_used_for_selection": False,
-        "primary_metric": "page_cer",
-        "tie_breakers": ["whitespace_normalized_page_cer", "earlier_optimizer_step"],
+        "selection_purpose": args.selection_purpose,
+        "primary_metric": primary_metric,
+        "tie_breakers": tie_breakers,
         "validation_manifest": str(args.validation_manifest.resolve()),
         "validation_manifest_sha256": sha256(args.validation_manifest.resolve()),
+        "locked_object_threshold": selected["validation_object_threshold"],
         "selection_physical_gpu": args.gpu_id,
         "selected": selected, "candidates": candidate_results,
     }

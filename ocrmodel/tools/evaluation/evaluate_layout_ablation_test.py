@@ -93,6 +93,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "--max-regions", str(args.max_regions), "--max-records", str(args.max_records),
         "--max-new-tokens", str(args.max_new_tokens),
         "--no-repeat-ngram-size", str(args.no_repeat_ngram_size),
+        "--object-threshold", str(selection["locked_object_threshold"]),
     ]
     log_path = output / "evaluator.log"
     require_gpu_free(args.gpu_id, args.gpu_utilization_limit)
@@ -114,6 +115,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         "test_manifest_sha256": sha256(args.test_manifest.resolve()),
         "inference_physical_gpu": args.gpu_id,
         "input_protocol": evaluator["input_protocol"], "metrics": evaluator["metrics"],
+        "locked_object_threshold": selection["locked_object_threshold"],
+        "test_threshold_source": "validation_selection",
         "inference_failures": evaluator.get("inference_failures", 0),
         "evaluator_summary": str(evaluator_summary_path),
     }

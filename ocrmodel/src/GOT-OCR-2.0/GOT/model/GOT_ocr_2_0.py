@@ -49,6 +49,14 @@ class GOTBaseModelOutputWithPast(BaseModelOutputWithPast):
     layout_generated_ids: Optional[torch.LongTensor] = None
     layout_generated_eos: Optional[torch.BoolTensor] = None
     layout_truncated: Optional[torch.BoolTensor] = None
+    layout_truncated_by_max_layout_tokens: Optional[torch.BoolTensor] = None
+    layout_stopped_by_max_layout_records: Optional[torch.BoolTensor] = None
+    layout_num_generated_regions: Optional[torch.LongTensor] = None
+    layout_num_layout_tokens: Optional[torch.LongTensor] = None
+    layout_region_token_probabilities: Optional[torch.FloatTensor] = None
+    layout_sequence_log_probability: Optional[torch.FloatTensor] = None
+    layout_coverage_summary: Optional[torch.FloatTensor] = None
+    layout_coverage_region_counts: Optional[torch.LongTensor] = None
     layout_record_mask: Optional[torch.BoolTensor] = None
     layout_type_logits: Optional[torch.FloatTensor] = None
 
@@ -82,6 +90,14 @@ class GOTCausalLMOutputWithPast(CausalLMOutputWithPast):
     layout_generated_ids: Optional[torch.LongTensor] = None
     layout_generated_eos: Optional[torch.BoolTensor] = None
     layout_truncated: Optional[torch.BoolTensor] = None
+    layout_truncated_by_max_layout_tokens: Optional[torch.BoolTensor] = None
+    layout_stopped_by_max_layout_records: Optional[torch.BoolTensor] = None
+    layout_num_generated_regions: Optional[torch.LongTensor] = None
+    layout_num_layout_tokens: Optional[torch.LongTensor] = None
+    layout_region_token_probabilities: Optional[torch.FloatTensor] = None
+    layout_sequence_log_probability: Optional[torch.FloatTensor] = None
+    layout_coverage_summary: Optional[torch.FloatTensor] = None
+    layout_coverage_region_counts: Optional[torch.LongTensor] = None
     layout_record_mask: Optional[torch.BoolTensor] = None
     layout_type_logits: Optional[torch.FloatTensor] = None
 
@@ -190,6 +206,9 @@ class GOTQwenModel(Qwen2Model):
                 direction_weight=config.vlqa_direction_weight,
             )
         if getattr(config, "variable_layout_enabled", False):
+            config.pvld_decoder_version = "causal_transformer_fsm_previous_region_v1"
+            config.pvld_decoder_memory = "layout_evidence_only"
+            config.pvld_coverage_detach = False
             config.num_layout_prompt_queries = int(
                 getattr(config, "num_layout_prompt_queries", 32)
             )
@@ -556,13 +575,36 @@ class GOTQwenModel(Qwen2Model):
         generated_ids = None
         generated_eos = None
         generated_truncated = None
+        generated_token_truncated = None
+        stopped_by_records = None
+        generated_region_counts = None
+        generated_token_counts = None
+        region_token_probabilities = None
+        sequence_log_probability = None
+        coverage_summary = None
+        coverage_region_counts = None
         record_mask = None
         record_bbox = None
         record_type_logits = None
         record_direction_logits = None
         if generate_variable_layout and generated_outputs:
+            def pad_records(value, width):
+                if value.shape[1] == width:
+                    return value
+                padding_shape = list(value.shape)
+                padding_shape[1] = width - value.shape[1]
+                return torch.cat((value, value.new_zeros(padding_shape)), dim=1)
+
+            record_width = max(output.record_mask.shape[1] for output in generated_outputs)
+            generated_width = max(
+                output.decoder_output.generated_ids.shape[1] for output in generated_outputs
+            )
             generated_ids = torch.cat(
-                [output.decoder_output.generated_ids for output in generated_outputs], dim=0
+                [
+                    pad_records(output.decoder_output.generated_ids, generated_width)
+                    for output in generated_outputs
+                ],
+                dim=0,
             )
             generated_eos = torch.cat(
                 [output.decoder_output.generated_eos for output in generated_outputs], dim=0
@@ -570,13 +612,52 @@ class GOTQwenModel(Qwen2Model):
             generated_truncated = torch.cat(
                 [output.decoder_output.truncated for output in generated_outputs], dim=0
             )
-            record_mask = torch.cat([output.record_mask for output in generated_outputs], dim=0)
-            record_bbox = torch.cat([output.record_output.bbox for output in generated_outputs], dim=0)
+            generated_token_truncated = torch.cat(
+                [output.decoder_output.truncated_by_max_layout_tokens for output in generated_outputs], dim=0
+            )
+            stopped_by_records = torch.cat(
+                [output.decoder_output.stopped_by_max_layout_records for output in generated_outputs], dim=0
+            )
+            generated_region_counts = torch.cat(
+                [output.decoder_output.num_generated_regions for output in generated_outputs], dim=0
+            )
+            generated_token_counts = torch.cat(
+                [output.decoder_output.num_layout_tokens for output in generated_outputs], dim=0
+            )
+            region_token_probabilities = torch.cat(
+                [
+                    pad_records(output.decoder_output.region_token_probabilities, record_width)
+                    for output in generated_outputs
+                ],
+                dim=0,
+            )
+            sequence_log_probability = torch.cat(
+                [output.decoder_output.sequence_log_probability for output in generated_outputs], dim=0
+            )
+            coverage_summary = torch.cat(
+                [output.decoder_output.coverage_summary for output in generated_outputs], dim=0
+            )
+            coverage_region_counts = torch.cat(
+                [output.decoder_output.coverage_region_counts for output in generated_outputs], dim=0
+            )
+            record_mask = torch.cat(
+                [pad_records(output.record_mask, record_width) for output in generated_outputs],
+                dim=0,
+            )
+            record_bbox = torch.cat(
+                [pad_records(output.record_output.bbox, record_width) for output in generated_outputs],
+                dim=0,
+            )
             record_type_logits = torch.cat(
-                [output.record_output.type_logits for output in generated_outputs], dim=0
+                [pad_records(output.record_output.type_logits, record_width) for output in generated_outputs],
+                dim=0,
             )
             record_direction_logits = torch.cat(
-                [output.record_output.direction_logits for output in generated_outputs], dim=0
+                [
+                    pad_records(output.record_output.direction_logits, record_width)
+                    for output in generated_outputs
+                ],
+                dim=0,
             )
 
         base_output = super(GOTQwenModel, self).forward(
@@ -667,6 +748,14 @@ class GOTQwenModel(Qwen2Model):
             layout_generated_ids=generated_ids,
             layout_generated_eos=generated_eos,
             layout_truncated=generated_truncated,
+            layout_truncated_by_max_layout_tokens=generated_token_truncated,
+            layout_stopped_by_max_layout_records=stopped_by_records,
+            layout_num_generated_regions=generated_region_counts,
+            layout_num_layout_tokens=generated_token_counts,
+            layout_region_token_probabilities=region_token_probabilities,
+            layout_sequence_log_probability=sequence_log_probability,
+            layout_coverage_summary=coverage_summary,
+            layout_coverage_region_counts=coverage_region_counts,
             layout_record_mask=record_mask,
             layout_type_logits=record_type_logits,
         )
@@ -830,6 +919,14 @@ class GOTQwenForCausalLM(Qwen2ForCausalLM):
             layout_generated_ids=outputs.layout_generated_ids,
             layout_generated_eos=outputs.layout_generated_eos,
             layout_truncated=outputs.layout_truncated,
+            layout_truncated_by_max_layout_tokens=outputs.layout_truncated_by_max_layout_tokens,
+            layout_stopped_by_max_layout_records=outputs.layout_stopped_by_max_layout_records,
+            layout_num_generated_regions=outputs.layout_num_generated_regions,
+            layout_num_layout_tokens=outputs.layout_num_layout_tokens,
+            layout_region_token_probabilities=outputs.layout_region_token_probabilities,
+            layout_sequence_log_probability=outputs.layout_sequence_log_probability,
+            layout_coverage_summary=outputs.layout_coverage_summary,
+            layout_coverage_region_counts=outputs.layout_coverage_region_counts,
             layout_record_mask=outputs.layout_record_mask,
             layout_type_logits=outputs.layout_type_logits,
         )

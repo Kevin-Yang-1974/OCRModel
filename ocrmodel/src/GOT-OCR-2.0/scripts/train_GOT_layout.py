@@ -568,18 +568,35 @@ def initialize_variable_layout_from_source(
             "layout_adapter_missing_keys": [],
             "layout_adapter_unexpected_keys": [],
         }
-    expected = {f"{VARIABLE_LAYOUT_STATE_PREFIX}{name}" for name in adapter.state_dict()}
+    adapter_state = adapter.state_dict()
+    expected = {f"{VARIABLE_LAYOUT_STATE_PREFIX}{name}" for name in adapter_state}
     with safe_open(str(source_weights), framework="pt", device="cpu") as handle:
         source = {
             name for name in handle.keys() if name.startswith(VARIABLE_LAYOUT_STATE_PREFIX)
         }
-    if source:
-        if source != expected:
-            raise RuntimeError("Source checkpoint contains a partial incompatible PVLD state.")
+        compatible = {}
+        incompatible_shape = []
+        for full_name in sorted(source & expected):
+            local_name = full_name[len(VARIABLE_LAYOUT_STATE_PREFIX) :]
+            value = handle.get_tensor(full_name)
+            if tuple(value.shape) == tuple(adapter_state[local_name].shape):
+                compatible[local_name] = value
+            else:
+                incompatible_shape.append(full_name)
+
+    with torch.random.fork_rng(devices=[]):
+        torch.manual_seed(0)
+        adapter.reset_parameters()
+    if compatible:
+        adapter.load_state_dict(compatible, strict=False)
+    missing = sorted(expected - {f"{VARIABLE_LAYOUT_STATE_PREFIX}{name}" for name in compatible})
+    unexpected = sorted((source - expected) | set(incompatible_shape))
+    if not source:
+        initialization = "pvld_fresh_deterministic_reset"
+    elif not missing and not unexpected:
         initialization = "pvld_checkpoint_loaded"
     else:
-        adapter.reset_parameters()
-        initialization = "pvld_fresh_deterministic_reset"
+        initialization = "pvld_legacy_checkpoint_migrated_deterministically"
     parameter_abs_max = max(
         float(parameter.detach().float().abs().max().cpu())
         for parameter in adapter.parameters()
@@ -591,8 +608,12 @@ def initialize_variable_layout_from_source(
         "layout_adapter_parameter_abs_max": parameter_abs_max,
         "layout_writeback_mode": "visual_value_layout_routing",
         "layout_writeback_source": "layout_evidence",
-        "layout_adapter_missing_keys": sorted(expected - source) if not source else [],
-        "layout_adapter_unexpected_keys": [],
+        "layout_adapter_missing_keys": missing,
+        "layout_adapter_unexpected_keys": unexpected,
+        "layout_adapter_loaded_compatible_keys": sorted(
+            f"{VARIABLE_LAYOUT_STATE_PREFIX}{name}" for name in compatible
+        ),
+        "layout_adapter_initialization_seed": 0,
     }
 
 
@@ -1152,6 +1173,22 @@ def main() -> None:
             "prompt_queries_are_region_slots": False if variable_adapter is not None else True,
             "max_layout_tokens": layout_args.max_layout_tokens,
             "max_layout_records": layout_args.max_layout_records,
+            "pvld_decoder_version": (
+                "causal_transformer_fsm_previous_region_v1"
+                if variable_adapter is not None else None
+            ),
+            "pvld_decoder_memory": (
+                "layout_evidence_only" if variable_adapter is not None else None
+            ),
+            "pvld_coverage": (
+                {
+                    "kind": "exclusive_previous_region_hidden_mean",
+                    "shape": "B,T,D",
+                    "detach": False,
+                    "full_attention_saved": False,
+                }
+                if variable_adapter is not None else None
+            ),
             "ablation_id": layout_args.ablation_id or "legacy_default",
             "layout_loss_preset": layout_args.layout_loss_preset or "legacy_explicit_weights",
             "loss_weights": {

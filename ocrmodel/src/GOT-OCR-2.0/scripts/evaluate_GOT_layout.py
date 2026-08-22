@@ -81,7 +81,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--model-max-length", type=positive_int, default=2048)
     parser.add_argument("--max-new-tokens", type=positive_int, default=2048)
     parser.add_argument("--no-repeat-ngram-size", type=nonnegative_int, default=20)
-    parser.add_argument("--object-threshold", type=probability, default=0.5)
+    parser.add_argument(
+        "--object-threshold",
+        type=probability,
+        default=None,
+        help="Default: 0.0 for PVLD (unfiltered), 0.5 for fixed-slot VLQA.",
+    )
     parser.add_argument("--iou-threshold", type=probability, default=0.5)
     parser.add_argument("--num-workers", type=nonnegative_int, default=0)
     parser.add_argument(
@@ -163,6 +168,13 @@ def require_variable_layout_predictions(outputs: Any) -> None:
         "layout_generated_ids",
         "layout_generated_eos",
         "layout_truncated",
+        "layout_truncated_by_max_layout_tokens",
+        "layout_stopped_by_max_layout_records",
+        "layout_num_generated_regions",
+        "layout_num_layout_tokens",
+        "layout_region_token_probabilities",
+        "layout_sequence_log_probability",
+        "layout_coverage_region_counts",
         "layout_record_mask",
         "layout_bbox_xyxy",
         "layout_type_logits",
@@ -336,13 +348,28 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
             for record in dataset.records
         )
     )
+    effective_object_threshold = (
+        args.object_threshold
+        if args.object_threshold is not None
+        else (0.0 if args.model_kind == "pvld" else 0.5)
+    )
     layout_accumulator = (
         LayoutValidationAccumulator(
-            object_threshold=args.object_threshold,
+            object_threshold=effective_object_threshold,
             iou_threshold=args.iou_threshold,
         )
         if has_layout_annotations
         else None
+    )
+    confidence_scan_accumulators = (
+        {
+            threshold: LayoutValidationAccumulator(
+                object_threshold=threshold, iou_threshold=args.iou_threshold
+            )
+            for threshold in (0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9)
+        }
+        if has_layout_annotations and args.model_kind == "pvld"
+        else {}
     )
     ocr_accumulator = OCRValidationAccumulator()
 
@@ -354,6 +381,7 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
     completed_pages = 0
     pvld_eos_pages = 0
     pvld_truncated_pages = 0
+    pvld_record_cap_pages = 0
     pvld_premature_eos_pages = 0
     pvld_layout_tokens = 0
     temporary_predictions = predictions_path.with_suffix(predictions_path.suffix + ".tmp")
@@ -462,7 +490,10 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
                             layout_outputs.layout_type_logits[row][valid]
                             .float().argmax(dim=-1).detach().cpu().tolist()
                         )
-                        object_scores = [1.0] * len(predicted_boxes)
+                        object_scores = (
+                            layout_outputs.layout_region_token_probabilities[row][valid]
+                            .float().detach().cpu().tolist()
+                        )
                         assert layout_accumulator is not None
                         page_metrics = layout_accumulator.add_page(
                             reference_text=batch["page_text"][row],
@@ -473,13 +504,27 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
                             predicted_boxes=predicted_boxes,
                             predicted_directions=predicted_directions,
                         )
+                        for scan_accumulator in confidence_scan_accumulators.values():
+                            scan_accumulator.add_page(
+                                reference_text=batch["page_text"][row],
+                                predicted_text=predicted_text,
+                                regions=batch["regions"][row],
+                                annotation_status=batch["layout_annotation_status"][row],
+                                object_scores=object_scores,
+                                predicted_boxes=predicted_boxes,
+                                predicted_directions=predicted_directions,
+                            )
                         eos = bool(layout_outputs.layout_generated_eos[row].item())
-                        truncated = bool(layout_outputs.layout_truncated[row].item())
-                        layout_tokens = int(
-                            layout_outputs.layout_generated_ids[row].ne(0).sum().item()
+                        truncated = bool(
+                            layout_outputs.layout_truncated_by_max_layout_tokens[row].item()
                         )
+                        stopped_by_records = bool(
+                            layout_outputs.layout_stopped_by_max_layout_records[row].item()
+                        )
+                        layout_tokens = int(layout_outputs.layout_num_layout_tokens[row].item())
                         pvld_eos_pages += int(eos)
                         pvld_truncated_pages += int(truncated)
+                        pvld_record_cap_pages += int(stopped_by_records)
                         pvld_layout_tokens += layout_tokens
                         pvld_premature_eos_pages += int(
                             eos and len(predicted_boxes) < len(batch["regions"][row])
@@ -491,7 +536,11 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
                                 "type": type_names[predicted_types[index]],
                                 "bbox": predicted_boxes[index],
                                 "direction": DIRECTION_LABELS[predicted_directions[index]],
-                                "score": 1.0,
+                                "region_token_probability": object_scores[index],
+                                "score": object_scores[index],
+                                "sequence_log_probability": float(
+                                    layout_outputs.layout_sequence_log_probability[row].item()
+                                ),
                             }
                             for index in range(len(predicted_boxes))
                         ]
@@ -552,8 +601,32 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
                             bool(layout_outputs.layout_generated_eos[row].item())
                             if args.model_kind == "pvld" and layout_outputs is not None else None
                         ),
+                        "truncated_by_max_layout_tokens": (
+                            bool(layout_outputs.layout_truncated_by_max_layout_tokens[row].item())
+                            if args.model_kind == "pvld" and layout_outputs is not None else None
+                        ),
+                        "stopped_by_max_layout_records": (
+                            bool(layout_outputs.layout_stopped_by_max_layout_records[row].item())
+                            if args.model_kind == "pvld" and layout_outputs is not None else None
+                        ),
+                        "num_generated_regions": (
+                            int(layout_outputs.layout_num_generated_regions[row].item())
+                            if args.model_kind == "pvld" and layout_outputs is not None else None
+                        ),
                         "layout_tokens": (
-                            int(layout_outputs.layout_generated_ids[row].ne(0).sum().item())
+                            int(layout_outputs.layout_num_layout_tokens[row].item())
+                            if args.model_kind == "pvld" and layout_outputs is not None else None
+                        ),
+                        "num_layout_tokens": (
+                            int(layout_outputs.layout_num_layout_tokens[row].item())
+                            if args.model_kind == "pvld" and layout_outputs is not None else None
+                        ),
+                        "sequence_log_probability": (
+                            float(layout_outputs.layout_sequence_log_probability[row].item())
+                            if args.model_kind == "pvld" and layout_outputs is not None else None
+                        ),
+                        "coverage_region_count": (
+                            int(layout_outputs.layout_coverage_region_counts[row].item())
                             if args.model_kind == "pvld" and layout_outputs is not None else None
                         ),
                         "metrics": page_metrics,
@@ -622,6 +695,18 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
                 else "not_available_for_original_got2"
             ),
             "architecture": "PVLD-32" if args.model_kind == "pvld" else "fixed_slot",
+            "decoder_version": (
+                getattr(model.config, "pvld_decoder_version", None)
+                if args.model_kind == "pvld" else None
+            ),
+            "decoder_memory": (
+                getattr(model.config, "pvld_decoder_memory", None)
+                if args.model_kind == "pvld" else None
+            ),
+            "coverage_detach": (
+                getattr(model.config, "pvld_coverage_detach", None)
+                if args.model_kind == "pvld" else None
+            ),
             "prompt_query_count": 32 if args.model_kind == "pvld" else None,
             "prompt_queries_are_region_slots": False if args.model_kind == "pvld" else None,
             "eos_success_rate": (
@@ -633,6 +718,9 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
             "max_length_truncation_rate": (
                 pvld_truncated_pages / completed_pages if args.model_kind == "pvld" else None
             ),
+            "stopped_by_max_layout_records_rate": (
+                pvld_record_cap_pages / completed_pages if args.model_kind == "pvld" else None
+            ),
             "mean_layout_tokens": (
                 pvld_layout_tokens / completed_pages if args.model_kind == "pvld" else None
             ),
@@ -641,6 +729,13 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
             layout_accumulator.summary()
             if layout_accumulator is not None
             else {"ocr": ocr_accumulator.summary(), "layout": None}
+        ),
+        "confidence_threshold_scan": (
+            {
+                str(threshold): accumulator.summary()["layout"]
+                for threshold, accumulator in confidence_scan_accumulators.items()
+            }
+            if args.model_kind == "pvld" else None
         ),
         "parameters": {
             "total": sum(parameter.numel() for parameter in model.parameters()),

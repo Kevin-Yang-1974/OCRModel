@@ -47,6 +47,31 @@ class LayoutAblationSelectionTests(unittest.TestCase):
         ]
         self.assertEqual(selection.select_best(candidates)["optimizer_step"], 2000)
 
+    def test_p1_selection_uses_validation_layout_rank_not_ocr(self) -> None:
+        def candidate(step: int, stopping: float, count_mae: float, f1: float) -> dict:
+            return {
+                "optimizer_step": step,
+                "validation_metrics": {
+                    "eos_success_rate": 1.0 - stopping,
+                    "premature_eos_rate": 0.0,
+                    "token_cap_rate": 0.0,
+                    "record_cap_rate": 0.0,
+                    "region_count_mae": count_mae,
+                    "complete_region_f1": f1,
+                    "matched_bbox_mean_iou": 0.5,
+                    "ordered_bbox_mean_iou": 0.4,
+                    "duplicate_region_rate_iou_0_9": 0.1,
+                    "region_count_exact_accuracy": 0.2,
+                },
+            }
+        candidates = [
+            candidate(12000, 0.2, 10.0, 0.5),
+            candidate(9000, 0.1, 12.0, 0.4),
+        ]
+        selected = selection.select_best(candidates, "p1_layout")
+        self.assertEqual(selected["optimizer_step"], 9000)
+        self.assertNotIn("page_cer", selected["validation_metrics"])
+
     def test_normalizes_current_evaluator_metric_names(self) -> None:
         normalized = selection.normalize_ocr_metrics({
             "page_cer": 0.2,

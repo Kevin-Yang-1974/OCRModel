@@ -20,6 +20,14 @@ class VariableLayoutOutput:
     region_positions: Optional[list[list[int]]] = None
     generated_eos: Optional[Tensor] = None
     truncated: Optional[Tensor] = None
+    truncated_by_max_layout_tokens: Optional[Tensor] = None
+    stopped_by_max_layout_records: Optional[Tensor] = None
+    num_generated_regions: Optional[Tensor] = None
+    num_layout_tokens: Optional[Tensor] = None
+    region_token_probabilities: Optional[Tensor] = None
+    sequence_log_probability: Optional[Tensor] = None
+    coverage_summary: Optional[Tensor] = None
+    coverage_region_counts: Optional[Tensor] = None
     generated_ids: Optional[Tensor] = None
 
     @property
@@ -170,10 +178,193 @@ class LayoutVocabulary:
         return [self.id_to_token[int(token_id)] for token_id in ids]
 
 
+class LayoutTokenFSM:
+    """Finite-state grammar for the actual PVLD structural vocabulary."""
+
+    EXPECT_LAYOUT = 0
+    RECORD_BOUNDARY = 1
+    EXPECT_TYPE_OPEN = 2
+    EXPECT_TYPE_VALUE = 3
+    EXPECT_TYPE_CLOSE = 4
+    EXPECT_REGION_CLOSE = 5
+    AFTER_EOS = 6
+
+    def __init__(self, vocabulary: LayoutVocabulary) -> None:
+        self.vocabulary = vocabulary
+        self.type_value_ids = tuple(
+            vocabulary.token_to_id[name]
+            for name in ("COLUMN", "ROW", "REGION")
+        )
+
+    def allowed_token_ids(
+        self,
+        state: int,
+        *,
+        region_count: int,
+        max_layout_records: Optional[int] = None,
+    ) -> tuple[int, ...]:
+        vocabulary = self.vocabulary
+        if state == self.EXPECT_LAYOUT:
+            return (vocabulary.layout_id,)
+        if state == self.RECORD_BOUNDARY:
+            if max_layout_records is not None and region_count >= max_layout_records:
+                return (vocabulary.eos_id,)
+            return (vocabulary.region_id, vocabulary.eos_id)
+        if state == self.EXPECT_TYPE_OPEN:
+            return (vocabulary.type_id,)
+        if state == self.EXPECT_TYPE_VALUE:
+            return self.type_value_ids
+        if state == self.EXPECT_TYPE_CLOSE:
+            return (vocabulary.end_type_id,)
+        if state == self.EXPECT_REGION_CLOSE:
+            return (vocabulary.end_region_id,)
+        if state == self.AFTER_EOS:
+            return (vocabulary.pad_id,)
+        raise ValueError(f"Unknown layout FSM state: {state}.")
+
+    def transition(self, state: int, token_id: int) -> tuple[int, int]:
+        vocabulary = self.vocabulary
+        if token_id not in self.allowed_token_ids(state, region_count=0):
+            raise ValueError(
+                f"Illegal layout token {vocabulary.id_to_token.get(token_id, token_id)!r} "
+                f"in FSM state {state}."
+            )
+        if state == self.EXPECT_LAYOUT:
+            return self.RECORD_BOUNDARY, 0
+        if state == self.RECORD_BOUNDARY:
+            return (
+                (self.EXPECT_TYPE_OPEN, 1)
+                if token_id == vocabulary.region_id
+                else (self.AFTER_EOS, 0)
+            )
+        if state == self.EXPECT_TYPE_OPEN:
+            return self.EXPECT_TYPE_VALUE, 0
+        if state == self.EXPECT_TYPE_VALUE:
+            return self.EXPECT_TYPE_CLOSE, 0
+        if state == self.EXPECT_TYPE_CLOSE:
+            return self.EXPECT_REGION_CLOSE, 0
+        if state == self.EXPECT_REGION_CLOSE:
+            return self.RECORD_BOUNDARY, 0
+        return self.AFTER_EOS, 0
+
+    def states_after_prefix(self, input_ids: Tensor) -> tuple[list[int], list[int]]:
+        states: list[int] = []
+        counts: list[int] = []
+        for row in input_ids.detach().cpu().tolist():
+            state = self.EXPECT_LAYOUT
+            count = 0
+            for token_id in row:
+                state, increment = self.transition(state, int(token_id))
+                count += increment
+            states.append(state)
+            counts.append(count)
+        return states, counts
+
+    def mask_logits(
+        self,
+        logits: Tensor,
+        input_ids: Tensor,
+        *,
+        max_layout_records: Optional[int] = None,
+    ) -> Tensor:
+        if logits.shape[:2] != input_ids.shape:
+            raise ValueError("FSM logits and input_ids must share [B,T].")
+        masked = logits.clone()
+        for row_index, row in enumerate(input_ids.detach().cpu().tolist()):
+            state = self.EXPECT_LAYOUT
+            count = 0
+            for position, token_id in enumerate(row):
+                state, increment = self.transition(state, int(token_id))
+                count += increment
+                allowed = self.allowed_token_ids(
+                    state,
+                    region_count=count,
+                    max_layout_records=max_layout_records,
+                )
+                invalid = torch.ones(
+                    logits.shape[-1], dtype=torch.bool, device=logits.device
+                )
+                invalid[list(allowed)] = False
+                masked[row_index, position].masked_fill_(invalid, float("-inf"))
+        return masked
+
+
 def causal_mask(length: int, device: torch.device) -> Tensor:
     if length < 1:
         raise ValueError("causal mask length must be positive.")
     return torch.triu(torch.ones(length, length, device=device, dtype=torch.bool), diagonal=1)
+
+
+class CausalLayoutDecoderBlock(nn.Module):
+    """Pre-norm causal self-attention, layout-memory attention, and FFN."""
+
+    def __init__(
+        self,
+        hidden_size: int,
+        num_heads: int,
+        feedforward_size: int,
+        dropout: float,
+    ) -> None:
+        super().__init__()
+        self.self_norm = nn.LayerNorm(hidden_size)
+        self.self_attention = nn.MultiheadAttention(
+            hidden_size, num_heads, dropout=dropout, batch_first=True
+        )
+        self.coverage_norm = nn.LayerNorm(hidden_size)
+        self.coverage_projection = nn.Linear(hidden_size, hidden_size, bias=False)
+        self.cross_norm = nn.LayerNorm(hidden_size)
+        self.cross_attention = nn.MultiheadAttention(
+            hidden_size, num_heads, dropout=dropout, batch_first=True
+        )
+        self.ffn_norm = nn.LayerNorm(hidden_size)
+        self.ffn = nn.Sequential(
+            nn.Linear(hidden_size, feedforward_size),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(feedforward_size, hidden_size),
+        )
+
+    @staticmethod
+    def previous_region_memory(hidden: Tensor, region_mask: Tensor) -> Tensor:
+        weighted = hidden * region_mask.unsqueeze(-1).to(hidden.dtype)
+        cumulative = weighted.cumsum(dim=1) - weighted
+        counts = region_mask.cumsum(dim=1) - region_mask.long()
+        return cumulative / counts.clamp_min(1).unsqueeze(-1).to(hidden.dtype)
+
+    def forward(
+        self,
+        hidden: Tensor,
+        memory: Tensor,
+        *,
+        attention_mask: Tensor,
+        target_padding_mask: Optional[Tensor],
+        memory_padding_mask: Optional[Tensor],
+        region_mask: Tensor,
+    ) -> Tensor:
+        normalized = self.self_norm(hidden)
+        self_update, _ = self.self_attention(
+            normalized,
+            normalized,
+            normalized,
+            attn_mask=attention_mask,
+            key_padding_mask=target_padding_mask,
+            need_weights=False,
+        )
+        hidden_self = hidden + self_update
+        coverage = self.previous_region_memory(hidden_self, region_mask)
+        hidden_coverage = hidden_self + self.coverage_projection(
+            self.coverage_norm(coverage)
+        )
+        normalized = self.cross_norm(hidden_coverage)
+        memory_update, _ = self.cross_attention(
+            normalized,
+            memory,
+            memory,
+            key_padding_mask=memory_padding_mask,
+            need_weights=False,
+        )
+        hidden_memory = hidden_coverage + memory_update
+        return hidden_memory + self.ffn(self.ffn_norm(hidden_memory))
 
 
 class VariableLayoutDecoder(nn.Module):
@@ -190,6 +381,7 @@ class VariableLayoutDecoder(nn.Module):
         feedforward_size: Optional[int] = None,
         max_layout_tokens: int = 2048,
         dropout: float = 0.0,
+        vocabulary: Optional[LayoutVocabulary] = None,
     ) -> None:
         super().__init__()
         if vocab_size < 2 or hidden_size < 1 or visual_size < 1:
@@ -202,49 +394,32 @@ class VariableLayoutDecoder(nn.Module):
         self.hidden_size = hidden_size
         self.visual_size = visual_size
         self.max_layout_tokens = max_layout_tokens
+        self.vocabulary = vocabulary or LayoutVocabulary()
+        if self.vocabulary.vocab_size != vocab_size:
+            raise ValueError("vocab_size does not match the supplied LayoutVocabulary.")
+        self.fsm = LayoutTokenFSM(self.vocabulary)
         self.embedding = nn.Embedding(vocab_size, hidden_size)
         self.position_embedding = nn.Embedding(max_layout_tokens, hidden_size)
         self.prompt_attention = LayoutPromptCrossAttention(
             visual_size, hidden_size, num_prompts, num_heads, dropout
         )
-        memory_projection = (
-            nn.Identity() if visual_size == hidden_size else nn.Linear(visual_size, hidden_size)
-        )
-        self.memory_projection = memory_projection
-        self.decoder_norms = nn.ModuleList(
-            nn.LayerNorm(hidden_size) for _ in range(num_layers)
-        )
         self.decoder_blocks = nn.ModuleList(
-            nn.Sequential(
-                nn.Linear(hidden_size, feedforward_size or hidden_size * 4),
-                nn.GELU(),
-                nn.Dropout(dropout),
-                nn.Linear(feedforward_size or hidden_size * 4, hidden_size),
+            CausalLayoutDecoderBlock(
+                hidden_size,
+                num_heads,
+                feedforward_size or hidden_size * 4,
+                dropout,
             )
             for _ in range(num_layers)
-        )
-        self.memory_attention = nn.MultiheadAttention(
-            hidden_size, num_heads, dropout=dropout, batch_first=True
         )
         self.output_norm = nn.LayerNorm(hidden_size)
         self.token_head = nn.Linear(hidden_size, vocab_size)
 
     def _memory(
         self,
-        visual_tokens: Tensor,
         layout_evidence: Tensor,
-        visual_padding_mask: Optional[Tensor],
     ) -> tuple[Tensor, Optional[Tensor]]:
-        visual = self.memory_projection(visual_tokens)
-        memory = torch.cat((visual, layout_evidence), dim=1)
-        if visual_padding_mask is None:
-            return memory, None
-        prompt_mask = torch.zeros(
-            (visual_padding_mask.shape[0], layout_evidence.shape[1]),
-            dtype=torch.bool,
-            device=visual_padding_mask.device,
-        )
-        return memory, torch.cat((visual_padding_mask, prompt_mask), dim=1)
+        return layout_evidence, None
 
     def forward(
         self,
@@ -254,6 +429,7 @@ class VariableLayoutDecoder(nn.Module):
         layout_evidence: Optional[Tensor] = None,
         prompt_attention: Optional[Tensor] = None,
         target_padding_mask: Optional[Tensor] = None,
+        max_layout_records: Optional[int] = None,
     ) -> VariableLayoutOutput:
         if input_ids.ndim != 2:
             raise ValueError("input_ids must have shape [B,T].")
@@ -265,30 +441,39 @@ class VariableLayoutDecoder(nn.Module):
             )
         positions = torch.arange(input_ids.shape[1], device=input_ids.device)
         target = self.embedding(input_ids) + self.position_embedding(positions).unsqueeze(0)
-        memory, memory_padding_mask = self._memory(
-            visual_tokens, layout_evidence, visual_padding_mask
-        )
-        denominators = torch.arange(
-            1, target.shape[1] + 1, device=target.device, dtype=target.dtype
-        ).view(1, -1, 1)
-        recurrent = target.cumsum(dim=1) / denominators
-        for norm, block in zip(self.decoder_norms, self.decoder_blocks):
-            recurrent = recurrent + block(norm(recurrent))
-        memory_update, _ = self.memory_attention(
-            query=recurrent,
-            key=memory,
-            value=memory,
-            key_padding_mask=memory_padding_mask,
-            need_weights=False,
-        )
-        hidden = self.output_norm(recurrent + memory_update)
+        memory, memory_padding_mask = self._memory(layout_evidence)
+        hidden = target
+        region_mask = input_ids.eq(self.vocabulary.region_id)
+        mask = causal_mask(input_ids.shape[1], input_ids.device)
+        for block in self.decoder_blocks:
+            hidden = block(
+                hidden,
+                memory,
+                attention_mask=mask,
+                target_padding_mask=target_padding_mask,
+                memory_padding_mask=memory_padding_mask,
+                region_mask=region_mask,
+            )
+        hidden = self.output_norm(hidden)
         if target_padding_mask is not None:
             hidden = hidden.masked_fill(target_padding_mask.unsqueeze(-1), 0.0)
+        logits = self.fsm.mask_logits(
+            self.token_head(hidden),
+            input_ids,
+            max_layout_records=max_layout_records,
+        )
+        coverage_counts = region_mask.sum(dim=1)
+        coverage_summary = (
+            (hidden * region_mask.unsqueeze(-1).to(hidden.dtype)).sum(dim=1)
+            / coverage_counts.clamp_min(1).unsqueeze(-1).to(hidden.dtype)
+        )
         return VariableLayoutOutput(
-            logits=self.token_head(hidden),
+            logits=logits,
             hidden_states=hidden,
             layout_evidence=layout_evidence,
             prompt_attention=prompt_attention,
+            coverage_summary=coverage_summary,
+            coverage_region_counts=coverage_counts,
         )
 
     @torch.no_grad()
@@ -301,12 +486,17 @@ class VariableLayoutDecoder(nn.Module):
         eos_id: int,
         pad_id: int,
         max_layout_tokens: Optional[int] = None,
+        max_layout_records: Optional[int] = None,
         visual_padding_mask: Optional[Tensor] = None,
         layout_evidence: Optional[Tensor] = None,
     ) -> VariableLayoutOutput:
         limit = max_layout_tokens or self.max_layout_tokens
         if limit < 2:
             raise ValueError("max_layout_tokens must be at least 2.")
+        if limit > self.max_layout_tokens:
+            raise ValueError("generation limit exceeds configured max_layout_tokens.")
+        if max_layout_records is not None and max_layout_records < 0:
+            raise ValueError("max_layout_records must be non-negative.")
         batch = visual_tokens.shape[0]
         device = visual_tokens.device
         prompt_attention = None
@@ -316,36 +506,51 @@ class VariableLayoutDecoder(nn.Module):
             )
         generated = torch.full((batch, 1), layout_id, dtype=torch.long, device=device)
         finished = torch.zeros(batch, dtype=torch.bool, device=device)
-        memory, memory_padding_mask = self._memory(
-            visual_tokens, layout_evidence, visual_padding_mask
-        )
-        running_sum = torch.zeros(
-            (batch, self.hidden_size), device=device, dtype=layout_evidence.dtype
-        )
         region_positions: list[list[int]] = [[] for _ in range(batch)]
-        for position in range(limit - 1):
-            current = generated[:, -1:]
-            target = self.embedding(current) + self.position_embedding(
-                torch.tensor([position], device=device)
-            ).unsqueeze(0)
-            running_sum = running_sum + target[:, 0]
-            recurrent = (running_sum / float(position + 1)).unsqueeze(1)
-            for norm, block in zip(self.decoder_norms, self.decoder_blocks):
-                recurrent = recurrent + block(norm(recurrent))
-            memory_update, _ = self.memory_attention(
-                query=recurrent,
-                key=memory,
-                value=memory,
-                key_padding_mask=memory_padding_mask,
-                need_weights=False,
+        region_probabilities: list[list[float]] = [[] for _ in range(batch)]
+        region_counts = torch.zeros(batch, dtype=torch.long, device=device)
+        stopped_by_records = torch.zeros(batch, dtype=torch.bool, device=device)
+        sequence_log_probability = torch.zeros(
+            batch, dtype=layout_evidence.dtype, device=device
+        )
+        for _ in range(limit - 1):
+            step_output = self.forward(
+                generated,
+                visual_tokens,
+                visual_padding_mask,
+                layout_evidence,
+                prompt_attention,
+                generated.eq(pad_id),
+                max_layout_records=max_layout_records,
             )
-            step_hidden = self.output_norm(recurrent + memory_update)
-            next_ids = self.token_head(step_hidden[:, 0]).argmax(dim=-1)
+            step_logits = step_output.logits[:, -1]
+            probabilities = step_logits.softmax(dim=-1)
+            states, counts = self.fsm.states_after_prefix(generated)
+            if max_layout_records is not None:
+                for row, (state, count) in enumerate(zip(states, counts)):
+                    if (
+                        not bool(finished[row])
+                        and state == self.fsm.RECORD_BOUNDARY
+                        and count >= max_layout_records
+                    ):
+                        stopped_by_records[row] = True
+            next_ids = step_logits.argmax(dim=-1)
             next_ids = torch.where(finished, torch.full_like(next_ids, pad_id), next_ids)
             for row, token_id in enumerate(next_ids.tolist()):
                 if not finished[row] and token_id == region_id:
                     region_positions[row].append(generated.shape[1])
+                    region_probabilities[row].append(
+                        float(probabilities[row, region_id].detach().cpu())
+                    )
+            active = ~finished
+            selected_probability = probabilities.gather(1, next_ids[:, None]).squeeze(1)
+            sequence_log_probability = sequence_log_probability + torch.where(
+                active,
+                selected_probability.clamp_min(torch.finfo(probabilities.dtype).tiny).log(),
+                torch.zeros_like(selected_probability),
+            )
             generated = torch.cat((generated, next_ids[:, None]), dim=1)
+            region_counts += active & next_ids.eq(region_id)
             finished |= next_ids.eq(eos_id)
             if bool(finished.all()):
                 break
@@ -356,7 +561,16 @@ class VariableLayoutDecoder(nn.Module):
             layout_evidence,
             prompt_attention,
             generated.eq(pad_id),
+            max_layout_records=max_layout_records,
         )
+        probability_width = max((len(row) for row in region_probabilities), default=0)
+        region_probability_tensor = layout_evidence.new_zeros((batch, probability_width))
+        for row, values in enumerate(region_probabilities):
+            if values:
+                region_probability_tensor[row, : len(values)] = torch.tensor(
+                    values, dtype=layout_evidence.dtype, device=device
+                )
+        truncated = ~finished
         return VariableLayoutOutput(
             logits=final_output.logits,
             hidden_states=final_output.hidden_states,
@@ -364,7 +578,15 @@ class VariableLayoutDecoder(nn.Module):
             prompt_attention=prompt_attention,
             region_positions=region_positions,
             generated_eos=finished,
-            truncated=~finished,
+            truncated=truncated,
+            truncated_by_max_layout_tokens=truncated,
+            stopped_by_max_layout_records=stopped_by_records,
+            num_generated_regions=region_counts,
+            num_layout_tokens=generated.ne(pad_id).sum(dim=1),
+            region_token_probabilities=region_probability_tensor,
+            sequence_log_probability=sequence_log_probability,
+            coverage_summary=final_output.coverage_summary,
+            coverage_region_counts=final_output.coverage_region_counts,
             generated_ids=generated,
         )
 
@@ -576,6 +798,7 @@ class PromptedVariableLayoutAdapter(nn.Module):
             num_heads=num_heads,
             max_layout_tokens=max_layout_tokens,
             dropout=dropout,
+            vocabulary=self.vocabulary,
         )
         self.record_heads = LayoutRecordHeads(
             hidden_size,
@@ -667,6 +890,7 @@ class PromptedVariableLayoutAdapter(nn.Module):
                 target_padding_mask=(
                     ~layout_attention_mask.bool() if layout_attention_mask is not None else None
                 ),
+                max_layout_records=self.max_layout_records,
             )
             if layout_region_positions is None or layout_record_mask is None:
                 raise ValueError("PVLD training requires REGION positions and record mask.")
@@ -696,6 +920,7 @@ class PromptedVariableLayoutAdapter(nn.Module):
                 eos_id=self.vocabulary.eos_id,
                 pad_id=self.vocabulary.pad_id,
                 max_layout_tokens=self.max_layout_tokens,
+                max_layout_records=self.max_layout_records,
                 visual_padding_mask=high_resolution_padding_mask,
                 layout_evidence=layout_evidence,
             )
