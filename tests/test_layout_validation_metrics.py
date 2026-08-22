@@ -124,6 +124,50 @@ class LayoutValidationMetricTests(unittest.TestCase):
         self.assertEqual(page["layout"]["region_recall"], 1.0)
         self.assertIsNone(page["layout"]["region_precision"])
 
+    def test_degenerate_prediction_is_counted_but_not_matched(self) -> None:
+        accumulator = metrics.LayoutValidationAccumulator()
+        page = accumulator.add_page(
+            reference_text="x",
+            predicted_text="x",
+            regions=[region(0, [0.1, 0.1, 0.4, 0.4], "unknown")],
+            annotation_status="complete",
+            object_scores=[0.9, 0.9],
+            predicted_boxes=[
+                [0.1, 0.1, 0.4, 0.4],
+                [0.5, 0.2, 0.5, 0.7],
+            ],
+            predicted_directions=[4, 4],
+        )
+        self.assertEqual(page["layout"]["predicted_regions"], 2)
+        self.assertEqual(page["layout"]["invalid_predicted_boxes"], 1)
+        self.assertEqual(page["layout"]["matched_regions"], 1)
+        self.assertEqual(page["layout"]["region_precision"], 0.5)
+        self.assertEqual(
+            accumulator.summary()["layout"]["invalid_predicted_boxes"], 1
+        )
+
+    def test_duplicate_count_and_true_count_buckets_are_aggregated(self) -> None:
+        accumulator = metrics.LayoutValidationAccumulator(object_threshold=0.0)
+        predictions = [
+            [0.1, 0.1, 0.4, 0.4],
+            [0.1, 0.1, 0.4, 0.4],
+        ]
+        page = accumulator.add_page(
+            reference_text="x",
+            predicted_text="x",
+            regions=[region(0, [0.1, 0.1, 0.4, 0.4], "unknown")],
+            annotation_status="complete",
+            object_scores=[0.8, 0.3],
+            predicted_boxes=predictions,
+            predicted_directions=[4, 4],
+        )
+        self.assertEqual(page["layout"]["duplicate_regions_iou_0_9"], 2)
+        summary = accumulator.summary()["layout"]
+        self.assertEqual(summary["region_count_mae"], 1.0)
+        self.assertEqual(summary["region_count_exact_accuracy"], 0.0)
+        self.assertEqual(summary["duplicate_region_rate_iou_0_9"], 1.0)
+        self.assertEqual(summary["true_region_count_buckets"]["0-8"]["pages"], 1)
+
 
 if __name__ == "__main__":
     unittest.main()

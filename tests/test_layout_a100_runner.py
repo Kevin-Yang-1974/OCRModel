@@ -86,7 +86,7 @@ class LayoutA100RunnerTests(unittest.TestCase):
 
     def test_ablation_training_command_carries_strict_contract(self) -> None:
         settings = runner.resolve_settings(self.formal_ablation_args(
-            "vlqa_ocr_only", "--p2-max-steps", "8000"
+            "vlqa_ocr_only", "--p2-max-steps", "8000", "--checkpoint-steps", "3000"
         ))
         command = runner.build_training_command(
             settings, stage="p2", source_model=self.tmp_path / "original",
@@ -95,6 +95,7 @@ class LayoutA100RunnerTests(unittest.TestCase):
         self.assertEqual(option_value(command, "--ablation_id"), "vlqa_ocr_only")
         self.assertEqual(option_value(command, "--layout_loss_preset"), "layout_none")
         self.assertEqual(option_value(command, "--layout_loss_weight"), "0")
+        self.assertEqual(option_value(command, "--save_total_limit"), "2")
 
     def test_direct_groups_reject_p1_and_a5_requires_p1(self) -> None:
         with self.assertRaisesRegex(runner.RunFailure, "direct P2"):

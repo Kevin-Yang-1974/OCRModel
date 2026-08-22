@@ -139,6 +139,13 @@ def _validated_box(value: Sequence[float], context: str) -> tuple[float, float, 
     return box
 
 
+def _prediction_box(value: Sequence[float]) -> tuple[float, float, float, float] | None:
+    try:
+        return _validated_box(value, "predicted box")
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
 def box_iou(first: Sequence[float], second: Sequence[float]) -> float:
     first_box = _validated_box(first, "first box")
     second_box = _validated_box(second, "second box")
@@ -155,6 +162,28 @@ def box_iou(first: Sequence[float], second: Sequence[float]) -> float:
     second_area = (second_box[2] - second_box[0]) * (second_box[3] - second_box[1])
     union = first_area + second_area - intersection
     return intersection / union if union > 0.0 else 0.0
+
+
+def duplicate_region_count(
+    boxes: Sequence[tuple[float, float, float, float] | None],
+    threshold: float = 0.9,
+) -> int:
+    valid = [box for box in boxes if box is not None]
+    return sum(
+        any(index != other and box_iou(box, candidate) >= threshold
+            for other, candidate in enumerate(valid))
+        for index, box in enumerate(valid)
+    )
+
+
+def region_count_bucket(count: int) -> str:
+    if count <= 8:
+        return "0-8"
+    if count <= 16:
+        return "9-16"
+    if count <= 32:
+        return "17-32"
+    return ">32"
 
 
 @dataclass
@@ -318,10 +347,7 @@ def evaluate_page(
     scores = [float(score) for score in object_scores]
     if any(not math.isfinite(score) or not 0.0 <= score <= 1.0 for score in scores):
         raise ValueError("Object scores must be finite probabilities in [0, 1].")
-    boxes = [
-        _validated_box(box, f"predicted_boxes[{index}]")
-        for index, box in enumerate(predicted_boxes)
-    ]
+    boxes = [_prediction_box(box) for box in predicted_boxes]
     directions = [int(direction) for direction in predicted_directions]
     if any(direction < 0 or direction >= len(DIRECTION_LABELS) for direction in directions):
         raise ValueError("Predicted direction indices are out of range.")
@@ -336,19 +362,22 @@ def evaluate_page(
     positive_indices = [
         index for index, score in enumerate(scores) if score >= object_threshold
     ]
-    positive_boxes = [boxes[index] for index in positive_indices]
+    matchable_indices = [index for index in positive_indices if boxes[index] is not None]
+    positive_boxes = [boxes[index] for index in matchable_indices]
     target_boxes = [region["bbox"] for region in validated_regions]
     relative_matches = match_regions(positive_boxes, target_boxes, iou_threshold)
     matches = [
         {
             **match,
-            "prediction_index": positive_indices[int(match["prediction_index"])],
+            "prediction_index": matchable_indices[int(match["prediction_index"])],
         }
         for match in relative_matches
     ]
 
     ordered_ious = [
-        box_iou(boxes[index], region["bbox"]) if index < len(boxes) else 0.0
+        box_iou(boxes[index], region["bbox"])
+        if index < len(boxes) and boxes[index] is not None
+        else 0.0
         for index, region in enumerate(validated_regions)
     ]
     ordered_object_hits = sum(
@@ -381,6 +410,7 @@ def evaluate_page(
 
     pair_count = concordant_pairs + discordant_pairs
     matched_iou_sum = sum(float(match["iou"]) for match in matches)
+    duplicate_regions = duplicate_region_count([boxes[index] for index in positive_indices])
     page: dict[str, Any] = {
         "ocr": {
             **ocr_metrics,
@@ -389,6 +419,8 @@ def evaluate_page(
             "annotation_status": annotation_status,
             "ground_truth_regions": len(validated_regions),
             "predicted_regions": len(positive_indices),
+            "invalid_predicted_boxes": sum(box is None for box in boxes),
+            "duplicate_regions_iou_0_9": duplicate_regions,
             "matched_regions": len(matches),
             "region_recall": safe_ratio(len(matches), len(validated_regions)),
             "region_precision": (
@@ -456,6 +488,10 @@ class LayoutValidationAccumulator:
         self.complete_regions = 0
         self.complete_predictions = 0
         self.complete_matches = 0
+        self.invalid_predicted_boxes = 0
+        self.duplicate_regions = 0
+        self.count_absolute_error = 0
+        self.count_exact_pages = 0
         self.ordered_object_hits = 0
         self.ordered_bbox_iou_sum = 0.0
         self.ordered_direction_hits = 0
@@ -464,6 +500,19 @@ class LayoutValidationAccumulator:
         self.reading_order_concordant = 0
         self.reading_order_discordant = 0
         self.reading_order_pages_evaluable = 0
+        self.region_count_buckets = {
+            name: {
+                "pages": 0,
+                "ground_truth_regions": 0,
+                "predicted_regions": 0,
+                "matched_regions": 0,
+                "absolute_count_error": 0,
+                "ordered_bbox_iou_sum": 0.0,
+                "matched_bbox_iou_sum": 0.0,
+                "duplicate_regions_iou_0_9": 0,
+            }
+            for name in ("0-8", "9-16", "17-32", ">32")
+        }
 
     def add_page(self, **kwargs: Any) -> dict[str, Any]:
         page = evaluate_page(
@@ -495,6 +544,22 @@ class LayoutValidationAccumulator:
             self.complete_regions += ground_truth_regions
             self.complete_predictions += int(layout["predicted_regions"])
             self.complete_matches += matched_regions
+            predicted_regions = int(layout["predicted_regions"])
+            self.count_absolute_error += abs(predicted_regions - ground_truth_regions)
+            self.count_exact_pages += int(predicted_regions == ground_truth_regions)
+            bucket = self.region_count_buckets[region_count_bucket(ground_truth_regions)]
+            bucket["pages"] += 1
+            bucket["ground_truth_regions"] += ground_truth_regions
+            bucket["predicted_regions"] += predicted_regions
+            bucket["matched_regions"] += matched_regions
+            bucket["absolute_count_error"] += abs(predicted_regions - ground_truth_regions)
+            bucket["ordered_bbox_iou_sum"] += float(counts["ordered_bbox_iou_sum"])
+            bucket["matched_bbox_iou_sum"] += float(counts["matched_bbox_iou_sum"])
+            bucket["duplicate_regions_iou_0_9"] += int(
+                layout["duplicate_regions_iou_0_9"]
+            )
+        self.invalid_predicted_boxes += int(layout["invalid_predicted_boxes"])
+        self.duplicate_regions += int(layout["duplicate_regions_iou_0_9"])
         self.ordered_object_hits += int(counts["ordered_object_hits"])
         self.ordered_bbox_iou_sum += float(counts["ordered_bbox_iou_sum"])
         self.ordered_direction_hits += int(counts["ordered_direction_hits"])
@@ -518,6 +583,37 @@ class LayoutValidationAccumulator:
                 else 0.0
             )
         reading_pairs = self.reading_order_concordant + self.reading_order_discordant
+        bucket_summary = {}
+        for name, bucket in self.region_count_buckets.items():
+            precision = safe_ratio(bucket["matched_regions"], bucket["predicted_regions"])
+            recall = safe_ratio(bucket["matched_regions"], bucket["ground_truth_regions"])
+            denominator = (precision or 0.0) + (recall or 0.0)
+            bucket_summary[name] = {
+                **bucket,
+                "mean_ground_truth_regions": safe_ratio(
+                    bucket["ground_truth_regions"], bucket["pages"]
+                ),
+                "mean_predicted_regions": safe_ratio(
+                    bucket["predicted_regions"], bucket["pages"]
+                ),
+                "count_mae": safe_ratio(bucket["absolute_count_error"], bucket["pages"]),
+                "region_precision": precision,
+                "region_recall": recall,
+                "region_f1": (
+                    2.0 * precision * recall / denominator
+                    if precision is not None and recall is not None and denominator > 0.0
+                    else 0.0
+                ),
+                "ordered_bbox_mean_iou": safe_ratio(
+                    bucket["ordered_bbox_iou_sum"], bucket["ground_truth_regions"]
+                ),
+                "matched_bbox_mean_iou": safe_ratio(
+                    bucket["matched_bbox_iou_sum"], bucket["matched_regions"]
+                ),
+                "duplicate_region_rate_iou_0_9": safe_ratio(
+                    bucket["duplicate_regions_iou_0_9"], bucket["predicted_regions"]
+                ),
+            }
         return {
             "thresholds": {
                 "object_probability": self.object_threshold,
@@ -557,6 +653,17 @@ class LayoutValidationAccumulator:
                 "complete_ground_truth_regions": self.complete_regions,
                 "complete_predicted_regions": self.complete_predictions,
                 "complete_matched_regions": self.complete_matches,
+                "invalid_predicted_boxes": self.invalid_predicted_boxes,
+                "region_count_mae": safe_ratio(
+                    self.count_absolute_error, self.complete_pages
+                ),
+                "region_count_exact_accuracy": safe_ratio(
+                    self.count_exact_pages, self.complete_pages
+                ),
+                "duplicate_regions_iou_0_9": self.duplicate_regions,
+                "duplicate_region_rate_iou_0_9": safe_ratio(
+                    self.duplicate_regions, self.complete_predictions
+                ),
                 "complete_region_precision": complete_precision,
                 "complete_region_recall": complete_recall,
                 "complete_region_f1": complete_f1,
@@ -590,5 +697,6 @@ class LayoutValidationAccumulator:
                     self.reading_order_concordant - self.reading_order_discordant,
                     reading_pairs,
                 ),
+                "true_region_count_buckets": bucket_summary,
             },
         }

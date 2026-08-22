@@ -47,7 +47,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--layout-decoder-num-heads", type=int, default=8)
     parser.add_argument("--p1-max-steps", type=int, default=12000)
     parser.add_argument("--p2-max-steps", type=int, default=30000)
-    parser.add_argument("--checkpoint-steps", type=int, default=3000)
+    parser.add_argument("--checkpoint-steps", type=int, default=2000)
+    parser.add_argument("--checkpoint-retention", type=int, default=2)
     parser.add_argument("--per-device-batch-size", type=int, default=1)
     parser.add_argument("--gradient-accumulation-steps", type=int, default=1)
     parser.add_argument("--p1-learning-rate", type=float, default=1e-4)
@@ -56,6 +57,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gpu-ids", required=True)
     parser.add_argument("--gpu-utilization-limit", type=int, default=50)
     parser.add_argument("--run-id", required=True)
+    parser.add_argument("--resume-existing-run", action="store_true")
     parser.add_argument(
         "--runs-root",
         type=Path,
@@ -96,6 +98,12 @@ def training_command(args: argparse.Namespace, stage: str, source: Path, output:
     learning_rate = args.p1_learning_rate if stage == "p1" else args.p2_learning_rate
     ocr_weight = "0" if stage == "p1" else "1"
     deepspeed = Path(sys.executable).with_name("deepspeed")
+    checkpoint_retention = args.checkpoint_retention
+    if stage == "p1":
+        checkpoint_retention = max(
+            checkpoint_retention,
+            math.ceil(args.p1_max_steps / args.checkpoint_steps),
+        )
     command = [
         str(deepspeed), "--master_port", str(free_port()),
         str(args.project_root / "scripts" / "train_GOT_layout.py"),
@@ -132,6 +140,7 @@ def training_command(args: argparse.Namespace, stage: str, source: Path, output:
         "--evaluation_strategy", "no",
         "--save_strategy", "steps",
         "--save_steps", str(args.checkpoint_steps),
+        "--save_total_limit", str(checkpoint_retention),
         "--save_safetensors", "True",
         "--logging_steps", "1",
         "--model_max_length", "2048",
@@ -156,14 +165,45 @@ def training_command(args: argparse.Namespace, stage: str, source: Path, output:
     return command
 
 
+def p1_selection_command(
+    args: argparse.Namespace,
+    model_root: Path,
+    output_dir: Path,
+    gpu_id: str,
+) -> list[str]:
+    command = [
+        sys.executable,
+        str(Path(__file__).resolve().parents[1] / "evaluation" / "select_layout_ablation_checkpoint.py"),
+        "--ablation", args.ablation,
+        "--model-root", str(model_root),
+        "--model-kind", "pvld",
+        "--selection-purpose", "p1_layout",
+        "--tokenizer-model", str(args.tokenizer_model),
+        "--validation-manifest", str(args.validation_manifest),
+        "--validation-image-root", str(args.validation_manifest.parent),
+        "--output-dir", str(output_dir),
+        "--project-root", str(args.project_root),
+        "--max-regions", str(args.max_layout_records),
+        "--max-records", "0",
+        "--max-new-tokens", str(args.max_layout_tokens),
+        "--no-repeat-ngram-size", "20",
+        "--gpu-id", gpu_id,
+        "--gpu-utilization-limit", str(args.gpu_utilization_limit),
+    ]
+    if (output_dir / "selection.json").is_file():
+        command.append("--resume")
+    return command
+
+
 def main() -> int:
     args = parse_args()
     ids, utilization = target_gpus(args.gpu_ids, args.gpu_utilization_limit)
     run_root = args.runs_root.resolve() / args.run_id
-    if run_root.exists():
-        raise FileExistsError(f"run already exists: {run_root}")
+    if run_root.exists() != args.resume_existing_run:
+        expected = "existing" if args.resume_existing_run else "new"
+        raise FileExistsError(f"expected {expected} run directory: {run_root}")
     metadata = run_root / "metadata"
-    metadata.mkdir(parents=True)
+    metadata.mkdir(parents=True, exist_ok=args.resume_existing_run)
     status = {
         "status": "running",
         "run_id": args.run_id,
@@ -175,16 +215,29 @@ def main() -> int:
         "train_manifest": str(args.manifest.resolve()),
         "validation_manifest": str(args.validation_manifest.resolve()),
         "test_manifest": str(args.test_manifest.resolve()),
+        "resumed_from_existing_run": args.resume_existing_run,
     }
     (metadata / "status.txt").write_text(compact(status) + "\n", encoding="utf-8")
     environment = dict(os.environ)
     environment["CUDA_VISIBLE_DEVICES"] = ",".join(ids)
     source = args.source_model.resolve()
     stage_metrics: dict[str, Any] = {}
+    if args.resume_existing_run:
+        p1_metrics = run_root / "p1" / "model" / "layout_training_metrics.json"
+        if p1_metrics.is_file():
+            metrics = json.loads(p1_metrics.read_text(encoding="utf-8"))
+            stage_metrics["p1"] = {
+                "global_step": int(metrics["global_step"]),
+                "train_loss": float(metrics["train_loss"]),
+                "model": str(p1_metrics.parent),
+                "metrics": str(p1_metrics),
+                "reused_completed_stage": True,
+            }
     for stage in args.stages.split(","):
         output = run_root / stage / "model"
-        output.mkdir(parents=True)
-        log_path = run_root / stage / "train.log"
+        output.mkdir(parents=True, exist_ok=args.resume_existing_run)
+        log_name = "train.recovery.log" if args.resume_existing_run else "train.log"
+        log_path = run_root / stage / log_name
         status.update({"stage": stage, "stage_status": "running"})
         (metadata / "status.txt").write_text(compact(status) + "\n", encoding="utf-8")
         with log_path.open("x", encoding="utf-8") as log:
@@ -214,12 +267,60 @@ def main() -> int:
             "log": str(log_path),
         }
         source = output
+        if stage == "p1" and args.ablation == "vlqa_layout_p1_p2":
+            selection_dir = run_root / "p1" / "validation_selection"
+            selection_log = run_root / "p1" / "validation_selection.log"
+            status.update({"stage": "p1_validation_selection", "stage_status": "running"})
+            (metadata / "status.txt").write_text(
+                compact(status) + "\n", encoding="utf-8"
+            )
+            with selection_log.open("a", encoding="utf-8") as log:
+                selected = subprocess.run(
+                    p1_selection_command(args, output, selection_dir, ids[0]),
+                    cwd=Path(__file__).resolve().parents[2],
+                    env=dict(os.environ),
+                    stdout=log,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                )
+            selection_path = selection_dir / "selection.json"
+            if selected.returncode or not selection_path.is_file():
+                status.update(
+                    {
+                        "status": "failed",
+                        "stage_status": "p1_validation_selection_failed",
+                        "log": str(selection_log),
+                    }
+                )
+                (metadata / "status.txt").write_text(
+                    compact(status) + "\n", encoding="utf-8"
+                )
+                raise RuntimeError(
+                    f"PVLD P1 validation selection failed; see {selection_log}"
+                )
+            selection = json.loads(selection_path.read_text(encoding="utf-8"))
+            if selection.get("selection_split") != "validation" or selection.get(
+                "test_used_for_selection"
+            ) is not False:
+                raise RuntimeError("P1 selection did not preserve validation-only protocol.")
+            source = Path(selection["selected"]["model_path"]).resolve()
+            stage_metrics["p1"].update(
+                {
+                    "validation_selection": str(selection_path),
+                    "selected_model": str(source),
+                    "selected_optimizer_step": int(
+                        selection["selected"]["optimizer_step"]
+                    ),
+                    "p2_source_is_validation_selected_p1": True,
+                }
+            )
     status.update({
         "status": "training_completed",
         "stage_status": "completed",
         "completed_at": datetime.now().astimezone().isoformat(timespec="seconds"),
         "stages": stage_metrics,
         "final_model": str(source),
+        "completed_via_recovery": args.resume_existing_run,
     })
     (metadata / "status.txt").write_text(compact(status) + "\n", encoding="utf-8")
     write_json(run_root / "layout_training_metrics.json", stage_metrics)

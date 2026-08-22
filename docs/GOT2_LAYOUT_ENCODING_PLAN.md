@@ -1,6 +1,6 @@
 # GOT2 整页端到端布局查询方案
 
-> 方案备案（2026-08-20）：本文同时保留 Fixed-Slot VLQA baseline，并记录独立的 Prompted Variable-Length Layout Decoder（PVLD-32）工程候选。PVLD-32 不覆盖、替换或改写既有 Fixed-Slot 代码和结果。
+> 实现备案（2026-08-22）：本文同时保留 Fixed-Slot VLQA baseline，并记录独立的 Prompted Variable-Length Layout Decoder（PVLD-32）工程候选。PVLD-32 不覆盖、替换或改写既有 Fixed-Slot 代码和结果；当前 causal decoder＋FSM＋previous-region coverage 仍需统一消融验证，不能称为已验证创新。
 
 ## 0. 方案备案与命名边界
 
@@ -26,7 +26,7 @@ PVLD-32 的 `32` 表示 32 个全局 layout prompt tokens，而不是 32 个区�
 | Fixed-Slot VLQA-K32 | 最多 32 个固定布局槽位 | 是 |
 | PVLD-32 | 32 个全局 layout prompt tokens | 否 |
 
-PVLD-32 的区域数量由 decoder 生成的 `REGION` 记录数和 `EOS` 决定。prompt bank 共同表达“请从当前页面中解析所有布局区域”，不绑定第一列、第二列或固定区域编号。decoder 始终保留对完整页面视觉 token 的 cross-attention 访问，不能只压缩成 32 个 prompt 后丢弃页面视觉 token。
+PVLD-32 的区域数量由 decoder 生成的 `REGION` 记录数和 `EOS` 决定。prompt bank 共同表达“请从当前页面中解析所有布局区域”，不绑定第一列、第二列或固定区域编号。完整高分辨率视觉特征 `F` 先由 32 个 global prompts 读取为 `layout_evidence=A`；修复版 decoder 以 `A` 为唯一 cross-attention memory，OCR 写回仍使用 `V_i→A→V_i` 的视觉 Value 路由。`A` 是对完整 `F` 的布局证据汇聚，不是 32 个区域槽位。
 
 设页面视觉 token 经投影后为 $\widetilde{\mathbf V}\in\mathbb R^{B\times L\times D_p}$，全局 prompt 为 $\mathbf P\in\mathbb R^{B\times K_p\times D_p}$，其中 $K_p=32$。令 $d_h$ 为注意力头维度，则 prompt cross-attention 的简式为：
 
@@ -70,7 +70,7 @@ $$\mathbf A_p=\mathrm{MHA}(\mathrm{LN}_p(\mathbf P),\widetilde{\mathbf V},\widet
 
 $$\mathbf H_p=\mathrm{LN}_{p,o}\left(\mathbf P+\mathbf A_p\right)\in\mathbb R^{B\times K_p\times D_p}.$$
 
-因此 $\mathbf H_p$ 是全局布局提示上下文，而不是 $K_p$ 个候选区域。保留完整 $\widetilde{\mathbf V}$ 作为后续 decoder memory，避免密集小区域在 prompt 压缩后丢失。
+因此 $\mathbf H_p$（代码中为 `layout_evidence=A`）是全局布局提示上下文，而不是 $K_p$ 个候选区域。当前修复版将 `A` 作为 decoder cross-attention memory；高分辨率 `F` 不直接拼入每层 decoder memory，以控制每步 cross-attention 成本。是否需要重新引入 `F` 必须作为独立消融，不能静默改变 memory 组成。
 
 #### 0.2.2 布局结构词表与 teacher forcing 序列
 
@@ -90,13 +90,17 @@ $$\mathbf y_i^*=\sigma(\mathcal R_i)=\left[\texttt{<LAYOUT>},\ \texttt{<REGION>}
 
 $$\mathbf X_i^*=\left[\mathbf E(y^*_{i1})+\mathbf e^{pos}_1,\ldots,\mathbf E(y^*_{iT_i})+\mathbf e^{pos}_{T_i}\right]\in\mathbb R^{T_i\times D_p}.$$
 
-decoder memory 同时包含完整视觉 token 和 prompt context：
+decoder memory 为 global prompts 从完整高分辨率视觉特征读取的 `layout_evidence=A`：
 
-$$\mathbf C_i=\mathrm{concat}\left(\widetilde{\mathbf V}_i,\mathbf H_{p,i}\right)\in\mathbb R^{(L_i+K_p)\times D_p}.$$
+$$\mathbf C_i=\mathbf A_i=\mathbf H_{p,i}\in\mathbb R^{K_p\times D_p}.$$
 
 以 $\mathbf M^{causal}\in\{0,1\}^{T_i\times T_i}$ 表示因果 mask，$M^{causal}_{tt'}=1$ 当且仅当 $t'>t$，decoder 第 $\ell$ 层计算：
 
-$$\mathbf Z_i^{(\ell)}=\mathrm{DecoderLayer}_{\ell}\left(\mathbf Z_i^{(\ell-1)},\mathbf C_i;\mathbf M^{causal}\right),\qquad \mathbf Z_i=\mathrm{LN}_d(\mathbf Z_i^{(L_d)}).$$
+$$\mathbf H_{self}^{\ell}=\mathbf H^{\ell-1}+\mathrm{MHA}_{self}^{\ell}(\mathrm{LN}(\mathbf H^{\ell-1}),\mathbf M^{causal}),$$
+
+$$\mathbf H_{mem}^{\ell}=\mathbf H_{self}^{\ell}+\mathrm{MHA}_{cross}^{\ell}(\mathrm{LN}(\mathbf H_{self}^{\ell}),\mathbf A_i),$$
+
+$$\mathbf H^{\ell}=\mathbf H_{mem}^{\ell}+\mathrm{FFN}^{\ell}(\mathrm{LN}(\mathbf H_{mem}^{\ell})),\qquad \mathbf Z_i=\mathrm{LN}_d(\mathbf H^{L_d}).$$
 
 其中 $L_d$ 为 decoder layer 数。结构 token logits 为：
 
@@ -111,6 +115,28 @@ $$p_\theta(\mathbf y_i\mid\mathbf V_i,\mathbf H_{p,i})=\prod_{t=1}^{T_i}p_\theta
 $$\widehat R_i=\#\left\{t:\widehat y_{it}=\texttt{<REGION>},\ t<\tau_{EOS,i}\right\}.$$
 
 若在 $T_{\max}$ 内没有生成 `<EOS>`，则令 `generated_eos=false`、`max_length_truncation=true`，不把达到最大长度当作正常停止。
+
+旧 `VariableLayoutDecoder` 并未实现上述 decoder layer：training `forward` 使用历史 token embedding 的 `cumsum/denominator`，generation 使用单一 `running_sum`，二者都只有累计均值状态、逐层 MLP 和一次共享 memory attention。MTHv2 validation 已确认该自由生成路径出现 EOS 失败、复杂页面严重过预测和大量近重复框。2026-08-22 修复已删除这两条累计均值路径；teacher forcing 与 generation 现在共同调用同一组 `CausalLayoutDecoderBlock`、同一 causal mask 和同一 memory。
+
+结构 logits 在 softmax/argmax 前应用显式 FSM mask。真实词表与合法转移为：
+
+| 当前状态 | 允许的下一个 token |
+|---|---|
+| 起始 | `<LAYOUT>` |
+| `<LAYOUT>` 或 `</REGION>` 后的记录边界 | `<REGION>` 或 `<EOS>` |
+| `<REGION>` 后 | `<TYPE>` |
+| `<TYPE>` 后 | `COLUMN`、`ROW` 或裸 `REGION` 类型 token |
+| 类型值后 | `</TYPE>` |
+| `</TYPE>` 后 | `</REGION>` |
+| `<EOS>` 后 | `<PAD>` |
+
+因此 0 区域序列 `<LAYOUT> <EOS>` 合法，记录内部 EOS 非法；MTHv2 没有 TITLE/AUTHOR 真值，词表不增加这些无监督结构词。
+
+previous-region coverage 在每个 decoder block 内计算。对该层 self-attention 后的 hidden states，仅在此前 `<REGION>` 位置做 exclusive cumulative mean，得到形状 `[B,T,D_p]` 的 previous-region memory，经独立 LayerNorm 和线性投影加到本层 cross-attention Query。当前位置 REGION 不计入自身 coverage；后续 token 可见此前 REGION。训练和生成均不 detach，额外参数为每层一个无 bias 的 $D_p\times D_p$ 投影；默认不保存完整 attention tensor，只输出 REGION 数和紧凑 coverage summary。coverage 只影响 layout decoder，不进入 OCR Value。
+
+`max_layout_records` 在生成循环内维护每个样本已生成 REGION 数。达到上限后，FSM 在记录边界只允许 EOS；若上限是在未闭合记录内达到，则按 FSM 完成 `<TYPE>…</REGION>` 的最小合法闭合后再强制 EOS。输出分别记录 `generated_eos`、`truncated_by_max_layout_tokens`、`stopped_by_max_layout_records`、`num_generated_regions` 和 `num_layout_tokens`。该参数只是工程安全上限，不是固定 query 槽位数。
+
+每个生成 REGION 的 confidence 定义为该时间步经过 FSM mask 后的条件概率 $s_r=\mathrm{softmax}(z_t)[\texttt{<REGION>}]$。prediction 同时写入 `region_token_probability` 与相同的 `score`，并记录 sequence log probability。validation 主报告默认阈值为 0.0，保留全部预测，同时输出阈值扫描；test 只能使用 `selection.json` 锁定的 validation 阈值。
 
 #### 0.2.4 REGION hidden state 的连续辅助头
 
@@ -184,7 +210,9 @@ $$\mathrm{premature\_EOS}=\frac{\#\{i:\widehat R_i<R_i\ \land\ \text{生成 EOS}
 
 #### 0.2.7 计算量边界
 
-prompt bank 读取完整视觉序列的额外 attention score 元素数量约为 $B K_p L$，对应计算量量级 $O(BK_pLD_p)$；自回归 decoder 的 cross-attention memory 长度为 $L+K_p$，不因 prompt 压缩而删除 $L$ 个视觉 token。布局 token 数 $T_i$ 随页面区域数和结构字段变化，推理成本应报告平均/分位数布局 token 数、单页延迟和峰值显存，而不能只报告固定 $K_p=32$。
+prompt bank 读取完整视觉序列的额外 attention score 元素数量约为 $B K_p L$，对应计算量量级 $O(BK_pLD_p)$。修复版每层 causal self-attention 为 $O(BT_i^2D_p)$，对 `A` 的 cross-attention 为 $O(BT_iK_pD_p)$；首版 generation 每步重算完整前缀，因此长序列时间成本高于带 KV cache 的实现。KV cache 只作为后续等价优化，不能建立另一套推理结构。布局 token 数 $T_i$ 随页面区域数和结构字段变化，必须报告平均/分位数、单页延迟和峰值显存。
+
+按当前 $D_p=256$、$L_d=2$ 配置，新 decoder blocks 相对旧累计均值 blocks 增加 `923,648` 个参数；同时删除旧 `F(1024)→D_p(256)` decoder-memory projection 的 `262,400` 个参数，PVLD 净增加 `661,248`。以旧 run 记录的 PVLD `3,569,688` 为基准，新候选理论值为 `4,230,936`；C3/C4/C5 可训练参数理论值由 `4,619,288` 增至 `5,280,536`。实际完整 checkpoint 参数量和峰值显存仍以新 run summary 为准。训练 activation 的主要新增项是每层 causal attention，理论 score 规模为 $O(BL_dHT_i^2)$；不能沿用旧累计均值 decoder 的显存结论。
 
 第一版采用平面区域列表，使用 `<LAYOUT>`、`<REGION>`、`<TYPE>`、`</REGION>` 和 `<EOS>` 等结构 token；如需同时表达列和行，先通过 `TYPE` 区分，不一开始引入 column-row 层级树。`REGION` 时间步 hidden state 接连续 bbox、type、direction heads，bbox 不强制作为自然语言小数生成。count head 只作为低权重辅助项，不能替代 EOS 停止机制；重复框先记录比例，不在缺少诊断证据时加入复杂重复正则。
 
@@ -192,7 +220,11 @@ PVLD-32 的自回归概率、连续 bbox/type/direction 头、各项 mask、总�
 
 ### 0.3 当前实现边界
 
-`GOT/model/layout_prompt_decoder.py`、`scripts/serialize_layout_targets.py`、`scripts/train_GOT_variable_layout.py`、`scripts/evaluate_GOT_variable_layout.py` 和 `tools/training/run_variable_layout_a100.py` 是独立 PVLD 原型。首版支持模块级 forward/backward、target 序列化、结构化 preflight、可选预计算视觉 feature tensor smoke 和评估产物契约；尚未把 PVLD 接入 GOT2 的视觉塔与 `GOTQwenModel.forward`，也未产生正式 A100 训练或性能结果。该边界必须保留，不能把 standalone preflight/smoke 写成 GOT2 whole-page 效果。
+`GOT/model/layout_prompt_decoder.py`、`GOT/model/GOT_ocr_2_0.py`、`scripts/layout_page_dataset.py`、`scripts/train_GOT_layout.py`、`scripts/evaluate_GOT_layout.py` 和 `tools/training/run_variable_layout_a100.py` 已组成 GOT2 whole-page PVLD 链路。2026-08-22 A100 smoke `pvld_causal_cuda_smoke_20260822_r2` 已通过 causal/cross attention、coverage、token/record heads、visual Value routing 的 finite/nonzero gradient和 0/1/多 REGION 停止检查。新 C3–C5 tmux `mthv2_pvld_causal_c3_c5_20260822` 已启动，validation/test 尚未执行。本结构仍是待统一消融的工程候选，不因完成接入和 smoke 自动获得性能结论。
+
+P1 每 2000 optimizer steps 保存一个待 validation 的 checkpoint。P1 不能按 OCR CER 或 final step 选点；预注册字典序为：停止错误总和 `1-EOS success + premature EOS + token-cap + record-cap`、count MAE、负 region F1、负 matched bbox IoU、负 ordered bbox IoU、duplicate rate、负 count exact accuracy、较早 step。P2 必须从该 validation-selected P1 初始化。P1-9000 优于 P1-12000 只证明 final P1 不是可靠默认值，不证明 9000 是全局最佳，也不支持仅增加 P1 steps。
+
+当前不加入 duplicate/coverage loss。只有完整 causal decoder＋FSM＋coverage 在连续 validation 点上仍出现严重重复，才另行提出有监督来源和独立消融；不得根据已查询的 MTHv2 frozen test 调整该损失或阈值。
 
 MTHv2 的 `label_textline` 仍只能标记为 ordered textline/region candidate，不改写为严格 column ground truth；whole-page 与 oracle-chunk 数据必须分开输出，oracle-chunk 结果不得与 whole-page PVLD 结果直接比较。
 

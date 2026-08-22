@@ -325,3 +325,32 @@ identity and must not be relabeled as PVLD. A new PVLD run must explicitly set
 Vary ViT features for `A=layout_evidence`, then applies factorized `V_i -> A -> V_i`
 routing; the final OCR Value is always projected from `V_i` and the output
 length remains `L_v`.
+
+## 12. PVLD causal 修复 smoke 与 MTHv2 C3–C5 新流程（2026-08-22）
+
+先使用第 1 节白名单同步工具；同步不包含数据、模型、checkpoint、run、缓存或日志。修复版有界 CUDA smoke 只需一次串行、无伪终端 SSH 调用：
+
+```bash
+cd /data3/yky/yangky_ocr_models/ocrmodel
+source config/paths.env
+bash tools/training/run_pvld_causal_cuda_smoke.sh \
+  0 \
+  pvld_causal_cuda_smoke_20260822_r1
+```
+
+入口只查询显式 GPU 0 的瞬时利用率，要求 `<50%`；使用新 evaluation run 目录，完整日志为 `smoke.log`，终端只打印紧凑 `summary.json`。检查项包括 causal self-attention、cross-attention、token head、coverage、bbox head 和 visual Value routing 的 finite gradient，0/1/多 REGION、FSM、两类 cap、REGION probability、bbox `[0,1]` 与 alpha=0 严格等价。它不加载 test，不启动正式训练。
+
+smoke 成功后，本会话明确授权的新 C3–C5 流程为：
+
+```bash
+bash tools/training/run_mthv2_page_pvld_c3_c5_tmux.sh \
+  --session mthv2_pvld_causal_c3_c5_20260822 \
+  --run-prefix mthv2_pvld_causal_20260822_v1 \
+  --gpu-ids 0,1,2,3,4
+```
+
+启动器固定读取原始整页 `mthv2_layout_page_v1`，不读取 oracle chunk。若可用卡数不少于三个，C3/C4/C5 各绑定一张；不足三个时，全部指定卡组成多卡作业并按 C3→C4→C5 串行。启动前查询命令指定的全部 GPU；任一卡 utilization 达到 50% 时，在创建任何控制任务前整体退出，不等待、不抢占、不停止已有进程。
+
+C3/C4 为 P2 42000 steps；C5 为 P1 12000＋P2 30000 steps。checkpoint 间隔 2000。C5 P1 checkpoints 全部排队做自由生成 validation，预注册 ranking 为：停止错误总和、count MAE、region F1、matched/ordered bbox IoU、duplicate rate、count exact accuracy、较早 step；P2 只从 selected P1 初始化。训练完成后，各控制在 validation 选择 P2 checkpoint，并把 validation 默认未筛选阈值 0.0 写入 `selection.json`；随后 test 只加载锁定 checkpoint 与锁定阈值。test 结果不允许反向调整训练、P1 ranking 或 threshold。
+
+该命令创建全新 run ID 和 tmux 会话，不使用 `--resume`，不覆盖旧 PVLD C1–C5、P1 checkpoints、selection 或 test。失败只查看对应 launcher/control 日志最后 20 行；不得直接输出完整 predictions、trainer state 或训练日志。

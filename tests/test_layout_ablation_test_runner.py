@@ -30,6 +30,7 @@ class LayoutAblationTestRunnerTests(unittest.TestCase):
             selection.write_text(json.dumps({
                 "purpose": "layout_ablation_validation_selection",
                 "test_used_for_selection": False,
+                "locked_object_threshold": 0.0,
                 "ablation_id": "projector_only",
                 "selected": {
                     "optimizer_step": 2000,
@@ -81,6 +82,8 @@ class LayoutAblationTestRunnerTests(unittest.TestCase):
             self.assertEqual(summary["metrics"]["ocr"]["total_reference_characters"], 10)
             self.assertEqual(summary["inference_physical_gpu"], "3")
             self.assertEqual(evaluator_environments[0]["CUDA_VISIBLE_DEVICES"], "3")
+            self.assertEqual(summary["locked_object_threshold"], 0.0)
+            self.assertEqual(summary["test_threshold_source"], "validation_selection")
 
 if __name__ == "__main__":
     unittest.main()

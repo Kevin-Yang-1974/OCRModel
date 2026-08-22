@@ -52,6 +52,16 @@ class LayoutAblationContractTests(unittest.TestCase):
         for forbidden in ("bbox", "direction", "reading_order"):
             self.assertNotIn(forbidden, call)
 
+    def test_legacy_pvld_checkpoint_migration_is_deterministic_and_audited(self) -> None:
+        source = (
+            ROOT / "src" / "GOT-OCR-2.0" / "scripts" / "train_GOT_layout.py"
+        ).read_text(encoding="utf-8")
+        self.assertIn("torch.manual_seed(0)", source)
+        self.assertIn("pvld_legacy_checkpoint_migrated_deterministically", source)
+        self.assertIn('"layout_adapter_missing_keys": missing', source)
+        self.assertIn('"layout_adapter_unexpected_keys": unexpected', source)
+        self.assertIn('"layout_adapter_loaded_compatible_keys"', source)
+
     def test_all_required_groups_are_declared(self) -> None:
         self.assertEqual(len(contract.ABLATION_IDS), 6)
         self.assertFalse(contract.ABLATIONS["got2_zero_shot"].training_allowed)

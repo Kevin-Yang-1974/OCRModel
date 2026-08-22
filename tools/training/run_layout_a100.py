@@ -34,6 +34,7 @@ EXIT_LOCKED = 73
 EXIT_EXISTS = 74
 EXIT_GPU_BUSY = 75
 DEFAULT_GPU_UTILIZATION_LIMIT = 50
+DEFAULT_CHECKPOINT_RETENTION = 2
 RUN_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 
 OVERFIT_P1_STEPS = 1000
@@ -1731,7 +1732,14 @@ def build_training_command(
             ]
         )
     if settings.checkpoint_steps:
-        command.extend(["--save_steps", str(settings.checkpoint_steps)])
+        command.extend(
+            [
+                "--save_steps",
+                str(settings.checkpoint_steps),
+                "--save_total_limit",
+                str(DEFAULT_CHECKPOINT_RETENTION),
+            ]
+        )
     if settings.replay_manifest is not None:
         command.extend(
             [
