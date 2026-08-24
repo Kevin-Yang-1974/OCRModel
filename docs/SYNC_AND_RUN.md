@@ -326,6 +326,20 @@ Vary ViT features for `A=layout_evidence`, then applies factorized `V_i -> A -> 
 routing; the final OCR Value is always projected from `V_i` and the output
 length remains `L_v`.
 
+## 13. MTHv2 SOTA 对比部署与 smoke（2026-08-23）
+
+SOTA 对比协议、实际 checkpoint revision、参数口径和 B0–B6 注册见 `docs/MTHV2_SOTA_COMPARISON_PROTOCOL.md`。本地白名单同步只上传 `tools/sota/` 源码；模型权重、环境、数据和日志留在服务器源码树外。
+
+服务器部署入口（只创建个人目录，不覆盖已有模型目录）：
+
+```bash
+cd /data3/yky/yangky_ocr_models/ocrmodel
+source config/paths.env
+bash tools/sota/deploy_sota_models.sh
+```
+
+zero-shot smoke 只使用 validation 1–2 页；显式传入 `--split validation`，禁止 test。GLM-OCR 的 fine-tune smoke 最多 1 optimizer step；没有官方微调入口的模型只记录 `official_finetuning_unavailable`，不伪造训练支持。正式总入口 `tools/sota/run_formal_sota_suite.sh` 默认锁定，只有用户明确授权并设置 `ALLOW_FORMAL_SOTA=1` 后才可解除。
+
 ## 12. PVLD causal 修复 smoke 与 MTHv2 C3–C5 新流程（2026-08-22）
 
 先使用第 1 节白名单同步工具；同步不包含数据、模型、checkpoint、run、缓存或日志。修复版有界 CUDA smoke 只需一次串行、无伪终端 SSH 调用：
@@ -354,3 +368,19 @@ bash tools/training/run_mthv2_page_pvld_c3_c5_tmux.sh \
 C3/C4 为 P2 42000 steps；C5 为 P1 12000＋P2 30000 steps。checkpoint 间隔 2000。C5 P1 checkpoints 全部排队做自由生成 validation，预注册 ranking 为：停止错误总和、count MAE、region F1、matched/ordered bbox IoU、duplicate rate、count exact accuracy、较早 step；P2 只从 selected P1 初始化。训练完成后，各控制在 validation 选择 P2 checkpoint，并把 validation 默认未筛选阈值 0.0 写入 `selection.json`；随后 test 只加载锁定 checkpoint 与锁定阈值。test 结果不允许反向调整训练、P1 ranking 或 threshold。
 
 该命令创建全新 run ID 和 tmux 会话，不使用 `--resume`，不覆盖旧 PVLD C1–C5、P1 checkpoints、selection 或 test。失败只查看对应 launcher/control 日志最后 20 行；不得直接输出完整 predictions、trainer state 或训练日志。
+
+causal 首轮中 C3/C4 已完成训练，而 C5 P2 因未显式传递 P1 selection provenance 被契约误拒绝。修复后使用以下 recovery 入口；它不使用 GPU 2，不重训 C3/C4 或 C5 P1，只在 GPU 4 补跑 C5 P2，之后在 GPU 0/1/3 并行执行 C3/C4/C5 validation selection 和 selection-locked test：
+
+```bash
+bash tools/training/run_mthv2_page_pvld_causal_eval_recovery_tmux.sh \
+  --session mthv2_pvld_causal_eval_recovery_20260824_v1 \
+  --run-prefix mthv2_pvld_causal_20260822_v1 \
+  --evaluation-suffix _causal_recovery_20260824_v1 \
+  --gpu-ids 0,1,3,4
+```
+
+P2 通过 `p1/validation_selection/selection.json` 核验 validation-only 用途、选中 checkpoint 绝对路径以及 config/weights SHA-256，不修改已有 P1 checkpoint。launcher 日志为：
+
+```text
+/data3/yky/yangky_ocr_models/training_runs/GOT/mthv2_pvld_causal_20260822_v1_mthv2_pvld_causal_eval_recovery_20260824_v1_logs/launcher.log
+```

@@ -1,6 +1,6 @@
 # 项目状态
 
-> 更新日期：2026 年 8 月 22 日
+> 更新日期：2026 年 8 月 24 日
 
 ## 当前状态
 
@@ -27,6 +27,7 @@
 - MTHv2 whole-page 训练：已启动独立 tmux 会话 `mthv2_page_train_20260820_r2`，使用原始页面 manifest `mthv2_layout_page_v1`（train/validation/test=`2159/240/800`），不是 oracle-chunk 图像；C1–C5 在 GPU 0 串行执行，`max_regions=512` 覆盖整页最多 407 个区域。C1 已进入 P2 optimizer steps，暂无性能结果。此前 `mthv2_page_ablation_20260820` 因审计条件未识别 `real_mthv2_official` 失败，`mthv2_page_ablation_20260820_r1` 因 `max_regions=64` 不足以容纳 71 区域页面失败；两个失败 run 均保留，不得复用。
 - 方案备案：原有布局结构现统一称为 Fixed-Slot VLQA baseline，保留 `Fixed-Slot VLQA-K16`（原始 `max_regions=16`）和 `Fixed-Slot VLQA-K32`（仅提高固定槽位容量到 32）两个对照。两者的 query 在训练期按阅读顺序对应固定区域，超过上限时仍需 oracle chunk 或截断；K32 不是变量长度解码创新。
 - PVLD-32 工程候选：32 表示 global layout prompt tokens，不表示 32 个区域槽位；区域数量由 decoder 的 REGION 记录和 EOS 决定。PVLD 已接入 GOT2 视觉塔与 `GOTQwenModel.forward`，Fixed-Slot 和旧 `layout_value`/`vqlca` 代码仍保留。完成工程接入不等于已验证结构创新；新 causal 版本仍待统一训练、validation 与跨来源消融。
+- MTHv2 SOTA 对比工程已建立于 `tools/sota/`，协议见 `docs/MTHV2_SOTA_COMPARISON_PROTOCOL.md`。当前 GOT2+PVLD 完整参数为 `564,759,576`，当前可训练参数为 `5,280,536`。已核实 PaddleOCR-VL-1.6、MinerU2.5-Pro、GLM-OCR 和 OpenDoc-0.1B 的官方 checkpoint/revision/许可证；当前只允许部署、validation zero-shot smoke 和最多 1-step fine-tune smoke，不启动正式微调、validation selection 或 MTHv2 test。内部 B0–B6 注册不改变已有 run，B4–B6 只读复用。
 - PVLD 路径修订（2026-08-20）：`GOTQwenModel.forward` 现将 `vision_tower_high(image[1])` 的高分辨率中间特征作为 `F`/第一阶段 Key-Value，将 `mm_projector_vary` 输出作为 `V_i`。全局 prompt 读取 `F` 得到命名为 `layout_evidence=A` 的布局证据；A 只进入布局分支和第二阶段视觉路由。新增显式 `layout_writeback_mode=visual_value_layout_routing`，用两跳 `V_i→A→V_i` 因子化路由保证最终 Value 只来自视觉 token，输出保持 `[B,L_v,D_v]` 后再送入 Qwen OCR。旧 `layout_value` 与 `vqlca` 保留为历史对照，不改写既有 VQLCA 训练结果。
 - A100 VQLCA smoke：`vqlca_wholepage_smoke_20260820_r1` 已在 GPU 2、MTHv2 原始整页 train manifest 上通过 `2159` 页/`72688` 区域审计、CUDA component forward/backward、gate=0 原路径等价、gate 打开后的 visual Q/K/V、layout-conditioning、context-key、output 与 layout-query finite/nonzero gradient 检查，以及 P1 1 step→checkpoint 重载→P2 1 step。P1/P2 train loss 为 `9.048427/9.792988`，只证明工程链路。
 - GPU 默认策略已写入根目录和 `ocrmodel/AGENTS.md`：训练、验证与评估默认在命令允许的 GPU 池中使用全部瞬时 `utilization.gpu < 50` 的卡；合格卡足够时按控制一一绑定，不足时全部合格卡组成多卡作业并按控制串行运行。
@@ -48,3 +49,17 @@
 C5/C6 共享 C4-best 后，C6-C5 的页面 CER 为 `-0.031084`，说明 synthetic layout supervision 相对纯 OCR replay 减轻退化；但 C5-C4 和 C6-C4 分别为 `+0.089588` 和 `+0.058504`，两种 replay 均未超过 C4。C1 与 C4 的结构、可训练参数和上游训练历史仍不同；普通 GOT2 的同上游历史、同数据和近似参数预算 C2 尚未实现，因此不能把 C1-C4 差异完全归因于 VLQA。当前 frozen test 不再用于 replay 配置选择，后续调整只允许使用 validation。
 
 PVLD-32 必须与 Fixed-Slot VLQA-K16、Fixed-Slot VLQA-K32、无布局监督 query、等参数量普通 adaptor 在统一 whole-page 数据协议和统一 optimizer budget 下比较。PVLD-32 的评估必须额外报告 EOS 成功率、提前 EOS、max-length 截断、区域数量 MAE、按真实区域数量分桶的区域召回率/bbox IoU 和 OCR CER；在这些消融完成前，不把 PVLD-32 称为已成立的结构创新。
+
+### MTHv2 外部 SOTA bounded smoke（2026-08-23）
+
+已部署 PaddleOCR-VL-1.6、MinerU2.5-Pro、GLM-OCR 和 OpenDoc-0.1B 官方权重；协议和固定 revision 见 `docs/MTHV2_SOTA_COMPARISON_PROTOCOL.md`。四个 zero-shot runner 均只允许读取 validation 1–2 页，当前没有正式 SOTA 指标。GLM-OCR zero-shot run `sota_zero_shot_20260823_v12_glm_ocr` 成功输出非空文本，runtime 参数量为 `1,107,405,824`，延迟约 `8.49s`、峰值显存约 `3216 MiB`。PaddleOCR-VL-1.6 因官方加载 `KeyError: 'default'` 受控失败；MinerU2.5-Pro 因缺少已确认的官方本地 provider runtime 保留 blocker；OpenDoc-0.1B 因 `paddlex` 依赖缺失受控失败。GLM-OCR GPU 单步曾因 AdamW OOM 退出，CPU run `sota_finetune_smoke_20260823_v3_glm_ocr_cpu` 已完成 1 step：loss `16.3594` finite、gradient finite、checkpoint save/reload 成功。所有失败 run 保留；未读取 MTHv2 test、未执行正式 validation selection 或长程微调。
+
+用户随后明确授权正式 SOTA 训练与测评，并要求不触碰 GPU 2。正式入口已在新 tmux 会话中使用 GPU `0,1,3,4` 启动；`sota_formal_20260823_v2` 至 `v7` 均保留。`v6` 完成 validation-only selection 和 800 页 selection-locked test 的 blocked schema 写出；`v7` 在独立 site-packages 注入后仍因 PyTorch C 扩展、OpenDoc `openocr` 和 MinerU provider blocker 退出，没有产生正式训练 loss、可用 checkpoint 或 MTHv2 性能指标。GPU 2 未查询、未使用；没有停止或干预其他进程。后续需先修复官方环境，再以新 run ID 重试。
+
+### MTHv2 外部 SOTA 与内部 C1-C5 结果更新（2026-08-24）
+
+PaddleOCR-VL-1.6 与 GLM-OCR 的官方 checkpoint whole-page zero-shot 已完成 validation-only 锁定和 800 页 selection-locked test，均为 0 inference failure、`test_used_for_selection=false`。统一重新计算结果：GLM-OCR micro/去空白/macro page CER 为 `0.339441/0.273526/0.315755`，平均编辑距离 `111.736`，平均延迟 `7.136s`；PaddleOCR-VL 为 `2.484101/2.125195/2.857077`，平均编辑距离 `817.710`，平均延迟 `16.826s`。两者 exact match 均为 0/800，均无可与 MTHv2 textline candidate 确定性对应的布局输出，布局指标记为 N/A。MinerU2.5-Pro 仍为官方本地 provider blocker，不计算 CER。OpenDoc 本条暂不汇总。
+
+内部旧 whole-page C1-C5 test page CER 仍为 C5 `0.835286`、C1 `0.842911`、C2 `0.850016`、C4 `0.885286`、C3 `0.889030`；C3/C4/C5 complete layout F1 为 `0.000075/0.106258/0.136239`。外部 zero-shot 与内部同数据训练属于不同训练条件，只能分表报告。causal 修复后 `mthv2_pvld_causal_20260822_v1` 的 C3/C4 训练完成但没有 validation/test；C5 在 selected P1 checkpoint 进入 P2 时触发初始化契约错误而失败，因此当前没有 causal 修复版性能结果。
+
+该契约错误已于 2026-08-24 修复：P2 现在显式读取并核验 P1 validation `selection.json`，不再要求周期 checkpoint 内存在只由 final model 保存的 `layout_training_metrics.json`。白名单同步后已启动新 tmux `mthv2_pvld_causal_eval_recovery_20260824_v1`；GPU 4 只补跑 C5 P2，完成后 GPU 0/1/3 分别执行 C3/C4/C5 validation selection 和 selection-locked test，GPU 2 未查询、未使用。启动后复核为 `TMUX=RUNNING`、C5 `stage=p2`、`stage_status=running`、`resumed_from_existing_run=true`。当前仍无 causal 修复版性能结果。

@@ -93,7 +93,13 @@ def free_port() -> int:
         return int(handle.getsockname()[1])
 
 
-def training_command(args: argparse.Namespace, stage: str, source: Path, output: Path) -> list[str]:
+def training_command(
+    args: argparse.Namespace,
+    stage: str,
+    source: Path,
+    output: Path,
+    source_validation_selection: Path | None = None,
+) -> list[str]:
     steps = args.p1_max_steps if stage == "p1" else args.p2_max_steps
     learning_rate = args.p1_learning_rate if stage == "p1" else args.p2_learning_rate
     ocr_weight = "0" if stage == "p1" else "1"
@@ -162,6 +168,12 @@ def training_command(args: argparse.Namespace, stage: str, source: Path, output:
         "--seed", str(args.seed),
         "--output_dir", str(output),
     ]
+    if stage == "p2" and args.ablation == "vlqa_layout_p1_p2":
+        if source_validation_selection is None:
+            raise ValueError("PVLD C5 P2 requires its validation-only P1 selection.")
+        command.extend(
+            ["--source_validation_selection", str(source_validation_selection)]
+        )
     return command
 
 
@@ -221,6 +233,7 @@ def main() -> int:
     environment = dict(os.environ)
     environment["CUDA_VISIBLE_DEVICES"] = ",".join(ids)
     source = args.source_model.resolve()
+    p1_selection_path: Path | None = None
     stage_metrics: dict[str, Any] = {}
     if args.resume_existing_run:
         p1_metrics = run_root / "p1" / "model" / "layout_training_metrics.json"
@@ -233,6 +246,9 @@ def main() -> int:
                 "metrics": str(p1_metrics),
                 "reused_completed_stage": True,
             }
+        candidate_selection = run_root / "p1" / "validation_selection" / "selection.json"
+        if candidate_selection.is_file():
+            p1_selection_path = candidate_selection.resolve()
     for stage in args.stages.split(","):
         output = run_root / stage / "model"
         output.mkdir(parents=True, exist_ok=args.resume_existing_run)
@@ -242,7 +258,10 @@ def main() -> int:
         (metadata / "status.txt").write_text(compact(status) + "\n", encoding="utf-8")
         with log_path.open("x", encoding="utf-8") as log:
             completed = subprocess.run(
-                training_command(args, stage, source, output),
+                training_command(
+                    args, stage, source, output,
+                    source_validation_selection=p1_selection_path,
+                ),
                 cwd=args.project_root.resolve(),
                 env=environment,
                 stdout=log,
@@ -304,6 +323,7 @@ def main() -> int:
             ) is not False:
                 raise RuntimeError("P1 selection did not preserve validation-only protocol.")
             source = Path(selection["selected"]["model_path"]).resolve()
+            p1_selection_path = selection_path.resolve()
             stage_metrics["p1"].update(
                 {
                     "validation_selection": str(selection_path),
