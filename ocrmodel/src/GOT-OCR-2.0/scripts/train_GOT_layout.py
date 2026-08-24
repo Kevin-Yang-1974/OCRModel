@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import gc
+import hashlib
 import json
 import math
 from dataclasses import dataclass, field
@@ -52,6 +53,38 @@ OUTPUT_DIAGNOSTIC_FIELDS = {
     "eos_accuracy": "layout_eos_accuracy",
     "region_count_mae": "layout_region_count_mae",
 }
+
+
+def file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(8 * 1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def validate_pvld_p1_selection(selection_path: Path, source_model: Path) -> dict[str, Any]:
+    selection = json.loads(selection_path.read_text(encoding="utf-8"))
+    selected = selection.get("selected") or {}
+    if (
+        selection.get("purpose") != "layout_ablation_validation_selection"
+        or selection.get("selection_purpose") != "p1_layout"
+        or selection.get("selection_split") != "validation"
+        or selection.get("test_used_for_selection") is not False
+        or selection.get("ablation_id") != "vlqa_layout_p1_p2"
+    ):
+        raise ValueError("PVLD C5 P1 selection does not satisfy the validation-only contract.")
+    selected_model = Path(str(selected.get("model_path", ""))).resolve()
+    if selected_model != source_model.resolve():
+        raise ValueError("PVLD C5 P2 source differs from the validation-selected P1 model.")
+    config_path = source_model / "config.json"
+    weights_path = source_model / "model.safetensors"
+    if (
+        selected.get("config_sha256") != file_sha256(config_path)
+        or selected.get("weights_sha256") != file_sha256(weights_path)
+    ):
+        raise ValueError("PVLD C5 selected P1 checkpoint hash mismatch.")
+    return selection
 
 LAYOUT_ADAPTER_STATE_PREFIX = "model.layout_adapter."
 GENERIC_ADAPTER_STATE_PREFIX = "model.generic_adapter."
@@ -210,6 +243,10 @@ class LayoutTrainingArguments:
         metadata={"help": "Dataset root; defaults to the manifest directory."},
     )
     layout_split: str = field(default="train")
+    source_validation_selection: str = field(
+        default="",
+        metadata={"help": "Validation-only P1 selection used to initialize PVLD C5 P2."},
+    )
     layout_stage: str = field(
         default="p1",
         metadata={"help": "p1 (layout-only warm-up) or p2 (joint page OCR/layout)."},
@@ -834,6 +871,7 @@ def main() -> None:
         json.loads(source_metrics_path.read_text(encoding="utf-8"))
         if source_metrics_path.is_file() else None
     )
+    p1_selection_payload = None
     if layout_args.ablation_id and layout_args.layout_architecture == "fixed_slot":
         assert_source_protocol(
             layout_args.ablation_id,
@@ -848,9 +886,13 @@ def main() -> None:
             and layout_args.layout_stage == "p2"
         )
         if expects_p1:
-            if (not source_pvld or not source_metrics_payload
-                    or source_metrics_payload.get("layout_stage") != "p1"
-                    or source_metrics_payload.get("layout_architecture") != "pvld"):
+            if layout_args.source_validation_selection:
+                p1_selection_payload = validate_pvld_p1_selection(
+                    Path(layout_args.source_validation_selection).resolve(), source_model
+                )
+            elif (not source_pvld or not source_metrics_payload
+                  or source_metrics_payload.get("layout_stage") != "p1"
+                  or source_metrics_payload.get("layout_architecture") != "pvld"):
                 raise ValueError("PVLD C5 P2 must initialize from its validation-eligible P1 model.")
         elif source_pvld:
             raise ValueError("Direct PVLD stages must initialize from original GOT2.")
@@ -1215,6 +1257,17 @@ def main() -> None:
             "passed_through_p1": (
                 layout_args.ablation_id == "vlqa_layout_p1_p2"
                 and layout_args.layout_stage == "p2"
+            ),
+            "p1_validation_selection": (
+                {
+                    "selection_path": str(Path(layout_args.source_validation_selection).resolve()),
+                    "selection_split": p1_selection_payload["selection_split"],
+                    "test_used_for_selection": p1_selection_payload["test_used_for_selection"],
+                    "selected_optimizer_step": p1_selection_payload["selected"]["optimizer_step"],
+                    "selected_config_sha256": p1_selection_payload["selected"]["config_sha256"],
+                    "selected_weights_sha256": p1_selection_payload["selected"]["weights_sha256"],
+                }
+                if p1_selection_payload is not None else None
             ),
             "layout_heads_expected_gradient": (
                 (model.get_model().layout_adapter is not None or variable_adapter is not None)
