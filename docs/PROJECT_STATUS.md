@@ -1,8 +1,14 @@
 # 项目状态
 
-> 更新日期：2026 年 8 月 24 日
+> **当前命名与方案边界（2026-08-25）**：当前论文方法统一命名为 **LAVP（Layout-Aware Visual Prompting）**。工程上，LAVP 使用 global visual/layout prompts 汇聚整页结构证据，以 causal PVLD 执行变量长度布局重建，并通过 `visual_value_layout_routing` 保持 OCR 内容 Value 来自视觉 token。原 Fixed-Slot VLQA 及其 VQLCA 写回变体均已退出当前主方案；旧实现、配置名、checkpoint、训练记录和结果只作为只读历史证据、兼容加载路径和 baseline 保留，不能再称为当前 VLQA 方案、当前正式主方案或 LAVP。LAVP/PVLD 尚待统一 validation 和消融验证，不能写成已验证创新。
+
+> 更新日期：2026 年 8 月 25 日
 
 ## 当前状态
+
+- PVLD M1a 已实现、待 A100 smoke：在原 causal decoder、FSM 和 previous-region hidden coverage 上增加 page-balanced REGION/EOS boundary loss，以及只在 FSM 同时允许 REGION/EOS 的记录边界生效的 count-conditioned logit bias。training forward 与 generation 复用同一 `_apply_count_condition`；默认两个系数均为 0，旧 checkpoint 和旧行为不变；本轮没有新增参数、动态 record cap、duplicate loss、M2 空间 coverage、M3 梯度缩放或 64 queries。
+- M1a 预注册运行协议：GPU `1,2,3,4` 组成单个四卡 DeepSpeed 作业；P1/P2 分别为 `3000/7500` optimizer steps、有效 batch 4，对应旧单卡 C5 的 `12000/30000` 页面曝光。学习率保持 `1e-4/5e-5`。P1 在 `1000/2000/3000`、P2 在 `2500/5000/7500` 保存，最多保留 `3+3` 个 checkpoint；候选 validation 采用多 GPU worker queues。该协议保持页面曝光但改变优化更新次数，不能冒充旧单卡轨迹的严格复现。本轮不运行 MTHv2 test。
+- M1a 本地验证：`python -m pytest -q ocrmodel/tests` 为 `140 passed, 3 skipped`；跳过项来自本机没有 PyTorch。涉及 Python `py_compile`、新增 Bash `bash -n` 和 `git diff --check` 均通过。A100 CUDA smoke、同步和正式 tmux 启动状态仍待记录，因此当前只有本地工程结论。
 
 - PVLD causal 修复：旧 `VariableLayoutDecoder.forward/generate` 的历史 token embedding 累计均值已替换为共享的 pre-norm causal self-attention、对 `layout_evidence=A` 的 cross-attention 和 FFN。实际 decoder memory 为 `A`；完整高分辨率 `F` 只用于提取 `A`。每层增加 exclusive previous-REGION hidden mean coverage，形状 `[B,T,D]`、不 detach，不保存完整 attention。
 - 结构生成协议：真实词表 FSM 固定为 `<LAYOUT> → (<REGION> <TYPE> {COLUMN|ROW|REGION} </TYPE> </REGION>)* → <EOS> → <PAD>*`，允许 0 REGION。`max_layout_records` 已进入生成循环，在合法记录边界强制 EOS，并与 `max_layout_tokens` 截断分别报告。REGION `score` 已改为真实生成时间步条件概率，不再固定为 1.0；validation 默认保留未筛选预测并输出 threshold scan，test 阈值由 validation selection 锁定。
@@ -29,10 +35,10 @@
 - PVLD-32 工程候选：32 表示 global layout prompt tokens，不表示 32 个区域槽位；区域数量由 decoder 的 REGION 记录和 EOS 决定。PVLD 已接入 GOT2 视觉塔与 `GOTQwenModel.forward`，Fixed-Slot 和旧 `layout_value`/`vqlca` 代码仍保留。完成工程接入不等于已验证结构创新；新 causal 版本仍待统一训练、validation 与跨来源消融。
 - MTHv2 SOTA 对比工程已建立于 `tools/sota/`，协议见 `docs/MTHV2_SOTA_COMPARISON_PROTOCOL.md`。当前 GOT2+PVLD 完整参数为 `564,759,576`，当前可训练参数为 `5,280,536`。已核实 PaddleOCR-VL-1.6、MinerU2.5-Pro、GLM-OCR 和 OpenDoc-0.1B 的官方 checkpoint/revision/许可证；当前只允许部署、validation zero-shot smoke 和最多 1-step fine-tune smoke，不启动正式微调、validation selection 或 MTHv2 test。内部 B0–B6 注册不改变已有 run，B4–B6 只读复用。
 - PVLD 路径修订（2026-08-20）：`GOTQwenModel.forward` 现将 `vision_tower_high(image[1])` 的高分辨率中间特征作为 `F`/第一阶段 Key-Value，将 `mm_projector_vary` 输出作为 `V_i`。全局 prompt 读取 `F` 得到命名为 `layout_evidence=A` 的布局证据；A 只进入布局分支和第二阶段视觉路由。新增显式 `layout_writeback_mode=visual_value_layout_routing`，用两跳 `V_i→A→V_i` 因子化路由保证最终 Value 只来自视觉 token，输出保持 `[B,L_v,D_v]` 后再送入 Qwen OCR。旧 `layout_value` 与 `vqlca` 保留为历史对照，不改写既有 VQLCA 训练结果。
-- A100 VQLCA smoke：`vqlca_wholepage_smoke_20260820_r1` 已在 GPU 2、MTHv2 原始整页 train manifest 上通过 `2159` 页/`72688` 区域审计、CUDA component forward/backward、gate=0 原路径等价、gate 打开后的 visual Q/K/V、layout-conditioning、context-key、output 与 layout-query finite/nonzero gradient 检查，以及 P1 1 step→checkpoint 重载→P2 1 step。P1/P2 train loss 为 `9.048427/9.792988`，只证明工程链路。
+- 历史 A100 VQLCA smoke：`vqlca_wholepage_smoke_20260820_r1` 已在 GPU 2、MTHv2 原始整页 train manifest 上通过 `2159` 页/`72688` 区域审计、CUDA component forward/backward、gate=0 原路径等价、gate 打开后的 visual Q/K/V、layout-conditioning、context-key、output 与 layout-query finite/nonzero gradient 检查，以及 P1 1 step→checkpoint 重载→P2 1 step。P1/P2 train loss 为 `9.048427/9.792988`，只证明旧方案工程链路。
 - GPU 默认策略已写入根目录和 `ocrmodel/AGENTS.md`：训练、验证与评估默认在命令允许的 GPU 池中使用全部瞬时 `utilization.gpu < 50` 的卡；合格卡足够时按控制一一绑定，不足时全部合格卡组成多卡作业并按控制串行运行。
 - 原 VQLCA 会话 `mthv2_page_vqlca_train_20260820` 按用户要求在 C1 P2 约第 `4245/42000` 步停止。第一次重启 `_r1` 因 GPU0 在子任务启动前升至 `72%` 而按准入规则退出，未启动控制任务且保留诊断日志。
-- 当前 VQLCA whole-page C1–C5 会话为 tmux `mthv2_page_vqlca_train_20260820_r2`，run prefix `mthv2_page_vqlca_ablation_20260820_r2`，使用 GPU `1,2,3,4` 四卡；C1 已通过 `3199` 页/`105579` 区域审计并进入真实 P2，`physical_gpus=["1","2","3","4"]`、`world_size=4`。数据固定为原始整页 `mthv2_layout_page_v1`，不是 chunk，`max_regions=512` 仍是 Fixed-Slot K512 工程容量。旧 `mthv2_page_train_20260820_r2` 未停止或覆盖；尚无 VQLCA 性能结论，也未启动新的 frozen test。
+- 历史 VQLCA whole-page C1–C5 会话当时使用 tmux `mthv2_page_vqlca_train_20260820_r2`，run prefix `mthv2_page_vqlca_ablation_20260820_r2`，使用 GPU `1,2,3,4` 四卡；C1 已通过 `3199` 页/`105579` 区域审计并进入真实 P2，`physical_gpus=["1","2","3","4"]`、`world_size=4`。数据固定为原始整页 `mthv2_layout_page_v1`，不是 chunk，`max_regions=512` 仍是 Fixed-Slot K512 工程容量。该记录不属于当前 LAVP/PVLD 性能证据。
 - 训练状态与未来报告从 `/data3/yky/yangky_ocr_models/training_runs/GOT/mthv2_page_vqlca_ablation_20260820_r2*` 提取；总启动日志为对应 `_tmux_logs/launcher.log`，单项状态和汇总分别看 `metadata/status.txt` 与 `summary.json`。
 
 ## 已完成的正式流程
@@ -62,4 +68,8 @@ PaddleOCR-VL-1.6 与 GLM-OCR 的官方 checkpoint whole-page zero-shot 已完成
 
 内部旧 whole-page C1-C5 test page CER 仍为 C5 `0.835286`、C1 `0.842911`、C2 `0.850016`、C4 `0.885286`、C3 `0.889030`；C3/C4/C5 complete layout F1 为 `0.000075/0.106258/0.136239`。外部 zero-shot 与内部同数据训练属于不同训练条件，只能分表报告。causal 修复后 `mthv2_pvld_causal_20260822_v1` 的 C3/C4 训练完成但没有 validation/test；C5 在 selected P1 checkpoint 进入 P2 时触发初始化契约错误而失败，因此当前没有 causal 修复版性能结果。
 
-该契约错误已于 2026-08-24 修复：P2 现在显式读取并核验 P1 validation `selection.json`，不再要求周期 checkpoint 内存在只由 final model 保存的 `layout_training_metrics.json`。白名单同步后已启动新 tmux `mthv2_pvld_causal_eval_recovery_20260824_v1`；GPU 4 只补跑 C5 P2，完成后 GPU 0/1/3 分别执行 C3/C4/C5 validation selection 和 selection-locked test，GPU 2 未查询、未使用。启动后复核为 `TMUX=RUNNING`、C5 `stage=p2`、`stage_status=running`、`resumed_from_existing_run=true`。当前仍无 causal 修复版性能结果。
+该契约错误已于 2026-08-24 修复：P2 显式读取并核验 P1 validation `selection.json`，不再要求周期 checkpoint 内存在只由 final model 保存的 `layout_training_metrics.json`。新 tmux `mthv2_pvld_causal_eval_recovery_20260824_v1` 随后使 C5 P2 在 GPU 4 正常训练至约 step 18000，但保存 `checkpoint-18000` 时 `/data3` 只剩 `36K`，DeepSpeed optimizer state 写入失败，pipeline 以 `pvld_causal_c5_p2_recovery_failed` 结束。最后完整可恢复点为 `checkpoint-16000`；`tmp-checkpoint-18000` 缺 trainer/optimizer state，不可用于恢复或评测。由于训练失败，C3/C4/C5 validation selection 与 selection-locked test 均未启动，新 evaluation 目录不存在，当前仍无 causal 修复版性能结果。OpenDoc run 当前约占 `72G`，但未获授权前不删除或改写它及任何半成品。GPU 2 未查询、未使用。
+
+用户随后授权清理旧口径/失败 checkpoint 并继续。已永久删除 oracle-chunk `mthv2_chunk_ablation_20260819_multi_C1-C5` 的非 validation-selected 周期 checkpoints、C5 旧 P1 周期 checkpoints 和损坏的 causal `tmp-checkpoint-18000`，释放后 `/data3` 可用空间为 `228G`。保留了 C1/C5 step 30000、C2/C3 step 42000、C4 step 39000、各 final model/selection/test 结果，以及 causal C5 `checkpoint-16000`；OpenDoc 72G 未删除。runner 现为每次 recovery 分配递增日志名，保留旧失败日志。新 tmux `mthv2_pvld_causal_eval_recovery_20260824_v2` 已从 C5 P2 step 16000 在 GPU 4 恢复，复核进度已到 `16081/30000`；后续仍排队 GPU 0/1/3 的 C3/C4/C5 validation selection 与 selection-locked test。当前仍无新性能结果。
+
+OpenDoc 旧 run 的无效 validation/test prediction（约 `32.0GB/44.6GB`）已按用户授权永久删除，旧审计 metadata 保留；删除后 `/data3` 可用空间约 `528G`。adapter 已修复 `recognition_results[*].text` 提取，并排除 raw `blocks[*].img`。新 CPU-only tmux `sota_opendoc_formal_20260824_v2` 已启动，不查询或使用 GPU；首批 2 页 prediction 仅 `13,528 bytes`、均为 `status=ok`，官方 ONNX provider 加载成功，文本非空且 block raw fields 不含 `img`。完整 validation selection/test 尚未结束，当前没有 OpenDoc 性能结论。

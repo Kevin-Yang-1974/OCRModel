@@ -11,7 +11,8 @@
 
 本项目相对当前上游布局的主要新增或改动包括：
 
-- `GOT/model/layout_query.py` 中的 Visual Layout Query Adapter；
+- `GOT/model/layout_prompt_decoder.py` 中的 LAVP/PVLD 布局重建模块；
+- `GOT/model/layout_query.py` 中保留的历史 Fixed-Slot Visual Layout Query Adapter/VQLCA；
 - GOT2 视觉 token 与布局模块的接线；
 - 页面级 layout dataset、P1/P2 训练及 checkpoint 审计；
 - HTML/Playwright 整页合成、数据审计和受限实验编排工具。
@@ -22,6 +23,6 @@
 
 ## 历史 AncientDoc 兼容评估
 
-`references/legacy-ancientdoc-eval` 保存项目早期共享环境中的四个评估脚本快照，用于核对历史 AncientDoc split5 解码和指标口径。它们不是当前活动源码，可能包含旧路径、旧参数和历史注释；不得直接作为正式整页 VLQA 入口。活动包装器位于 `tools/evaluation`。
+`references/legacy-ancientdoc-eval` 保存项目早期共享环境中的四个评估脚本快照，用于核对历史 AncientDoc split5 解码和指标口径。它们不是当前活动源码，可能包含旧路径、旧参数和历史注释；不得直接作为当前 LAVP/PVLD 入口。活动包装器位于 `tools/evaluation`。
 
 模型权重、数据集和历史完整预测均未包含在共享仓库中，其访问和使用仍受各自来源条款约束。

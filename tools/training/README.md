@@ -1,4 +1,8 @@
-# AncientDoc 训练协议
+# 训练协议与方案边界
+
+> **现行命名（2026-08-25）**：当前论文方法为 **LAVP（Layout-Aware Visual Prompting）**；工程实现以 global visual/layout prompts、causal PVLD 布局重建和 `visual_value_layout_routing` 为核心。Fixed-Slot VLQA 及其 `layout_writeback_mode=vqlca` 写回变体均为旧方案，不再是当前主方案，也不是 LAVP 的别名。本文中的 AncientDoc C4–C6、A3–A5、VQLCA C1–C5 和相应命令仅用于历史结果复现、checkpoint 兼容和 baseline。LAVP/PVLD 仍待统一消融验证，不能称为已验证创新。
+
+## 历史 AncientDoc Fixed-Slot VLQA 协议
 
 ## 用户入口
 
@@ -44,9 +48,9 @@ C5/C6 metrics、summary 和 suite JSONL 均记录 selected C4 step、model path�
 
 MTHv2 原始整页 VQLCA C1–C5 使用 `run_mthv2_page_vqlca_ablation_tmux.sh`。该入口固定数据根为 `mthv2_layout_page_v1`、`max_regions=512`，并只给 C3/C4/C5 显式传入历史 `layout_writeback_mode=vqlca`；C1/C2 不构造 VLQA/VQLCA。K512 是 Fixed-Slot 工程容量设置，不是 PVLD 或变量长度解码。新的 PVLD 候选必须显式使用 `layout_writeback_mode=visual_value_layout_routing` 与 `layout_writeback_source=layout_evidence`，且尚无性能结论。
 
-## PVLD-32 原型入口
+## LAVP/PVLD 当前工程入口
 
-`run_variable_layout_a100.py` 是 GOT2 whole-page Prompted Variable-Length Layout Decoder 编排器，不修改 `run_layout_a100.py` 或 Fixed-Slot K16/K32 历史结果。PVLD 已接入 GOT2 视觉塔和 `GOTQwenModel.forward`，输入只包含 `whole_page_image + ocr_prompt`。修复版 decoder 为 causal self-attention＋`layout_evidence=A` cross-attention＋FFN，并带真实 vocabulary FSM、previous-REGION coverage、生成期 record cap 和真实 REGION probability；OCR Value 继续只来自视觉 token。
+`run_variable_layout_a100.py` 是 LAVP 中 GOT2 whole-page Prompted Variable-Length Layout Decoder 的编排器，不修改 `run_layout_a100.py` 或 Fixed-Slot K16/K32 历史结果。PVLD 已接入 GOT2 视觉塔和 `GOTQwenModel.forward`，输入只包含 `whole_page_image + ocr_prompt`。修复版 decoder 为 causal self-attention＋`layout_evidence=A` cross-attention＋FFN，并带真实 vocabulary FSM、previous-REGION coverage、生成期 record cap 和真实 REGION probability；OCR Value 继续只来自视觉 token。
 
 MTHv2 内部 B0–B6 与外部 SOTA 对比工程见 `docs/MTHV2_SOTA_COMPARISON_PROTOCOL.md` 和 `tools/sota/`。外部模型权重不进入源码树，当前阶段只执行官方权重部署、validation 1–2 页 zero-shot smoke 和最多 1-step fine-tune smoke；正式长程微调、validation selection 和 MTHv2 test 由 `run_formal_sota_suite.sh` 锁定，必须等待用户授权。
 

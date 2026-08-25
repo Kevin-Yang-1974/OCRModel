@@ -1,12 +1,22 @@
-# GOT2 整页端到端布局查询方案
+# LAVP：GOT2 整页布局感知视觉提示方案
 
-> 实现备案（2026-08-22）：本文同时保留 Fixed-Slot VLQA baseline，并记录独立的 Prompted Variable-Length Layout Decoder（PVLD-32）工程候选。PVLD-32 不覆盖、替换或改写既有 Fixed-Slot 代码和结果；当前 causal decoder＋FSM＋previous-region coverage 仍需统一消融验证，不能称为已验证创新。
+> **现行口径（2026-08-25）**：当前论文方法统一命名为 **LAVP（Layout-Aware Visual Prompting）**。工程实现以 global visual/layout prompts 汇聚整页结构证据，以 causal PVLD 执行变量长度布局重建，并通过 `visual_value_layout_routing` 保证 OCR 内容 Value 仍来自视觉 token。Fixed-Slot VLQA 及其 VQLCA 写回变体均为旧方案，已经退出当前主方案；旧代码、配置名、checkpoint 和结果仅用于兼容加载、实验溯源与 baseline，不得作为 LAVP 的别名。LAVP/PVLD 仍需统一消融验证，不能称为已验证创新。
+
+| 层级 | 统一名称 | 工程含义 | 状态 |
+|---|---|---|---|
+| 论文方法 | LAVP | Layout-Aware Visual Prompting 总体方法 | 当前论文命名 |
+| 布局重建模块 | causal PVLD | 从 `layout_evidence=A` 生成 REGION/EOS 序列及区域属性 | 当前工程候选 |
+| OCR 视觉路由 | `visual_value_layout_routing` | 布局证据调制视觉到视觉路由，OCR Value 仍来自视觉 token | 当前工程候选 |
+| 固定槽位布局模块 | Fixed-Slot VLQA | 固定 query 与区域按顺序一一对应 | 历史 baseline |
+| 固定槽位写回变体 | VQLCA | `layout_writeback_mode=vqlca` | 历史消融/兼容路径 |
+
+论文中的 “visual prompting” 对应 learnable global prompt bank 对高分辨率视觉特征执行 cross-attention，而不是把 prompt 当作普通 token 字面拼接到 Vary ViT encoder 输入序列。摘要、方法图和公式应按实际代码描述这一点；除非后续代码明确实现并验证 encoder-sequence prepend，否则不得使用 “prepended to the encoder sequence” 作为工程事实。
 
 ## 0. 方案备案与命名边界
 
-### 0.1 Fixed-Slot VLQA baseline
+### 0.1 已归档的 Fixed-Slot VLQA/VQLCA 旧方案
 
-原有方案统一称为 **Fixed-Slot VLQA baseline**，并分为两个容量配置：
+原有方案统一归档为 **Fixed-Slot VLQA historical baseline**。VQLCA 不是另一条当前主线，而是该固定槽位架构中曾使用的历史视觉写回变体。旧方案分为两个容量配置：
 
 - **Fixed-Slot VLQA-K16**：原始 `max_regions=16`，作为既有主基线；
 - **Fixed-Slot VLQA-K32**：仅将固定槽位上限提高到 `max_regions=32`，作为容量控制对照。
@@ -15,9 +25,9 @@
 
 当区域数量超过固定上限时，当前 Fixed-Slot 协议采用 oracle chunk 或截断。因此 K16/K32 都不能声称能够自适应输出任意数量区域；K32 只是容量对照，不能包装为变量长度解码创新。
 
-### 0.2 Prompted Variable-Length Layout Decoder（工程候选）
+### 0.2 LAVP 中的 Prompted Variable-Length Layout Decoder（工程候选）
 
-新方案暂称 **Prompted Variable-Length Layout Decoder（PVLD-32）**。该名称只是工程候选名称，不能直接作为最终创新结论。它必须在相同 whole-page 输入、数据划分、seed、有效 batch size、optimizer steps、OCR prompt、解码参数和 validation-only checkpoint 选择协议下，与 Fixed-Slot VLQA-K32、普通 adaptor 和无布局监督 VLQA 统一消融比较。
+LAVP 当前使用的布局重建模块称为 **Prompted Variable-Length Layout Decoder（PVLD-32）**。LAVP 是论文方法总名，PVLD 是其工程子模块，二者不是与 Fixed-Slot VLQA/VQLCA 可互换的名称。该模块必须在相同 whole-page 输入、数据划分、seed、有效 batch size、optimizer steps、OCR prompt、解码参数和 validation-only checkpoint 选择协议下，与 Fixed-Slot VLQA-K32、普通 adaptor 和无布局监督历史对照统一比较。
 
 PVLD-32 的 `32` 表示 32 个全局 layout prompt tokens，而不是 32 个区域槽位：
 
@@ -222,13 +232,19 @@ PVLD-32 的自回归概率、连续 bbox/type/direction 头、各项 mask、总�
 
 `GOT/model/layout_prompt_decoder.py`、`GOT/model/GOT_ocr_2_0.py`、`scripts/layout_page_dataset.py`、`scripts/train_GOT_layout.py`、`scripts/evaluate_GOT_layout.py` 和 `tools/training/run_variable_layout_a100.py` 已组成 GOT2 whole-page PVLD 链路。2026-08-22 A100 smoke `pvld_causal_cuda_smoke_20260822_r2` 已通过 causal/cross attention、coverage、token/record heads、visual Value routing 的 finite/nonzero gradient和 0/1/多 REGION 停止检查。新 C3–C5 tmux `mthv2_pvld_causal_c3_c5_20260822` 已启动，validation/test 尚未执行。本结构仍是待统一消融的工程候选，不因完成接入和 smoke 自动获得性能结论。
 
+2026-08-25 的 M1a 候选在不改变 decoder block 的前提下增加两项边界机制。设第 $i$ 页真值中非终止 REGION 边界集合为 $R_i$、终止 EOS 边界为 $e_i$，则零区域页使用 $L_{b,i}=-\log p(e_i=\mathrm{EOS})$；其他页面使用 $L_{b,i}=\frac{1}{2}|R_i|^{-1}\sum_{t\in R_i}-\log p_t(\mathrm{REGION})+\frac{1}{2}[-\log p_{e_i}(\mathrm{EOS})]$，最终 $L_{boundary}=B^{-1}\sum_iL_{b,i}$。它与原 sequence CE 并存，避免区域多的页面和记录内部确定性 token 稀释每页唯一 EOS。
+
+现有 count head 从 `page_hidden=mean(layout_evidence, dim=1)` 产生 `c_hat`。在 FSM 同时允许 REGION/EOS 的位置，令已产生区域数为 $n_t$、$b_t=\lambda_c\tanh(c_{hat}-n_t-0.5)$，然后执行 $z_{REGION}\leftarrow z_{REGION}+b_t$、$z_{EOS}\leftarrow z_{EOS}-b_t$；记录内部 logits 不变。training forward 与 generation 都调用同一实现。第一轮固定 `boundary_weight=1.0`、`count_condition_strength=1.0`，只按 validation 判断；默认 0.0 时严格保留旧路径。该机制不新增参数，仅增加边界处 $O(BT)$ 的 count bias 和训练时小词表 log-softmax；额外激活显存为 $O(BT)$，相对 decoder self-attention 的 $O(BT^2D)$ 为次要项。
+
+M1a 不实现诊断文档中尚待验证的动态 record cap，也不修改已有静态 `max_layout_records=512` 安全上限。本轮仍使用 32 个 global layout prompts，它们不是 32 个区域槽。M2 空间 attention coverage、M3 共享梯度缩放、M4 预测布局反馈 OCR 和 `K=16/32/64` query 容量消融均保持未启用；因此 M1a validation 只能回答边界损失和 count-conditioned stopping 是否改善 EOS/count/重复传播，不能保证 OCR 改善。
+
 P1 每 2000 optimizer steps 保存一个待 validation 的 checkpoint。P1 不能按 OCR CER 或 final step 选点；预注册字典序为：停止错误总和 `1-EOS success + premature EOS + token-cap + record-cap`、count MAE、负 region F1、负 matched bbox IoU、负 ordered bbox IoU、duplicate rate、负 count exact accuracy、较早 step。P2 必须从该 validation-selected P1 初始化。P1-9000 优于 P1-12000 只证明 final P1 不是可靠默认值，不证明 9000 是全局最佳，也不支持仅增加 P1 steps。
 
 当前不加入 duplicate/coverage loss。只有完整 causal decoder＋FSM＋coverage 在连续 validation 点上仍出现严重重复，才另行提出有监督来源和独立消融；不得根据已查询的 MTHv2 frozen test 调整该损失或阈值。
 
 MTHv2 的 `label_textline` 仍只能标记为 ordered textline/region candidate，不改写为严格 column ground truth；whole-page 与 oracle-chunk 数据必须分开输出，oracle-chunk 结果不得与 whole-page PVLD 结果直接比较。
 
-> 历史状态记录（2026 年 8 月 12 日；当前备案见文首 2026-08-20）
+> **以下第 1–10 节是 2026 年 8 月 12 日的 Fixed-Slot VLQA/VQLCA 历史设计记录，不是当前 LAVP 方案定义。当前定义以第 0 节和第 11 节 causal PVLD 为准。**
 >
 > 文档性质：单模型 VLQA 路线的架构、目标函数与消融执行依据
 >
@@ -273,7 +289,7 @@ GOT 原论文同时支持 slice 与 whole-page 图像，并将单张 $1024\times
 | LayTokenLLM [8] | 将显式 bbox 压缩为少量 layout token | 显式 bbox 压缩基线 | 不作为当前端到端主结构 |
 | DocLayout-YOLO [9] | 通过多样合成数据增强文档版面分析 | 合成模板、背景和扰动多样性 | 其检测器不是本仓库的主识别结构 |
 
-本项目新增并正在验证的候选结构暂称 **Visual Layout Query Adapter（VLQA）**：布局 queries 直接读取整页视觉特征，使用布局辅助头进行语义约束，再通过零初始化门控残差写回 GOT2 的 256 个视觉 token。该结构已有首版代码，A100 forward/backward、P1→P2 工程链路、固定 1000 steps 两页实现诊断和两页 prompt-only checkpoint 重载链路均已通过；后者使用同一 `train` split 的 P1 overfit checkpoint，只能证明工程链路，不能表述为真实页面性能或泛化提升。
+本节当时新增并验证的候选结构称为 **Visual Layout Query Adapter（VLQA）**。该结构现已归档为 Fixed-Slot VLQA 历史 baseline，不再是当前候选；相关工程链路和结果只能用于说明旧实现与旧实验，不能用于描述当前 LAVP/PVLD。
 
 ## 4. 总体架构
 
@@ -541,9 +557,9 @@ A100 run `layout_overfit_20260812_002747` 已完成固定 P1、2 条记录、100
 8. 若完整 VLQA 在同预算下不优于等参数量视觉 adaptor，应保留简单 adaptor 或原 GOT2，不把无效结构包装为布局创新。
 9. 若 P1 不能在两个固定模板页面上把 object/direction 分类和 bbox 定位拟合到预设阈值，应先修复数值、初始化、冻结范围或目标实现，不得扩大数据或启动 P2。
 
-## 12. 当前结论
+## 12. 历史结论（已被文首现行口径取代）
 
-当前主候选已从“line crop＋显式 bbox/列序输入的 region-token adapter（旧 PCLA）”修订为“整页 GOT2＋端到端 Visual Layout Query Adapter”。页面视觉 token 提供原页面坐标参考，learnable queries 从视觉特征中产生布局表示；bbox、方向和阅读顺序只作为训练期辅助监督或评测标签，推理时不要求外部 metadata。显式 region-token adapter（旧 PCLA）、外部检测器路线和双 GOT2 路线均只作为独立对照。
+本节记录的“整页 GOT2＋端到端 Visual Layout Query Adapter”是当时结论，现已被文首 2026-08-25 口径取代。Fixed-Slot VLQA/VQLCA 只保留为历史 baseline；当前论文方法为 LAVP，活动工程子模块为 causal PVLD。bbox、方向和阅读顺序仍只作为训练期辅助监督或评测标签，不作为推理输入。
 
 该方案已完成设计修订、首版工程链路、加载后初始化修复、1000 steps 两页实现诊断和两页 prompt-only checkpoint 重载验证。后一次验证使用同一 `train` split 的 P1 overfit checkpoint，不能替代正式 held-out validation。能否提高页面 OCR、阅读顺序和小样本跨域泛化，仍必须由正式 split 和新版统一预算 `A0`–`A5` 消融决定。
 
@@ -558,10 +574,10 @@ A100 run `layout_overfit_20260812_002747` 已完成固定 P1、2 条记录、100
 7. Wang, J., Jin, L., & Ding, K. “LiLT: A Simple yet Effective Language-Independent Layout Transformer for Structured Document Understanding.” *ACL*, 2022. DOI: [10.18653/v1/2022.acl-long.534](https://doi.org/10.18653/v1/2022.acl-long.534)。
 8. Zhu, Z. et al. “A Simple yet Effective Layout Token in Large Language Models for Document Understanding.” *CVPR*, 2025. DOI: [10.1109/CVPR52734.2025.01349](https://doi.org/10.1109/CVPR52734.2025.01349)。
 9. Wang, D. et al. “DocLayout-YOLO: Enhancing Document Layout Analysis through Diverse Synthetic Data and Global-to-Local Adaptive Perception.” arXiv:2410.12628, 2024. [代码](https://github.com/opendatalab/DocLayout-YOLO)。
-## 11. PVLD visual-value layout routing (current formal candidate)
+## 11. LAVP/PVLD visual-value layout routing（当前工程候选）
 
-The earlier VQLCA wording is superseded for the PVLD path. The production
-candidate uses these symbols consistently:
+The earlier VQLCA wording is superseded for the PVLD path. The current LAVP
+engineering candidate uses these symbols consistently:
 
 ```text
 F       = Vary ViT high-resolution intermediate features [B, L_f, D_f]
@@ -610,6 +626,6 @@ This is not layout-to-visual content writeback.
 
 The old `layout_value` mode (`Q=visual, K/V=layout`) remains only as a
 historical ablation. The old `vqlca` mode remains loadable for provenance but
-is not the PVLD main path. Formal PVLD experiments must explicitly set
+is not the PVLD main path. LAVP/PVLD experiments must explicitly set
 `layout_writeback_mode=visual_value_layout_routing` and
 `layout_writeback_source=layout_evidence`.
