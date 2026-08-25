@@ -2,7 +2,7 @@
 
 > 更新日期：2026 年 8 月 12 日
 >
-> 文档性质：Visual Layout Query Adapter（VLQA）的数据与训练执行方案
+> 文档性质：Fixed-Slot Visual Layout Query Adapter（VLQA）的历史数据与训练执行方案。VLQA/VQLCA 已退出当前主方案；当前论文方法为 LAVP，工程子模块为 causal PVLD。本文保留用于旧实验复现和 baseline，不定义当前 LAVP 训练协议。
 >
 > 当前状态：整页生成与审计及 A100 工程链路已经打通；`layout_overfit_20260812_002747` 已通过固定 1000 steps 的 P1 两样本实现诊断，object/direction/bbox 均达到实现门槛；tokenizer 预检修复后的 `layout_validate_20260812_014816` 已在两页 `train` split 上完成 prompt-only 链路验证，但正式 held-out validation、消融和效果验证仍未完成；以下参数和比例仍是首轮候选
 
@@ -173,7 +173,7 @@ $$\mathcal L_{\mathrm{total}}=\mathcal L_{\mathrm{ocr}}+\mathcal L_{\mathrm{layo
 6. 可视化同一页面在正确模型和无监督 query 对照中的注意力区域；
 7. 将同一内容放到不同合法版面，检查 OCR 与 query 定位是否稳定。
 
-旧版“正确 metadata、全零 metadata、随机 metadata”测试只适用于显式 region-token adapter（旧 PCLA）对照，不适用于不接收 metadata 的 VLQA 主模型。
+旧版“正确 metadata、全零 metadata、随机 metadata”测试只适用于显式 region-token adapter（旧 PCLA）对照，不适用于不接收 metadata 的当前 LAVP/PVLD 模型。
 
 ## 7. 小样本协议
 
@@ -231,7 +231,7 @@ A100 run `layout_overfit_20260811_113817` 已确认上述初始化与尺度修�
 
 A100 run `layout_overfit_20260812_002747` 已完成固定 P1、2 条记录、1000 steps 的实现诊断并返回 `overfit_assessment.status=pass`。末 20 步均值为 object loss 0.00201755、bbox L1 0.00531464、bbox GIoU 0.05508578、direction loss 0.00154159、object/direction accuracy 1.0、bbox mean IoU 0.94497279，尾段范围也通过阈值。该 run 只证明两页实现可拟合。
 
-现有 `scripts/linelevel_dataset.py`、`train_GOT_linelevel.py` 和 `run_linelevel_smoke.sh` 只保留为既有工程链路与 line-level 诊断入口，不能作为新版整页 VLQA 的正式运行命令。现有 `ancientdoc_dataset.py` 可用于核对整页数据读取方式，但其历史 split 存在书籍级重叠，不能直接充当无泄漏主实验。
+现有 `scripts/linelevel_dataset.py`、`train_GOT_linelevel.py` 和 `run_linelevel_smoke.sh` 只保留为既有工程链路与 line-level 诊断入口，不能作为当前整页 LAVP/PVLD 的正式运行命令。现有 `ancientdoc_dataset.py` 可用于核对整页数据读取方式，但其历史 split 存在书籍级重叠，不能直接充当无泄漏主实验。
 
 正式实现顺序固定为：
 

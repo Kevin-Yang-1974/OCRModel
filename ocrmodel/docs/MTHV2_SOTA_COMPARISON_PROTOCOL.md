@@ -1,5 +1,7 @@
 # MTHv2 统一内部基线与外部 SOTA 对比协议
 
+> **命名边界**：当前论文方法为 LAVP（Layout-Aware Visual Prompting），当前工程子模块为 causal PVLD。Fixed-Slot VLQA/VQLCA 是历史方案，只作为内部 baseline；LAVP、PVLD、VLQA 和 VQLCA 不得混作同一模型名。
+
 ## 当前阶段边界
 
 本协议用于建立可重复的 MTHv2 whole-page 对比工程。当前阶段只允许官方模型权重部署、validation 1–2 页 zero-shot smoke 和最多 1 optimizer step 的 fine-tune smoke；不启动正式长程微调、正式 validation selection、MTHv2 test 或 frozen test。所有正式 test 必须在 validation selection、prompt、阈值和后处理锁定后，由用户另行授权启动。
@@ -8,7 +10,7 @@ MTHv2 数据根固定为 `/data3/yky/yangky_ocr_models/datasets/MTHv2/converted/
 
 ## 参数量口径
 
-当前 GOT2 + PVLD-32 完整模型参数量为 `564,759,576`（约 `564.76M/0.565B`），其中当前训练只更新 `5,280,536`（约 `5.28M`）参数：`mm_projector_vary=1,049,600`，PVLD=4,230,936。外部模型比较使用完整推理模型参数量；训练成本单独报告可训练参数量，不能用 5.28M 冒充模型总参数。
+当前 GOT2 + LAVP/PVLD 完整模型参数量为 `564,759,576`（约 `564.76M/0.565B`），其中当前训练只更新 `5,280,536`（约 `5.28M`）参数：`mm_projector_vary=1,049,600`，LAVP/PVLD layout branch=4,230,936。外部模型比较使用完整推理模型参数量；训练成本单独报告可训练参数量，不能用 5.28M 冒充模型总参数。
 
 ## 内部基线
 
@@ -18,9 +20,9 @@ MTHv2 数据根固定为 `/data3/yky/yangky_ocr_models/datasets/MTHv2/converted/
 | B1 | 原始 GOT2 OCR-only | 同数据适配 | 尽量统一起点、seed、batch、optimizer 和页面曝光量 |
 | B2 | GOT2 + 等参数量普通 adaptor | 同数据适配 | 目标可训练参数约 5.28M |
 | B3 | Fixed-Slot VLQA-K32 | 同数据适配 | 明确记录 `>32` 区域容量限制 |
-| B4 | causal PVLD C3 | 已有 run 只读复用 | 不重复启动 |
-| B5 | causal PVLD C4 | 已有 run 只读复用 | 直接 P2 布局联合训练 |
-| B6 | causal PVLD C5 | 已有 run 只读复用 | validation-selected P1 后进入 P2，额外 P1 预算单列 |
+| B4 | LAVP/PVLD C3 | 已有 run 只读复用 | causal PVLD；不重复启动 |
+| B5 | LAVP/PVLD C4 | 已有 run 只读复用 | causal PVLD；直接 P2 布局联合训练 |
+| B6 | LAVP/PVLD C5 | 已有 run 只读复用 | causal PVLD；validation-selected P1 后进入 P2，额外 P1 预算单列 |
 
 B4–B6 复用时记录原 run ID、selection 路径和权重哈希，不复制或覆盖服务器产物。
 
@@ -157,3 +159,11 @@ GLM-OCR 与 PaddleOCR-VL 均为 800 页有效 schema、0 inference failure、0 e
 该表对应 2026-08-22 已完成的旧 whole-page C1-C5 selection-locked test，exact match 均为 0/800。C5 在这组内部控制中 OCR 和布局最好，但只比 C1 降低 `0.007625` CER，且多出 P1 12,000 steps；单 seed 结果不足以声称结构已验证。该轮 C3-C5 使用后来确认存在缺陷的累计均值自由生成器，因此不能作为 causal decoder 修复版的性能结论。
 
 causal 修复后 run `mthv2_pvld_causal_20260822_v1` 当前只有 C3/C4 分别完成 42,000-step P2 训练，尚无 validation selection 或 test；C5 的 P1 validation 在 step 4,000 选中 checkpoint，但 P2 因 `PVLD C5 P2 must initialize from its validation-eligible P1 model` 契约检查失败。该新 run 当前只有训练/故障结论，不能加入上述结果表。
+
+## OpenDoc serialization 修复与正式重跑（2026-08-24）
+
+旧 run `sota_opendoc_formal_20260824_v1` 错误地把 `blocks[*].img` NumPy 像素数组序列化到 raw output，同时文本标准化未识别官方 `recognition_results[*].text`。因此旧 validation/test prediction 分别膨胀到 `32,045,280,763` 和 `44,584,796,160` bytes，且其 normalized text 不可用于 CER。经用户明确授权，已永久删除这两个无效 JSONL，保留约 `1.6MB` 的日志、protocol、selection 和 finished metadata 作为失败审计；删除内容本机不可恢复。
+
+修复后 raw output 保留官方有意义字段，但从 `blocks` 中排除内部 `img`；文本只从 `recognition_results[*].text` 等确定性官方字段提取。专用入口 `tools/sota/run_opendoc_formal_tmux.sh` 显式使用官方 OpenOCR ONNX CPU provider，不查询 GPU，不使用总启动器的 `cuda:4` 路径；validation 必须为 240 条且全部 `status=ok` 后才允许 selection，test 必须为 800 条且全部成功，最后自动计算统一指标。任何失败都会写 `failed.json`，不静默进入下一阶段。
+
+新 tmux `sota_opendoc_formal_20260824_v2`、run `sota_opendoc_formal_20260824_v2` 已启动。真实首批验证为 provider `official_openocr_onnx`、device `cpu`、2 页共 `13,528` bytes；首条 `normalized_text` 长度 `511`，`blocks` keys 仅为 `box/label/merge_aligns/score`，不含 `img`，单页延迟约 `13.26s`。这只证明修复后的正式链路正在正常运行，完整 240/800 页和最终 CER 尚未完成。

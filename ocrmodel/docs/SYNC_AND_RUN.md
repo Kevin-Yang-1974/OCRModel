@@ -1,4 +1,6 @@
-# AncientDoc 同步与运行
+# LAVP/PVLD、历史基线与 AncientDoc 同步运行
+
+> **命名边界（2026-08-25）**：当前论文方法为 LAVP，当前布局重建工程模块为 causal PVLD，写回模式为 `visual_value_layout_routing`。本文出现的 Fixed-Slot VLQA、VQLCA、`vlqa_*` 配置和 AncientDoc C4–C6 均为历史方案或历史实验入口，只用于复现、溯源与 baseline，不得作为 LAVP 的别名或当前主方案。运行命令中的旧 ID 为兼容性接口，不代表当前论文命名。
 
 正式协议固定使用书籍隔离数据集 `ancientdoc_layout_260707_group_isolated_seed20260815`。模型输入为原始整页图像和 `OCR: ` prompt；布局 metadata 不作为推理输入。
 
@@ -384,3 +386,63 @@ P2 通过 `p1/validation_selection/selection.json` 核验 validation-only 用途
 ```text
 /data3/yky/yangky_ocr_models/training_runs/GOT/mthv2_pvld_causal_20260822_v1_mthv2_pvld_causal_eval_recovery_20260824_v1_logs/launcher.log
 ```
+
+该 recovery 于保存 C5 P2 `checkpoint-18000` 时因 `/data3` 空间耗尽结束，未进入 C3-C5 validation/test。`checkpoint-16000` 是最后一个同时具有 model、config、trainer state 和 optimizer state 的完整恢复点；`tmp-checkpoint-18000` 不可使用。恢复前必须先由用户明确授权处理磁盘占用，并使用新的 tmux/session 和 evaluation suffix；不得直接删除约 `72G` 的 OpenDoc run、失败 checkpoint 或旧结果。
+
+用户授权后已清理 oracle-chunk 旧口径的非选中周期 checkpoints，并保留每组 validation-selected checkpoint；`/data3` 恢复为 `228G` 可用。第二次 recovery 使用：
+
+```bash
+bash tools/training/run_mthv2_page_pvld_causal_eval_recovery_tmux.sh \
+  --session mthv2_pvld_causal_eval_recovery_20260824_v2 \
+  --run-prefix mthv2_pvld_causal_20260822_v1 \
+  --evaluation-suffix _causal_recovery_20260824_v2 \
+  --gpu-ids 0,1,3,4
+```
+
+runner 为重复恢复依次使用 `train.recovery.log`、`train.recovery.2.log` 等新文件，不覆盖失败日志。v2 已核验从完整 `checkpoint-16000` 继续，而不是从头训练。
+
+## 14. OpenDoc CPU-only 正式重跑
+
+OpenDoc ONNX provider 在当前服务器缺少 cuDNN 9，固定使用 CPU。不要复用会查询 `0,1,3,4` 的多模型总启动器；使用专用入口：
+
+```bash
+bash tools/sota/run_opendoc_formal_tmux.sh \
+  --session sota_opendoc_formal_20260824_v2 \
+  --run-id sota_opendoc_formal_20260824_v2
+```
+
+该入口不调用 `nvidia-smi`，固定依次执行 240 页 validation、validation-only selection、800 页 selection-locked test 和 unified metrics。状态入口：
+
+```bash
+tmux has-session -t sota_opendoc_formal_20260824_v2 && echo RUNNING || echo ENDED
+tail -n 20 /data3/yky/yangky_ocr_models/evaluation_runs/SOTA/sota_opendoc_formal_20260824_v2/launcher.log
+```
+
+成功必须同时存在 `opendoc_0_1b/finished.json`、`selection.json`、`test/summary.json` 和 `test/unified_metrics.json`。失败查看 `opendoc_0_1b/failed.json` 及对应阶段日志，不能因 tmux 退出直接写成完成。
+
+## 15. PVLD M1a 四卡训练与 validation-only 选点
+
+本地检查和白名单同步完成后，先执行 M1a CUDA bounded smoke；只有 smoke 成功才启动正式 tmux。正式入口固定使用原始整页 MTHv2、GPU `1,2,3,4`，不运行 test：
+
+```bash
+bash tools/training/run_mthv2_pvld_m1_tmux.sh \
+  --session mthv2_pvld_m1_20260825 \
+  --run-id mthv2_pvld_m1_boundary_count_20260825_v1 \
+  --gpu-ids 1,2,3,4
+```
+
+四卡训练的 P1/P2 optimizer steps 为 `3000/7500`，有效 batch 为 4，页面曝光与旧单卡 C5 的 `12000/30000` 相同；它是提高吞吐的 large-batch 协议，不是相同 optimizer trajectory。P1 checkpoints 为 `1000/2000/3000`，P2 为 `2500/5000/7500`，`save_total_limit=3`，全线最多 6 个 checkpoint 目录。P1 与 P2 的三个候选分别使用 `--parallel-gpu-ids 1,2,3,4` 做 validation-only selection；selector 在任何候选启动前只查询这四张卡一次，任一卡 `>=50%` 时整体退出，之后每张卡运行一个顺序 worker queue。
+
+状态入口：
+
+```bash
+tmux has-session -t mthv2_pvld_m1_20260825 && echo RUNNING || echo ENDED
+python - <<'PY'
+import json
+from pathlib import Path
+p = Path('/data3/yky/yangky_ocr_models/training_runs/GOT/mthv2_pvld_m1_boundary_count_20260825_v1/metadata/status.txt')
+print(json.dumps(json.loads(p.read_text()), ensure_ascii=False, separators=(',', ':')))
+PY
+```
+
+完整日志保存在新 run 的 `p1/train.log`、`p1/validation_selection.log`、`p2/train.log` 及独立 P2 validation selection 目录。成功条件是训练 run 存在 `PVLD_TRAINING_FINISHED`，P1/P2 两份 `selection.json` 均为 `selection_split=validation`、`test_used_for_selection=false`，checkpoint 目录不超过 6。本轮没有 selection-locked test；只有 M1a validation 结果足以锁定后续方案后，才另行授权 test。
