@@ -42,6 +42,7 @@ class GOTBaseModelOutputWithPast(BaseModelOutputWithPast):
     layout_bbox_xyxy: Optional[torch.FloatTensor] = None
     layout_direction_logits: Optional[torch.FloatTensor] = None
     layout_sequence_loss: Optional[torch.FloatTensor] = None
+    layout_boundary_loss: Optional[torch.FloatTensor] = None
     layout_type_loss: Optional[torch.FloatTensor] = None
     layout_count_loss: Optional[torch.FloatTensor] = None
     layout_eos_accuracy: Optional[torch.FloatTensor] = None
@@ -57,6 +58,7 @@ class GOTBaseModelOutputWithPast(BaseModelOutputWithPast):
     layout_sequence_log_probability: Optional[torch.FloatTensor] = None
     layout_coverage_summary: Optional[torch.FloatTensor] = None
     layout_coverage_region_counts: Optional[torch.LongTensor] = None
+    layout_spatial_coverage: Optional[torch.FloatTensor] = None
     layout_record_mask: Optional[torch.BoolTensor] = None
     layout_type_logits: Optional[torch.FloatTensor] = None
 
@@ -83,6 +85,7 @@ class GOTCausalLMOutputWithPast(CausalLMOutputWithPast):
     layout_bbox_xyxy: Optional[torch.FloatTensor] = None
     layout_direction_logits: Optional[torch.FloatTensor] = None
     layout_sequence_loss: Optional[torch.FloatTensor] = None
+    layout_boundary_loss: Optional[torch.FloatTensor] = None
     layout_type_loss: Optional[torch.FloatTensor] = None
     layout_count_loss: Optional[torch.FloatTensor] = None
     layout_eos_accuracy: Optional[torch.FloatTensor] = None
@@ -98,6 +101,7 @@ class GOTCausalLMOutputWithPast(CausalLMOutputWithPast):
     layout_sequence_log_probability: Optional[torch.FloatTensor] = None
     layout_coverage_summary: Optional[torch.FloatTensor] = None
     layout_coverage_region_counts: Optional[torch.LongTensor] = None
+    layout_spatial_coverage: Optional[torch.FloatTensor] = None
     layout_record_mask: Optional[torch.BoolTensor] = None
     layout_type_logits: Optional[torch.FloatTensor] = None
 
@@ -206,9 +210,25 @@ class GOTQwenModel(Qwen2Model):
                 direction_weight=config.vlqa_direction_weight,
             )
         if getattr(config, "variable_layout_enabled", False):
-            config.pvld_decoder_version = "causal_transformer_fsm_previous_region_v1"
-            config.pvld_decoder_memory = "layout_evidence_only"
-            config.pvld_coverage_detach = False
+            config.pvld_decoder_version = "causal_transformer_fsm_m2_spatial_memory_v1"
+            config.pvld_decoder_memory = str(
+                getattr(config, "pvld_decoder_memory", "layout_evidence_only")
+            )
+            config.pvld_use_spatial_memory = bool(
+                getattr(config, "pvld_use_spatial_memory", False)
+            )
+            config.pvld_coverage_detach = bool(
+                getattr(config, "pvld_coverage_detach", config.pvld_use_spatial_memory)
+            )
+            config.pvld_shared_gradient_scale = float(
+                getattr(config, "pvld_shared_gradient_scale", 1.0)
+            )
+            config.pvld_record_gradient_scale = float(
+                getattr(config, "pvld_record_gradient_scale", 1.0)
+            )
+            config.pvld_predicted_layout_routing = bool(
+                getattr(config, "pvld_predicted_layout_routing", False)
+            )
             config.num_layout_prompt_queries = int(
                 getattr(config, "num_layout_prompt_queries", 32)
             )
@@ -220,6 +240,12 @@ class GOTQwenModel(Qwen2Model):
             )
             config.layout_decoder_num_heads = int(
                 getattr(config, "layout_decoder_num_heads", 8)
+            )
+            config.layout_boundary_loss_weight = float(
+                getattr(config, "layout_boundary_loss_weight", 0.0)
+            )
+            config.layout_count_condition_strength = float(
+                getattr(config, "layout_count_condition_strength", 0.0)
             )
             config.layout_writeback_mode = "visual_value_layout_routing"
             config.layout_writeback_source = "layout_evidence"
@@ -245,6 +271,13 @@ class GOTQwenModel(Qwen2Model):
                 prompt_diversity_weight=float(
                     getattr(config, "layout_prompt_diversity_loss_weight", 0.0)
                 ),
+                boundary_weight=config.layout_boundary_loss_weight,
+                count_condition_strength=config.layout_count_condition_strength,
+                use_spatial_memory=config.pvld_use_spatial_memory,
+                coverage_detach=config.pvld_coverage_detach,
+                shared_gradient_scale=config.pvld_shared_gradient_scale,
+                record_gradient_scale=config.pvld_record_gradient_scale,
+                predicted_layout_routing=config.pvld_predicted_layout_routing,
             )
 
     @staticmethod
@@ -583,6 +616,7 @@ class GOTQwenModel(Qwen2Model):
         sequence_log_probability = None
         coverage_summary = None
         coverage_region_counts = None
+        spatial_coverage = None
         record_mask = None
         record_bbox = None
         record_type_logits = None
@@ -640,6 +674,13 @@ class GOTQwenModel(Qwen2Model):
             coverage_region_counts = torch.cat(
                 [output.decoder_output.coverage_region_counts for output in generated_outputs], dim=0
             )
+            spatial_values = [
+                output.decoder_output.spatial_coverage
+                for output in generated_outputs
+                if output.decoder_output.spatial_coverage is not None
+            ]
+            if spatial_values:
+                spatial_coverage = torch.cat(spatial_values, dim=0)
             record_mask = torch.cat(
                 [pad_records(output.record_mask, record_width) for output in generated_outputs],
                 dim=0,
@@ -741,6 +782,7 @@ class GOTQwenModel(Qwen2Model):
                 else record_direction_logits
             ),
             layout_sequence_loss=mean_variable("sequence_loss"),
+            layout_boundary_loss=mean_variable("boundary_loss"),
             layout_type_loss=mean_variable("type_loss"),
             layout_count_loss=mean_variable("count_loss"),
             layout_eos_accuracy=mean_variable("eos_accuracy"),
@@ -756,6 +798,7 @@ class GOTQwenModel(Qwen2Model):
             layout_sequence_log_probability=sequence_log_probability,
             layout_coverage_summary=coverage_summary,
             layout_coverage_region_counts=coverage_region_counts,
+            layout_spatial_coverage=spatial_coverage,
             layout_record_mask=record_mask,
             layout_type_logits=record_type_logits,
         )
@@ -912,6 +955,7 @@ class GOTQwenForCausalLM(Qwen2ForCausalLM):
             layout_bbox_xyxy=outputs.layout_bbox_xyxy,
             layout_direction_logits=outputs.layout_direction_logits,
             layout_sequence_loss=outputs.layout_sequence_loss,
+            layout_boundary_loss=outputs.layout_boundary_loss,
             layout_type_loss=outputs.layout_type_loss,
             layout_count_loss=outputs.layout_count_loss,
             layout_eos_accuracy=outputs.layout_eos_accuracy,
@@ -927,6 +971,7 @@ class GOTQwenForCausalLM(Qwen2ForCausalLM):
             layout_sequence_log_probability=outputs.layout_sequence_log_probability,
             layout_coverage_summary=outputs.layout_coverage_summary,
             layout_coverage_region_counts=outputs.layout_coverage_region_counts,
+            layout_spatial_coverage=outputs.layout_spatial_coverage,
             layout_record_mask=outputs.layout_record_mask,
             layout_type_logits=outputs.layout_type_logits,
         )

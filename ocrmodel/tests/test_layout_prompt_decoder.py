@@ -94,6 +94,114 @@ def test_record_heads_bound_bbox_and_loss_backpropagates() -> None:
     assert decoder.prompt_attention.prompt_bank.prompts.grad is not None
 
 
+def test_boundary_loss_is_page_balanced_and_supports_zero_regions() -> None:
+    vocabulary = module.LayoutVocabulary()
+    target_ids = torch.tensor([
+        vocabulary.encode([
+            "<LAYOUT>", "<REGION>", "<TYPE>", "REGION", "</TYPE>",
+            "</REGION>", "<REGION>", "<TYPE>", "ROW", "</TYPE>",
+            "</REGION>", "<EOS>",
+        ]),
+        vocabulary.encode(["<LAYOUT>", "<EOS>"]) + [vocabulary.pad_id] * 10,
+    ])
+    logits = torch.randn(2, 12, vocabulary.vocab_size, requires_grad=True)
+    output = module.VariableLayoutOutput(
+        logits=logits,
+        hidden_states=torch.zeros(2, 12, 8),
+        layout_evidence=torch.zeros(2, 4, 8),
+    )
+    records = module.LayoutRecordOutput(
+        bbox=torch.full((2, 2, 4), 0.5),
+        type_logits=torch.zeros(2, 2, 5),
+        direction_logits=torch.zeros(2, 2, 5),
+        count=torch.tensor([2.0, 0.0]),
+    )
+    criterion = module.VariableLayoutLoss(boundary_weight=1.0)
+    losses = criterion(
+        output, target_ids, records, torch.full((2, 2, 4), 0.5),
+        torch.full((2, 2), -100, dtype=torch.long),
+        torch.full((2, 2), -100, dtype=torch.long),
+        torch.tensor([[True, True], [False, False]]),
+        torch.tensor([2.0, 0.0]), vocabulary.pad_id,
+        vocabulary.region_id, vocabulary.eos_id,
+    )
+    log_probabilities = logits[:, :-1].float().log_softmax(dim=-1)
+    shifted = target_ids[:, 1:]
+    page0_region = -log_probabilities[0, shifted[0].eq(vocabulary.region_id), vocabulary.region_id].mean()
+    page0_eos = -log_probabilities[0, shifted[0].eq(vocabulary.eos_id), vocabulary.eos_id].mean()
+    page1_eos = -log_probabilities[1, shifted[1].eq(vocabulary.eos_id), vocabulary.eos_id].mean()
+    expected = (0.5 * (page0_region + page0_eos) + page1_eos) / 2
+    assert torch.allclose(losses.boundary_loss, expected)
+    assert torch.isfinite(losses.loss)
+    losses.loss.backward()
+    assert logits.grad is not None and torch.isfinite(logits.grad).all()
+
+
+def test_count_condition_zero_is_exact_identity_and_prior_biases_boundaries() -> None:
+    vocabulary = module.LayoutVocabulary()
+    decoder = module.VariableLayoutDecoder(
+        vocabulary.vocab_size, 16, 16, num_layers=1, num_heads=4,
+        max_layout_tokens=16, vocabulary=vocabulary,
+        count_condition_strength=0.0,
+    )
+    ids = torch.tensor([[vocabulary.layout_id]])
+    logits = torch.zeros(1, 1, vocabulary.vocab_size)
+    unchanged = decoder._apply_count_condition(logits, ids, torch.tensor([3.0]))
+    assert unchanged is logits
+
+    decoder.count_condition_strength = 1.0
+    before_count = decoder._apply_count_condition(logits, ids, torch.tensor([2.0]))
+    at_count = decoder._apply_count_condition(logits, ids, torch.tensor([0.0]))
+    assert before_count[0, 0, vocabulary.region_id] > before_count[0, 0, vocabulary.eos_id]
+    assert at_count[0, 0, vocabulary.eos_id] > at_count[0, 0, vocabulary.region_id]
+
+
+def test_count_condition_has_finite_nonzero_count_prior_gradient() -> None:
+    vocabulary = module.LayoutVocabulary()
+    decoder = module.VariableLayoutDecoder(
+        vocabulary.vocab_size, 16, 16, num_layers=1, num_heads=4,
+        max_layout_tokens=16, vocabulary=vocabulary,
+        count_condition_strength=1.0,
+    )
+    ids = torch.tensor([vocabulary.encode([
+        "<LAYOUT>", "<REGION>", "<TYPE>", "REGION", "</TYPE>",
+        "</REGION>", "<EOS>",
+    ])])
+    count_prior = torch.tensor([1.5], requires_grad=True)
+    output = decoder(ids, torch.randn(1, 5, 16), count_prior=count_prior)
+    loss = torch.nn.functional.cross_entropy(
+        output.logits[:, :-1].reshape(-1, vocabulary.vocab_size),
+        ids[:, 1:].reshape(-1),
+    )
+    loss.backward()
+    assert count_prior.grad is not None and torch.isfinite(count_prior.grad).all()
+    assert count_prior.grad.abs().sum() > 0
+
+
+def test_generation_reuses_forward_count_condition_path() -> None:
+    vocabulary = module.LayoutVocabulary()
+    decoder = module.VariableLayoutDecoder(
+        vocabulary.vocab_size, 16, 16, num_layers=1, num_heads=4,
+        max_layout_tokens=8, vocabulary=vocabulary,
+        count_condition_strength=1.0,
+    )
+    observed = []
+    original_forward = decoder.forward
+
+    def recording_forward(*args, **kwargs):
+        observed.append(kwargs.get("count_prior"))
+        return original_forward(*args, **kwargs)
+
+    decoder.forward = recording_forward
+    prior = torch.tensor([0.0])
+    decoder.generate(
+        torch.randn(1, 4, 16), layout_id=vocabulary.layout_id,
+        region_id=vocabulary.region_id, eos_id=vocabulary.eos_id,
+        pad_id=vocabulary.pad_id, count_prior=prior,
+    )
+    assert observed and all(value is prior for value in observed)
+
+
 def test_variable_generation_can_finish_with_eos_and_marks_truncation() -> None:
     vocabulary = module.LayoutVocabulary()
     decoder = module.VariableLayoutDecoder(
@@ -287,6 +395,66 @@ def test_previous_region_coverage_changes_later_routing() -> None:
     assert not torch.equal(with_coverage.logits[:, 2:], without_coverage.logits[:, 2:])
     with torch.no_grad():
         decoder.decoder_blocks[0].coverage_projection.weight.copy_(weight)
+
+
+def test_m2_spatial_memory_appends_projected_visual_tokens_and_detaches_coverage() -> None:
+    vocabulary = module.LayoutVocabulary()
+    decoder = module.VariableLayoutDecoder(
+        vocabulary.vocab_size, 16, 12, num_layers=1, num_heads=4,
+        max_layout_tokens=16, vocabulary=vocabulary,
+        use_spatial_memory=True, coverage_detach=True,
+    )
+    ids = torch.tensor([vocabulary.encode([
+        "<LAYOUT>", "<REGION>", "<TYPE>", "REGION", "</TYPE>", "</REGION>", "<EOS>"
+    ])])
+    output = decoder(ids, torch.randn(1, 25, 12, requires_grad=True))
+    assert output.spatial_coverage is not None
+    assert output.spatial_coverage.shape == (1, 25)
+    assert not output.spatial_coverage.requires_grad
+    assert decoder.spatial_memory_projection.weight.numel() == 16 * 12 + 16
+
+
+def test_m3_straight_through_scale_preserves_forward_and_scales_gradient() -> None:
+    value = torch.tensor([2.0], requires_grad=True)
+    scaled = module.straight_through_scale(value, 0.25)
+    assert torch.equal(scaled.detach(), value.detach())
+    scaled.sum().backward()
+    assert torch.allclose(value.grad, torch.tensor([0.25]))
+
+
+def test_m4_predicted_layout_routing_is_visual_value_only_and_supports_shuffle() -> None:
+    adapter = module.PromptedVariableLayoutAdapter(
+        visual_dim=16, high_resolution_dim=12, hidden_size=16,
+        num_prompt_queries=4, decoder_layers=1, num_heads=4,
+        max_layout_tokens=10, max_layout_records=2,
+        predicted_layout_routing=True,
+    ).eval()
+    with torch.no_grad():
+        adapter.decoder.token_head.weight.zero_()
+        adapter.decoder.token_head.bias.zero_()
+        adapter.decoder.token_head.bias[adapter.vocabulary.region_id] = 5.0
+        adapter.decoder.token_head.bias[adapter.vocabulary.type_id] = 4.0
+        adapter.decoder.token_head.bias[adapter.vocabulary.token_to_id["REGION"]] = 3.0
+        adapter.decoder.token_head.bias[adapter.vocabulary.end_type_id] = 2.0
+        adapter.decoder.token_head.bias[adapter.vocabulary.end_region_id] = 1.0
+        adapter.decoder.token_head.bias[adapter.vocabulary.eos_id] = 0.5
+        adapter.residual_gate.fill_(0.5)
+    visual = torch.randn(2, 5, 16)
+    high = torch.randn(2, 9, 12)
+    with torch.no_grad():
+        identity = adapter(visual, high, shuffle_predicted_layout=False)
+        adapter.residual_gate.zero_()
+        alpha_zero = adapter(visual, high, shuffle_predicted_layout=False)
+        adapter.residual_gate.fill_(0.5)
+    normal = adapter(visual, high)
+    shuffled = adapter(visual, high, shuffle_predicted_layout=True)
+    assert normal.predicted_layout_condition is not None
+    assert normal.routing_reliability is not None
+    assert normal.visual_tokens.shape == visual.shape
+    assert torch.equal(alpha_zero.visual_tokens, visual)
+    assert not torch.equal(normal.visual_tokens, visual)
+    assert not torch.equal(normal.predicted_layout_condition, shuffled.predicted_layout_condition)
+    assert adapter.visual_routing.visual_value.weight.grad is None
 
 
 def test_integrated_pvld_routes_only_visual_values_and_blocks_teacher_forcing_leakage() -> None:

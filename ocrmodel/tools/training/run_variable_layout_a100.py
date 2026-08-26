@@ -23,6 +23,17 @@ def write_json(path: Path, payload: Any) -> None:
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2, default=str) + "\n", encoding="utf-8")
 
 
+def training_log_path(stage_root: Path, resume: bool) -> Path:
+    if not resume:
+        return stage_root / "train.log"
+    candidate = stage_root / "train.recovery.log"
+    attempt = 2
+    while candidate.exists():
+        candidate = stage_root / f"train.recovery.{attempt}.log"
+        attempt += 1
+    return candidate
+
+
 def parse_args() -> argparse.Namespace:
     root = Path(__file__).resolve().parents[2]
     parser = argparse.ArgumentParser(description=__doc__)
@@ -48,7 +59,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--p1-max-steps", type=int, default=12000)
     parser.add_argument("--p2-max-steps", type=int, default=30000)
     parser.add_argument("--checkpoint-steps", type=int, default=2000)
+    parser.add_argument("--p1-checkpoint-steps", type=int)
+    parser.add_argument("--p2-checkpoint-steps", type=int)
     parser.add_argument("--checkpoint-retention", type=int, default=2)
+    parser.add_argument("--layout-boundary-loss-weight", type=float, default=0.0)
+    parser.add_argument("--layout-count-condition-strength", type=float, default=0.0)
+    parser.add_argument("--pvld-use-spatial-memory", action="store_true")
+    parser.add_argument("--pvld-shared-gradient-scale", type=float, default=1.0)
+    parser.add_argument("--pvld-record-gradient-scale", type=float, default=1.0)
+    parser.add_argument("--pvld-predicted-layout-routing", action="store_true")
     parser.add_argument("--per-device-batch-size", type=int, default=1)
     parser.add_argument("--gradient-accumulation-steps", type=int, default=1)
     parser.add_argument("--p1-learning-rate", type=float, default=1e-4)
@@ -56,8 +75,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--gpu-ids", required=True)
     parser.add_argument("--gpu-utilization-limit", type=int, default=50)
+    parser.add_argument(
+        "--distributed-strategy",
+        choices=("deepspeed_zero2", "ddp"),
+        default="deepspeed_zero2",
+    )
+    parser.add_argument(
+        "--nccl-p2p-disable",
+        action="store_true",
+        help="Disable NCCL GPU P2P for the known A100 topology issue.",
+    )
     parser.add_argument("--run-id", required=True)
     parser.add_argument("--resume-existing-run", action="store_true")
+    parser.add_argument(
+        "--skip-p1-validation-selection",
+        action="store_true",
+        help="Bounded P1 distributed smoke only; requires --stages p1 and <=10 steps.",
+    )
     parser.add_argument(
         "--runs-root",
         type=Path,
@@ -101,19 +135,34 @@ def training_command(
     source_validation_selection: Path | None = None,
 ) -> list[str]:
     steps = args.p1_max_steps if stage == "p1" else args.p2_max_steps
+    checkpoint_steps = (
+        args.p1_checkpoint_steps if stage == "p1" else args.p2_checkpoint_steps
+    ) or args.checkpoint_steps
     learning_rate = args.p1_learning_rate if stage == "p1" else args.p2_learning_rate
     ocr_weight = "0" if stage == "p1" else "1"
-    deepspeed = Path(sys.executable).with_name("deepspeed")
+    torchrun = Path(sys.executable).with_name("torchrun")
     checkpoint_retention = args.checkpoint_retention
     if stage == "p1":
         checkpoint_retention = max(
             checkpoint_retention,
-            math.ceil(args.p1_max_steps / args.checkpoint_steps),
+            math.ceil(args.p1_max_steps / checkpoint_steps),
         )
     command = [
-        str(deepspeed), "--master_port", str(free_port()),
+        str(torchrun), "--standalone", "--nproc_per_node",
+        str(len(args.gpu_ids.split(","))), "--master_port", str(free_port()),
         str(args.project_root / "scripts" / "train_GOT_layout.py"),
-        "--deepspeed", str(args.project_root / "zero_config" / "zero2.json"),
+    ]
+    if args.distributed_strategy == "deepspeed_zero2":
+        command.extend(
+            ["--deepspeed", str(args.project_root / "zero_config" / "zero2.json")]
+        )
+    else:
+        # PVLD P2 can legitimately leave visual-routing parameters unused
+        # while residual_gate is initialized at zero. Let DDP detect and
+        # reduce only parameters participating in each step; otherwise the
+        # second optimizer step fails in reducer bucket rebuild.
+        command.extend(["--ddp_find_unused_parameters", "True"])
+    command.extend([
         "--model_name_or_path", str(source),
         "--tokenizer_name_or_path", str(args.tokenizer_model),
         "--layout_manifest", str(args.manifest),
@@ -131,6 +180,12 @@ def training_command(
         "--layout_decoder_layers", str(args.layout_decoder_layers),
         "--layout_decoder_hidden_size", str(args.layout_decoder_hidden_size),
         "--layout_decoder_num_heads", str(args.layout_decoder_num_heads),
+        "--layout_boundary_loss_weight", str(args.layout_boundary_loss_weight),
+        "--layout_count_condition_strength", str(args.layout_count_condition_strength),
+        "--pvld_use_spatial_memory", str(args.pvld_use_spatial_memory),
+        "--pvld_shared_gradient_scale", str(args.pvld_shared_gradient_scale),
+        "--pvld_record_gradient_scale", str(args.pvld_record_gradient_scale),
+        "--pvld_predicted_layout_routing", str(args.pvld_predicted_layout_routing),
         "--layout_writeback_mode", "visual_value_layout_routing",
         "--layout_writeback_source", "layout_evidence",
         "--layout_writeback_num_heads", str(args.layout_decoder_num_heads),
@@ -145,7 +200,7 @@ def training_command(
         "--optim", "adamw_torch",
         "--evaluation_strategy", "no",
         "--save_strategy", "steps",
-        "--save_steps", str(args.checkpoint_steps),
+        "--save_steps", str(checkpoint_steps),
         "--save_total_limit", str(checkpoint_retention),
         "--save_safetensors", "True",
         "--logging_steps", "1",
@@ -167,7 +222,7 @@ def training_command(
         "--ocr_loss_weight", ocr_weight,
         "--seed", str(args.seed),
         "--output_dir", str(output),
-    ]
+    ])
     if stage == "p2" and args.ablation == "vlqa_layout_p1_p2":
         if source_validation_selection is None:
             raise ValueError("PVLD C5 P2 requires its validation-only P1 selection.")
@@ -181,7 +236,7 @@ def p1_selection_command(
     args: argparse.Namespace,
     model_root: Path,
     output_dir: Path,
-    gpu_id: str,
+    gpu_ids: tuple[str, ...],
 ) -> list[str]:
     command = [
         sys.executable,
@@ -199,7 +254,7 @@ def p1_selection_command(
         "--max-records", "0",
         "--max-new-tokens", str(args.max_layout_tokens),
         "--no-repeat-ngram-size", "20",
-        "--gpu-id", gpu_id,
+        "--parallel-gpu-ids", ",".join(gpu_ids),
         "--gpu-utilization-limit", str(args.gpu_utilization_limit),
     ]
     if (output_dir / "selection.json").is_file():
@@ -209,6 +264,12 @@ def p1_selection_command(
 
 def main() -> int:
     args = parse_args()
+    if args.skip_p1_validation_selection and (
+        args.stages != "p1" or args.p1_max_steps > 10
+    ):
+        raise ValueError(
+            "--skip-p1-validation-selection is limited to P1 smokes of at most 10 steps"
+        )
     ids, utilization = target_gpus(args.gpu_ids, args.gpu_utilization_limit)
     run_root = args.runs_root.resolve() / args.run_id
     if run_root.exists() != args.resume_existing_run:
@@ -228,10 +289,24 @@ def main() -> int:
         "validation_manifest": str(args.validation_manifest.resolve()),
         "test_manifest": str(args.test_manifest.resolve()),
         "resumed_from_existing_run": args.resume_existing_run,
+        "p1_max_steps": args.p1_max_steps,
+        "p2_max_steps": args.p2_max_steps,
+        "p1_checkpoint_steps": args.p1_checkpoint_steps or args.checkpoint_steps,
+        "p2_checkpoint_steps": args.p2_checkpoint_steps or args.checkpoint_steps,
+        "checkpoint_retention": args.checkpoint_retention,
+        "layout_boundary_loss_weight": args.layout_boundary_loss_weight,
+        "layout_count_condition_strength": args.layout_count_condition_strength,
+        "distributed_strategy": args.distributed_strategy,
+        "p1_validation_selection_skipped": args.skip_p1_validation_selection,
+        "nccl_p2p_disable": args.nccl_p2p_disable and len(ids) > 1,
     }
     (metadata / "status.txt").write_text(compact(status) + "\n", encoding="utf-8")
     environment = dict(os.environ)
+    # torchrun children use logical local ranks. Restrict the parent once to
+    # the explicitly admitted physical cards, then let torchrun map 0..N-1.
     environment["CUDA_VISIBLE_DEVICES"] = ",".join(ids)
+    if args.nccl_p2p_disable and len(ids) > 1:
+        environment["NCCL_P2P_DISABLE"] = "1"
     source = args.source_model.resolve()
     p1_selection_path: Path | None = None
     stage_metrics: dict[str, Any] = {}
@@ -252,8 +327,7 @@ def main() -> int:
     for stage in args.stages.split(","):
         output = run_root / stage / "model"
         output.mkdir(parents=True, exist_ok=args.resume_existing_run)
-        log_name = "train.recovery.log" if args.resume_existing_run else "train.log"
-        log_path = run_root / stage / log_name
+        log_path = training_log_path(run_root / stage, args.resume_existing_run)
         status.update({"stage": stage, "stage_status": "running"})
         (metadata / "status.txt").write_text(compact(status) + "\n", encoding="utf-8")
         with log_path.open("x", encoding="utf-8") as log:
@@ -286,7 +360,11 @@ def main() -> int:
             "log": str(log_path),
         }
         source = output
-        if stage == "p1" and args.ablation == "vlqa_layout_p1_p2":
+        if (
+            stage == "p1"
+            and args.ablation == "vlqa_layout_p1_p2"
+            and not args.skip_p1_validation_selection
+        ):
             selection_dir = run_root / "p1" / "validation_selection"
             selection_log = run_root / "p1" / "validation_selection.log"
             status.update({"stage": "p1_validation_selection", "stage_status": "running"})
@@ -295,7 +373,7 @@ def main() -> int:
             )
             with selection_log.open("a", encoding="utf-8") as log:
                 selected = subprocess.run(
-                    p1_selection_command(args, output, selection_dir, ids[0]),
+                    p1_selection_command(args, output, selection_dir, ids),
                     cwd=Path(__file__).resolve().parents[2],
                     env=dict(os.environ),
                     stdout=log,

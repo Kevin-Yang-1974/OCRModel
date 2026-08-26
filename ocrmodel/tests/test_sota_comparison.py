@@ -145,6 +145,18 @@ def test_formal_launcher_is_locked() -> None:
     assert "formal_sota_locked" in source
 
 
+def test_opendoc_formal_launcher_is_cpu_only_and_strict() -> None:
+    source = (ROOT / "tools" / "sota" / "run_opendoc_formal_tmux.sh").read_text(encoding="utf-8")
+    assert "nvidia-smi" not in source
+    assert source.count("--device cpu --dtype fp32") == 2
+    assert "official_finetuning_unavailable" in source
+    assert 'validate_predictions "${base}/validation/predictions.jsonl" 240 validation' in source
+    assert 'validate_predictions "${base}/test/predictions.jsonl" 800 test' in source
+    assert "--allow-formal-test" in source
+    assert "--expected-pages 800" in source
+    assert "|| true" not in source
+
+
 def test_deployment_does_not_overwrite_and_uses_personal_root() -> None:
     source = (ROOT / "tools" / "sota" / "deploy_sota_models.sh").read_text(encoding="utf-8")
     assert "data3/yky/yangky_ocr_models" in source

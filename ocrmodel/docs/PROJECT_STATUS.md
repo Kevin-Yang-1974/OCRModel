@@ -1,14 +1,21 @@
 # 项目状态
 
+## 2026-08-25 M1a 多卡状态
+
+M1a v1 已按用户授权终止并保留全部产物；旧 run 的 `metadata/stalled_termination_20260825.json` 记录了四卡长期 100% utilization、约 1927 MiB 显存且无 optimizer step/checkpoint。独立 NCCL smoke 随后确认根因是 rank 未按 `LOCAL_RANK` 绑定 CUDA，报告 `Duplicate GPU detected`。
+
+当前正式运行是 tmux `mthv2_pvld_m1_20260825_v3`、run `mthv2_pvld_m1_boundary_count_20260825_v3`，使用 GPU 1–4。训练入口已改为 torchrun，并在模型构造前读取 `LOCAL_RANK` 执行 `torch.cuda.set_device`；日志已确认 local rank 0/1/2/3 分别绑定逻辑 device 0/1/2/3。四卡 NCCL smoke `nccl_a100_smoke_20260825_v2` 成功（world size 4、all-reduce sum 10）。v3 只执行 M1 P1/P2 和 validation-only selection，不运行 MTHv2 test，当前没有性能结论。
+
 > **当前命名与方案边界（2026-08-25）**：当前论文方法统一命名为 **LAVP（Layout-Aware Visual Prompting）**。工程上，LAVP 使用 global visual/layout prompts 汇聚整页结构证据，以 causal PVLD 执行变量长度布局重建，并通过 `visual_value_layout_routing` 保持 OCR 内容 Value 来自视觉 token。原 Fixed-Slot VLQA 及其 VQLCA 写回变体均已退出当前主方案；旧实现、配置名、checkpoint、训练记录和结果只作为只读历史证据、兼容加载路径和 baseline 保留，不能再称为当前 VLQA 方案、当前正式主方案或 LAVP。LAVP/PVLD 尚待统一 validation 和消融验证，不能写成已验证创新。
 
 > 更新日期：2026 年 8 月 25 日
 
 ## 当前状态
 
-- PVLD M1a 已实现、待 A100 smoke：在原 causal decoder、FSM 和 previous-region hidden coverage 上增加 page-balanced REGION/EOS boundary loss，以及只在 FSM 同时允许 REGION/EOS 的记录边界生效的 count-conditioned logit bias。training forward 与 generation 复用同一 `_apply_count_condition`；默认两个系数均为 0，旧 checkpoint 和旧行为不变；本轮没有新增参数、动态 record cap、duplicate loss、M2 空间 coverage、M3 梯度缩放或 64 queries。
+- PVLD M1a 已实现并通过 A100 smoke：在原 causal decoder、FSM 和 previous-region hidden coverage 上增加 page-balanced REGION/EOS boundary loss，以及只在 FSM 同时允许 REGION/EOS 的记录边界生效的 count-conditioned logit bias。training forward 与 generation 复用同一 `_apply_count_condition`；默认两个系数均为 0，旧 checkpoint 和旧行为不变；本轮没有新增参数、动态 record cap、duplicate loss、M2 空间 coverage、M3 梯度缩放或 64 queries。
 - M1a 预注册运行协议：GPU `1,2,3,4` 组成单个四卡 DeepSpeed 作业；P1/P2 分别为 `3000/7500` optimizer steps、有效 batch 4，对应旧单卡 C5 的 `12000/30000` 页面曝光。学习率保持 `1e-4/5e-5`。P1 在 `1000/2000/3000`、P2 在 `2500/5000/7500` 保存，最多保留 `3+3` 个 checkpoint；候选 validation 采用多 GPU worker queues。该协议保持页面曝光但改变优化更新次数，不能冒充旧单卡轨迹的严格复现。本轮不运行 MTHv2 test。
-- M1a 本地验证：`python -m pytest -q ocrmodel/tests` 为 `140 passed, 3 skipped`；跳过项来自本机没有 PyTorch。涉及 Python `py_compile`、新增 Bash `bash -n` 和 `git diff --check` 均通过。A100 CUDA smoke、同步和正式 tmux 启动状态仍待记录，因此当前只有本地工程结论。
+- M1a 本地验证：`python -m pytest -q ocrmodel/tests` 为 `140 passed, 3 skipped`；跳过项来自本机没有 PyTorch。涉及 Python `py_compile`、新增 Bash `bash -n` 和 `git diff --check` 均通过。白名单同步为 `SYNC_OK files=180`。A100 smoke `pvld_m1_cuda_smoke_20260825_v3` 在 GPU 4 通过：loss/boundary loss=`9.442816/0.640063`，count head 经 boundary logits 梯度范数 `0.770625`，其余 causal/cross/token/coverage/bbox/visual-routing 梯度 finite/nonzero，零系数严格回退旧 logits；v1/v2 失败 smoke 均保留。
+- M1a 正式运行已启动：tmux `mthv2_pvld_m1_20260825`、run `mthv2_pvld_m1_boundary_count_20260825_v1` 使用 GPU `1,2,3,4`，准入利用率均为 0，已进入 P1 四 rank NCCL 初始化。该 run 只排队 P1/P2 和各自 validation-only selection，不含 MTHv2 test。当前只有启动与 smoke 结论，没有性能结论。
 
 - PVLD causal 修复：旧 `VariableLayoutDecoder.forward/generate` 的历史 token embedding 累计均值已替换为共享的 pre-norm causal self-attention、对 `layout_evidence=A` 的 cross-attention 和 FFN。实际 decoder memory 为 `A`；完整高分辨率 `F` 只用于提取 `A`。每层增加 exclusive previous-REGION hidden mean coverage，形状 `[B,T,D]`、不 detach，不保存完整 attention。
 - 结构生成协议：真实词表 FSM 固定为 `<LAYOUT> → (<REGION> <TYPE> {COLUMN|ROW|REGION} </TYPE> </REGION>)* → <EOS> → <PAD>*`，允许 0 REGION。`max_layout_records` 已进入生成循环，在合法记录边界强制 EOS，并与 `max_layout_tokens` 截断分别报告。REGION `score` 已改为真实生成时间步条件概率，不再固定为 1.0；validation 默认保留未筛选预测并输出 threshold scan，test 阈值由 validation selection 锁定。
@@ -73,3 +80,17 @@ PaddleOCR-VL-1.6 与 GLM-OCR 的官方 checkpoint whole-page zero-shot 已完成
 用户随后授权清理旧口径/失败 checkpoint 并继续。已永久删除 oracle-chunk `mthv2_chunk_ablation_20260819_multi_C1-C5` 的非 validation-selected 周期 checkpoints、C5 旧 P1 周期 checkpoints 和损坏的 causal `tmp-checkpoint-18000`，释放后 `/data3` 可用空间为 `228G`。保留了 C1/C5 step 30000、C2/C3 step 42000、C4 step 39000、各 final model/selection/test 结果，以及 causal C5 `checkpoint-16000`；OpenDoc 72G 未删除。runner 现为每次 recovery 分配递增日志名，保留旧失败日志。新 tmux `mthv2_pvld_causal_eval_recovery_20260824_v2` 已从 C5 P2 step 16000 在 GPU 4 恢复，复核进度已到 `16081/30000`；后续仍排队 GPU 0/1/3 的 C3/C4/C5 validation selection 与 selection-locked test。当前仍无新性能结果。
 
 OpenDoc 旧 run 的无效 validation/test prediction（约 `32.0GB/44.6GB`）已按用户授权永久删除，旧审计 metadata 保留；删除后 `/data3` 可用空间约 `528G`。adapter 已修复 `recognition_results[*].text` 提取，并排除 raw `blocks[*].img`。新 CPU-only tmux `sota_opendoc_formal_20260824_v2` 已启动，不查询或使用 GPU；首批 2 页 prediction 仅 `13,528 bytes`、均为 `status=ok`，官方 ONNX provider 加载成功，文本非空且 block raw fields 不含 `img`。完整 validation selection/test 尚未结束，当前没有 OpenDoc 性能结论。
+## 2026-08-25 M2-M4 engineering status
+
+M1 v4 remains an active four-GPU run and is read-only. M2/M3/M4 are implemented as validation candidates only; no formal long-run training, new MTHv2 test, or frozen test was started.
+
+- M2 decoder memory is `[A ; P(F)]`: global layout evidence `A` followed by projected high-resolution visual tokens `P(F)`. The high-resolution padding mask is propagated to both cross-attention and spatial coverage. Coverage has shape `[B, L_F]`, accumulates REGION-step spatial attention, applies a detached negative prior by default, and is reported only as a compact tensor.
+- M3 uses straight-through path scales `s_shared` and `s_record`; forward values are unchanged and backward gradients are scaled. Bounded smoke records OCR/layout shared-evidence gradient norms and cosine. Scale one is the legacy path.
+- M4 optionally routes OCR using free predicted layout condition, confidence, EOS and truncation reliability. Gold layout tokens/bboxes/order/direction are not read. OCR Value remains visual-token-only and `residual_gate=0` is an exact GOT2 fallback. Normal, alpha-zero and shuffled routing are causal controls for future validation.
+- M5 only registers K16/K32/K64 resource estimates; no sweep was started.
+
+These changes are engineering and bounded-smoke results, not OCR or layout performance claims. `label_textline` remains an ordered textline/region candidate rather than strict column ground truth.
+
+Bounded smoke records: A100 GPU 0 `pvld_m2_m3_m4_cuda_smoke_20260825_v7` and BSCC Slurm job `1452473` both completed with finite losses/gradients and the M2-M4 contracts enabled. The previously designated M1 v4 run was checked read-only; its tmux session is ended and its status remains `p1_validation_selection_failed`. No restart or modification was performed in this turn.
+
+M1 failure diagnosis: P1 training reached step 3000 and wrote complete checkpoints. The first validation selection failed inside the step-3000 evaluator while atomically replacing its temporary JSONL; retry then exposed that old checkpoints lack newly introduced M2-M4 tensors and `low_cpu_mem_usage=True` left them on meta device. The evaluator now uses deterministic CPU initialization (`seed=20260825`), `output_loading_info=True`, and writes `checkpoint_loading_info.json` with missing/unexpected keys before CUDA transfer. A new validation-only retry is running; P2 must wait for its selection.json.
