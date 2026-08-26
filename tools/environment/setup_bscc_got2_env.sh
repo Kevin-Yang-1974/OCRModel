@@ -52,8 +52,16 @@ python -m pip install --index-url https://mirrors.aliyun.com/pypi/simple/ \
     'sympy>=1.11,<2' \
     'networkx>=2.8,<4' \
     markdown2 \
-    shortuuid
+    shortuuid \
+    packaging \
+    psutil \
+    py-cpuinfo \
+    ninja
+
+DS_BUILD_OPS=0 python -m pip install \
+    --index-url https://mirrors.aliyun.com/pypi/simple/ \
+    'deepspeed==0.12.3'
 
 python -m pip install --no-deps -e "${workspace}/ocrmodel/src/GOT-OCR-2.0"
 
-python -c 'import cv2, torch, torchvision, transformers; print("ENV_OK torch=%s cuda=%s torchvision=%s transformers=%s cv2=%s" % (torch.__version__, torch.version.cuda, torchvision.__version__, transformers.__version__, cv2.__version__))'
+python -c 'import cv2, deepspeed, torch, torchvision, transformers; print("ENV_OK torch=%s cuda=%s torchvision=%s transformers=%s cv2=%s deepspeed=%s" % (torch.__version__, torch.version.cuda, torchvision.__version__, transformers.__version__, cv2.__version__, deepspeed.__version__))'

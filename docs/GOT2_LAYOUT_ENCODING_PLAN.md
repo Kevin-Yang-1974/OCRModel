@@ -629,3 +629,12 @@ historical ablation. The old `vqlca` mode remains loadable for provenance but
 is not the PVLD main path. LAVP/PVLD experiments must explicitly set
 `layout_writeback_mode=visual_value_layout_routing` and
 `layout_writeback_source=layout_evidence`.
+## M2-M5 candidate extensions (2026-08-25)
+
+M2 extends causal PVLD memory to `[A; P(F)]`, where `A` is global prompt evidence and `F` is high-resolution visual memory projected to decoder width. Spatial coverage is `[B,L_F]`; only REGION steps add cross-attention mass, the running prior is detached before the next-step bias, and padding positions are masked. Coverage conditions layout decoding only and never supplies OCR Value. Duplicate loss remains disabled pending validation.
+
+M3 applies `stopgrad(x)+s*(x-stopgrad(x))` on shared evidence and record hidden states during P2. It changes backward scale without changing forward values; `s_shared=s_record=1` is the legacy path. Validation ranking remains OCR CER first with layout non-collapse constraints.
+
+M4 uses free predicted bbox/order/direction/confidence and EOS/truncation reliability to modulate OCR query/key routing. Teacher-forced gold layout is prohibited. Values remain visual tokens. `alpha=0` is the exact GOT2 fallback; normal, alpha-zero and shuffled predicted-layout controls are required before any OCR claim.
+
+M5 only prepares K16/K32/K64 prompt-query and decoder-capacity estimates. K is global evidence prompt count, not a region-slot limit. No formal sweep has run.

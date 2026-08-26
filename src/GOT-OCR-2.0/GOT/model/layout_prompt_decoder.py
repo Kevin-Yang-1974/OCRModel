@@ -29,6 +29,7 @@ class VariableLayoutOutput:
     coverage_summary: Optional[Tensor] = None
     coverage_region_counts: Optional[Tensor] = None
     generated_ids: Optional[Tensor] = None
+    spatial_coverage: Optional[Tensor] = None
 
     @property
     def prompt_context(self) -> Tensor:
@@ -48,6 +49,7 @@ class LayoutRecordOutput:
 class VariableLayoutLossOutput:
     loss: Tensor
     sequence_loss: Tensor
+    boundary_loss: Tensor
     bbox_loss: Tensor
     bbox_l1_loss: Tensor
     bbox_giou_loss: Tensor
@@ -67,6 +69,16 @@ class PromptedVariableLayoutOutput:
     record_output: Optional[LayoutRecordOutput] = None
     record_mask: Optional[Tensor] = None
     losses: Optional[VariableLayoutLossOutput] = None
+    routing_reliability: Optional[Tensor] = None
+    predicted_layout_condition: Optional[Tensor] = None
+
+
+def straight_through_scale(value: Tensor, scale: float) -> Tensor:
+    """Scale only the backward path while preserving the exact forward value."""
+    if scale == 1.0:
+        return value
+    detached = value.detach()
+    return detached + float(scale) * (value - detached)
 
 
 class LayoutPromptBank(nn.Module):
@@ -340,7 +352,11 @@ class CausalLayoutDecoderBlock(nn.Module):
         target_padding_mask: Optional[Tensor],
         memory_padding_mask: Optional[Tensor],
         region_mask: Tensor,
-    ) -> Tensor:
+        spatial_memory: Optional[Tensor] = None,
+        spatial_padding_mask: Optional[Tensor] = None,
+        spatial_coverage: Optional[Tensor] = None,
+        coverage_detach: bool = True,
+    ) -> tuple[Tensor, Optional[Tensor]]:
         normalized = self.self_norm(hidden)
         self_update, _ = self.self_attention(
             normalized,
@@ -356,6 +372,33 @@ class CausalLayoutDecoderBlock(nn.Module):
             self.coverage_norm(coverage)
         )
         normalized = self.cross_norm(hidden_coverage)
+        next_spatial_coverage = spatial_coverage
+        if spatial_memory is not None:
+            spatial_scores = torch.matmul(
+                normalized, spatial_memory.transpose(-1, -2)
+            ) / math.sqrt(max(1, normalized.shape[-1]))
+            if spatial_padding_mask is not None:
+                spatial_scores = spatial_scores.masked_fill(
+                    spatial_padding_mask.unsqueeze(1), torch.finfo(spatial_scores.dtype).min
+                )
+            prior = spatial_coverage
+            if prior is None:
+                prior = spatial_memory.new_zeros(
+                    spatial_memory.shape[0], spatial_memory.shape[1]
+                )
+            prior_for_bias = prior.detach() if coverage_detach else prior
+            spatial_attention = torch.softmax(
+                spatial_scores - prior_for_bias.unsqueeze(1), dim=-1
+            )
+            region_attention = spatial_attention * region_mask.unsqueeze(-1).to(
+                spatial_attention.dtype
+            )
+            next_spatial_coverage = prior + region_attention.sum(dim=1)
+            if coverage_detach:
+                next_spatial_coverage = next_spatial_coverage.detach()
+            spatial_context = torch.matmul(spatial_attention, spatial_memory)
+            hidden_coverage = hidden_coverage + spatial_context
+            normalized = self.cross_norm(hidden_coverage)
         memory_update, _ = self.cross_attention(
             normalized,
             memory,
@@ -364,7 +407,7 @@ class CausalLayoutDecoderBlock(nn.Module):
             need_weights=False,
         )
         hidden_memory = hidden_coverage + memory_update
-        return hidden_memory + self.ffn(self.ffn_norm(hidden_memory))
+        return hidden_memory + self.ffn(self.ffn_norm(hidden_memory)), next_spatial_coverage
 
 
 class VariableLayoutDecoder(nn.Module):
@@ -380,8 +423,11 @@ class VariableLayoutDecoder(nn.Module):
         num_heads: int = 8,
         feedforward_size: Optional[int] = None,
         max_layout_tokens: int = 2048,
+        count_condition_strength: float = 0.0,
         dropout: float = 0.0,
         vocabulary: Optional[LayoutVocabulary] = None,
+        use_spatial_memory: bool = False,
+        coverage_detach: bool = True,
     ) -> None:
         super().__init__()
         if vocab_size < 2 or hidden_size < 1 or visual_size < 1:
@@ -394,6 +440,9 @@ class VariableLayoutDecoder(nn.Module):
         self.hidden_size = hidden_size
         self.visual_size = visual_size
         self.max_layout_tokens = max_layout_tokens
+        self.count_condition_strength = float(count_condition_strength)
+        self.use_spatial_memory = bool(use_spatial_memory)
+        self.coverage_detach = bool(coverage_detach)
         self.vocabulary = vocabulary or LayoutVocabulary()
         if self.vocabulary.vocab_size != vocab_size:
             raise ValueError("vocab_size does not match the supplied LayoutVocabulary.")
@@ -403,6 +452,7 @@ class VariableLayoutDecoder(nn.Module):
         self.prompt_attention = LayoutPromptCrossAttention(
             visual_size, hidden_size, num_prompts, num_heads, dropout
         )
+        self.spatial_memory_projection = nn.Linear(visual_size, hidden_size)
         self.decoder_blocks = nn.ModuleList(
             CausalLayoutDecoderBlock(
                 hidden_size,
@@ -418,8 +468,41 @@ class VariableLayoutDecoder(nn.Module):
     def _memory(
         self,
         layout_evidence: Tensor,
+        visual_tokens: Optional[Tensor] = None,
+        visual_padding_mask: Optional[Tensor] = None,
     ) -> tuple[Tensor, Optional[Tensor]]:
-        return layout_evidence, None
+        if not self.use_spatial_memory or visual_tokens is None:
+            return layout_evidence, None
+        projected = self.spatial_memory_projection(visual_tokens)
+        prompt_mask = torch.zeros(
+            layout_evidence.shape[:2], dtype=torch.bool, device=layout_evidence.device
+        )
+        memory_mask = torch.cat((prompt_mask, visual_padding_mask), dim=1) if visual_padding_mask is not None else None
+        return torch.cat((layout_evidence, projected), dim=1), memory_mask
+
+    def _apply_count_condition(
+        self,
+        logits: Tensor,
+        input_ids: Tensor,
+        count_prior: Optional[Tensor],
+    ) -> Tensor:
+        if count_prior is None or self.count_condition_strength == 0.0:
+            return logits
+        vocabulary = self.vocabulary
+        region_logits = logits[..., vocabulary.region_id]
+        eos_logits = logits[..., vocabulary.eos_id]
+        boundary = torch.isfinite(region_logits) & torch.isfinite(eos_logits)
+        generated_regions = input_ids.eq(vocabulary.region_id).cumsum(dim=1)
+        remaining = (
+            count_prior.clamp_min(0).to(logits.dtype).unsqueeze(1)
+            - generated_regions.to(logits.dtype)
+        )
+        bias = self.count_condition_strength * torch.tanh(remaining - 0.5)
+        bias = torch.where(boundary, bias, torch.zeros_like(bias))
+        conditioned = logits.clone()
+        conditioned[..., vocabulary.region_id] = region_logits + bias
+        conditioned[..., vocabulary.eos_id] = eos_logits - bias
+        return conditioned
 
     def forward(
         self,
@@ -430,6 +513,7 @@ class VariableLayoutDecoder(nn.Module):
         prompt_attention: Optional[Tensor] = None,
         target_padding_mask: Optional[Tensor] = None,
         max_layout_records: Optional[int] = None,
+        count_prior: Optional[Tensor] = None,
     ) -> VariableLayoutOutput:
         if input_ids.ndim != 2:
             raise ValueError("input_ids must have shape [B,T].")
@@ -441,18 +525,28 @@ class VariableLayoutDecoder(nn.Module):
             )
         positions = torch.arange(input_ids.shape[1], device=input_ids.device)
         target = self.embedding(input_ids) + self.position_embedding(positions).unsqueeze(0)
-        memory, memory_padding_mask = self._memory(layout_evidence)
+        memory, memory_padding_mask = self._memory(
+            layout_evidence, visual_tokens, visual_padding_mask
+        )
         hidden = target
         region_mask = input_ids.eq(self.vocabulary.region_id)
         mask = causal_mask(input_ids.shape[1], input_ids.device)
+        spatial_coverage = None
         for block in self.decoder_blocks:
-            hidden = block(
+            hidden, spatial_coverage = block(
                 hidden,
                 memory,
                 attention_mask=mask,
                 target_padding_mask=target_padding_mask,
                 memory_padding_mask=memory_padding_mask,
                 region_mask=region_mask,
+                spatial_memory=(
+                    memory[:, layout_evidence.shape[1] :]
+                    if self.use_spatial_memory else None
+                ),
+                spatial_padding_mask=visual_padding_mask if self.use_spatial_memory else None,
+                spatial_coverage=spatial_coverage,
+                coverage_detach=self.coverage_detach,
             )
         hidden = self.output_norm(hidden)
         if target_padding_mask is not None:
@@ -462,6 +556,7 @@ class VariableLayoutDecoder(nn.Module):
             input_ids,
             max_layout_records=max_layout_records,
         )
+        logits = self._apply_count_condition(logits, input_ids, count_prior)
         coverage_counts = region_mask.sum(dim=1)
         coverage_summary = (
             (hidden * region_mask.unsqueeze(-1).to(hidden.dtype)).sum(dim=1)
@@ -474,6 +569,7 @@ class VariableLayoutDecoder(nn.Module):
             prompt_attention=prompt_attention,
             coverage_summary=coverage_summary,
             coverage_region_counts=coverage_counts,
+            spatial_coverage=spatial_coverage,
         )
 
     @torch.no_grad()
@@ -489,6 +585,7 @@ class VariableLayoutDecoder(nn.Module):
         max_layout_records: Optional[int] = None,
         visual_padding_mask: Optional[Tensor] = None,
         layout_evidence: Optional[Tensor] = None,
+        count_prior: Optional[Tensor] = None,
     ) -> VariableLayoutOutput:
         limit = max_layout_tokens or self.max_layout_tokens
         if limit < 2:
@@ -522,6 +619,7 @@ class VariableLayoutDecoder(nn.Module):
                 prompt_attention,
                 generated.eq(pad_id),
                 max_layout_records=max_layout_records,
+                count_prior=count_prior,
             )
             step_logits = step_output.logits[:, -1]
             probabilities = step_logits.softmax(dim=-1)
@@ -562,6 +660,7 @@ class VariableLayoutDecoder(nn.Module):
             prompt_attention,
             generated.eq(pad_id),
             max_layout_records=max_layout_records,
+            count_prior=count_prior,
         )
         probability_width = max((len(row) for row in region_probabilities), default=0)
         region_probability_tensor = layout_evidence.new_zeros((batch, probability_width))
@@ -607,6 +706,11 @@ class LayoutRecordHeads(nn.Module):
         self.direction_head = nn.Linear(hidden_size, num_directions)
         self.count_head = nn.Linear(hidden_size, 1) if with_count else None
 
+    def predict_count(self, page_hidden: Tensor) -> Tensor:
+        if self.count_head is None:
+            return page_hidden.new_zeros(page_hidden.shape[0])
+        return self.count_head(page_hidden).squeeze(-1)
+
     def forward(self, region_hidden: Tensor, page_hidden: Optional[Tensor] = None) -> LayoutRecordOutput:
         if region_hidden.ndim != 3:
             raise ValueError("region_hidden must have shape [B,R,D].")
@@ -618,12 +722,9 @@ class LayoutRecordHeads(nn.Module):
         bbox = torch.stack((x0, y0, x1, y1), dim=-1)
         type_logits = self.type_head(region_hidden)
         direction_logits = self.direction_head(region_hidden)
-        if self.count_head is None:
-            count = region_hidden.new_zeros((region_hidden.shape[0], 1))
-        else:
-            if page_hidden is None:
-                page_hidden = region_hidden[:, 0]
-            count = self.count_head(page_hidden).squeeze(-1)
+        if page_hidden is None:
+            page_hidden = region_hidden[:, 0]
+        count = self.predict_count(page_hidden)
         return LayoutRecordOutput(bbox, type_logits, direction_logits, count)
 
 
@@ -646,6 +747,7 @@ class VariableLayoutLoss(nn.Module):
         direction_weight: float = 1.0,
         count_weight: float = 0.1,
         prompt_diversity_weight: float = 0.0,
+        boundary_weight: float = 0.0,
     ) -> None:
         super().__init__()
         weights = (
@@ -655,6 +757,7 @@ class VariableLayoutLoss(nn.Module):
             direction_weight,
             count_weight,
             prompt_diversity_weight,
+            boundary_weight,
         )
         if any(weight < 0 for weight in weights):
             raise ValueError("loss weights must be non-negative")
@@ -671,12 +774,31 @@ class VariableLayoutLoss(nn.Module):
         record_mask: Tensor,
         count_targets: Tensor,
         pad_id: int,
+        region_id: int = 2,
+        eos_id: int = 6,
     ) -> VariableLayoutLossOutput:
+        shifted_logits = output.logits[:, :-1]
+        shifted_targets = target_ids[:, 1:]
         sequence_loss = F.cross_entropy(
-            output.logits[:, :-1].reshape(-1, output.logits.shape[-1]),
-            target_ids[:, 1:].reshape(-1),
+            shifted_logits.reshape(-1, output.logits.shape[-1]),
+            shifted_targets.reshape(-1),
             ignore_index=pad_id,
         )
+        boundary_log_probabilities = shifted_logits.float().log_softmax(dim=-1)
+        page_boundary_losses = []
+        for row in range(shifted_targets.shape[0]):
+            row_targets = shifted_targets[row]
+            region_mask = row_targets.eq(region_id)
+            eos_mask = row_targets.eq(eos_id)
+            eos_loss = -boundary_log_probabilities[row, eos_mask, eos_id].mean()
+            if bool(region_mask.any()):
+                region_loss = -boundary_log_probabilities[
+                    row, region_mask, region_id
+                ].mean()
+                page_boundary_losses.append(0.5 * (region_loss + eos_loss))
+            else:
+                page_boundary_losses.append(eos_loss)
+        boundary_loss = torch.stack(page_boundary_losses).mean()
         mask = record_mask.to(dtype=record_output.bbox.dtype)
         bbox_l1 = (record_output.bbox - bbox_targets).abs().mean(dim=-1)
         bbox_l1_loss = (bbox_l1 * mask).sum() / mask.sum().clamp_min(1.0)
@@ -723,15 +845,16 @@ class VariableLayoutLoss(nn.Module):
         )
         count_loss = F.smooth_l1_loss(record_output.count.float(), count_targets.float())
         diversity = layout_prompt_diversity_loss(output.layout_evidence)
-        eos_targets = target_ids[:, 1:].eq(6)
+        eos_targets = shifted_targets.eq(eos_id)
         eos_accuracy = (
-            output.logits[:, :-1].argmax(dim=-1)[eos_targets].eq(6).float().mean()
+            shifted_logits.argmax(dim=-1)[eos_targets].eq(eos_id).float().mean()
             if bool(eos_targets.any())
             else output.logits.new_zeros(())
         )
         region_count_mae = (record_output.count.float() - count_targets.float()).abs().mean()
         total = (
             sequence_loss
+            + self.weights[6] * boundary_loss
             + bbox_loss
             + self.weights[2] * type_loss
             + self.weights[3] * direction_loss
@@ -741,6 +864,7 @@ class VariableLayoutLoss(nn.Module):
         return VariableLayoutLossOutput(
             total,
             sequence_loss,
+            boundary_loss,
             bbox_loss,
             bbox_l1_loss,
             bbox_giou_loss,
@@ -781,6 +905,13 @@ class PromptedVariableLayoutAdapter(nn.Module):
         direction_weight: float = 1.0,
         count_weight: float = 0.1,
         prompt_diversity_weight: float = 0.0,
+        boundary_weight: float = 0.0,
+        count_condition_strength: float = 0.0,
+        use_spatial_memory: bool = False,
+        coverage_detach: bool = True,
+        shared_gradient_scale: float = 1.0,
+        record_gradient_scale: float = 1.0,
+        predicted_layout_routing: bool = False,
     ) -> None:
         super().__init__()
         from GOT.model.layout_query import VisualValueLayoutRouting
@@ -789,6 +920,9 @@ class PromptedVariableLayoutAdapter(nn.Module):
         self.num_prompt_queries = num_prompt_queries
         self.max_layout_tokens = max_layout_tokens
         self.max_layout_records = max_layout_records
+        self.shared_gradient_scale = float(shared_gradient_scale)
+        self.record_gradient_scale = float(record_gradient_scale)
+        self.predicted_layout_routing = bool(predicted_layout_routing)
         self.decoder = VariableLayoutDecoder(
             vocab_size=self.vocabulary.vocab_size,
             hidden_size=hidden_size,
@@ -797,8 +931,11 @@ class PromptedVariableLayoutAdapter(nn.Module):
             num_layers=decoder_layers,
             num_heads=num_heads,
             max_layout_tokens=max_layout_tokens,
+            count_condition_strength=count_condition_strength,
             dropout=dropout,
             vocabulary=self.vocabulary,
+            use_spatial_memory=use_spatial_memory,
+            coverage_detach=coverage_detach,
         )
         self.record_heads = LayoutRecordHeads(
             hidden_size,
@@ -809,6 +946,7 @@ class PromptedVariableLayoutAdapter(nn.Module):
         self.visual_projection = nn.Linear(visual_dim, hidden_size)
         self.visual_routing = VisualValueLayoutRouting(hidden_size, num_heads, dropout)
         self.writeback_output = nn.Linear(hidden_size, visual_dim)
+        self.predicted_condition_projection = nn.Linear(hidden_size, hidden_size)
         self.residual_gate = nn.Parameter(torch.tensor(float(gate_init)))
         self.criterion = VariableLayoutLoss(
             bbox_weight=bbox_weight,
@@ -817,6 +955,7 @@ class PromptedVariableLayoutAdapter(nn.Module):
             direction_weight=direction_weight,
             count_weight=count_weight,
             prompt_diversity_weight=prompt_diversity_weight,
+            boundary_weight=boundary_weight,
         )
 
     def reset_parameters(self) -> None:
@@ -863,18 +1002,73 @@ class PromptedVariableLayoutAdapter(nn.Module):
         visual_padding_mask: Optional[Tensor] = None,
         high_resolution_padding_mask: Optional[Tensor] = None,
         generate_layout: bool = False,
+        shuffle_predicted_layout: bool = False,
     ) -> PromptedVariableLayoutOutput:
         layout_evidence, _ = self.decoder.prompt_attention(
             high_resolution_features,
             high_resolution_padding_mask,
             return_attention=False,
         )
+        page_hidden = layout_evidence.mean(dim=1)
+        count_prior = self.record_heads.predict_count(page_hidden)
+        predicted_condition = None
+        routing_reliability = None
+        predicted_decoder_output = None
+        predicted_record_output = None
+        if self.predicted_layout_routing:
+            with torch.no_grad():
+                predicted_decoder_output = self.decoder.generate(
+                    high_resolution_features,
+                    layout_id=self.vocabulary.layout_id,
+                    region_id=self.vocabulary.region_id,
+                    eos_id=self.vocabulary.eos_id,
+                    pad_id=self.vocabulary.pad_id,
+                    max_layout_tokens=self.max_layout_tokens,
+                    max_layout_records=self.max_layout_records,
+                    visual_padding_mask=high_resolution_padding_mask,
+                    layout_evidence=layout_evidence,
+                    count_prior=count_prior,
+                )
+                positions = predicted_decoder_output.region_positions or [[] for _ in range(visual_tokens.shape[0])]
+                width = min(max((len(row) for row in positions), default=0), self.max_layout_records)
+                if width:
+                    indices = torch.zeros(
+                        (visual_tokens.shape[0], width), dtype=torch.long, device=visual_tokens.device
+                    )
+                    mask = torch.zeros_like(indices, dtype=torch.bool)
+                    for row, values in enumerate(positions):
+                        values = values[:width]
+                        if values:
+                            indices[row, : len(values)] = torch.tensor(values, device=visual_tokens.device)
+                            mask[row, : len(values)] = True
+                    hidden = self._gather_records(predicted_decoder_output.hidden_states, indices, mask)
+                    predicted_record_output = self.record_heads(hidden, page_hidden)
+                    pooled = hidden.masked_fill(~mask.unsqueeze(-1), 0.0).sum(dim=1)
+                    pooled = pooled / mask.sum(dim=1, keepdim=True).clamp_min(1).to(hidden.dtype)
+                else:
+                    pooled = page_hidden.new_zeros(page_hidden.shape)
+                confidence = predicted_decoder_output.region_token_probabilities
+                confidence_mean = (
+                    confidence.sum(dim=1) / confidence.ne(0).sum(dim=1).clamp_min(1).to(confidence.dtype)
+                    if confidence is not None else page_hidden.new_ones(page_hidden.shape[0])
+                )
+                routing_reliability = confidence_mean * predicted_decoder_output.generated_eos.float()
+                routing_reliability = routing_reliability * (~predicted_decoder_output.truncated).float()
+            predicted_condition = self.predicted_condition_projection(pooled)
+            if shuffle_predicted_layout and predicted_condition.shape[0] > 1:
+                predicted_condition = predicted_condition.roll(1, dims=0)
+                routing_reliability = routing_reliability.roll(1, dims=0)
         projected_visual = self.visual_projection(self.visual_norm(visual_tokens))
         routed, _ = self.visual_routing(
             projected_visual,
             layout_evidence,
             visual_padding_mask=visual_padding_mask,
         )
+        if predicted_condition is not None:
+            # Reliability gates only the predicted-layout residual.  The base
+            # visual-value route remains active so low-confidence/free-layout
+            # pages cannot disconnect OCR gradients from visual tokens.
+            routed = routed + predicted_condition.unsqueeze(1) * routing_reliability.view(-1, 1, 1)
         visual_output = visual_tokens + torch.tanh(self.residual_gate) * self.writeback_output(routed)
 
         decoder_output = None
@@ -886,11 +1080,12 @@ class PromptedVariableLayoutAdapter(nn.Module):
                 layout_input_ids,
                 high_resolution_features,
                 high_resolution_padding_mask,
-                layout_evidence,
+                straight_through_scale(layout_evidence, self.shared_gradient_scale),
                 target_padding_mask=(
                     ~layout_attention_mask.bool() if layout_attention_mask is not None else None
                 ),
                 max_layout_records=self.max_layout_records,
+                count_prior=count_prior,
             )
             if layout_region_positions is None or layout_record_mask is None:
                 raise ValueError("PVLD training requires REGION positions and record mask.")
@@ -899,7 +1094,10 @@ class PromptedVariableLayoutAdapter(nn.Module):
                 layout_region_positions,
                 layout_record_mask,
             )
-            record_output = self.record_heads(region_hidden, layout_evidence.mean(dim=1))
+            region_hidden = straight_through_scale(
+                region_hidden, self.record_gradient_scale
+            )
+            record_output = self.record_heads(region_hidden, page_hidden)
             if layout_bbox_targets is not None:
                 losses = self.criterion(
                     decoder_output,
@@ -911,6 +1109,8 @@ class PromptedVariableLayoutAdapter(nn.Module):
                     layout_record_mask,
                     layout_count_targets,
                     self.vocabulary.pad_id,
+                    self.vocabulary.region_id,
+                    self.vocabulary.eos_id,
                 )
         elif generate_layout:
             decoder_output = self.decoder.generate(
@@ -923,6 +1123,7 @@ class PromptedVariableLayoutAdapter(nn.Module):
                 max_layout_records=self.max_layout_records,
                 visual_padding_mask=high_resolution_padding_mask,
                 layout_evidence=layout_evidence,
+                count_prior=count_prior,
             )
             positions = decoder_output.region_positions or [[] for _ in range(visual_tokens.shape[0])]
             width = min(max((len(row) for row in positions), default=0), self.max_layout_records)
@@ -938,7 +1139,7 @@ class PromptedVariableLayoutAdapter(nn.Module):
             region_hidden = self._gather_records(
                 decoder_output.hidden_states, region_positions, record_mask
             )
-            record_output = self.record_heads(region_hidden, layout_evidence.mean(dim=1))
+            record_output = self.record_heads(region_hidden, page_hidden)
 
         return PromptedVariableLayoutOutput(
             visual_tokens=visual_output,
@@ -947,4 +1148,6 @@ class PromptedVariableLayoutAdapter(nn.Module):
             record_output=record_output,
             record_mask=record_mask,
             losses=losses,
+            routing_reliability=routing_reliability,
+            predicted_layout_condition=predicted_condition,
         )

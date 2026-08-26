@@ -6,8 +6,10 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 MODULE_PATH = Path(__file__).resolve().parents[1] / "tools" / "evaluation" / "select_layout_ablation_checkpoint.py"
+AUTO_EVAL_PATH = Path(__file__).resolve().parents[1] / "tools" / "training" / "run_pvld_p2_auto_eval_tmux.sh"
 SPEC = importlib.util.spec_from_file_location("layout_ablation_selection_under_test", MODULE_PATH)
 selection = importlib.util.module_from_spec(SPEC)
 assert SPEC.loader is not None
@@ -38,6 +40,61 @@ class LayoutAblationSelectionTests(unittest.TestCase):
             )],
             [2000, 4000, 8000],
         )
+
+    def test_final_model_wins_over_same_step_checkpoint_with_different_hash(self) -> None:
+        self.model(self.root, 7500)
+        (self.root / "layout_training_metrics.json").write_text(
+            json.dumps({"global_step": 7500, "ablation_id": "vlqa_layout_p1_p2"}),
+            encoding="utf-8",
+        )
+        duplicate_step = self.root / "checkpoint-7500"
+        self.model(duplicate_step, 7501)
+        candidates = selection.discover_candidates(
+            self.root, expected_ablation="vlqa_layout_p1_p2"
+        )
+        self.assertEqual(candidates, [(7500, self.root.resolve())])
+
+    def test_resume_preserves_partial_candidate_and_uses_retry_directory(self) -> None:
+        output = self.root / "selection"
+        partial = output / "step-00007500"
+        partial.mkdir(parents=True)
+        (partial / "evaluator.log").write_text("failed\n", encoding="utf-8")
+        candidate_dir, summary_path = selection.candidate_output_dir(
+            output, 7500, resume=True
+        )
+        self.assertEqual(candidate_dir, output / "step-00007500-retry-01")
+        self.assertEqual(summary_path, candidate_dir / "layout_validation_metrics.json")
+        self.assertEqual((partial / "evaluator.log").read_text(encoding="utf-8"), "failed\n")
+
+    def test_resume_reuses_completed_retry_candidate(self) -> None:
+        output = self.root / "selection"
+        partial = output / "step-00007500"
+        retry = output / "step-00007500-retry-01"
+        partial.mkdir(parents=True)
+        retry.mkdir(parents=True)
+        (partial / "evaluator.log").write_text("failed\n", encoding="utf-8")
+        metrics = retry / "layout_validation_metrics.json"
+        metrics.write_text("{}", encoding="utf-8")
+        candidate_dir, summary_path = selection.candidate_output_dir(
+            output, 7500, resume=True
+        )
+        self.assertEqual(candidate_dir, retry)
+        self.assertEqual(summary_path, metrics)
+
+    def test_non_resume_refuses_partial_candidate(self) -> None:
+        output = self.root / "selection"
+        partial = output / "step-00007500"
+        partial.mkdir(parents=True)
+        (partial / "evaluator.log").write_text("failed\n", encoding="utf-8")
+        with self.assertRaisesRegex(FileExistsError, "use --resume"):
+            selection.candidate_output_dir(output, 7500, resume=False)
+
+    def test_auto_eval_uses_resume_and_session_scoped_log(self) -> None:
+        source = AUTO_EVAL_PATH.read_text(encoding="utf-8")
+        self.assertIn("--gpu-utilization-limit 50 --resume", source)
+        self.assertIn('--parallel-gpu-ids "${gpu_ids}"', source)
+        self.assertIn('pipeline_log="${log_root}/${session}.log"', source)
+        self.assertNotIn('>"${log_root}/pipeline.log"', source)
 
     def test_selection_uses_page_cer_then_whitespace_then_step(self) -> None:
         candidates = [
@@ -184,6 +241,46 @@ class LayoutAblationSelectionTests(unittest.TestCase):
             "--gpu-id", "3",
         ])
         self.assertEqual(args.gpu_id, "3")
+
+    def test_parallel_gpu_ids_are_explicit_unique_and_ordered(self) -> None:
+        self.assertEqual(selection.parse_gpu_ids("3,1,4", "0"), ("3", "1", "4"))
+        with self.assertRaisesRegex(ValueError, "unique"):
+            selection.parse_gpu_ids("1,1", "0")
+        with self.assertRaisesRegex(ValueError, "numeric"):
+            selection.parse_gpu_ids("1,gpu2", "0")
+
+    def test_gpu_admission_queries_only_the_explicit_set_once(self) -> None:
+        with mock.patch.object(
+            selection, "gpu_utilization", side_effect=[3, 4, 5]
+        ) as utilization:
+            observed = selection.require_gpus_free(("1", "2", "4"), 50)
+        self.assertEqual(observed, {"1": 3, "2": 4, "4": 5})
+        self.assertEqual(
+            [call.args[0] for call in utilization.call_args_list], ["1", "2", "4"]
+        )
+
+    def test_worker_queue_is_sequential_and_preserves_candidate_order(self) -> None:
+        candidates = [
+            (step, self.root / f"model-{step}", self.root / f"out-{step}",
+             self.root / f"out-{step}" / "summary.json", [str(step)])
+            for step in (1000, 3000, 5000)
+        ]
+        observed = []
+
+        def fake_evaluate(candidate, *, gpu_id, project_root):
+            observed.append((candidate[0], gpu_id, project_root))
+            return candidate[0], candidate[1], candidate[3]
+
+        with mock.patch.object(selection, "evaluate_candidate", side_effect=fake_evaluate):
+            results = selection.evaluate_worker_queue(
+                candidates, gpu_id="2", project_root=self.root
+            )
+        self.assertEqual([item[0] for item in results], [1000, 3000, 5000])
+        self.assertEqual(observed, [
+            (1000, "2", self.root),
+            (3000, "2", self.root),
+            (5000, "2", self.root),
+        ])
 
 if __name__ == "__main__":
     unittest.main()

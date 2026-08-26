@@ -21,4 +21,4 @@ CUDA_VISIBLE_DEVICES="${gpu_id}" bash "${ocrmodel_root}/tools/environment/run_go
         tail -n 20 "${run_root}/smoke.log" >&2
         exit 1
     }
-jq -c '{status,device,loss,gradients,generation,ocr_visual_value_source,alpha_zero_exact_identity,formal_training_started,frozen_test_started}' "${run_root}/summary.json"
+jq -c '{status,device,loss,boundary_loss,boundary_only_loss,count_condition,gradients,generation,ocr_visual_value_source,alpha_zero_exact_identity,formal_training_started,frozen_test_started}' "${run_root}/summary.json"

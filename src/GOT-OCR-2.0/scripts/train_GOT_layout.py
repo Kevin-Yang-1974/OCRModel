@@ -4,6 +4,7 @@ import gc
 import hashlib
 import json
 import math
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
@@ -48,6 +49,7 @@ OUTPUT_DIAGNOSTIC_FIELDS = {
     "prediction_query_abs_max": "layout_prediction_query_abs_max",
     "bbox_logit_abs_max": "layout_bbox_logit_abs_max",
     "sequence_loss": "layout_sequence_loss",
+    "boundary_loss": "layout_boundary_loss",
     "type_loss": "layout_type_loss",
     "count_loss": "layout_count_loss",
     "eos_accuracy": "layout_eos_accuracy",
@@ -146,6 +148,8 @@ class LayoutDiagnosticTrainer(GOTTrainer):
         self._diagnostic_sums: dict[str, torch.Tensor] = {}
         self._diagnostic_count = 0
         self._latest_gradient_norms: dict[str, torch.Tensor] = {}
+        self._first_forward_started = False
+        self._first_training_step_started = False
         model_base = self.model.get_model()
         self._layout_adapter = (
             model_base.layout_adapter or model_base.variable_layout_adapter
@@ -165,6 +169,21 @@ class LayoutDiagnosticTrainer(GOTTrainer):
             "residual_gate_gradient_abs",
             self._layout_adapter.residual_gate,
         )
+        if hasattr(self._layout_adapter, "decoder"):
+            self._register_gradient_hook(
+                "layout_decoder_gradient_norm",
+                self._layout_adapter.decoder.token_head.weight,
+            )
+        if hasattr(self._layout_adapter, "record_heads"):
+            self._register_gradient_hook(
+                "record_bbox_gradient_norm",
+                self._layout_adapter.record_heads.bbox_head.weight,
+            )
+        if hasattr(self._layout_adapter, "visual_routing"):
+            self._register_gradient_hook(
+                "visual_routing_gradient_norm",
+                self._layout_adapter.visual_routing.visual_value.weight,
+            )
 
     def _register_gradient_hook(self, name: str, parameter: torch.Tensor) -> None:
         if not parameter.requires_grad:
@@ -198,11 +217,47 @@ class LayoutDiagnosticTrainer(GOTTrainer):
         return_outputs: bool = False,
         **kwargs: Any,
     ) -> Any:
+        first_forward = model.training and not self._first_forward_started
+        if first_forward:
+            self._first_forward_started = True
+            self._distributed_event("first_forward_start")
         outputs = model(**inputs)
         loss = outputs["loss"] if isinstance(outputs, dict) else outputs[0]
+        if first_forward:
+            self._distributed_event(
+                "first_forward_complete",
+                loss_finite=bool(torch.isfinite(loss.detach()).all()),
+            )
         if model.training:
             self._record_outputs(outputs)
         return (loss, outputs) if return_outputs else loss
+
+    def training_step(
+        self,
+        model: torch.nn.Module,
+        inputs: dict[str, Any],
+    ) -> torch.Tensor:
+        first_step = not self._first_training_step_started
+        if first_step:
+            self._first_training_step_started = True
+            self._distributed_event("first_training_step_start")
+        loss = super().training_step(model, inputs)
+        if first_step:
+            self._distributed_event(
+                "first_training_step_complete",
+                loss_finite=bool(torch.isfinite(loss.detach()).all()),
+            )
+        return loss
+
+    @staticmethod
+    def _distributed_event(event: str, **payload: Any) -> None:
+        record = {
+            "event": event,
+            "rank": int(os.environ.get("RANK", "0")),
+            "local_rank": int(os.environ.get("LOCAL_RANK", "0")),
+            **payload,
+        }
+        print(json.dumps(record, separators=(",", ":")), flush=True)
 
     def log(self, logs: dict[str, float], *args: Any, **kwargs: Any) -> None:
         enriched = dict(logs)
@@ -280,6 +335,13 @@ class LayoutTrainingArguments:
     layout_type_loss_weight: float = field(default=1.0)
     layout_direction_loss_weight: float = field(default=1.0)
     layout_count_loss_weight: float = field(default=0.1)
+    layout_boundary_loss_weight: float = field(default=0.0)
+    layout_count_condition_strength: float = field(default=0.0)
+    pvld_use_spatial_memory: bool = field(default=False)
+    pvld_coverage_detach: bool = field(default=False)
+    pvld_shared_gradient_scale: float = field(default=1.0)
+    pvld_record_gradient_scale: float = field(default=1.0)
+    pvld_predicted_layout_routing: bool = field(default=False)
     layout_prompt_diversity_loss_weight: float = field(default=0.0)
     max_train_records: int = field(default=0)
     min_layout_regions: int = field(default=0)
@@ -358,6 +420,12 @@ def validate_layout_args(args: LayoutTrainingArguments) -> None:
         if (args.layout_decoder_hidden_size < 1 or args.layout_decoder_num_heads < 1
                 or args.layout_decoder_hidden_size % args.layout_decoder_num_heads):
             raise ValueError("PVLD hidden size must be divisible by decoder heads.")
+        if args.layout_boundary_loss_weight < 0.0:
+            raise ValueError("PVLD boundary loss weight must be non-negative.")
+        if args.layout_count_condition_strength < 0.0:
+            raise ValueError("PVLD count condition strength must be non-negative.")
+        if args.pvld_shared_gradient_scale < 0.0 or args.pvld_record_gradient_scale < 0.0:
+            raise ValueError("PVLD gradient scales must be non-negative.")
     if args.max_train_records < 0:
         raise ValueError("--max_train_records cannot be negative.")
     if args.min_layout_regions < 0:
@@ -452,6 +520,15 @@ def build_layout_config(
     config.layout_type_loss_weight = args.layout_type_loss_weight
     config.layout_direction_loss_weight = args.layout_direction_loss_weight
     config.layout_count_loss_weight = args.layout_count_loss_weight
+    config.layout_boundary_loss_weight = args.layout_boundary_loss_weight
+    config.layout_count_condition_strength = args.layout_count_condition_strength
+    config.pvld_use_spatial_memory = args.pvld_use_spatial_memory
+    config.pvld_coverage_detach = bool(
+        args.pvld_coverage_detach or args.pvld_use_spatial_memory
+    )
+    config.pvld_shared_gradient_scale = args.pvld_shared_gradient_scale
+    config.pvld_record_gradient_scale = args.pvld_record_gradient_scale
+    config.pvld_predicted_layout_routing = args.pvld_predicted_layout_routing
     config.layout_prompt_diversity_loss_weight = args.layout_prompt_diversity_loss_weight
     config.vlqa_num_direction_classes = 5
     config.vlqa_layout_input_dim = 1024
@@ -683,6 +760,17 @@ def configure_trainable_parameters(
     elif stage == "p1":
         if model_base.variable_layout_adapter is not None:
             adapter.requires_grad_(True)
+            # P1 has layout supervision only. The visual routing/writeback path
+            # feeds OCR tokens and therefore has no gradient source in this
+            # stage; leaving it trainable can stall distributed gradient sync.
+            for module in (
+                adapter.visual_norm,
+                adapter.visual_projection,
+                adapter.visual_routing,
+                adapter.writeback_output,
+            ):
+                module.requires_grad_(False)
+            adapter.residual_gate.requires_grad_(False)
             with torch.no_grad():
                 adapter.residual_gate.zero_()
             model_base.vision_tower_high.requires_grad_(False)
@@ -731,6 +819,31 @@ def configure_trainable_parameters(
     if trainable == 0:
         raise RuntimeError("No parameters are trainable.")
     return trainable, total, trainable_names
+
+
+def configure_ddp_frozen_parameter_ignores(
+    model: GOTQwenForCausalLM,
+    training_args: TrainingArguments,
+) -> dict[str, int]:
+    if training_args.world_size <= 1 or training_args.deepspeed:
+        return {"ignored_parameters": 0, "ignored_parameter_elements": 0}
+    ignored = [
+        name for name, parameter in model.named_parameters()
+        if not parameter.requires_grad
+    ]
+    torch.nn.parallel.DistributedDataParallel._set_params_and_buffers_to_ignore_for_model(
+        model,
+        ignored,
+    )
+    ignored_elements = sum(
+        parameter.numel()
+        for _, parameter in model.named_parameters()
+        if not parameter.requires_grad
+    )
+    return {
+        "ignored_parameters": len(ignored),
+        "ignored_parameter_elements": ignored_elements,
+    }
 
 
 def module_parameter_report(model: GOTQwenForCausalLM) -> dict[str, dict[str, Any]]:
@@ -841,6 +954,18 @@ def main() -> None:
         (ModelArguments, DataArguments, TrainingArguments, LayoutTrainingArguments)
     )
     model_args, data_args, training_args, layout_args = parser.parse_args_into_dataclasses()
+    # Bind each torchrun process to its logical visible device before model
+    # construction; otherwise all ranks can default to CUDA device 0 and
+    # NCCL reports duplicate GPU ownership.
+    local_rank = int(os.environ.get("LOCAL_RANK", str(training_args.local_rank)))
+    if torch.cuda.is_available() and local_rank >= 0:
+        torch.cuda.set_device(local_rank)
+        print(
+            f"DISTRIBUTED_DEVICE_BINDING local_rank={local_rank} "
+            f"cuda_device={torch.cuda.current_device()} "
+            f"cuda_visible_devices={os.environ.get('CUDA_VISIBLE_DEVICES', '')}",
+            flush=True,
+        )
     validate_layout_args(layout_args)
     if training_args.remove_unused_columns:
         raise ValueError(
@@ -962,6 +1087,7 @@ def main() -> None:
         layout_args.p2_train_scope,
         layout_args.ablation_id,
     )
+    ddp_ignores = configure_ddp_frozen_parameter_ignores(model, training_args)
     module_parameters = (
         assert_ablation_trainable_scope(layout_args.ablation_id, layout_args.layout_stage, model)
         if layout_args.ablation_id else module_parameter_report(model)
@@ -1104,6 +1230,11 @@ def main() -> None:
     print(f"MAX_REGIONS={layout_args.max_regions}")
     print(f"TRAINABLE_PARAMETERS={trainable}")
     print(f"TOTAL_PARAMETERS={total}")
+    print(f"DDP_IGNORED_FROZEN_PARAMETERS={ddp_ignores['ignored_parameters']}")
+    print(
+        "DDP_IGNORED_FROZEN_PARAMETER_ELEMENTS="
+        f"{ddp_ignores['ignored_parameter_elements']}"
+    )
     print(f"TRAINABLE_PARAMETER_PREFIXES={','.join(sorted(set(name.split('.')[0] for name in trainable_names)))}")
     print(f"FIRST_SAMPLE_LAYOUT_REGIONS={layout_regions}")
     print(f"FIRST_SAMPLE_OBJECT_SLOTS={object_slots}")
@@ -1117,13 +1248,47 @@ def main() -> None:
         if (model.get_model().layout_adapter is not None
             or model.get_model().variable_layout_adapter is not None) else GOTTrainer
     )
+    print(
+        json.dumps(
+            {
+                "event": "trainer_construction_start",
+                "rank": int(os.environ.get("RANK", "0")),
+                "local_rank": int(os.environ.get("LOCAL_RANK", "0")),
+            },
+            separators=(",", ":"),
+        ),
+        flush=True,
+    )
     trainer = trainer_class(
         model=model,
         tokenizer=tokenizer,
         args=training_args,
         **data_module,
     )
+    print(
+        json.dumps(
+            {
+                "event": "trainer_construction_complete",
+                "rank": int(os.environ.get("RANK", "0")),
+                "local_rank": int(os.environ.get("LOCAL_RANK", "0")),
+            },
+            separators=(",", ":"),
+        ),
+        flush=True,
+    )
     checkpoints = sorted(output_dir.glob("checkpoint-*"))
+    print(
+        json.dumps(
+            {
+                "event": "trainer_train_start",
+                "rank": int(os.environ.get("RANK", "0")),
+                "local_rank": int(os.environ.get("LOCAL_RANK", "0")),
+                "resume": bool(checkpoints),
+            },
+            separators=(",", ":"),
+        ),
+        flush=True,
+    )
     train_result = trainer.train(resume_from_checkpoint=bool(checkpoints))
     trainer.save_state()
     trainer._safe_save(output_dir=str(output_dir))
@@ -1216,21 +1381,39 @@ def main() -> None:
             "max_layout_tokens": layout_args.max_layout_tokens,
             "max_layout_records": layout_args.max_layout_records,
             "pvld_decoder_version": (
-                "causal_transformer_fsm_previous_region_v1"
+                (
+                    "causal_transformer_fsm_boundary_count_v1"
+                    if layout_args.layout_boundary_loss_weight > 0.0
+                    or layout_args.layout_count_condition_strength > 0.0
+                    else "causal_transformer_fsm_previous_region_v1"
+                )
                 if variable_adapter is not None else None
             ),
             "pvld_decoder_memory": (
-                "layout_evidence_only" if variable_adapter is not None else None
+                (
+                    "layout_evidence_plus_projected_high_resolution"
+                    if variable_adapter is not None and layout_args.pvld_use_spatial_memory
+                    else "layout_evidence_only"
+                ) if variable_adapter is not None else None
             ),
             "pvld_coverage": (
                 {
-                    "kind": "exclusive_previous_region_hidden_mean",
-                    "shape": "B,T,D",
-                    "detach": False,
+                    "kind": (
+                        "exclusive_previous_region_hidden_mean_plus_spatial_cross_attention"
+                        if layout_args.pvld_use_spatial_memory
+                        else "exclusive_previous_region_hidden_mean"
+                    ),
+                    "shape": "B,T,D; spatial=B,L_F",
+                    "detach": layout_args.pvld_coverage_detach,
                     "full_attention_saved": False,
                 }
                 if variable_adapter is not None else None
             ),
+            "m3_gradient_scales": {
+                "shared": layout_args.pvld_shared_gradient_scale,
+                "record": layout_args.pvld_record_gradient_scale,
+            },
+            "m4_predicted_layout_routing": layout_args.pvld_predicted_layout_routing,
             "ablation_id": layout_args.ablation_id or "legacy_default",
             "layout_loss_preset": layout_args.layout_loss_preset or "legacy_explicit_weights",
             "loss_weights": {
@@ -1240,6 +1423,10 @@ def main() -> None:
                 "bbox_giou": layout_args.bbox_giou_loss_weight,
                 "direction_order": layout_args.direction_loss_weight,
                 "layout": layout_args.layout_loss_weight,
+                "pvld_boundary": layout_args.layout_boundary_loss_weight,
+                "pvld_count_condition_strength": (
+                    layout_args.layout_count_condition_strength
+                ),
             },
             "projector_trainable": module_parameters["mm_projector_vary"]["trainable"] > 0,
             "use_vlqa": model.get_model().layout_adapter is not None,

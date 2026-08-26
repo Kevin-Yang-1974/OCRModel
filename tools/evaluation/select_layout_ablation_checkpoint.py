@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import hashlib
 import json
 import os
@@ -49,8 +50,33 @@ def require_gpu_free(gpu_id: str, utilization_limit: int) -> None:
             f"GPU{gpu_id}_BUSY utilization={utilization} limit={utilization_limit}"
         )
 
+def parse_gpu_ids(parallel_gpu_ids: str | None, gpu_id: str) -> tuple[str, ...]:
+    raw_ids = parallel_gpu_ids.split(",") if parallel_gpu_ids else [gpu_id]
+    gpu_ids = tuple(value.strip() for value in raw_ids if value.strip())
+    if not gpu_ids or any(not value.isdigit() for value in gpu_ids):
+        raise ValueError("GPU IDs must be a non-empty comma-separated numeric list.")
+    if len(set(gpu_ids)) != len(gpu_ids):
+        raise ValueError("GPU IDs must be unique.")
+    return gpu_ids
+
+def require_gpus_free(
+    gpu_ids: Sequence[str], utilization_limit: int
+) -> dict[str, int]:
+    utilization = {gpu_id: gpu_utilization(gpu_id) for gpu_id in gpu_ids}
+    busy = {
+        gpu_id: value
+        for gpu_id, value in utilization.items()
+        if value >= utilization_limit
+    }
+    if busy:
+        detail = ",".join(f"GPU{gpu_id}={value}" for gpu_id, value in busy.items())
+        raise RuntimeError(
+            f"GPU_SET_BUSY {detail} limit={utilization_limit}"
+        )
+    return utilization
+
 def discover_candidates(model_root: Path, *, zero_shot: bool = False,
-                        expected_ablation: str | None = None) -> list[tuple[int, Path]]:
+                         expected_ablation: str | None = None) -> list[tuple[int, Path]]:
     metrics_path = model_root / "layout_training_metrics.json"
     if zero_shot:
         if not (model_root / "model.safetensors").is_file():
@@ -62,16 +88,48 @@ def discover_candidates(model_root: Path, *, zero_shot: bool = False,
     if expected_ablation and metrics.get("ablation_id") != expected_ablation:
         raise RuntimeError("Training metrics ablation_id does not match selection request.")
     final_step = int(metrics["global_step"])
-    candidates = [(final_step, model_root)]
-    for path in model_root.glob("checkpoint-*"):
+    # The final export and the last periodic checkpoint can represent the same
+    # optimizer step while having different serialized hashes. Keep one model
+    # per step and prefer the final export for the final step.
+    candidates_by_step: dict[int, Path] = {final_step: model_root.resolve()}
+    for path in sorted(model_root.glob("checkpoint-*")):
         match = STEP_PATTERN.search(path.name)
         if match and (path / "model.safetensors").is_file() and (path / "config.json").is_file():
-            candidates.append((int(match.group(1)), path))
+            candidates_by_step.setdefault(int(match.group(1)), path.resolve())
     unique: dict[str, tuple[int, Path]] = {}
-    for step, path in sorted(candidates):
+    for step, path in sorted(candidates_by_step.items()):
         digest = sha256(path / "model.safetensors")
-        unique.setdefault(digest, (step, path.resolve()))
+        unique.setdefault(digest, (step, path))
     return sorted(unique.values())
+
+
+def candidate_output_dir(output: Path, step: int, *, resume: bool) -> tuple[Path, Path]:
+    base = output / f"step-{step:08d}"
+    attempts = [base, *sorted(output.glob(f"{base.name}-retry-*"))]
+    completed = [
+        attempt for attempt in attempts
+        if (attempt / "layout_validation_metrics.json").is_file()
+    ]
+    if completed:
+        candidate_dir = completed[-1]
+        return candidate_dir, candidate_dir / "layout_validation_metrics.json"
+
+    occupied = [attempt for attempt in attempts if attempt.exists() and any(attempt.iterdir())]
+    if occupied and not resume:
+        raise FileExistsError(
+            f"Incomplete validation candidate exists; use --resume: {occupied[-1]}"
+        )
+    if not occupied:
+        return base, base / "layout_validation_metrics.json"
+
+    retry_numbers = []
+    retry_pattern = re.compile(rf"{re.escape(base.name)}-retry-(\d+)$")
+    for attempt in attempts[1:]:
+        match = retry_pattern.fullmatch(attempt.name)
+        if match:
+            retry_numbers.append(int(match.group(1)))
+    candidate_dir = output / f"{base.name}-retry-{max(retry_numbers, default=0) + 1:02d}"
+    return candidate_dir, candidate_dir / "layout_validation_metrics.json"
 
 def p1_layout_rank(item: dict[str, Any]) -> tuple[float, ...]:
     metrics = item["validation_metrics"]
@@ -189,7 +247,11 @@ def load_resumable_candidate_summary(
     if not isinstance(summary, dict) or summary.get("status") != "ok":
         raise RuntimeError(f"Existing validation summary is not status=ok: {summary_path}")
     checks = {
-        "model": Path(str(summary.get("model", ""))).resolve() == model.resolve(),
+        "model": (
+            Path(str(summary.get("model", ""))).resolve() == model.resolve()
+            or Path(str(summary.get("model", ""))).resolve() in model.resolve().parents
+            or model.resolve() in Path(str(summary.get("model", ""))).resolve().parents
+        ),
         "model_kind": summary.get("model_kind") == model_kind,
         "manifest": (
             Path(str(summary.get("manifest", ""))).resolve()
@@ -237,13 +299,53 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--max-records", type=int, default=0)
     parser.add_argument("--max-new-tokens", type=int, default=2048)
     parser.add_argument("--no-repeat-ngram-size", type=int, default=20)
+    parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--gpu-id", default="0")
+    parser.add_argument("--parallel-gpu-ids")
     parser.add_argument("--gpu-utilization-limit", type=int, default=DEFAULT_GPU_UTILIZATION_LIMIT)
     parser.add_argument("--resume", action="store_true")
     parser.add_argument(
         "--selection-purpose", choices=("ocr", "p1_layout"), default="ocr"
     )
     return parser.parse_args(argv)
+
+def evaluate_candidate(
+    candidate: tuple[int, Path, Path, Path, list[str]],
+    *,
+    gpu_id: str,
+    project_root: Path,
+) -> tuple[int, Path, Path]:
+    step, model, candidate_dir, summary_path, command = candidate
+    candidate_dir.mkdir(parents=True, exist_ok=True)
+    environment = dict(os.environ)
+    environment["CUDA_VISIBLE_DEVICES"] = gpu_id
+    log_path = candidate_dir / "evaluator.log"
+    with log_path.open("w", encoding="utf-8") as log:
+        completed = subprocess.run(
+            command,
+            cwd=project_root,
+            env=environment,
+            stdout=log,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+    if completed.returncode != 0 or not summary_path.is_file():
+        raise RuntimeError(
+            f"Validation failed for checkpoint step {step} on GPU{gpu_id}; "
+            f"see {log_path}."
+        )
+    return step, model, summary_path
+
+def evaluate_worker_queue(
+    queue: Sequence[tuple[int, Path, Path, Path, list[str]]],
+    *,
+    gpu_id: str,
+    project_root: Path,
+) -> list[tuple[int, Path, Path]]:
+    return [
+        evaluate_candidate(candidate, gpu_id=gpu_id, project_root=project_root)
+        for candidate in queue
+    ]
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
@@ -256,13 +358,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(compact({"event": "layout_ablation_checkpoint_selected", "selection": str(selection_path), "selected": payload["selected"], "resumed": True}))
         return 0
     output.mkdir(parents=True, exist_ok=True)
-    candidate_results: list[dict[str, Any]] = []
-    for step, model in discover_candidates(
+    gpu_ids = parse_gpu_ids(args.parallel_gpu_ids, args.gpu_id)
+    candidates = discover_candidates(
         args.model_root.resolve(), zero_shot=args.ablation == "got2_zero_shot",
         expected_ablation=(None if args.ablation == "got2_zero_shot" else args.ablation),
-    ):
-        candidate_dir = output / f"step-{step:08d}"
-        summary_path = candidate_dir / "layout_validation_metrics.json"
+    )
+    prepared: list[tuple[int, Path, Path, Path, list[str]]] = []
+    summaries: dict[int, tuple[Path, Path]] = {}
+    for step, model in candidates:
+        candidate_dir, summary_path = candidate_output_dir(
+            output, step, resume=args.resume
+        )
         command = [
             sys.executable, str(args.project_root / "scripts" / "evaluate_GOT_layout.py"),
             "--model-name-or-path", str(model), "--model-kind", args.model_kind,
@@ -273,16 +379,16 @@ def main(argv: Sequence[str] | None = None) -> int:
             "--max-regions", str(args.max_regions), "--max-records", str(args.max_records),
             "--max-new-tokens", str(args.max_new_tokens),
             "--no-repeat-ngram-size", str(args.no_repeat_ngram_size),
+            "--batch-size", str(args.batch_size),
         ]
         if args.selection_purpose == "p1_layout":
             command.extend(["--require-vlqa-stage", "p1"])
-        log_path = candidate_dir / "evaluator.log"
         if summary_path.is_file():
             if not args.resume:
                 raise FileExistsError(
                     f"Validation candidate already exists; use --resume: {summary_path}"
                 )
-            summary = load_resumable_candidate_summary(
+            load_resumable_candidate_summary(
                 summary_path,
                 model=model,
                 model_kind=args.model_kind,
@@ -290,16 +396,42 @@ def main(argv: Sequence[str] | None = None) -> int:
                 max_new_tokens=args.max_new_tokens,
                 no_repeat_ngram_size=args.no_repeat_ngram_size,
             )
+            summaries[step] = (model, summary_path)
         else:
-            require_gpu_free(args.gpu_id, args.gpu_utilization_limit)
-            candidate_dir.mkdir(parents=True, exist_ok=True)
-            environment = dict(os.environ)
-            environment["CUDA_VISIBLE_DEVICES"] = args.gpu_id
-            with log_path.open("w", encoding="utf-8") as log:
-                completed = subprocess.run(command, cwd=args.project_root, env=environment, stdout=log, stderr=subprocess.STDOUT, text=True)
-            if completed.returncode != 0 or not summary_path.is_file():
-                raise RuntimeError(f"Validation failed for checkpoint step {step}; see {log_path}.")
-            summary = json.loads(summary_path.read_text(encoding="utf-8"))
+            prepared.append((step, model, candidate_dir, summary_path, command))
+
+    utilization: dict[str, int] = {}
+    if prepared:
+        utilization = require_gpus_free(gpu_ids, args.gpu_utilization_limit)
+        queues: list[list[tuple[int, Path, Path, Path, list[str]]]] = [
+            [] for _ in gpu_ids
+        ]
+        for index, candidate in enumerate(prepared):
+            queues[index % len(gpu_ids)].append(candidate)
+        active = [(gpu_id, queue) for gpu_id, queue in zip(gpu_ids, queues) if queue]
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(active)) as executor:
+            futures = [
+                executor.submit(
+                    evaluate_worker_queue,
+                    queue,
+                    gpu_id=gpu_id,
+                    project_root=args.project_root,
+                )
+                for gpu_id, queue in active
+            ]
+            for future in futures:
+                for step, model, summary_path in future.result():
+                    summaries[step] = (model, summary_path)
+
+    candidate_results: list[dict[str, Any]] = []
+    for step, model in candidates:
+        stored_model, summary_path = summaries[step]
+        if stored_model != model:
+            stored_path = Path(stored_model).resolve()
+            model_path = model.resolve()
+            if stored_path not in model_path.parents and model_path not in stored_path.parents:
+                raise RuntimeError(f"Candidate model mismatch at step {step}.")
+        summary = json.loads(summary_path.read_text(encoding="utf-8"))
         validation_metrics = (
             normalize_p1_layout_metrics(summary)
             if args.selection_purpose == "p1_layout"
@@ -341,7 +473,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         "validation_manifest": str(args.validation_manifest.resolve()),
         "validation_manifest_sha256": sha256(args.validation_manifest.resolve()),
         "locked_object_threshold": selected["validation_object_threshold"],
-        "selection_physical_gpu": args.gpu_id,
+        "selection_physical_gpu": gpu_ids[0],
+        "selection_physical_gpus": list(gpu_ids),
+        "gpu_utilization_at_admission": utilization,
         "selected": selected, "candidates": candidate_results,
     }
     write_json(selection_path, payload)

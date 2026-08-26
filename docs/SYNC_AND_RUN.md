@@ -446,3 +446,6 @@ PY
 ```
 
 完整日志保存在新 run 的 `p1/train.log`、`p1/validation_selection.log`、`p2/train.log` 及独立 P2 validation selection 目录。成功条件是训练 run 存在 `PVLD_TRAINING_FINISHED`，P1/P2 两份 `selection.json` 均为 `selection_split=validation`、`test_used_for_selection=false`，checkpoint 目录不超过 6。本轮没有 selection-locked test；只有 M1a validation 结果足以锁定后续方案后，才另行授权 test。
+### PVLD M2-M4 bounded smoke
+
+After local checks, synchronize only the allow-listed source tree. A100 bounded smoke must use an explicitly permitted idle GPU (currently GPU 0 only while M1 v4 owns GPUs 1-4) and a new run ID; it must not alter M1 artifacts. Invoke `smoke_pvld_causal_decoder_cuda.py --m2 --m3-scale 0.25 --m4` for the combined candidate check. BSCC uses Slurm/srun, never tmux or `/tmp`, with separate run IDs for M1, M2, M3 and M4 component smokes. Neither path starts formal training, validation selection, or MTHv2/frozen test.

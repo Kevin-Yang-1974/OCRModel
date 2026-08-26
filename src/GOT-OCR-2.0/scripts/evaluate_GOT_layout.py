@@ -301,14 +301,34 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
     )
     tokenizer.padding_side = "left"
     tokenizer.model_max_length = args.model_max_length
-    model = GOTQwenForCausalLM.from_pretrained(
+    # Older PVLD checkpoints do not contain newly added M2-M4 parameters.
+    # Avoid meta tensors from low-memory loading so those parameters receive
+    # deterministic constructor initialization before moving to CUDA.
+    torch.manual_seed(20260825)
+    model, loading_info = GOTQwenForCausalLM.from_pretrained(
         model_path,
-        low_cpu_mem_usage=True,
+        low_cpu_mem_usage=False,
         use_safetensors=True,
         pad_token_id=151643,
         torch_dtype=dtype,
         local_files_only=True,
-    ).eval()
+        output_loading_info=True,
+    )
+    model.eval()
+    (output_dir / "checkpoint_loading_info.json").write_text(
+        json.dumps(
+            {
+                "missing_keys": sorted(loading_info.get("missing_keys", [])),
+                "unexpected_keys": sorted(loading_info.get("unexpected_keys", [])),
+                "error_msgs": loading_info.get("error_msgs", []),
+                "deterministic_init_seed": 20260825,
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
     model.to(device=device, dtype=dtype)
     checkpoint_stage = validate_model_protocol(
         model=model,
