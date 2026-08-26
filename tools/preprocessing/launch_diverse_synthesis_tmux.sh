@@ -9,9 +9,11 @@ session=""
 content_root=""
 output_root=""
 seed=20260817
-train_pages=8000
-validation_pages=1000
-test_pages=1000
+train_pages=20000
+validation_pages=2000
+test_pages=2000
+min_train_pages_total=10000
+target_train_region_exposures=1000000
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -22,6 +24,8 @@ while [[ $# -gt 0 ]]; do
         --train-pages-per-tier) train_pages="$2"; shift 2 ;;
         --validation-pages-per-tier) validation_pages="$2"; shift 2 ;;
         --test-pages-per-tier) test_pages="$2"; shift 2 ;;
+        --min-train-pages-total) min_train_pages_total="$2"; shift 2 ;;
+        --target-train-region-exposures) target_train_region_exposures="$2"; shift 2 ;;
         *) printf '{"event":"diverse_synthesis_launch_failed","error":"unknown argument","argument":"%s"}\n' "$1" >&2; exit 64 ;;
     esac
 done
@@ -30,7 +34,7 @@ done
     printf '%s\n' '{"event":"diverse_synthesis_launch_failed","error":"invalid tmux session"}' >&2
     exit 64
 }
-for value in "${seed}" "${train_pages}" "${validation_pages}" "${test_pages}"; do
+for value in "${seed}" "${train_pages}" "${validation_pages}" "${test_pages}" "${min_train_pages_total}" "${target_train_region_exposures}"; do
     [[ "${value}" =~ ^[0-9]+$ ]] || {
         printf '%s\n' '{"event":"diverse_synthesis_launch_failed","error":"seed/page counts must be integers"}' >&2
         exit 64
@@ -79,6 +83,8 @@ args=(
     --train-pages-per-tier "${train_pages}"
     --validation-pages-per-tier "${validation_pages}"
     --test-pages-per-tier "${test_pages}"
+    --min-train-pages-total "${min_train_pages_total}"
+    --target-train-region-exposures "${target_train_region_exposures}"
     --chromium-executable /usr/bin/google-chrome
     --progress-every 1000
 )
@@ -98,4 +104,4 @@ fi
 pane_pid="$(tmux display-message -p -t "${session}:0.0" '#{pane_pid}')"
 printf '{"event":"diverse_synthesis_started","session":"%s","pane_pid":%s,"output":"%s","log":"%s","total_pages":%s,"cuda_visible_devices":""}\n' \
     "${session}" "${pane_pid}" "${output_root}" "${log_path}" \
-    "$((3 * (train_pages + validation_pages + test_pages)))"
+    "$((5 * (train_pages + validation_pages + test_pages)))"

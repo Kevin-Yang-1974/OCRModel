@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import sys
+from unittest.mock import patch
 from pathlib import Path
 
 
@@ -74,6 +75,9 @@ def test_runner_propagates_m1_boundary_configuration_and_parallel_selection() ->
     assert '"--pvld-shared-gradient-scale"' in source
     assert '"--pvld-record-gradient-scale"' in source
     assert '"--pvld-predicted-layout-routing"' in source
+    assert 'args.pvld_shared_gradient_scale if stage == "p2" else 1.0' in source
+    assert 'args.pvld_predicted_layout_routing and stage == "p2"' in source
+    assert '"p1_forces_legacy_gradient_scale_and_routing": True' in source
     assert 'args.stages != "p1" or args.p1_max_steps > 10' in source
     assert 'and not args.skip_p1_validation_selection' in source
     train_source = (
@@ -101,3 +105,81 @@ def test_runner_propagates_m1_boundary_configuration_and_parallel_selection() ->
     ).read_text(encoding="utf-8")
     assert '"count_head_through_boundary_logits"' in smoke_source
     assert '"zero_strength_legacy_exact": True' in smoke_source
+
+
+def test_target_gpus_auto_admits_all_cards_below_threshold() -> None:
+    result = type("Result", (), {
+        "returncode": 0,
+        "stdout": "0, 49\n1, 50\n2, 3\n3, 0\n",
+        "stderr": "",
+    })()
+    with patch.object(runner.subprocess, "run", return_value=result) as mocked:
+        ids, observed = runner.target_gpus("", 50)
+    assert ids == ("0", "2", "3")
+    assert observed == {"0": 49, "1": 50, "2": 3, "3": 0}
+    command = mocked.call_args.args[0]
+    assert command[0] == "nvidia-smi"
+    assert "-i" not in command
+    assert "--query-gpu=index,utilization.gpu" in command
+
+
+def test_target_gpus_explicit_queries_only_requested_cards() -> None:
+    result = type("Result", (), {
+        "returncode": 0,
+        "stdout": "3, 1\n1, 2\n",
+        "stderr": "",
+    })()
+    with patch.object(runner.subprocess, "run", return_value=result) as mocked:
+        ids, observed = runner.target_gpus("3,1", 50)
+    assert ids == ("3", "1")
+    assert observed == {"3": 1, "1": 2}
+    command = mocked.call_args.args[0]
+    assert command[0:3] == ["nvidia-smi", "-i", "3,1"]
+
+
+def test_target_gpus_auto_fails_when_all_cards_are_busy() -> None:
+    result = type("Result", (), {
+        "returncode": 0,
+        "stdout": "0, 50\n1, 99\n",
+        "stderr": "",
+    })()
+    with patch.object(runner.subprocess, "run", return_value=result):
+        try:
+            runner.target_gpus("", 50)
+        except RuntimeError as exc:
+            assert "no GPU" in str(exc)
+        else:
+            raise AssertionError("busy auto-admission unexpectedly succeeded")
+
+
+def test_stage_learning_rates_are_differentiated() -> None:
+    args = type(
+        "Args",
+        (),
+        {
+            "p1_vision_learning_rate": 1e-6,
+            "p1_projector_learning_rate": 1e-5,
+            "p1_layout_learning_rate": 1e-4,
+            "p1_qwen_learning_rate": 0.0,
+            "p1_gate_learning_rate": 0.0,
+            "p1_lm_head_learning_rate": 0.0,
+            "p2_vision_learning_rate": 5e-7,
+            "p2_projector_learning_rate": 5e-6,
+            "p2_layout_learning_rate": 5e-5,
+            "p2_qwen_learning_rate": 1e-6,
+            "p2_gate_learning_rate": 1e-5,
+            "p2_lm_head_learning_rate": 0.0,
+            "p3_vision_learning_rate": 2e-7,
+            "p3_projector_learning_rate": 2e-6,
+            "p3_layout_learning_rate": 1e-5,
+            "p3_qwen_learning_rate": 5e-7,
+            "p3_gate_learning_rate": 1e-6,
+            "p3_lm_head_learning_rate": 0.0,
+        },
+    )()
+    p1 = runner.stage_learning_rates(args, "p1")
+    p2 = runner.stage_learning_rates(args, "p2")
+    p3 = runner.stage_learning_rates(args, "p3")
+    assert p1["vision"] > p2["vision"] > p3["vision"]
+    assert p1["layout"] > p2["layout"] > p3["layout"]
+    assert p2["qwen"] > p3["qwen"]

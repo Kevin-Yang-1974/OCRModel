@@ -13,7 +13,9 @@ from typing import Any, Iterable, Mapping, Sequence
 
 
 SCHEMA_VERSION = 2
-TIERS = ("s0-html-text", "s1-html-crop", "s2-hard")
+TIERS = (
+    "s0-html-text", "s1-html-crop", "s2-hard", "s3-ancient-hard", "s4-mixed"
+)
 WRITING_DIRECTIONS = (
     "horizontal_ltr",
     "horizontal_rtl",
@@ -213,6 +215,12 @@ class GeneratorConfig:
     page_height: int = 1024
     min_regions: int = 4
     max_regions: int = 12
+    region_count_weights: dict[str, float] = field(
+        default_factory=lambda: {
+            "1-8": 0.10, "9-16": 0.15, "17-32": 0.25,
+            "33-64": 0.30, "65-128": 0.15, ">128": 0.05,
+        }
+    )
     margin_min: int = 72
     margin_max: int = 112
     gap_min: int = 12
@@ -259,6 +267,10 @@ class GeneratorConfig:
     s2_noise_sigma_max: float = 5.0
     s2_speckle_density_min: float = 0.0
     s2_speckle_density_max: float = 0.0
+    s3_texture_strength: float = 0.35
+    s3_occlusion_probability: float = 0.20
+    s4_mixed_direction_probability: float = 0.75
+    s4_overlap_probability: float = 0.20
 
     @classmethod
     def from_json(cls, path: Path | None) -> "GeneratorConfig":
@@ -340,6 +352,13 @@ class GeneratorConfig:
                 raise ValueError(f"{name}_min/max must be non-negative and ordered.")
         if self.region_extent_weight_min <= 0:
             raise ValueError("region_extent_weight_min must be positive.")
+        if not isinstance(self.region_count_weights, dict) or not self.region_count_weights:
+            raise ValueError("region_count_weights must be a non-empty object.")
+        if any(
+            not isinstance(key, str) or not isinstance(value, (int, float)) or value <= 0
+            for key, value in self.region_count_weights.items()
+        ):
+            raise ValueError("region_count_weights must map bucket names to positive numbers.")
         if not 0.5 <= self.line_height_min <= self.line_height_max <= 3.0:
             raise ValueError("line heights must satisfy 0.5 <= min <= max <= 3.0.")
         if not isinstance(self.glyph_extent_safety_factor, (int, float)) or not (
@@ -464,7 +483,7 @@ def tier_accepts_item(tier: str, item: ContentItem) -> bool:
         return item.kind == "text"
     if tier == "s1-html-crop":
         return item.kind == "image"
-    if tier == "s2-hard":
+    if tier in {"s2-hard", "s3-ancient-hard", "s4-mixed"}:
         return item.kind in {"text", "image"}
     raise ValueError(f"Unknown tier: {tier!r}")
 
@@ -633,7 +652,26 @@ def build_page_plan(
     else:
         direction = rng.choice(available_directions)
     eligible = by_direction[direction]
-    sampled_count = rng.randint(config.min_regions, min(config.max_regions, len(eligible)))
+    max_count = min(config.max_regions, len(eligible))
+    weighted_buckets = []
+    for label, weight in config.region_count_weights.items():
+        if label == ">128":
+            lower, upper = 129, max_count
+        else:
+            lower, upper = (int(part) for part in label.split("-", maxsplit=1))
+        lower = max(lower, config.min_regions)
+        upper = min(upper, max_count)
+        if lower <= upper:
+            weighted_buckets.append((lower, upper, float(weight)))
+    if weighted_buckets:
+        lower, upper, _ = rng.choices(
+            weighted_buckets,
+            weights=[entry[2] for entry in weighted_buckets],
+            k=1,
+        )[0]
+        sampled_count = rng.randint(lower, upper)
+    else:
+        sampled_count = rng.randint(config.min_regions, max_count)
 
     tier_tag = tier.split("-", maxsplit=1)[0]
     page_id = f"{split}_{tier_tag}_seed{base_seed:08d}_p{page_index:06d}"
@@ -665,11 +703,18 @@ def build_page_plan(
                         letter_spacing=letter_spacing,
                         region_padding=config.region_padding,
                     )
+                region_direction = direction
+                if tier == "s4-mixed" and rng.random() < config.s4_mixed_direction_probability:
+                    supported = [
+                        value for value in config.directions if item.supports_direction(value)
+                    ]
+                    if supported:
+                        region_direction = rng.choice(supported)
                 candidate_regions.append(
                     RegionPlan(
                         region_id=f"{page_id}_r{reading_order:03d}",
                         reading_order=reading_order,
-                        writing_direction=direction,
+                        writing_direction=region_direction,
                         bbox_px=bbox_px,
                         font_size=font_size,
                         font_family=_sample_choice(rng, font_families),

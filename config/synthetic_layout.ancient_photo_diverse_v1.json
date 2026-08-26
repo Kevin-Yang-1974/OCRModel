@@ -2,7 +2,15 @@
   "page_width": 1024,
   "page_height": 1024,
   "min_regions": 3,
-  "max_regions": 14,
+  "max_regions": 160,
+  "region_count_weights": {
+    "1-8": 0.10,
+    "9-16": 0.15,
+    "17-32": 0.25,
+    "33-64": 0.30,
+    "65-128": 0.15,
+    ">128": 0.05
+  },
   "margin_min": 28,
   "margin_max": 108,
   "gap_min": 5,
@@ -11,12 +19,12 @@
   "dense_gap_min": 0,
   "dense_gap_max": 6,
   "region_inset_min": 0,
-  "region_inset_max": 4,
+  "region_inset_max": 0,
   "region_extent_weight_min": 0.62,
   "region_extent_weight_max": 1.55,
-  "font_size_min": 18,
+  "font_size_min": 8,
   "font_size_max": 52,
-  "region_padding": 1,
+  "region_padding": 0,
   "line_height_min": 0.88,
   "line_height_max": 1.42,
   "glyph_extent_safety_factor": 1.55,
@@ -103,5 +111,9 @@
   "s2_noise_sigma_min": 0.5,
   "s2_noise_sigma_max": 11.0,
   "s2_speckle_density_min": 0.00002,
-  "s2_speckle_density_max": 0.004
+  "s2_speckle_density_max": 0.004,
+  "s3_texture_strength": 0.35,
+  "s3_occlusion_probability": 0.20,
+  "s4_mixed_direction_probability": 0.75,
+  "s4_overlap_probability": 0.20
 }

@@ -74,36 +74,50 @@ class GOTTrainer(Trainer):
         if self.optimizer is None:
             decay_parameters = get_parameter_names(opt_model, ALL_LAYERNORM_LAYERS)
             decay_parameters = [name for name in decay_parameters if "bias" not in name]
+            learning_rates = {
+                "vision": float(getattr(self.args, "vision_learning_rate", self.args.learning_rate)),
+                "projector": float(getattr(self.args, "projector_learning_rate", self.args.learning_rate)),
+                "layout": float(getattr(self.args, "layout_learning_rate", self.args.learning_rate)),
+                "qwen": float(getattr(self.args, "qwen_learning_rate", self.args.learning_rate)),
+                "gate": float(getattr(self.args, "gate_learning_rate", self.args.learning_rate)),
+                "lm_head": float(getattr(self.args, "lm_head_learning_rate", self.args.learning_rate)),
+            }
+
+            def group_name(name: str) -> str:
+                if "residual_gate" in name:
+                    return "gate"
+                if name.startswith("lm_head."):
+                    return "lm_head"
+                if "vision_tower_high" in name:
+                    return "vision"
+                if "mm_projector_vary" in name:
+                    return "projector"
+                if any(token in name for token in (
+                    "layout_adapter", "variable_layout_adapter", "generic_adapter"
+                )):
+                    return "layout"
+                return "qwen"
+
+            grouped: dict[tuple[str, bool], list[torch.nn.Parameter]] = {}
+            for name, parameter in opt_model.named_parameters():
+                if not parameter.requires_grad:
+                    continue
+                category = group_name(name)
+                use_decay = name in decay_parameters
+                grouped.setdefault((category, use_decay), []).append(parameter)
             optimizer_grouped_parameters = [
                 {
-                    "params": [
-                        p for n, p in opt_model.named_parameters() if 'vision_encoder' in n and n in decay_parameters and p.requires_grad
-                    ],
-                    "weight_decay": self.args.weight_decay,
-                    "lr": self.args.learning_rate,
-                },
-                {
-                    "params": [
-                        p for n, p in opt_model.named_parameters() if 'vision_encoder' in n and n not in decay_parameters and p.requires_grad],
-                    "weight_decay": 0.0,
-                    "lr": self.args.learning_rate,
-                },
-                {
-                    "params": [
-                        p for n, p in opt_model.named_parameters() if 'vision_encoder' not in n and n in decay_parameters and p.requires_grad],
-                    "weight_decay": self.args.weight_decay,
-                    "lr": self.args.learning_rate,
-                },
-                {
-                    "params": [
-                        p for n, p in opt_model.named_parameters() if 'vision_encoder' not in n and n not in decay_parameters and p.requires_grad
-                    ],
-                    "weight_decay": 0.0,
-                    "lr": self.args.learning_rate,
-                },
+                    "params": parameters,
+                    "weight_decay": self.args.weight_decay if use_decay else 0.0,
+                    "lr": learning_rates[category],
+                    "group_name": f"{category}_{'decay' if use_decay else 'nodecay'}",
+                }
+                for (category, use_decay), parameters in grouped.items()
             ]
             for idx, group in enumerate(optimizer_grouped_parameters):
-                print(idx, len(group['params']), group['lr'])
+                print(
+                    idx, group["group_name"], len(group["params"]), group["lr"], flush=True
+                )
             optimizer_cls, optimizer_kwargs = Trainer.get_optimizer_cls_and_kwargs(self.args)
             self.optimizer = optimizer_cls(optimizer_grouped_parameters, **optimizer_kwargs)
 

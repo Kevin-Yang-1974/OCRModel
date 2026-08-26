@@ -95,6 +95,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default="bfloat16",
     )
     parser.add_argument("--device", default="cuda")
+    parser.add_argument(
+        "--pvld-routing-control",
+        choices=("normal", "alpha_zero", "shuffled_evidence"),
+        default="normal",
+        help="Validation-only OCR routing control for predicted-layout PVLD checkpoints.",
+    )
     return parser.parse_args(argv)
 
 
@@ -337,6 +343,31 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
         max_regions=args.max_regions,
         required_vlqa_stage=args.require_vlqa_stage,
     )
+    variable_adapter = model.get_model().variable_layout_adapter
+    checkpoint_predicted_routing = bool(
+        getattr(model.config, "pvld_predicted_layout_routing", False)
+    )
+    if args.pvld_routing_control != "normal":
+        if args.model_kind != "pvld" or variable_adapter is None:
+            raise ValueError("PVLD routing controls require --model-kind pvld.")
+        if not checkpoint_predicted_routing:
+            raise RuntimeError(
+                "PVLD routing controls require a checkpoint trained with predicted-layout routing."
+            )
+    if args.pvld_routing_control == "shuffled_evidence" and args.batch_size < 2:
+        raise ValueError("shuffled_evidence requires --batch-size of at least 2.")
+    checkpoint_residual_gate = (
+        float(variable_adapter.residual_gate.detach().float().cpu())
+        if variable_adapter is not None else None
+    )
+    if args.pvld_routing_control == "alpha_zero":
+        with torch.no_grad():
+            variable_adapter.residual_gate.zero_()
+    effective_residual_gate = (
+        float(variable_adapter.residual_gate.detach().float().cpu())
+        if variable_adapter is not None else None
+    )
+    shuffle_predicted_layout = args.pvld_routing_control == "shuffled_evidence"
 
     image_processor = BlipImageEvalProcessor(image_size=1024)
     data_module = make_layout_page_validation_data_module(
@@ -350,6 +381,10 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
         max_records=args.max_records,
     )
     dataset = data_module["eval_dataset"]
+    if shuffle_predicted_layout and len(dataset) % args.batch_size:
+        raise ValueError(
+            "shuffled_evidence requires every evaluation batch to contain at least two pages."
+        )
     loader = DataLoader(
         dataset,
         batch_size=args.batch_size,
@@ -433,6 +468,7 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
                             images=images,
                             use_cache=False,
                             generate_variable_layout=args.model_kind == "pvld",
+                            shuffle_predicted_layout=shuffle_predicted_layout,
                             return_dict=True,
                         )
                     synchronize(device)
@@ -451,6 +487,7 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
                     "do_sample": False,
                     "num_beams": 1,
                     "max_new_tokens": args.max_new_tokens,
+                    "shuffle_predicted_layout": shuffle_predicted_layout,
                 }
                 stop_token_ids = tokenizer(
                     stop_string,
@@ -692,6 +729,16 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
             "ocr_prompt": "OCR: ",
             "layout_metadata_as_model_input": False,
             "layout_metadata_usage": "offline_metrics_only",
+        },
+        "pvld_routing_control": {
+            "condition": args.pvld_routing_control,
+            "checkpoint_predicted_layout_routing": checkpoint_predicted_routing,
+            "checkpoint_residual_gate": checkpoint_residual_gate,
+            "effective_residual_gate": effective_residual_gate,
+            "shuffle_scope": (
+                "cyclic_within_batch" if shuffle_predicted_layout else "none"
+            ),
+            "batch_size": args.batch_size,
         },
         "decoding": {
             "do_sample": False,

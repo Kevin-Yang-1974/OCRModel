@@ -216,7 +216,7 @@ bash tools/evaluation/run_layout_ablation_selection_smoke.sh \
 
 ## 10. MTHv2 原始整页 VQLCA C1–C5
 
-该入口固定读取 `/data3/yky/yangky_ocr_models/datasets/MTHv2/converted/mthv2_layout_page_v1` 的 train/validation/test 原始整页 manifest，不读取 `mthv2_layout_column_chunks16_v1`。C1/C2 保持 projector/普通 adaptor 对照；C3/C4/C5 显式使用 `layout_writeback_mode=vqlca`。`max_regions=512` 只是覆盖当前最多约 407 个 ordered textline/region candidates 的 Fixed-Slot K512 容量设置，不是 PVLD。
+该入口固定读取 `/data3/yky/yangky_ocr_models/datasets/MTHv2/converted/mthv2_layout_page_v1` 的 train/validation/test 原始整页 manifest，不读取 `mthv2_layout_column_chunks16_v1`。C1/C2 保持 projector/普通 adaptor 对照；C3/C4/C5 显式使用 `layout_writeback_mode=vqlca`。`max_regions=512` 只是覆盖当前最多约 407 个 ordered textline/region candidates 的 Fixed-Slot K512 容量设置，不是 PVLD。新版 `run_variable_layout_a100.py` 省略 `--gpu-ids` 时会自动使用所有瞬时 utilization 严格低于 50% 的 GPU；显式传入时只检查指定列表。
 
 ```bash
 cd /data3/yky/yangky_ocr_models/ocrmodel
@@ -449,3 +449,22 @@ PY
 ### PVLD M2-M4 bounded smoke
 
 After local checks, synchronize only the allow-listed source tree. A100 bounded smoke must use an explicitly permitted idle GPU (currently GPU 0 only while M1 v4 owns GPUs 1-4) and a new run ID; it must not alter M1 artifacts. Invoke `smoke_pvld_causal_decoder_cuda.py --m2 --m3-scale 0.25 --m4` for the combined candidate check. BSCC uses Slurm/srun, never tmux or `/tmp`, with separate run IDs for M1, M2, M3 and M4 component smokes. Neither path starts formal training, validation selection, or MTHv2/frozen test.
+
+## 16. BSCC M4 validation-only routing controls
+
+该入口只能在 M4 正式 pipeline 已产生 P2 `selection.json` 后运行。它读取该 validation-selected checkpoint，在三个独立 GPU 上分别执行 `normal`、`alpha_zero` 和 `shuffled_evidence`；三项均只读取 240 页 validation，固定 batch 2，shuffled 条件在每个 batch 内做循环置换。该诊断不读取 test、不重新选 checkpoint，也不能根据结果修改已经锁定的正式 test。
+
+```bash
+cd /home/bingxing2/home/scx9fxd/yangky_ocr_models_bscc_proto/ocrmodel
+sbatch --export=ALL,PVLD_M4_CONTROL_RUN_ID=mthv2_pvld_m4_validation_controls_20260826_v1 \
+  tools/evaluation/run_bscc_pvld_m4_validation_controls.sbatch
+```
+
+若正式 M4 run ID 不是默认的 `mthv2_pvld_m4_predrouting_20260826_v1`，须同时显式传入 `PVLD_M4_FORMAL_RUN_ID`。作业启动前一次性核验三张 Slurm 分配卡的瞬时 utilization 均 `<50%`；任一卡不合格时，在启动任何 evaluator 前整体退出。
+
+成功条件为控制 run 根目录存在 `summary.json`，其中 `status=ok`、`selection_split=validation`、`test_used_for_selection=false`、`test_manifest_read=false`，且三个 condition 均有 240 页指标。完整 predictions 和单项日志保留在各 condition 子目录；终端只回传：
+
+```bash
+jq -c '{status,control_run_id,formal_run_id,selection_split,test_used_for_selection,test_manifest_read,conditions,page_cer_delta_vs_normal}' \
+  /home/bingxing2/home/scx9fxd/yangky_ocr_models_bscc_proto/evaluation_runs/GOT/mthv2_pvld_m4_validation_controls_20260826_v1/summary.json
+```

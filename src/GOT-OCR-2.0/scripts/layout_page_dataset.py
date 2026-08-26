@@ -107,6 +107,7 @@ class LayoutPageConversationDataset(LineLevelConversationDataset):
         layout_target_mode: str = "fixed_slot",
         max_layout_tokens: int = 2048,
         max_layout_records: int = 512,
+        source_kind: str = "primary",
     ) -> None:
         Dataset.__init__(self)
         if datasets != "layout-page-jsonl":
@@ -130,6 +131,9 @@ class LayoutPageConversationDataset(LineLevelConversationDataset):
         self.layout_target_mode = layout_target_mode
         self.max_layout_tokens = max_layout_tokens
         self.max_layout_records = max_layout_records
+        if source_kind not in {"primary", "replay"}:
+            raise ValueError("source_kind must be primary or replay.")
+        self.source_kind = source_kind
         conversation_lib.default_conversation = conversation_lib.conv_templates["mpt"]
         if not self.image_root.is_dir():
             raise FileNotFoundError(self.image_root)
@@ -354,6 +358,7 @@ class LayoutPageConversationDataset(LineLevelConversationDataset):
             "labels": labels,
             "image": [image],
             "image_high": [image],
+            "replay_sample": self.source_kind == "replay",
         }
         if self.layout_target_mode == "fixed_slot":
             item.update(self._layout_targets(record))
@@ -442,6 +447,10 @@ class LayoutPageDataCollator:
 
     def __call__(self, instances: Sequence[dict[str, Any]]) -> dict[str, Any]:
         batch = self.base(instances)
+        batch["replay_sample_mask"] = torch.tensor(
+            [bool(instance.get("replay_sample", False)) for instance in instances],
+            dtype=torch.bool,
+        )
         if "layout_input_ids" in instances[0]:
             token_width = max(instance["layout_input_ids"].numel() for instance in instances)
             record_width = max(instance["layout_record_mask"].numel() for instance in instances)
@@ -501,7 +510,7 @@ class InterleavedLayoutDataset(Dataset):
         primary: Dataset[Any],
         replay: Dataset[Any],
         *,
-        primary_per_replay: int = 3,
+        primary_per_replay: int = 7,
     ) -> None:
         if len(primary) < 1 or len(replay) < 1:
             raise ValueError("primary and replay datasets must be non-empty.")
@@ -518,9 +527,13 @@ class InterleavedLayoutDataset(Dataset):
     def __getitem__(self, index: int) -> Any:
         if index % self.period == self.primary_per_replay:
             replay_index = (index // self.period) % len(self.replay)
-            return self.replay[replay_index]
+            item = dict(self.replay[replay_index])
+            item["replay_sample"] = True
+            return item
         primary_index = (index - index // self.period) % len(self.primary)
-        return self.primary[primary_index]
+        item = dict(self.primary[primary_index])
+        item["replay_sample"] = False
+        return item
 
 
 def summarize_training_budget(
@@ -679,6 +692,7 @@ def make_layout_page_data_module(
         max_regions=max_regions,
         max_records=max_records,
         supervise_ocr=supervise_ocr,
+        source_kind="primary",
         layout_target_mode=(layout_target_mode if include_layout_targets else "none"),
         max_layout_tokens=max_layout_tokens,
         max_layout_records=max_layout_records,
@@ -703,7 +717,8 @@ def make_layout_page_data_module(
             split=replay_split or split,
             max_regions=max_regions,
             max_records=replay_max_records,
-            supervise_ocr=supervise_ocr,
+            supervise_ocr=True,
+            source_kind="replay",
             layout_target_mode=(layout_target_mode if include_layout_targets else "none"),
             max_layout_tokens=max_layout_tokens,
             max_layout_records=max_layout_records,
