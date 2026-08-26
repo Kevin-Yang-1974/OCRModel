@@ -85,6 +85,14 @@ def expect_bbox(value: Any, context: str) -> tuple[float, float, float, float]:
     return x0, y0, x1, y1
 
 
+def perceptual_hash(path: Path) -> str:
+    with Image.open(path) as image:
+        gray = image.convert("L").resize((8, 8))
+        pixels = list(gray.getdata())
+    mean = sum(pixels) / len(pixels)
+    return "".join("1" if value >= mean else "0" for value in pixels)
+
+
 def validate_rendered_fonts(
     value: Any,
     source_kind: str,
@@ -332,6 +340,8 @@ def audit_record(
                 "source_kind": source_kind,
                 "text": region_text,
                 "direction": direction,
+                "bbox_area": round((bbox[2] - bbox[0]) * (bbox[3] - bbox[1]), 8),
+                "bbox_aspect": round((bbox[2] - bbox[0]) / max(1e-9, bbox[3] - bbox[1]), 8),
             }
         )
 
@@ -361,6 +371,8 @@ def audit_record(
         "layout_annotation_status": annotation_status,
         "template_id": record.get("template_id", layout_source),
         "image_sha256": expected_image_hash,
+        "perceptual_hash": perceptual_hash(image_path),
+        "page_text": page_text,
         "regions": region_summaries,
         "source_group_id": sorted(source_groups)[0] if source_groups else None,
     }
@@ -407,8 +419,10 @@ def main() -> int:
     crop_hash_splits: dict[str, str] = {}
     page_hash_splits: dict[str, str] = {}
     text_hash_splits: dict[str, str] = {}
+    page_text_hash_splits: dict[str, str] = {}
+    perceptual_hash_splits: dict[tuple[str, str], str] = {}
 
-    def enforce_single_split(mapping: dict[str, str], key: str, split: str, label: str) -> None:
+    def enforce_single_split(mapping: dict[Any, str], key: Any, split: str, label: str) -> None:
         previous = mapping.setdefault(key, split)
         if previous != split:
             errors.append(f"{label} occurs in multiple splits: {key!r} -> {previous!r}, {split!r}")
@@ -418,6 +432,16 @@ def main() -> int:
         image_sha256 = page["image_sha256"]
         if image_sha256:
             enforce_single_split(page_hash_splits, image_sha256, split, "page image hash")
+        normalized_page_text = " ".join(page["page_text"].casefold().split())
+        enforce_single_split(
+            page_text_hash_splits, normalized_page_text, split, "normalized page text"
+        )
+        enforce_single_split(
+            perceptual_hash_splits,
+            (page["perceptual_hash"], normalized_page_text),
+            split,
+            "perceptual image/text near-duplicate",
+        )
         for region in page["regions"]:
             content_id = region["content_id"]
             enforce_single_split(content_splits, content_id, split, "content_id")
@@ -451,6 +475,16 @@ def main() -> int:
     direction_counts = Counter(
         region["direction"] for page in audited for region in page["regions"]
     )
+    region_bucket_counts = Counter(
+        "1-8" if len(page["regions"]) <= 8 else
+        "9-16" if len(page["regions"]) <= 16 else
+        "17-32" if len(page["regions"]) <= 32 else
+        "33-64" if len(page["regions"]) <= 64 else
+        "65-128" if len(page["regions"]) <= 128 else ">128"
+        for page in audited
+    )
+    bbox_areas = [region["bbox_area"] for page in audited for region in page["regions"]]
+    bbox_aspects = [region["bbox_aspect"] for page in audited for region in page["regions"]]
     region_count = sum(len(page["regions"]) for page in audited)
     summary_payload = {
         "schema_version": SCHEMA_VERSION,
@@ -464,6 +498,17 @@ def main() -> int:
         "tier_counts": dict(sorted(tier_counts.items())),
         "template_counts": dict(sorted(template_counts.items())),
         "direction_counts": dict(sorted(direction_counts.items())),
+        "region_count_bucket_counts": dict(sorted(region_bucket_counts.items())),
+        "bbox_area": {
+            "min": min(bbox_areas) if bbox_areas else 0.0,
+            "median": sorted(bbox_areas)[len(bbox_areas) // 2] if bbox_areas else 0.0,
+            "max": max(bbox_areas) if bbox_areas else 0.0,
+        },
+        "bbox_aspect": {
+            "min": min(bbox_aspects) if bbox_aspects else 0.0,
+            "median": sorted(bbox_aspects)[len(bbox_aspects) // 2] if bbox_aspects else 0.0,
+            "max": max(bbox_aspects) if bbox_aspects else 0.0,
+        },
         "image_hash_checked": not args.skip_image_hash,
         "html_checked": not args.skip_html_check,
         "errors": errors[: args.max_errors],

@@ -177,7 +177,18 @@ class ImageEncoderViT(nn.Module):
         self.net_2 = nn.Conv2d(256, 512, kernel_size=3, stride=2, padding=1, bias=False)
         self.net_3 = nn.Conv2d(512, 1024, kernel_size=3, stride=2, padding=1, bias=False)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward_features(
+        self,
+        x: torch.Tensor,
+        *,
+        return_intermediate: bool = False,
+    ) -> torch.Tensor | dict[str, torch.Tensor]:
+        """Return the final 16x16 features and, optionally, the 64x64 neck map.
+
+        The neck output is the last genuinely high-resolution Vary feature.  It
+        is kept separate from the 16x16 OCR path so callers can use it for
+        layout memory without changing GOT2's 256 visual-token contract.
+        """
         x = self.patch_embed(x)
         if self.pos_embed is not None:
             x = x + self.pos_embed
@@ -185,12 +196,24 @@ class ImageEncoderViT(nn.Module):
         for blk in self.blocks:
             x = blk(x)
 
-        x = self.neck(x.permute(0, 3, 1, 2))
-        x = self.net_2(x)
-        x = self.net_3(x)
+        layout_memory_64 = self.neck(x.permute(0, 3, 1, 2))
+        x = self.net_2(layout_memory_64)
+        ocr_features_16 = self.net_3(x)
 
+        if return_intermediate:
+            return {
+                "layout_memory_64": layout_memory_64,
+                "ocr_features_16": ocr_features_16,
+            }
+        return ocr_features_16
 
-        return x
+    def forward(
+        self,
+        x: torch.Tensor,
+        *,
+        return_intermediate: bool = False,
+    ) -> torch.Tensor | dict[str, torch.Tensor]:
+        return self.forward_features(x, return_intermediate=return_intermediate)
 
 
 class Block(nn.Module):

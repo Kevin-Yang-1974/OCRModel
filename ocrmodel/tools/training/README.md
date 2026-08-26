@@ -50,7 +50,7 @@ MTHv2 原始整页 VQLCA C1–C5 使用 `run_mthv2_page_vqlca_ablation_tmux.sh`�
 
 ## LAVP/PVLD 当前工程入口
 
-`run_variable_layout_a100.py` 是 LAVP 中 GOT2 whole-page Prompted Variable-Length Layout Decoder 的编排器，不修改 `run_layout_a100.py` 或 Fixed-Slot K16/K32 历史结果。PVLD 已接入 GOT2 视觉塔和 `GOTQwenModel.forward`，输入只包含 `whole_page_image + ocr_prompt`。修复版 decoder 为 causal self-attention＋`layout_evidence=A` cross-attention＋FFN，并带真实 vocabulary FSM、previous-REGION coverage、生成期 record cap 和真实 REGION probability；OCR Value 继续只来自视觉 token。
+`run_variable_layout_a100.py` 是 LAVP 中 GOT2 whole-page Prompted Variable-Length Layout Decoder 的编排器，不修改 `run_layout_a100.py` 或 Fixed-Slot K16/K32 历史结果。PVLD 已接入 GOT2 视觉塔和 `GOTQwenModel.forward`，输入只包含 `whole_page_image + ocr_prompt`。修复版 decoder 为 causal self-attention＋`layout_evidence=A` cross-attention＋FFN，并带真实 vocabulary FSM、previous-REGION coverage、生成期 record cap 和真实 REGION probability；OCR Value 继续只来自视觉 token。该入口的 `--gpu-ids` 为可选参数：省略时仅在启动瞬间查询所有物理卡并使用全部 `utilization.gpu < --gpu-utilization-limit` 的卡；显式传入时只查询和使用指定卡，忙卡不等待。
 
 MTHv2 内部 B0–B6 与外部 SOTA 对比工程见 `docs/MTHV2_SOTA_COMPARISON_PROTOCOL.md` 和 `tools/sota/`。外部模型权重不进入源码树，当前阶段只执行官方权重部署、validation 1–2 页 zero-shot smoke 和最多 1-step fine-tune smoke；正式长程微调、validation selection 和 MTHv2 test 由 `run_formal_sota_suite.sh` 锁定，必须等待用户授权。
 

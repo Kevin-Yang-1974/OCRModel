@@ -58,6 +58,8 @@ generator_args=(
     --output-dir "${output_dir}"
     --split train
     --tier s0-html-text
+    --tier s3-ancient-hard
+    --tier s4-mixed
     --num-pages "${smoke_num_pages}"
     --seed 20260817
     --config "${ocrmodel_root}/config/synthetic_layout.ancient_photo_diverse_v1.json"

@@ -10,7 +10,9 @@ from pathlib import Path
 from typing import Sequence
 
 
-TIERS = ("s0-html-text", "s1-html-crop", "s2-hard")
+TIERS = (
+    "s0-html-text", "s1-html-crop", "s2-hard", "s3-ancient-hard", "s4-mixed"
+)
 
 
 def positive_int(value: str) -> int:
@@ -34,9 +36,17 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default=root / "config" / "synthetic_layout.ancient_photo_diverse_v1.json",
     )
     parser.add_argument("--seed", type=int, default=20260817)
-    parser.add_argument("--train-pages-per-tier", type=positive_int, default=8000)
-    parser.add_argument("--validation-pages-per-tier", type=positive_int, default=1000)
-    parser.add_argument("--test-pages-per-tier", type=positive_int, default=1000)
+    parser.add_argument("--train-pages-per-tier", type=positive_int, default=20000)
+    parser.add_argument("--validation-pages-per-tier", type=positive_int, default=2000)
+    parser.add_argument("--test-pages-per-tier", type=positive_int, default=2000)
+    parser.add_argument(
+        "--min-train-pages-total", type=positive_int, default=10000,
+        help="Minimum unique rendered train pages across all selected tiers.",
+    )
+    parser.add_argument(
+        "--target-train-region-exposures", type=positive_int, default=1_000_000,
+        help="Required train region exposures; this is checked after rendering and audit.",
+    )
     parser.add_argument("--tier", choices=TIERS, action="append", default=[])
     browser = parser.add_mutually_exclusive_group()
     browser.add_argument("--browser-channel")
@@ -83,11 +93,18 @@ def main(argv: Sequence[str] | None = None) -> int:
     output_root.mkdir(parents=True)
 
     tiers = args.tier or list(TIERS)
+    requested_train_pages = len(tiers) * args.train_pages_per_tier
+    if requested_train_pages < args.min_train_pages_total:
+        raise ValueError(
+            "The formal synthesis target requires at least "
+            f"{args.min_train_pages_total} train pages; requested={requested_train_pages}."
+        )
     pages = {
         "train": args.train_pages_per_tier,
         "validation": args.validation_pages_per_tier,
         "test": args.test_pages_per_tier,
     }
+    train_regions = None
     script_dir = Path(__file__).resolve().parent
     generator = script_dir / "generate_synthetic_layout.py"
     for split, split_pages in pages.items():
@@ -137,6 +154,16 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
         audit_command.extend(("--summary-json", str(audit_summary)))
         subprocess.run(audit_command, check=True, stdout=subprocess.DEVNULL)
+        train_regions = 0
+        train_manifest = output_root / "train" / "manifest.jsonl"
+        for line in train_manifest.read_text(encoding="utf-8").splitlines():
+            if line.strip():
+                train_regions += len(json.loads(line).get("regions", []))
+        if train_regions < args.target_train_region_exposures:
+            raise RuntimeError(
+                "Train region exposures are below the registered target: "
+                f"{train_regions} < {args.target_train_region_exposures}."
+            )
 
     protocol = {
         "status": "plan_only" if args.plan_only else "ready",
@@ -150,6 +177,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         "tiers": tiers,
         "pages_per_tier": pages,
         "total_pages": len(tiers) * sum(pages.values()),
+        "minimum_train_pages_total": args.min_train_pages_total,
+        "target_train_region_exposures": args.target_train_region_exposures,
+        "train_page_count": requested_train_pages,
+        "train_region_exposures": train_regions,
         "input_level": "whole_page_image",
         "layout_metadata_as_model_input": False,
         "formal_manifest_emitted": not args.plan_only,

@@ -118,6 +118,11 @@ class GOTQwenModel(Qwen2Model):
         self.vision_tower_high = build_vary_vit_b()
 
         self.mm_projector_vary =  nn.Linear(1024, 1024)
+        self.layout_memory_resolution = str(
+            getattr(config, "layout_memory_resolution", "16")
+        )
+        if self.layout_memory_resolution not in {"16", "64"}:
+            raise ValueError("layout_memory_resolution must be '16' or '64'.")
 
         self.layout_adapter = None
         self.variable_layout_adapter = None
@@ -249,9 +254,17 @@ class GOTQwenModel(Qwen2Model):
             )
             config.layout_writeback_mode = "visual_value_layout_routing"
             config.layout_writeback_source = "layout_evidence"
+            config.layout_memory_resolution = str(
+                getattr(config, "layout_memory_resolution", "16")
+            )
+            if config.layout_memory_resolution not in {"16", "64"}:
+                raise ValueError("layout_memory_resolution must be '16' or '64'.")
+            config.layout_memory_input_dim = (
+                256 if config.layout_memory_resolution == "64" else 1024
+            )
             self.variable_layout_adapter = PromptedVariableLayoutAdapter(
                 visual_dim=1024,
-                high_resolution_dim=1024,
+                high_resolution_dim=config.layout_memory_input_dim,
                 hidden_size=config.layout_decoder_hidden_size,
                 num_prompt_queries=config.num_layout_prompt_queries,
                 decoder_layers=config.layout_decoder_layers,
@@ -369,6 +382,8 @@ class GOTQwenModel(Qwen2Model):
         layout_type_targets: Optional[torch.LongTensor] = None,
         layout_count_targets: Optional[torch.FloatTensor] = None,
         generate_variable_layout: bool = False,
+        shuffle_predicted_layout: bool = False,
+        replay_sample_mask: Optional[torch.BoolTensor] = None,
         return_dict: Optional[bool] = None,
     ) -> Union[Tuple, BaseModelOutputWithPast]:
 
@@ -451,19 +466,41 @@ class GOTQwenModel(Qwen2Model):
                 #     # image_features.append(cnn_feature)
                 # image_features_2.append(cnn_feature)
                 if P == 1:
-                    with torch.set_grad_enabled(False):
-                        # print(image[1].shape)
-                        cnn_feature = vision_tower_high(image[1])
-                        cnn_feature = cnn_feature.flatten(2).permute(0, 2, 1) # 256*1024
-                        # image_features.append(cnn_feature)
-                    # image_features_2.append(cnn_feature)
-                    image_feature = self.mm_projector_vary(cnn_feature)
+                    vision_outputs = vision_tower_high(
+                        image[1],
+                        return_intermediate=self.variable_layout_adapter is not None,
+                    )
+                    if isinstance(vision_outputs, dict):
+                        ocr_cnn_feature = vision_outputs["ocr_features_16"]
+                        layout_cnn_feature = vision_outputs[
+                            "layout_memory_64"
+                            if self.layout_memory_resolution == "64"
+                            else "ocr_features_16"
+                        ]
+                    else:
+                        ocr_cnn_feature = vision_outputs
+                        layout_cnn_feature = vision_outputs
+                    ocr_cnn_feature = ocr_cnn_feature.flatten(2).permute(0, 2, 1)
+                    layout_cnn_feature = layout_cnn_feature.flatten(2).permute(0, 2, 1)
+                    feature_summary = ocr_cnn_feature.detach().float().mean(dim=(0, 1))
+                    reference = getattr(self, "_vision_feature_reference", None)
+                    if reference is None:
+                        self._vision_feature_reference = feature_summary.clone()
+                        self._last_vision_feature_drift = torch.zeros(
+                            (), device=feature_summary.device
+                        )
+                    else:
+                        self._last_vision_feature_drift = (
+                            (feature_summary - reference.to(feature_summary.device)).norm()
+                            / reference.to(feature_summary.device).norm().clamp_min(1e-6)
+                        )
+                    image_feature = self.mm_projector_vary(ocr_cnn_feature)
                     if self.generic_adapter is not None:
                         image_feature = self.generic_adapter(image_feature)
                     if self.layout_adapter is not None:
                         layout_output = self.layout_adapter(
                             image_feature,
-                            layout_memory=cnn_feature,
+                            layout_memory=ocr_cnn_feature,
                             memory_grid_size=(16, 16),
                         )
                         image_feature = layout_output.visual_tokens
@@ -471,7 +508,15 @@ class GOTQwenModel(Qwen2Model):
                     elif self.variable_layout_adapter is not None:
                         variable_output = self.variable_layout_adapter(
                             image_feature,
-                            cnn_feature,
+                            layout_cnn_feature,
+                            visual_padding_mask=torch.zeros(
+                                image_feature.shape[0], image_feature.shape[1],
+                                dtype=torch.bool, device=image_feature.device,
+                            ),
+                            high_resolution_padding_mask=torch.zeros(
+                                layout_cnn_feature.shape[0], layout_cnn_feature.shape[1],
+                                dtype=torch.bool, device=layout_cnn_feature.device,
+                            ),
                             layout_input_ids=(
                                 layout_input_ids[image_index : image_index + 1]
                                 if has_variable_targets else None
@@ -505,6 +550,7 @@ class GOTQwenModel(Qwen2Model):
                                 if has_variable_targets else None
                             ),
                             generate_layout=generate_variable_layout,
+                            shuffle_predicted_layout=shuffle_predicted_layout,
                         )
                         image_feature = variable_output.visual_tokens
                         variable_layout_outputs.append(variable_output)
@@ -521,9 +567,8 @@ class GOTQwenModel(Qwen2Model):
                     image_patches_features = []
                     for image_patch in image_patches:
                         image_p = torch.stack([image_patch])
-                        with torch.set_grad_enabled(False):
-                            cnn_feature_p = vision_tower_high(image_p)
-                            cnn_feature_p = cnn_feature_p.flatten(2).permute(0, 2, 1)
+                        cnn_feature_p = vision_tower_high(image_p)
+                        cnn_feature_p = cnn_feature_p.flatten(2).permute(0, 2, 1)
                         image_feature_p = self.mm_projector_vary(cnn_feature_p)
                         image_patches_features.append(image_feature_p)
                     image_feature = torch.cat(image_patches_features, dim=1)
@@ -851,6 +896,8 @@ class GOTQwenForCausalLM(Qwen2ForCausalLM):
         layout_type_targets: Optional[torch.LongTensor] = None,
         layout_count_targets: Optional[torch.FloatTensor] = None,
         generate_variable_layout: bool = False,
+        shuffle_predicted_layout: bool = False,
+        replay_sample_mask: Optional[torch.BoolTensor] = None,
         return_dict: Optional[bool] = None,
         
     ) -> Union[Tuple, CausalLMOutputWithPast]:
@@ -888,6 +935,8 @@ class GOTQwenForCausalLM(Qwen2ForCausalLM):
             layout_type_targets=layout_type_targets,
             layout_count_targets=layout_count_targets,
             generate_variable_layout=generate_variable_layout,
+            shuffle_predicted_layout=shuffle_predicted_layout,
+            replay_sample_mask=replay_sample_mask,
             return_dict=return_dict
             
         )
@@ -1032,6 +1081,7 @@ class GOTQwenForCausalLM(Qwen2ForCausalLM):
                 "attention_mask": attention_mask,
                 "images": kwargs.get("images", None),
                 "generate_variable_layout": kwargs.get("generate_variable_layout", False),
+                "shuffle_predicted_layout": kwargs.get("shuffle_predicted_layout", False),
             }
         )
         return model_inputs

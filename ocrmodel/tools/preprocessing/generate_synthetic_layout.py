@@ -240,6 +240,49 @@ def apply_s2_degradation(
     }
 
 
+def apply_tier_degradation(
+    image_path: Path, seed: int, tier: str, config: GeneratorConfig
+) -> dict[str, Any]:
+    """Apply geometry-preserving S2/S3/S4 scan degradation and provenance."""
+    if tier == "s2-hard":
+        return apply_s2_degradation(image_path, seed, config)
+    base = apply_s2_degradation(image_path, seed, config)
+    rng = random.Random(seed ^ 0xC3C3C3C3)
+    with Image.open(image_path) as source:
+        image = source.convert("RGBA")
+    overlay = Image.new("RGBA", image.size, (0, 0, 0, 0))
+    draw = ImageDraw.Draw(overlay, "RGBA")
+    occlusion_count = 0
+    if tier in {"s3-ancient-hard", "s4-mixed"}:
+        texture_alpha = max(0.0, min(1.0, config.s3_texture_strength))
+        for _ in range(max(1, round(image.width * image.height / 220000))):
+            x0 = rng.randint(0, max(0, image.width - 80))
+            y0 = rng.randint(0, max(0, image.height - 80))
+            x1 = min(image.width, x0 + rng.randint(30, 180))
+            y1 = min(image.height, y0 + rng.randint(30, 180))
+            draw.rectangle((x0, y0, x1, y1), fill=(78, 53, 31, round(35 * texture_alpha)))
+        if rng.random() < config.s3_occlusion_probability:
+            occlusion_count = rng.randint(1, 3)
+            for _ in range(occlusion_count):
+                x0 = rng.randint(0, max(0, image.width - 120))
+                y0 = rng.randint(0, max(0, image.height - 120))
+                draw.rectangle(
+                    (x0, y0, min(image.width, x0 + rng.randint(40, 180)),
+                     min(image.height, y0 + rng.randint(20, 100))),
+                    fill=(35, 29, 22, rng.randint(20, 70)),
+                )
+    image = Image.alpha_composite(image, overlay).convert("RGB")
+    image.save(image_path)
+    base["tier"] = tier
+    base["operations"].update({
+        "texture_strength": round(config.s3_texture_strength, 6),
+        "occlusion_probability": round(config.s3_occlusion_probability, 6),
+        "occlusion_count": occlusion_count,
+        "geometry_preserved": True,
+    })
+    return base
+
+
 def import_playwright() -> Any:
     try:
         from playwright.sync_api import sync_playwright
@@ -638,9 +681,9 @@ def main() -> None:
                                     f"expected={plan.page_size}, actual={rendered.size}"
                                 )
                         degradation: dict[str, Any]
-                        if plan.tier == "s2-hard":
-                            degradation = apply_s2_degradation(
-                                image_path, plan.page_seed, config
+                        if plan.tier in {"s2-hard", "s3-ancient-hard", "s4-mixed"}:
+                            degradation = apply_tier_degradation(
+                                image_path, plan.page_seed, plan.tier, config
                             )
                         else:
                             degradation = {
@@ -683,6 +726,15 @@ def main() -> None:
                                     for result in font_fit_results
                                     if result["adjusted"]
                                 ],
+                                "region_count_bucket": (
+                                    "1-8" if len(plan.regions) <= 8 else
+                                    "9-16" if len(plan.regions) <= 16 else
+                                    "17-32" if len(plan.regions) <= 32 else
+                                    "33-64" if len(plan.regions) <= 64 else
+                                    "65-128" if len(plan.regions) <= 128 else ">128"
+                                ),
+                                "column_count": len(plan.regions),
+                                "difficulty_tier": plan.tier,
                             },
                             degradation=degradation,
                         )

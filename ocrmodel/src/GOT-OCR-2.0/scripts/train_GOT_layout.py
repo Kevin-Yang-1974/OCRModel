@@ -148,9 +148,13 @@ class LayoutDiagnosticTrainer(GOTTrainer):
         self._diagnostic_sums: dict[str, torch.Tensor] = {}
         self._diagnostic_count = 0
         self._latest_gradient_norms: dict[str, torch.Tensor] = {}
+        self._parameter_update_references: dict[str, dict[str, torch.Tensor]] = {}
+        self._last_batch_labels: list[torch.Tensor] = []
+        self._last_batch_replay_mask: list[bool] = []
         self._first_forward_started = False
         self._first_training_step_started = False
         model_base = self.model.get_model()
+        self._model_base = model_base
         self._layout_adapter = (
             model_base.layout_adapter or model_base.variable_layout_adapter
         )
@@ -184,6 +188,11 @@ class LayoutDiagnosticTrainer(GOTTrainer):
                 "visual_routing_gradient_norm",
                 self._layout_adapter.visual_routing.visual_value.weight,
             )
+        self._register_first_parameter_hook("vision_gradient_norm", model_base.vision_tower_high)
+        self._register_first_parameter_hook("projector_gradient_norm", model_base.mm_projector_vary)
+        self._register_parameter_update_reference("vision_parameter_update_norm", model_base.vision_tower_high)
+        self._register_parameter_update_reference("projector_parameter_update_norm", model_base.mm_projector_vary)
+        self._register_parameter_update_reference("layout_parameter_update_norm", self._layout_adapter)
 
     def _register_gradient_hook(self, name: str, parameter: torch.Tensor) -> None:
         if not parameter.requires_grad:
@@ -194,6 +203,39 @@ class LayoutDiagnosticTrainer(GOTTrainer):
             return gradient
 
         parameter.register_hook(capture)
+
+    def _register_first_parameter_hook(self, name: str, module: torch.nn.Module) -> None:
+        parameter = next((p for p in module.parameters() if p.requires_grad), None)
+        if parameter is not None:
+            self._register_gradient_hook(name, parameter)
+
+    def _register_parameter_update_reference(self, name: str, module: torch.nn.Module) -> None:
+        self._parameter_update_references[name] = {
+            parameter_name: parameter.detach().float().clone()
+            for parameter_name, parameter in module.named_parameters()
+            if parameter.requires_grad
+        }
+
+    def _parameter_update_norms(self) -> dict[str, float]:
+        modules = {
+            "vision_parameter_update_norm": self._model_base.vision_tower_high,
+            "projector_parameter_update_norm": self._model_base.mm_projector_vary,
+            "layout_parameter_update_norm": self._layout_adapter,
+        }
+        values: dict[str, float] = {}
+        for name, module in modules.items():
+            references = self._parameter_update_references.get(name, {})
+            squared = None
+            for parameter_name, parameter in module.named_parameters():
+                reference = references.get(parameter_name)
+                if reference is None or not parameter.requires_grad:
+                    continue
+                delta = parameter.detach().float() - reference.to(parameter.device)
+                term = delta.pow(2).sum()
+                squared = term if squared is None else squared + term
+            if squared is not None:
+                values[name] = float(squared.sqrt().cpu())
+        return values
 
     def _record_outputs(self, outputs: Any) -> None:
         recorded = False
@@ -228,6 +270,13 @@ class LayoutDiagnosticTrainer(GOTTrainer):
                 "first_forward_complete",
                 loss_finite=bool(torch.isfinite(loss.detach()).all()),
             )
+        labels = inputs.get("labels")
+        replay_mask = inputs.get("replay_sample_mask")
+        self._last_batch_labels = [row.detach() for row in labels] if labels is not None else []
+        self._last_batch_replay_mask = (
+            [bool(value) for value in replay_mask.detach().cpu().tolist()]
+            if replay_mask is not None else []
+        )
         if model.training:
             self._record_outputs(outputs)
         return (loss, outputs) if return_outputs else loss
@@ -272,6 +321,19 @@ class LayoutDiagnosticTrainer(GOTTrainer):
         enriched["residual_gate"] = float(
             self._layout_adapter.residual_gate.detach().float().cpu()
         )
+        enriched.update(self._parameter_update_norms())
+        enriched["replay_supervised_tokens"] = float(
+            sum(
+                int(labels.ne(IGNORE_INDEX).sum())
+                for labels, is_replay in zip(
+                    self._last_batch_labels, self._last_batch_replay_mask
+                )
+                if is_replay
+            )
+        )
+        feature_drift = getattr(self._model_base, "_last_vision_feature_drift", None)
+        if feature_drift is not None:
+            enriched["vision_feature_drift_from_initial"] = float(feature_drift)
         enriched.update(
             {
                 name: round(float(value.cpu()), 8)
@@ -304,7 +366,7 @@ class LayoutTrainingArguments:
     )
     layout_stage: str = field(
         default="p1",
-        metadata={"help": "p1 (layout-only warm-up) or p2 (joint page OCR/layout)."},
+        metadata={"help": "p1 warm-up, p2 synthetic joint training, or p3 real-domain adaptation."},
     )
     ablation_id: str = field(
         default="",
@@ -331,6 +393,7 @@ class LayoutTrainingArguments:
     layout_decoder_layers: int = field(default=2)
     layout_decoder_hidden_size: int = field(default=256)
     layout_decoder_num_heads: int = field(default=8)
+    layout_memory_resolution: str = field(default="16")
     layout_bbox_loss_weight: float = field(default=5.0)
     layout_type_loss_weight: float = field(default=1.0)
     layout_direction_loss_weight: float = field(default=1.0)
@@ -364,18 +427,28 @@ class LayoutTrainingArguments:
     direction_loss_weight: float = field(default=1.0)
     layout_loss_weight: float = field(default=1.0)
     ocr_loss_weight: float = field(default=0.0)
+    replay_ocr_loss_weight: float = field(default=0.25)
     replay_layout_manifest: Optional[str] = field(default=None)
     replay_layout_image_root: Optional[str] = field(default=None)
     replay_layout_split: str = field(default="train")
     replay_max_train_records: int = field(default=0)
-    primary_per_replay: int = field(default=3)
+    primary_per_replay: int = field(default=7)
+    vision_learning_rate: float = field(default=1e-6)
+    projector_learning_rate: float = field(default=1e-5)
+    layout_learning_rate: float = field(default=1e-4)
+    qwen_learning_rate: float = field(default=1e-6)
+    gate_learning_rate: float = field(default=1e-5)
+    lm_head_learning_rate: float = field(default=0.0)
+    qwen_unfreeze_fraction: float = field(default=0.25)
 
 
 def validate_layout_args(args: LayoutTrainingArguments) -> None:
     if args.layout_architecture not in {"fixed_slot", "pvld"}:
         raise ValueError("--layout_architecture must be fixed_slot or pvld.")
-    if args.layout_stage not in {"p1", "p2"}:
-        raise ValueError("--layout_stage must be p1 or p2.")
+    if args.layout_stage not in {"p1", "p2", "p3"}:
+        raise ValueError("--layout_stage must be p1, p2, or p3.")
+    if args.layout_memory_resolution not in {"16", "64"}:
+        raise ValueError("--layout_memory_resolution must be 16 or 64.")
     if args.p2_train_scope not in {
         "adapter_projector",
         "decoder_adapter_projector",
@@ -466,16 +539,28 @@ def validate_layout_args(args: LayoutTrainingArguments) -> None:
     )
     if any(weight < 0.0 for weight in weights):
         raise ValueError("All loss weights must be non-negative.")
-    if args.layout_stage == "p1" and args.ocr_loss_weight != 0.0:
-        raise ValueError("P1 is layout-only; set --ocr_loss_weight 0.")
-    if args.layout_stage == "p2" and args.ocr_loss_weight <= 0.0:
-        raise ValueError("P2 requires a positive --ocr_loss_weight.")
+    if args.layout_stage == "p1" and args.replay_layout_manifest is None and args.ocr_loss_weight != 0.0:
+        raise ValueError("P1 without replay requires --ocr_loss_weight 0.")
+    if args.layout_stage == "p1" and args.replay_layout_manifest is not None and args.replay_ocr_loss_weight != 0.25:
+        raise ValueError("The registered P1 replay protocol requires replay_ocr_loss_weight=0.25.")
+    if args.layout_stage in {"p2", "p3"} and args.ocr_loss_weight <= 0.0:
+        raise ValueError("P2/P3 require a positive --ocr_loss_weight.")
     if args.replay_max_train_records < 0:
         raise ValueError("--replay_max_train_records cannot be negative.")
-    if args.primary_per_replay < 1:
-        raise ValueError("--primary_per_replay must be positive.")
+    if args.primary_per_replay != 7:
+        raise ValueError("The registered replay protocol requires --primary_per_replay 7.")
+    for name in (
+        "vision_learning_rate", "projector_learning_rate", "layout_learning_rate",
+        "qwen_learning_rate", "gate_learning_rate", "lm_head_learning_rate",
+    ):
+        if getattr(args, name) < 0.0:
+            raise ValueError(f"--{name} must be non-negative.")
+    if not 0.0 <= args.qwen_unfreeze_fraction <= 1.0:
+        raise ValueError("--qwen_unfreeze_fraction must be in [0, 1].")
     if args.replay_layout_image_root and not args.replay_layout_manifest:
         raise ValueError("--replay_layout_image_root requires --replay_layout_manifest.")
+    if args.replay_ocr_loss_weight < 0.0:
+        raise ValueError("--replay_ocr_loss_weight must be non-negative.")
 
 
 def build_layout_config(
@@ -529,6 +614,7 @@ def build_layout_config(
     config.pvld_shared_gradient_scale = args.pvld_shared_gradient_scale
     config.pvld_record_gradient_scale = args.pvld_record_gradient_scale
     config.pvld_predicted_layout_routing = args.pvld_predicted_layout_routing
+    config.layout_memory_resolution = args.layout_memory_resolution
     config.layout_prompt_diversity_loss_weight = args.layout_prompt_diversity_loss_weight
     config.vlqa_num_direction_classes = 5
     config.vlqa_layout_input_dim = 1024
@@ -537,7 +623,12 @@ def build_layout_config(
     config.vlqa_bbox_giou_weight = args.bbox_giou_loss_weight
     config.vlqa_direction_weight = args.direction_loss_weight
     config.layout_loss_weight = args.layout_loss_weight
-    config.ocr_loss_weight = args.ocr_loss_weight
+    config.ocr_loss_weight = (
+        args.replay_ocr_loss_weight
+        if args.layout_stage == "p1" and args.replay_layout_manifest
+        else args.ocr_loss_weight
+    )
+    config.replay_ocr_loss_weight = args.replay_ocr_loss_weight
     config.layout_stage = args.layout_stage
     config.layout_architecture = args.layout_architecture
     config.use_cache = False
@@ -758,58 +849,43 @@ def configure_trainable_parameters(
     if adapter is None:
         pass
     elif stage == "p1":
-        if model_base.variable_layout_adapter is not None:
-            adapter.requires_grad_(True)
-            # P1 has layout supervision only. The visual routing/writeback path
-            # feeds OCR tokens and therefore has no gradient source in this
-            # stage; leaving it trainable can stall distributed gradient sync.
-            for module in (
-                adapter.visual_norm,
-                adapter.visual_projection,
-                adapter.visual_routing,
-                adapter.writeback_output,
-            ):
-                module.requires_grad_(False)
-            adapter.residual_gate.requires_grad_(False)
-            with torch.no_grad():
-                adapter.residual_gate.zero_()
-            model_base.vision_tower_high.requires_grad_(False)
-            trainable_names = [
-                name for name, parameter in model.named_parameters() if parameter.requires_grad
-            ]
-            trainable = sum(
-                parameter.numel() for parameter in model.parameters() if parameter.requires_grad
-            )
-            total = sum(parameter.numel() for parameter in model.parameters())
-            return trainable, total, trainable_names
-        adapter.requires_grad_(False)
-        adapter.query_embeddings.requires_grad_(True)
+        adapter.requires_grad_(True)
+        # P1 learns layout from the high-resolution branch, while the OCR
+        # replay path separately supplies gradients to ViT and projector.
         for module in (
-            adapter.memory_norm,
-            adapter.memory_projection,
-            adapter.query_norm,
-            adapter.query_cross_attention,
-            adapter.query_ffn_norm,
-            adapter.query_ffn,
-            adapter.prediction_norm,
-            adapter.object_head,
-            adapter.box_head,
-            adapter.direction_head,
+            getattr(adapter, "visual_norm", None),
+            getattr(adapter, "visual_projection", None),
+            getattr(adapter, "visual_routing", None),
+            getattr(adapter, "writeback_output", None),
         ):
-            module.requires_grad_(True)
+            if module is not None:
+                module.requires_grad_(False)
+        adapter.residual_gate.requires_grad_(False)
         with torch.no_grad():
             adapter.residual_gate.zero_()
-    elif stage == "p2":
-        if p2_train_scope == "adapter_projector":
-            adapter.requires_grad_(True)
-            model_base.mm_projector_vary.requires_grad_(True)
-        elif p2_train_scope == "decoder_adapter_projector":
-            model.requires_grad_(True)
-        else:
-            raise ValueError(p2_train_scope)
+        model_base.vision_tower_high.requires_grad_(True)
+        model_base.mm_projector_vary.requires_grad_(True)
+    elif stage in {"p2", "p3"}:
+        adapter.requires_grad_(True)
+        model_base.mm_projector_vary.requires_grad_(True)
+        model_base.vision_tower_high.requires_grad_(True)
+        adapter.residual_gate.requires_grad_(True)
+        # Qwen decoder is trainable at a deliberately small learning rate;
+        # lm_head remains frozen unless an explicit GOT2 tied-head path needs it.
+        visual_prefixes = (
+            "model.vision_tower_high.",
+            "model.mm_projector_vary.",
+            "model.layout_adapter.",
+            "model.variable_layout_adapter.",
+            "model.generic_adapter.",
+        )
+        for name, parameter in model.named_parameters():
+            if name.startswith("lm_head."):
+                parameter.requires_grad_(False)
+            elif name.startswith("model.") and not name.startswith(visual_prefixes):
+                parameter.requires_grad_(True)
     else:
         raise ValueError(stage)
-    model_base.vision_tower_high.requires_grad_(False)
 
     trainable_names = [
         name for name, parameter in model.named_parameters() if parameter.requires_grad
@@ -894,12 +970,16 @@ def assert_ablation_trainable_scope(
 ) -> dict[str, dict[str, Any]]:
     report = module_parameter_report(model)
     if model.get_model().variable_layout_adapter is not None:
-        expected = {"pvld"} if stage == "p1" else {"mm_projector_vary", "pvld"}
+        expected = (
+            {"vary_vit", "mm_projector_vary", "pvld"}
+            if stage == "p1"
+            else {"vary_vit", "mm_projector_vary", "pvld", "qwen"}
+        )
         actual = {
             name for name in ("mm_projector_vary", "generic_adapter", "vlqa", "pvld")
             if int(report[name]["trainable"]) > 0
         }
-        if actual != expected or int(report["vary_vit"]["trainable"]) or int(report["qwen"]["trainable"]):
+        if actual != expected:
             raise RuntimeError(
                 f"PVLD {stage.upper()} trainable modules mismatch: "
                 f"actual={sorted(actual)}, expected={sorted(expected)}."
@@ -1041,6 +1121,10 @@ def main() -> None:
         config=config,
         use_safetensors=True,
         local_files_only=True,
+        ignore_mismatched_sizes=(
+            layout_args.layout_architecture == "pvld"
+            and layout_args.layout_memory_resolution == "64"
+        ),
     )
     if model.get_model().layout_adapter is not None:
         layout_initialization = initialize_layout_adapter_from_source(model, source_weights)
@@ -1112,7 +1196,7 @@ def main() -> None:
         split=layout_args.layout_split,
         max_regions=layout_args.max_regions,
         max_records=layout_args.max_train_records,
-        supervise_ocr=layout_args.layout_stage == "p2",
+        supervise_ocr=layout_args.layout_stage in {"p2", "p3"},
         include_layout_targets=include_layout_targets,
         layout_target_mode=layout_target_mode,
         max_layout_tokens=layout_args.max_layout_tokens,
@@ -1162,8 +1246,13 @@ def main() -> None:
         )
     if layout_args.layout_stage == "p1" and supervised_tokens != 0:
         raise RuntimeError("P1 unexpectedly retained OCR-supervised tokens.")
-    if layout_args.layout_stage == "p2" and supervised_tokens < 1:
-        raise RuntimeError("P2 requires at least one OCR-supervised token.")
+    if layout_args.layout_stage in {"p2", "p3"} and supervised_tokens < 1:
+        raise RuntimeError("P2/P3 require at least one OCR-supervised token.")
+    if layout_args.layout_stage == "p1" and layout_args.replay_layout_manifest:
+        replay_probe = data_module["train_dataset"][layout_args.primary_per_replay]
+        replay_tokens = int((replay_probe["labels"] != IGNORE_INDEX).sum().item())
+        if replay_tokens < 1:
+            raise RuntimeError("P1 replay sample has no OCR-supervised tokens.")
 
     first_batch = data_module["data_collator"]([first_sample])
     bbox_batch_shape = (
@@ -1193,8 +1282,8 @@ def main() -> None:
     )
     if layout_args.layout_stage == "p1" and batch_supervised_tokens != 0:
         raise RuntimeError("P1 collator unexpectedly retained OCR-supervised tokens.")
-    if layout_args.layout_stage == "p2" and batch_supervised_tokens < 1:
-        raise RuntimeError("P2 collator requires at least one OCR-supervised token.")
+    if layout_args.layout_stage in {"p2", "p3"} and batch_supervised_tokens < 1:
+        raise RuntimeError("P2/P3 collator requires at least one OCR-supervised token.")
     del first_sample
     del first_batch
     gc.collect()
@@ -1343,17 +1432,34 @@ def main() -> None:
             ),
             "frozen_modules": (
                 ["model.vision_tower_high"]
-                if layout_args.layout_stage == "p2"
+                if layout_args.layout_stage in {"p2", "p3"}
                 and layout_args.p2_train_scope == "decoder_adapter_projector"
                 else ["language_model", "model.vision_tower_high"]
             ),
             "train_scope": (
                 layout_args.p2_train_scope
-                if layout_args.layout_stage == "p2"
-                else "p1_layout_warmup"
+                if layout_args.layout_stage in {"p2", "p3"}
+                else "p1_visual_replay_layout_warmup"
             ),
             "optimizer": training_args.optim,
             "learning_rate": training_args.learning_rate,
+            "learning_rate_groups": {
+                "vision": layout_args.vision_learning_rate,
+                "projector": layout_args.projector_learning_rate,
+                "layout": layout_args.layout_learning_rate,
+                "qwen": layout_args.qwen_learning_rate,
+                "gate": layout_args.gate_learning_rate,
+                "lm_head": layout_args.lm_head_learning_rate,
+            },
+            "layout_memory_resolution": layout_args.layout_memory_resolution,
+            "replay_protocol": {
+                "primary_per_replay": layout_args.primary_per_replay,
+                "replay_ocr_loss_weight": layout_args.replay_ocr_loss_weight,
+                "replay_manifest": (
+                    str(Path(layout_args.replay_layout_manifest).resolve())
+                    if layout_args.replay_layout_manifest else None
+                ),
+            },
             "lr_scheduler_type": str(training_args.lr_scheduler_type),
             "weight_decay": training_args.weight_decay,
             "per_device_train_batch_size": training_args.per_device_train_batch_size,
@@ -1417,7 +1523,7 @@ def main() -> None:
             "ablation_id": layout_args.ablation_id or "legacy_default",
             "layout_loss_preset": layout_args.layout_loss_preset or "legacy_explicit_weights",
             "loss_weights": {
-                "ocr": layout_args.ocr_loss_weight,
+                "ocr": float(getattr(model.config, "ocr_loss_weight", layout_args.ocr_loss_weight)),
                 "object": layout_args.object_loss_weight,
                 "bbox_l1": layout_args.bbox_l1_loss_weight,
                 "bbox_giou": layout_args.bbox_giou_loss_weight,
@@ -1443,7 +1549,7 @@ def main() -> None:
             "pvld_parameters": pvld_parameters,
             "passed_through_p1": (
                 layout_args.ablation_id == "vlqa_layout_p1_p2"
-                and layout_args.layout_stage == "p2"
+                and layout_args.layout_stage in {"p2", "p3"}
             ),
             "p1_validation_selection": (
                 {

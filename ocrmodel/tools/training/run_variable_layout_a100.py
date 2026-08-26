@@ -43,7 +43,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--test-manifest", type=Path, required=True)
     parser.add_argument("--source-model", type=Path, required=True)
     parser.add_argument("--tokenizer-model", type=Path, required=True)
-    parser.add_argument("--stages", choices=("p1", "p2", "p1,p2"), default="p1,p2")
+    parser.add_argument("--stages", choices=("p1", "p2", "p3", "p1,p2", "p2,p3", "p1,p2,p3"), default="p1,p2")
     parser.add_argument(
         "--ablation",
         choices=("vlqa_ocr_only", "vlqa_layout_direct", "vlqa_layout_p1_p2"),
@@ -56,8 +56,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--layout-decoder-layers", type=int, default=2)
     parser.add_argument("--layout-decoder-hidden-size", type=int, default=256)
     parser.add_argument("--layout-decoder-num-heads", type=int, default=8)
+    parser.add_argument("--layout-memory-resolution", choices=("16", "64"), default="16")
     parser.add_argument("--p1-max-steps", type=int, default=12000)
     parser.add_argument("--p2-max-steps", type=int, default=30000)
+    parser.add_argument("--p3-max-steps", type=int, default=8000)
     parser.add_argument("--checkpoint-steps", type=int, default=2000)
     parser.add_argument("--p1-checkpoint-steps", type=int)
     parser.add_argument("--p2-checkpoint-steps", type=int)
@@ -72,8 +74,31 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gradient-accumulation-steps", type=int, default=1)
     parser.add_argument("--p1-learning-rate", type=float, default=1e-4)
     parser.add_argument("--p2-learning-rate", type=float, default=5e-5)
+    parser.add_argument("--vision-learning-rate", type=float, default=1e-6)
+    parser.add_argument("--projector-learning-rate", type=float, default=1e-5)
+    parser.add_argument("--layout-learning-rate", type=float, default=1e-4)
+    parser.add_argument("--qwen-learning-rate", type=float, default=1e-6)
+    parser.add_argument("--gate-learning-rate", type=float, default=1e-5)
+    parser.add_argument("--lm-head-learning-rate", type=float, default=0.0)
+    for stage, defaults in {
+        "p1": {"vision": 1e-6, "projector": 1e-5, "layout": 1e-4, "qwen": 0.0, "gate": 0.0, "lm_head": 0.0},
+        "p2": {"vision": 5e-7, "projector": 5e-6, "layout": 5e-5, "qwen": 1e-6, "gate": 1e-5, "lm_head": 0.0},
+        "p3": {"vision": 2e-7, "projector": 2e-6, "layout": 1e-5, "qwen": 5e-7, "gate": 1e-6, "lm_head": 0.0},
+    }.items():
+        for group, default in defaults.items():
+            parser.add_argument(
+                f"--{stage}-{group.replace('_', '-')}-learning-rate",
+                type=float,
+                default=default,
+            )
+    parser.add_argument("--replay-manifest", type=Path)
+    parser.add_argument("--replay-image-root", type=Path)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--gpu-ids", required=True)
+    parser.add_argument(
+        "--gpu-ids",
+        default="",
+        help="Comma-separated physical GPU ids. Omit to admit every GPU whose instantaneous utilization is below the limit.",
+    )
     parser.add_argument("--gpu-utilization-limit", type=int, default=50)
     parser.add_argument(
         "--distributed-strategy",
@@ -101,24 +126,69 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def target_gpus(raw: str, limit: int) -> tuple[tuple[str, ...], dict[str, int]]:
-    ids = tuple(part.strip() for part in raw.split(",") if part.strip())
+def _parse_gpu_utilization_output(output: str) -> dict[str, int]:
     observed: dict[str, int] = {}
-    for gpu_id in ids:
-        result = subprocess.run(
-            ["nvidia-smi", "-i", gpu_id, "--query-gpu=utilization.gpu", "--format=csv,noheader,nounits"],
-            capture_output=True,
-            text=True,
-            timeout=20,
+    for line in output.splitlines():
+        fields = [field.strip() for field in line.split(",")]
+        if len(fields) != 2 or not fields[0] or not fields[1].isdigit():
+            raise RuntimeError(f"cannot parse nvidia-smi GPU utilization row: {line!r}")
+        gpu_id, utilization = fields
+        if gpu_id in observed:
+            raise RuntimeError(f"nvidia-smi returned duplicate GPU id: {gpu_id}")
+        observed[gpu_id] = int(utilization)
+    if not observed:
+        raise RuntimeError("nvidia-smi returned no GPUs")
+    return observed
+
+
+def _query_gpu_utilization(gpu_ids: tuple[str, ...] | None = None) -> dict[str, int]:
+    command = [
+        "nvidia-smi",
+        "--query-gpu=index,utilization.gpu",
+        "--format=csv,noheader,nounits",
+    ]
+    if gpu_ids is not None:
+        command[1:1] = ["-i", ",".join(gpu_ids)]
+    result = subprocess.run(command, capture_output=True, text=True, timeout=20)
+    if result.returncode:
+        detail = (result.stderr or result.stdout).strip()[:400]
+        raise RuntimeError(f"nvidia-smi GPU query failed: {detail}")
+    return _parse_gpu_utilization_output(result.stdout)
+
+
+def target_gpus(raw: str, limit: int) -> tuple[tuple[str, ...], dict[str, int]]:
+    if limit < 1 or limit > 100:
+        raise ValueError("GPU utilization limit must be in [1, 100]")
+    requested = tuple(part.strip() for part in raw.split(",") if part.strip())
+    if len(set(requested)) != len(requested):
+        raise ValueError("--gpu-ids must not contain duplicates")
+    if requested:
+        observed = _query_gpu_utilization(requested)
+        missing = tuple(gpu_id for gpu_id in requested if gpu_id not in observed)
+        if missing:
+            raise RuntimeError(f"nvidia-smi did not report requested GPU ids: {missing}")
+        observed = {gpu_id: observed[gpu_id] for gpu_id in requested}
+        busy = {gpu: value for gpu, value in observed.items() if value >= limit}
+        if busy:
+            raise RuntimeError(f"GPU admission failed: {busy}; required utilization<{limit}")
+        return requested, observed
+
+    observed = _query_gpu_utilization()
+    eligible = tuple(gpu_id for gpu_id, value in observed.items() if value < limit)
+    if not eligible:
+        raise RuntimeError(
+            f"GPU admission failed: no GPU has utilization<{limit}; observed={observed}"
         )
-        value = result.stdout.strip()
-        if result.returncode or not value.isdigit():
-            raise RuntimeError(f"cannot query target GPU {gpu_id}")
-        observed[gpu_id] = int(value)
-    busy = {gpu: value for gpu, value in observed.items() if value >= limit}
-    if busy:
-        raise RuntimeError(f"GPU admission failed: {busy}; required utilization<{limit}")
-    return ids, observed
+    return eligible, observed
+
+
+def stage_learning_rates(args: argparse.Namespace, stage: str) -> dict[str, float]:
+    if stage not in {"p1", "p2", "p3"}:
+        raise ValueError(stage)
+    return {
+        group: float(getattr(args, f"{stage}_{group}_learning_rate"))
+        for group in ("vision", "projector", "layout", "qwen", "gate", "lm_head")
+    }
 
 
 def free_port() -> int:
@@ -132,14 +202,22 @@ def training_command(
     stage: str,
     source: Path,
     output: Path,
+    gpu_ids: tuple[str, ...],
     source_validation_selection: Path | None = None,
 ) -> list[str]:
-    steps = args.p1_max_steps if stage == "p1" else args.p2_max_steps
+    steps = {
+        "p1": args.p1_max_steps,
+        "p2": args.p2_max_steps,
+        "p3": args.p3_max_steps,
+    }[stage]
     checkpoint_steps = (
         args.p1_checkpoint_steps if stage == "p1" else args.p2_checkpoint_steps
     ) or args.checkpoint_steps
     learning_rate = args.p1_learning_rate if stage == "p1" else args.p2_learning_rate
     ocr_weight = "0" if stage == "p1" else "1"
+    shared_gradient_scale = args.pvld_shared_gradient_scale if stage == "p2" else 1.0
+    record_gradient_scale = args.pvld_record_gradient_scale if stage == "p2" else 1.0
+    predicted_layout_routing = args.pvld_predicted_layout_routing and stage == "p2"
     torchrun = Path(sys.executable).with_name("torchrun")
     checkpoint_retention = args.checkpoint_retention
     if stage == "p1":
@@ -149,7 +227,7 @@ def training_command(
         )
     command = [
         str(torchrun), "--standalone", "--nproc_per_node",
-        str(len(args.gpu_ids.split(","))), "--master_port", str(free_port()),
+        str(len(gpu_ids)), "--master_port", str(free_port()),
         str(args.project_root / "scripts" / "train_GOT_layout.py"),
     ]
     if args.distributed_strategy == "deepspeed_zero2":
@@ -162,6 +240,7 @@ def training_command(
         # reduce only parameters participating in each step; otherwise the
         # second optimizer step fails in reducer bucket rebuild.
         command.extend(["--ddp_find_unused_parameters", "True"])
+    group_learning_rates = stage_learning_rates(args, stage)
     command.extend([
         "--model_name_or_path", str(source),
         "--tokenizer_name_or_path", str(args.tokenizer_model),
@@ -180,12 +259,13 @@ def training_command(
         "--layout_decoder_layers", str(args.layout_decoder_layers),
         "--layout_decoder_hidden_size", str(args.layout_decoder_hidden_size),
         "--layout_decoder_num_heads", str(args.layout_decoder_num_heads),
+        "--layout_memory_resolution", str(args.layout_memory_resolution),
         "--layout_boundary_loss_weight", str(args.layout_boundary_loss_weight),
         "--layout_count_condition_strength", str(args.layout_count_condition_strength),
         "--pvld_use_spatial_memory", str(args.pvld_use_spatial_memory),
-        "--pvld_shared_gradient_scale", str(args.pvld_shared_gradient_scale),
-        "--pvld_record_gradient_scale", str(args.pvld_record_gradient_scale),
-        "--pvld_predicted_layout_routing", str(args.pvld_predicted_layout_routing),
+        "--pvld_shared_gradient_scale", str(shared_gradient_scale),
+        "--pvld_record_gradient_scale", str(record_gradient_scale),
+        "--pvld_predicted_layout_routing", str(predicted_layout_routing),
         "--layout_writeback_mode", "visual_value_layout_routing",
         "--layout_writeback_source", "layout_evidence",
         "--layout_writeback_num_heads", str(args.layout_decoder_num_heads),
@@ -220,9 +300,21 @@ def training_command(
         "--direction_loss_weight", "1" if args.layout_loss_preset == "layout_full" else "0",
         "--layout_loss_weight", "1" if args.layout_loss_preset == "layout_full" else "0",
         "--ocr_loss_weight", ocr_weight,
+        "--primary_per_replay", "7",
+        "--replay_ocr_loss_weight", "0.25",
+        "--vision_learning_rate", str(group_learning_rates["vision"]),
+        "--projector_learning_rate", str(group_learning_rates["projector"]),
+        "--layout_learning_rate", str(group_learning_rates["layout"]),
+        "--qwen_learning_rate", str(group_learning_rates["qwen"]),
+        "--gate_learning_rate", str(group_learning_rates["gate"]),
+        "--lm_head_learning_rate", str(group_learning_rates["lm_head"]),
         "--seed", str(args.seed),
         "--output_dir", str(output),
     ])
+    if args.replay_manifest is not None:
+        command.extend(["--replay_layout_manifest", str(args.replay_manifest)])
+        if args.replay_image_root is not None:
+            command.extend(["--replay_layout_image_root", str(args.replay_image_root)])
     if stage == "p2" and args.ablation == "vlqa_layout_p1_p2":
         if source_validation_selection is None:
             raise ValueError("PVLD C5 P2 requires its validation-only P1 selection.")
@@ -271,6 +363,7 @@ def main() -> int:
             "--skip-p1-validation-selection is limited to P1 smokes of at most 10 steps"
         )
     ids, utilization = target_gpus(args.gpu_ids, args.gpu_utilization_limit)
+    admission_mode = "explicit" if args.gpu_ids.strip() else "auto"
     run_root = args.runs_root.resolve() / args.run_id
     if run_root.exists() != args.resume_existing_run:
         expected = "existing" if args.resume_existing_run else "new"
@@ -283,6 +376,7 @@ def main() -> int:
         "layout_architecture": "pvld",
         "input_granularity": "whole_page_image",
         "physical_gpu_ids": ids,
+        "gpu_admission_mode": admission_mode,
         "gpu_utilization_at_admission": utilization,
         "started_at": datetime.now().astimezone().isoformat(timespec="seconds"),
         "train_manifest": str(args.manifest.resolve()),
@@ -294,8 +388,23 @@ def main() -> int:
         "p1_checkpoint_steps": args.p1_checkpoint_steps or args.checkpoint_steps,
         "p2_checkpoint_steps": args.p2_checkpoint_steps or args.checkpoint_steps,
         "checkpoint_retention": args.checkpoint_retention,
+        "layout_memory_resolution": args.layout_memory_resolution,
+        "replay_protocol": {
+            "primary_per_replay": 7,
+            "replay_ocr_loss_weight": 0.25,
+            "manifest": str(args.replay_manifest.resolve()) if args.replay_manifest else None,
+        },
+        "learning_rate_groups": {
+            stage: stage_learning_rates(args, stage)
+            for stage in ("p1", "p2", "p3")
+        },
         "layout_boundary_loss_weight": args.layout_boundary_loss_weight,
         "layout_count_condition_strength": args.layout_count_condition_strength,
+        "pvld_use_spatial_memory": args.pvld_use_spatial_memory,
+        "pvld_shared_gradient_scale_p2": args.pvld_shared_gradient_scale,
+        "pvld_record_gradient_scale_p2": args.pvld_record_gradient_scale,
+        "pvld_predicted_layout_routing_p2": args.pvld_predicted_layout_routing,
+        "p1_forces_legacy_gradient_scale_and_routing": True,
         "distributed_strategy": args.distributed_strategy,
         "p1_validation_selection_skipped": args.skip_p1_validation_selection,
         "nccl_p2p_disable": args.nccl_p2p_disable and len(ids) > 1,
@@ -334,6 +443,7 @@ def main() -> int:
             completed = subprocess.run(
                 training_command(
                     args, stage, source, output,
+                    ids,
                     source_validation_selection=p1_selection_path,
                 ),
                 cwd=args.project_root.resolve(),

@@ -80,17 +80,13 @@ PaddleOCR-VL-1.6 与 GLM-OCR 的官方 checkpoint whole-page zero-shot 已完成
 用户随后授权清理旧口径/失败 checkpoint 并继续。已永久删除 oracle-chunk `mthv2_chunk_ablation_20260819_multi_C1-C5` 的非 validation-selected 周期 checkpoints、C5 旧 P1 周期 checkpoints 和损坏的 causal `tmp-checkpoint-18000`，释放后 `/data3` 可用空间为 `228G`。保留了 C1/C5 step 30000、C2/C3 step 42000、C4 step 39000、各 final model/selection/test 结果，以及 causal C5 `checkpoint-16000`；OpenDoc 72G 未删除。runner 现为每次 recovery 分配递增日志名，保留旧失败日志。新 tmux `mthv2_pvld_causal_eval_recovery_20260824_v2` 已从 C5 P2 step 16000 在 GPU 4 恢复，复核进度已到 `16081/30000`；后续仍排队 GPU 0/1/3 的 C3/C4/C5 validation selection 与 selection-locked test。当前仍无新性能结果。
 
 OpenDoc 旧 run 的无效 validation/test prediction（约 `32.0GB/44.6GB`）已按用户授权永久删除，旧审计 metadata 保留；删除后 `/data3` 可用空间约 `528G`。adapter 已修复 `recognition_results[*].text` 提取，并排除 raw `blocks[*].img`。新 CPU-only tmux `sota_opendoc_formal_20260824_v2` 已启动，不查询或使用 GPU；首批 2 页 prediction 仅 `13,528 bytes`、均为 `status=ok`，官方 ONNX provider 加载成功，文本非空且 block raw fields 不含 `img`。完整 validation selection/test 尚未结束，当前没有 OpenDoc 性能结论。
-## 2026-08-25 M2-M4 engineering status
+## 2026-08-26 M1 与 M2-M4 执行状态
 
-M1 v4 remains an active four-GPU run and is read-only. M2/M3/M4 are implemented as validation candidates only; no formal long-run training, new MTHv2 test, or frozen test was started.
+- M1a 已完成 P2 7500 steps、validation-only 选点和 selection-locked test。validation 选中 step 7500，`selection_split=validation`、`test_used_for_selection=false`；test 800 页 page CER 为 `1.3453380015`，complete region F1 为 `0.308170`。该锁定 test 只用于报告，不参与后续结构、阈值或 checkpoint 调整。复杂 `>32` 区域页面仍是主要失败来源。
+- M2 decoder memory 为 `[A;P(F)]`，空间 coverage 形状为 `[B,L_F]`；M3 仅在 P2 将 shared/record 反向梯度缩放为 `0.25`，不改变前向；M4 使用自由预测布局调制 OCR routing，禁止读取 gold layout，OCR Value 仍只来自视觉 token。M5 只登记 K16/K32/K64 资源估算，尚未启动 sweep。
+- A100 bounded run `pvld_m2_m3_m4_cuda_smoke_20260825_v7` 与 BSCC Slurm `1452473` 已通过 finite loss/gradient、spatial coverage、visual-only Value、`alpha=0` 和 shuffled 工程检查。这些是实现证据，不是 OCR 或布局性能结论。
+- BSCC 数据准备 `1454346` 已完成，正式 whole-page 数据为 `train/validation/test=2159/240/800`。M2 `1454347` 与 M3 `1454348` 已各自完成 P1 validation-only selection 并进入 P2；M2 选中 P1 step 2000，M3 选中 step 3000。M4 `1454349` 仍为 `PENDING (AssocGrpGRES)`，没有失败，不得重复提交。
+- 三个正式 run 固定执行 P1 `3000` -> P1 validation selection -> P2 `7500` -> P2 validation selection -> selection-locked test。M2/M3/M4 的 checkpoint、selection、日志和 test 必须保持独立；当前尚无三者最终 test 结果。
+- evaluator 已增加 M4 validation-only routing control：`normal`、`alpha_zero`、`shuffled_evidence`。控制 summary 记录 checkpoint/effective gate 和 batch 内循环置换；独立 BSCC launcher 只允许读取 M4 已选定 P2 checkpoint 与 validation，不读取 test，也不得反向参与 checkpoint 选择。
 
-- M2 decoder memory is `[A ; P(F)]`: global layout evidence `A` followed by projected high-resolution visual tokens `P(F)`. The high-resolution padding mask is propagated to both cross-attention and spatial coverage. Coverage has shape `[B, L_F]`, accumulates REGION-step spatial attention, applies a detached negative prior by default, and is reported only as a compact tensor.
-- M3 uses straight-through path scales `s_shared` and `s_record`; forward values are unchanged and backward gradients are scaled. Bounded smoke records OCR/layout shared-evidence gradient norms and cosine. Scale one is the legacy path.
-- M4 optionally routes OCR using free predicted layout condition, confidence, EOS and truncation reliability. Gold layout tokens/bboxes/order/direction are not read. OCR Value remains visual-token-only and `residual_gate=0` is an exact GOT2 fallback. Normal, alpha-zero and shuffled routing are causal controls for future validation.
-- M5 only registers K16/K32/K64 resource estimates; no sweep was started.
-
-These changes are engineering and bounded-smoke results, not OCR or layout performance claims. `label_textline` remains an ordered textline/region candidate rather than strict column ground truth.
-
-Bounded smoke records: A100 GPU 0 `pvld_m2_m3_m4_cuda_smoke_20260825_v7` and BSCC Slurm job `1452473` both completed with finite losses/gradients and the M2-M4 contracts enabled. The previously designated M1 v4 run was checked read-only; its tmux session is ended and its status remains `p1_validation_selection_failed`. No restart or modification was performed in this turn.
-
-M1 failure diagnosis: P1 training reached step 3000 and wrote complete checkpoints. The first validation selection failed inside the step-3000 evaluator while atomically replacing its temporary JSONL; retry then exposed that old checkpoints lack newly introduced M2-M4 tensors and `low_cpu_mem_usage=True` left them on meta device. The evaluator now uses deterministic CPU initialization (`seed=20260825`), `output_loading_info=True`, and writes `checkpoint_loading_info.json` with missing/unexpected keys before CUDA transfer. A new validation-only retry is running; P2 must wait for its selection.json.
+`label_textline` 仍只视为有序 textline/region 候选，不等同于严格列标注。M2-M4 当前结论边界仍是“正式流程正在运行、待 validation/test 核验”，不得写成创新已成立。

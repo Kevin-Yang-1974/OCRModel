@@ -98,7 +98,7 @@ python tools/preprocessing/generate_synthetic_layout.py `
 
 面向古籍照片域的多样化 preset 为 `config/synthetic_layout.ancient_photo_diverse_v1.json`。它在不改变 bbox 几何真值的前提下覆盖：非均匀行/列宽、普通与 0–6 px 密集间距、18–52 px 字号、紧凑行高、负字距、逐区域 CJK/衬线字体栈、墨色/透明度、十种纸张底色，以及更宽的对比度、透印、污渍、模糊、高斯噪声和离散噪点范围。该 preset 只是更接近古籍照片退化分布的合成近似，不等同于真实古籍。
 
-统一生成 train/validation/test 的入口如下；默认每个 tier 生成 `8000/1000/1000` 页，即三 tier 合计 30000 页。先用 `--plan-only` 小规模检查内容、字体与版式，再执行正式浏览器渲染：
+统一生成 train/validation/test 的入口如下。新主线默认选择五个 tier，每个 tier 生成 `20000/2000/2000` 页，即 `100000` 张 train、`10000` 张 validation、`10000` 张 test 页面；正式入口还要求 train 至少 `10000` 张唯一渲染页面，并在审计后达到至少 `1000000` 个 region exposure。页面数量、独立 content/source 数量和训练曝光次数必须分别记录，重复布局不能冒充新的内容实例。先用 `--plan-only` 小规模检查内容、字体与版式，再执行正式浏览器渲染：
 
 ```powershell
 & .\.venv\Scripts\python.exe tools\preprocessing\prepare_diverse_synthetic_layout.py `
@@ -119,7 +119,7 @@ html/<page_id>.html
 images/<page_id>.png
 ```
 
-`s0-html-text` 只接受文本内容，`s1-html-crop` 只接受真实 crop，`s2-hard` 接受两者并增加保持几何不变的对比度、透印、污渍、模糊和噪声。当前 `s2-hard` 不做会改变 bbox 的几何形变。
+`s0-html-text` 只接受文本内容，`s1-html-crop` 只接受真实 crop，`s2-hard` 接受两者并增加保持几何不变的对比度、透印、污渍、模糊和噪声；`s3-ancient-hard` 增加纹理、遮挡和更强扫描退化，`s4-mixed` 增加混合方向与复杂阅读顺序。所有新增退化均保持 DOM bbox 几何不变，近重复和跨 split 泄漏由审计器检查。
 
 ## 4. 审计
 
