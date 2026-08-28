@@ -451,20 +451,11 @@ class GOTQwenModel(Qwen2Model):
             im_start_token = 151857
 
             im_end_token = 151858
-            
-
 
             image_features = []
-            
 
             for image_index, image in enumerate(images):
                 P, C, H, W = image[1].shape
-                # with torch.set_grad_enabled(True):
-                #     # print(image[1].shape)
-                #     cnn_feature = vision_tower_high(image[1])
-                #     cnn_feature = cnn_feature.flatten(2).permute(0, 2, 1) # 256  1024
-                #     # image_features.append(cnn_feature)
-                # image_features_2.append(cnn_feature)
                 if P == 1:
                     vision_outputs = vision_tower_high(
                         image[1],

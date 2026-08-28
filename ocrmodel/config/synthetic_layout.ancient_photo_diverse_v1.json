@@ -18,6 +18,8 @@
   "dense_gap_probability": 0.45,
   "dense_gap_min": 0,
   "dense_gap_max": 6,
+  "dense_grid_min_regions": 33,
+  "dense_grid_max_tracks": 20,
   "region_inset_min": 0,
   "region_inset_max": 0,
   "region_extent_weight_min": 0.62,

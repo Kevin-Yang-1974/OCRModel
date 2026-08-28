@@ -43,6 +43,25 @@ class VisualReplayProtocolTest(unittest.TestCase):
         self.assertIn("qwen_learning_rate", source)
         self.assertIn("gate_learning_rate", source)
         self.assertIn('layout_stage in {"p2", "p3"}', source)
+        self.assertIn("replay_global_samples", source)
+        self.assertIn("torch.distributed.all_reduce(replay_values", source)
+        self.assertIn("replay_ocr_loss", source)
+
+    def test_registered_group_rates_reach_the_optimizer_arguments(self) -> None:
+        source = TRAIN.read_text(encoding="utf-8")
+        self.assertIn('for group_name in (', source)
+        self.assertIn('"vision", "projector", "layout", "qwen", "gate", "lm_head"', source)
+        self.assertIn('f"{group_name}_learning_rate"', source)
+        self.assertIn('float(getattr(layout_args, f"{group_name}_learning_rate"))', source)
+
+    def test_pvld_trainable_scope_audit_includes_vision_and_qwen(self) -> None:
+        source = TRAIN.read_text(encoding="utf-8")
+        self.assertIn(
+            '"vary_vit", "mm_projector_vary", "generic_adapter", "vlqa", "pvld", "qwen"',
+            source,
+        )
+        self.assertIn('{"vary_vit", "mm_projector_vary", "pvld"}', source)
+        self.assertIn('{"vary_vit", "mm_projector_vary", "pvld", "qwen"}', source)
 
     def test_dataset_marks_replay_and_keeps_replay_ocr(self) -> None:
         source = DATASET.read_text(encoding="utf-8")

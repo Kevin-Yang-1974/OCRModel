@@ -58,6 +58,10 @@ P1 默认每 `2000` steps 保存 checkpoint，全部 P1 checkpoints 作为 valid
 
 有界 CUDA smoke 使用 `run_pvld_causal_cuda_smoke.sh <gpu-id> <new-run-id>`；正式 MTHv2 C3–C5 新流程使用 `run_mthv2_page_pvld_c3_c5_tmux.sh`。后者训练完成后先做 validation-only P2 checkpoint selection，再执行 selection-locked test；test 锁定 validation 的 object threshold，结果不得反向调整训练、阈值或 P1 ranking。两者都只查询命令指定 GPU 的瞬时 utilization，任一卡达到 50% 即在启动子任务前退出。
 
+新的视觉解冻主线使用 `run_lavp_p1_p3_formal_tmux.sh`。该入口不轮询 S3/S4 正式合成数据；每次调用只做一次 manifest 预检与全量 manifest、近重复和 source leakage audit。仅当 `dataset_protocol.status=ready`、全量 audit 通过且 train 至少有 10,000 页时才会返回可提交确认的 ready 状态；必须在用户确认后的新调用中显式附加 `--confirm-formal-training`，才会创建正式训练。region exposure 是必须报告的数据覆盖指标，但不是一百万的启动阻断条件。确认后的入口严格串联 P1 layout validation selection -> P2、P2 OCR validation selection -> P3，并分别执行 selection-locked synthetic-ID 和 Real-OOD test。P1 的 MTHv2 replay 固定为 train-only、primary:replay=`7:1`、OCR loss weight=`0.25`；64×64 layout memory 由入口显式传入，Qwen 仍只接收 256 个 16×16 OCR visual tokens。
+
+历史合成数据工程 pilot 使用 `run_historical_s3s4_p1_p2_pilot_tmux.sh`。它只读 `ancient_photo_diverse_formal_s3s4_20260826_v1`，独立锁定 256 页 `tier × region bucket × direction` validation，运行 P1 2,000 steps -> P1 validation-only selection -> P2 5,000 steps -> P2 validation-only selection，每 1,000 steps 保存。它永远不执行 P3 或 test，且其 run、checkpoint 和 selection 不得进入正式主线。完整配置与已知失败记录见 `docs/LAVP_EXPERIMENT_CONFIGURATION_REGISTER.md`。
+
 selection 的 `--resume` 只复用通过模型路径、manifest、split、解码参数和 whole-page prompt-only 输入协议校验的既有 candidate summary；不一致时拒绝继续。指标兼容层把 evaluator 的 `character_edits`、`reference_characters`、`page_exact_matches` 规范化为 selection/test 的稳定总量字段。用 `tools/evaluation/run_layout_ablation_selection_smoke.sh <training-run-id> <dataset-id> <checkpoint-step>` 做 1 页断点续跑工程验证；该结果不能代替正式 validation 选点。
 
 多样化 synthetic A5 到 AncientDoc C0/C1/C4/C5/C6 的阶段化入口为 `run_diverse_synthetic_ancientdoc.sh`。默认 synthetic P1/P2 为 12000/24000 steps、每 2000 steps 保存并在 synthetic validation 选 P2-best；C4 必须通过 `--source-selection` 从该 selected checkpoint 启动。AncientDoc 继续先选 C4-best，再独立训练 C5/C6，最后分开执行 Ancient validation selection 与 frozen test。

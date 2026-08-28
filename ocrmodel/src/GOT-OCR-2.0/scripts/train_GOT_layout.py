@@ -65,27 +65,41 @@ def file_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def validate_pvld_p1_selection(selection_path: Path, source_model: Path) -> dict[str, Any]:
+def validate_pvld_source_selection(
+    selection_path: Path,
+    source_model: Path,
+    *,
+    expected_selection_purpose: str,
+    target_stage: str,
+) -> dict[str, Any]:
     selection = json.loads(selection_path.read_text(encoding="utf-8"))
     selected = selection.get("selected") or {}
     if (
         selection.get("purpose") != "layout_ablation_validation_selection"
-        or selection.get("selection_purpose") != "p1_layout"
+        or selection.get("selection_purpose") != expected_selection_purpose
         or selection.get("selection_split") != "validation"
         or selection.get("test_used_for_selection") is not False
         or selection.get("ablation_id") != "vlqa_layout_p1_p2"
     ):
-        raise ValueError("PVLD C5 P1 selection does not satisfy the validation-only contract.")
+        raise ValueError(
+            f"PVLD {target_stage.upper()} source selection does not satisfy the "
+            "validation-only contract."
+        )
     selected_model = Path(str(selected.get("model_path", ""))).resolve()
     if selected_model != source_model.resolve():
-        raise ValueError("PVLD C5 P2 source differs from the validation-selected P1 model.")
+        raise ValueError(
+            f"PVLD {target_stage.upper()} source differs from the "
+            "validation-selected model."
+        )
     config_path = source_model / "config.json"
     weights_path = source_model / "model.safetensors"
     if (
         selected.get("config_sha256") != file_sha256(config_path)
         or selected.get("weights_sha256") != file_sha256(weights_path)
     ):
-        raise ValueError("PVLD C5 selected P1 checkpoint hash mismatch.")
+        raise ValueError(
+            f"PVLD {target_stage.upper()} selected source checkpoint hash mismatch."
+        )
     return selection
 
 LAYOUT_ADAPTER_STATE_PREFIX = "model.layout_adapter."
@@ -151,6 +165,7 @@ class LayoutDiagnosticTrainer(GOTTrainer):
         self._parameter_update_references: dict[str, dict[str, torch.Tensor]] = {}
         self._last_batch_labels: list[torch.Tensor] = []
         self._last_batch_replay_mask: list[bool] = []
+        self._last_replay_ocr_loss: torch.Tensor | None = None
         self._first_forward_started = False
         self._first_training_step_started = False
         model_base = self.model.get_model()
@@ -277,6 +292,11 @@ class LayoutDiagnosticTrainer(GOTTrainer):
             [bool(value) for value in replay_mask.detach().cpu().tolist()]
             if replay_mask is not None else []
         )
+        self._last_replay_ocr_loss = None
+        if any(self._last_batch_replay_mask):
+            replay_ocr_loss = getattr(outputs, "ocr_loss", None)
+            if replay_ocr_loss is not None:
+                self._last_replay_ocr_loss = replay_ocr_loss.detach()
         if model.training:
             self._record_outputs(outputs)
         return (loss, outputs) if return_outputs else loss
@@ -322,7 +342,7 @@ class LayoutDiagnosticTrainer(GOTTrainer):
             self._layout_adapter.residual_gate.detach().float().cpu()
         )
         enriched.update(self._parameter_update_norms())
-        enriched["replay_supervised_tokens"] = float(
+        replay_tokens = float(
             sum(
                 int(labels.ne(IGNORE_INDEX).sum())
                 for labels, is_replay in zip(
@@ -331,6 +351,23 @@ class LayoutDiagnosticTrainer(GOTTrainer):
                 if is_replay
             )
         )
+        replay_ocr_loss = (
+            self._last_replay_ocr_loss.detach().float()
+            if self._last_replay_ocr_loss is not None
+            else torch.zeros((), device=self.args.device, dtype=torch.float32)
+        )
+        replay_values = torch.tensor(
+            [replay_tokens, 1.0 if self._last_replay_ocr_loss is not None else 0.0],
+            device=self.args.device,
+            dtype=torch.float32,
+        )
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            torch.distributed.all_reduce(replay_values, op=torch.distributed.ReduceOp.SUM)
+            torch.distributed.all_reduce(replay_ocr_loss, op=torch.distributed.ReduceOp.SUM)
+        enriched["replay_supervised_tokens"] = float(replay_values[0].cpu())
+        enriched["replay_global_samples"] = float(replay_values[1].cpu())
+        if replay_values[1].item() > 0:
+            enriched["replay_ocr_loss"] = float((replay_ocr_loss / replay_values[1]).cpu())
         feature_drift = getattr(self._model_base, "_last_vision_feature_drift", None)
         if feature_drift is not None:
             enriched["vision_feature_drift_from_initial"] = float(feature_drift)
@@ -362,7 +399,10 @@ class LayoutTrainingArguments:
     layout_split: str = field(default="train")
     source_validation_selection: str = field(
         default="",
-        metadata={"help": "Validation-only P1 selection used to initialize PVLD C5 P2."},
+        metadata={
+            "help": "Validation-only source selection: P1 layout selection for P2, "
+            "or P2 OCR selection for P3."
+        },
     )
     layout_stage: str = field(
         default="p1",
@@ -897,28 +937,30 @@ def configure_trainable_parameters(
     return trainable, total, trainable_names
 
 
-def configure_ddp_frozen_parameter_ignores(
+def audit_ddp_frozen_parameters(
     model: GOTQwenForCausalLM,
     training_args: TrainingArguments,
-) -> dict[str, int]:
-    if training_args.world_size <= 1 or training_args.deepspeed:
-        return {"ignored_parameters": 0, "ignored_parameter_elements": 0}
-    ignored = [
+) -> dict[str, int | bool]:
+    """Report frozen state without mutating DDP's parameter/buffer registry.
+
+    The private DDP ignore registration API caused different rank-visible
+    parameter sets for the GOT2 model wrapper. Frozen parameters already have
+    ``requires_grad=False`` and are excluded from optimizer groups, so DDP must
+    retain the identical module state on every rank and only audit the freeze.
+    """
+    frozen = [
         name for name, parameter in model.named_parameters()
         if not parameter.requires_grad
     ]
-    torch.nn.parallel.DistributedDataParallel._set_params_and_buffers_to_ignore_for_model(
-        model,
-        ignored,
-    )
-    ignored_elements = sum(
+    frozen_elements = sum(
         parameter.numel()
         for _, parameter in model.named_parameters()
         if not parameter.requires_grad
     )
     return {
-        "ignored_parameters": len(ignored),
-        "ignored_parameter_elements": ignored_elements,
+        "frozen_parameters": len(frozen),
+        "frozen_parameter_elements": frozen_elements,
+        "ddp_private_ignore_applied": False,
     }
 
 
@@ -976,7 +1018,9 @@ def assert_ablation_trainable_scope(
             else {"vary_vit", "mm_projector_vary", "pvld", "qwen"}
         )
         actual = {
-            name for name in ("mm_projector_vary", "generic_adapter", "vlqa", "pvld")
+            name for name in (
+                "vary_vit", "mm_projector_vary", "generic_adapter", "vlqa", "pvld", "qwen"
+            )
             if int(report[name]["trainable"]) > 0
         }
         if actual != expected:
@@ -1076,7 +1120,7 @@ def main() -> None:
         json.loads(source_metrics_path.read_text(encoding="utf-8"))
         if source_metrics_path.is_file() else None
     )
-    p1_selection_payload = None
+    source_selection_payload = None
     if layout_args.ablation_id and layout_args.layout_architecture == "fixed_slot":
         assert_source_protocol(
             layout_args.ablation_id,
@@ -1086,19 +1130,27 @@ def main() -> None:
         )
     elif layout_args.ablation_id and layout_args.layout_architecture == "pvld":
         source_pvld = source_config_payload.get("variable_layout_enabled") is True
-        expects_p1 = (
-            layout_args.ablation_id == "vlqa_layout_p1_p2"
-            and layout_args.layout_stage == "p2"
-        )
-        if expects_p1:
+        expected_selection_purpose = {
+            "p2": "p1_layout",
+            "p3": "ocr",
+        }.get(layout_args.layout_stage)
+        if expected_selection_purpose is not None:
             if layout_args.source_validation_selection:
-                p1_selection_payload = validate_pvld_p1_selection(
-                    Path(layout_args.source_validation_selection).resolve(), source_model
+                source_selection_payload = validate_pvld_source_selection(
+                    Path(layout_args.source_validation_selection).resolve(),
+                    source_model,
+                    expected_selection_purpose=expected_selection_purpose,
+                    target_stage=layout_args.layout_stage,
                 )
             elif (not source_pvld or not source_metrics_payload
-                  or source_metrics_payload.get("layout_stage") != "p1"
+                  or source_metrics_payload.get("layout_stage") != (
+                      "p1" if layout_args.layout_stage == "p2" else "p2"
+                  )
                   or source_metrics_payload.get("layout_architecture") != "pvld"):
-                raise ValueError("PVLD C5 P2 must initialize from its validation-eligible P1 model.")
+                raise ValueError(
+                    f"PVLD {layout_args.layout_stage.upper()} must initialize from its "
+                    "validation-selected preceding-stage model."
+                )
         elif source_pvld:
             raise ValueError("Direct PVLD stages must initialize from original GOT2.")
 
@@ -1171,7 +1223,7 @@ def main() -> None:
         layout_args.p2_train_scope,
         layout_args.ablation_id,
     )
-    ddp_ignores = configure_ddp_frozen_parameter_ignores(model, training_args)
+    ddp_frozen_audit = audit_ddp_frozen_parameters(model, training_args)
     module_parameters = (
         assert_ablation_trainable_scope(layout_args.ablation_id, layout_args.layout_stage, model)
         if layout_args.ablation_id else module_parameter_report(model)
@@ -1319,10 +1371,14 @@ def main() -> None:
     print(f"MAX_REGIONS={layout_args.max_regions}")
     print(f"TRAINABLE_PARAMETERS={trainable}")
     print(f"TOTAL_PARAMETERS={total}")
-    print(f"DDP_IGNORED_FROZEN_PARAMETERS={ddp_ignores['ignored_parameters']}")
+    print(f"DDP_FROZEN_PARAMETERS={ddp_frozen_audit['frozen_parameters']}")
     print(
-        "DDP_IGNORED_FROZEN_PARAMETER_ELEMENTS="
-        f"{ddp_ignores['ignored_parameter_elements']}"
+        "DDP_FROZEN_PARAMETER_ELEMENTS="
+        f"{ddp_frozen_audit['frozen_parameter_elements']}"
+    )
+    print(
+        "DDP_PRIVATE_IGNORE_APPLIED="
+        f"{ddp_frozen_audit['ddp_private_ignore_applied']}"
     )
     print(f"TRAINABLE_PARAMETER_PREFIXES={','.join(sorted(set(name.split('.')[0] for name in trainable_names)))}")
     print(f"FIRST_SAMPLE_LAYOUT_REGIONS={layout_regions}")
@@ -1337,6 +1393,18 @@ def main() -> None:
         if (model.get_model().layout_adapter is not None
             or model.get_model().variable_layout_adapter is not None) else GOTTrainer
     )
+    # LayoutTrainingArguments are parsed separately from Hugging Face's
+    # TrainingArguments. Copy the registered per-module rates onto the object
+    # consumed by GOTTrainer.create_optimizer; otherwise every group silently
+    # falls back to the generic --learning_rate.
+    for group_name in (
+        "vision", "projector", "layout", "qwen", "gate", "lm_head"
+    ):
+        setattr(
+            training_args,
+            f"{group_name}_learning_rate",
+            float(getattr(layout_args, f"{group_name}_learning_rate")),
+        )
     print(
         json.dumps(
             {
@@ -1551,16 +1619,17 @@ def main() -> None:
                 layout_args.ablation_id == "vlqa_layout_p1_p2"
                 and layout_args.layout_stage in {"p2", "p3"}
             ),
-            "p1_validation_selection": (
+            "source_validation_selection": (
                 {
                     "selection_path": str(Path(layout_args.source_validation_selection).resolve()),
-                    "selection_split": p1_selection_payload["selection_split"],
-                    "test_used_for_selection": p1_selection_payload["test_used_for_selection"],
-                    "selected_optimizer_step": p1_selection_payload["selected"]["optimizer_step"],
-                    "selected_config_sha256": p1_selection_payload["selected"]["config_sha256"],
-                    "selected_weights_sha256": p1_selection_payload["selected"]["weights_sha256"],
+                    "selection_purpose": source_selection_payload["selection_purpose"],
+                    "selection_split": source_selection_payload["selection_split"],
+                    "test_used_for_selection": source_selection_payload["test_used_for_selection"],
+                    "selected_optimizer_step": source_selection_payload["selected"]["optimizer_step"],
+                    "selected_config_sha256": source_selection_payload["selected"]["config_sha256"],
+                    "selected_weights_sha256": source_selection_payload["selected"]["weights_sha256"],
                 }
-                if p1_selection_payload is not None else None
+                if source_selection_payload is not None else None
             ),
             "layout_heads_expected_gradient": (
                 (model.get_model().layout_adapter is not None or variable_adapter is not None)

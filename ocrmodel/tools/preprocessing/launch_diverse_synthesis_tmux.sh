@@ -14,6 +14,7 @@ validation_pages=2000
 test_pages=2000
 min_train_pages_total=10000
 target_train_region_exposures=1000000
+tiers=()
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -26,6 +27,7 @@ while [[ $# -gt 0 ]]; do
         --test-pages-per-tier) test_pages="$2"; shift 2 ;;
         --min-train-pages-total) min_train_pages_total="$2"; shift 2 ;;
         --target-train-region-exposures) target_train_region_exposures="$2"; shift 2 ;;
+        --tier) tiers+=("$2"); shift 2 ;;
         *) printf '{"event":"diverse_synthesis_launch_failed","error":"unknown argument","argument":"%s"}\n' "$1" >&2; exit 64 ;;
     esac
 done
@@ -44,6 +46,15 @@ done
     printf '%s\n' '{"event":"diverse_synthesis_launch_failed","error":"page counts must be positive"}' >&2
     exit 64
 }
+if (( ${#tiers[@]} == 0 )); then
+    tiers=(s0-html-text s1-html-crop s2-hard s3-ancient-hard s4-mixed)
+fi
+for tier in "${tiers[@]}"; do
+    [[ "${tier}" =~ ^s[0-4]-[a-z-]+$ ]] || {
+        printf '{"event":"diverse_synthesis_launch_failed","error":"invalid_tier","tier":"%s"}\n' "${tier}" >&2
+        exit 64
+    }
+done
 
 python_bin="${OCR_WORKSPACE}/envs/layout-synthesis/bin/python"
 content_manifest="${content_root}/content.jsonl"
@@ -88,6 +99,9 @@ args=(
     --chromium-executable /usr/bin/google-chrome
     --progress-every 1000
 )
+for tier in "${tiers[@]}"; do
+    args+=(--tier "${tier}")
+done
 printf -v launch_command '%q ' "${args[@]}"
 printf -v quoted_root '%q' "${ocrmodel_root}"
 printf -v quoted_log '%q' "${log_path}"
@@ -104,4 +118,4 @@ fi
 pane_pid="$(tmux display-message -p -t "${session}:0.0" '#{pane_pid}')"
 printf '{"event":"diverse_synthesis_started","session":"%s","pane_pid":%s,"output":"%s","log":"%s","total_pages":%s,"cuda_visible_devices":""}\n' \
     "${session}" "${pane_pid}" "${output_root}" "${log_path}" \
-    "$((5 * (train_pages + validation_pages + test_pages)))"
+    "$(( ${#tiers[@]} * (train_pages + validation_pages + test_pages) ))"

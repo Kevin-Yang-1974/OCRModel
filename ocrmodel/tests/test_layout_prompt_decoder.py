@@ -457,6 +457,25 @@ def test_m4_predicted_layout_routing_is_visual_value_only_and_supports_shuffle()
     assert adapter.visual_routing.visual_value.weight.grad is None
 
 
+def test_m4_routing_casts_float_reliability_to_bfloat16_writeback() -> None:
+    adapter = module.PromptedVariableLayoutAdapter(
+        visual_dim=16, high_resolution_dim=12, hidden_size=16,
+        num_prompt_queries=4, decoder_layers=1, num_heads=4,
+        max_layout_tokens=10, max_layout_records=2,
+        predicted_layout_routing=True,
+    ).to(dtype=torch.bfloat16).eval()
+    with torch.no_grad():
+        adapter.decoder.token_head.weight.zero_()
+        adapter.decoder.token_head.bias.zero_()
+        adapter.decoder.token_head.bias[adapter.vocabulary.eos_id] = 5.0
+        adapter.residual_gate.fill_(0.5)
+    visual = torch.randn(2, 5, 16, dtype=torch.bfloat16)
+    high = torch.randn(2, 9, 12, dtype=torch.bfloat16)
+    output = adapter(visual, high)
+    assert output.visual_tokens.dtype == torch.bfloat16
+    assert output.routing_reliability is not None
+
+
 def test_integrated_pvld_routes_only_visual_values_and_blocks_teacher_forcing_leakage() -> None:
     project_root = MODULE_PATH.parents[2]
     sys.path.insert(0, str(project_root))

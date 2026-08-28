@@ -41,7 +41,10 @@ class LayoutAblationContractTests(unittest.TestCase):
         self.assertIn("writeback_mode=config.layout_writeback_mode", model_source)
         self.assertIn("layout_writeback_source", training_source)
         self.assertIn("visual_value_layout_routing", training_source)
-        self.assertIn("layout_memory=cnn_feature", model_source)
+        # Fixed-Slot VLQA continues to consume only the OCR 16x16 feature
+        # map. PVLD independently selects the optional 64x64 layout memory.
+        self.assertIn("layout_memory=ocr_cnn_feature", model_source)
+        self.assertIn("memory_grid_size=(16, 16)", model_source)
 
     def test_whole_page_protocol_does_not_pass_layout_metadata_to_adapter(self) -> None:
         model_source = (

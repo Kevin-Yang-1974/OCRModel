@@ -608,6 +608,66 @@ def test_diverse_dense_layout_records_language_font_and_nonuniform_widths(
     assert all("font_family" in region for region in record["regions"])
 
 
+def test_high_region_tail_uses_readable_dense_grid_without_count_fallback(
+    tmp_path: Path,
+) -> None:
+    manifest = tmp_path / "high_region_tail.jsonl"
+    records = [
+        {
+            "content_id": f"dense_tail_{index:03d}",
+            "source_group_id": f"dense_tail_source_{index:03d}",
+            "split": "train",
+            "kind": "text",
+            "orientation": "any",
+            "text": "甲",
+        }
+        for index in range(180)
+    ]
+    manifest.write_text(
+        "".join(json.dumps(record, ensure_ascii=False) + "\n" for record in records),
+        encoding="utf-8",
+    )
+    config = GeneratorConfig(
+        page_width=1024,
+        page_height=1024,
+        min_regions=129,
+        max_regions=140,
+        margin_min=28,
+        margin_max=28,
+        gap_min=0,
+        gap_max=0,
+        dense_gap_probability=1.0,
+        dense_gap_min=0,
+        dense_gap_max=0,
+        dense_grid_min_regions=33,
+        dense_grid_max_tracks=20,
+        region_inset_min=0,
+        region_inset_max=0,
+        font_size_min=8,
+        font_size_max=8,
+        region_padding=0,
+        directions=["vertical_rtl"],
+        region_count_weights={">128": 1.0},
+    )
+    config.validate()
+    plan = build_page_plan(
+        load_content_items(manifest), config, "train", "s3-ancient-hard", 71, 0
+    )
+    assert len(plan.regions) > 128
+    assert plan.template_id.endswith("region")
+    assert plan.layout_geometry == "dense_grid"
+    assert 1 < plan.column_count < len(plan.regions)
+    assert 1 < plan.row_count < len(plan.regions)
+    assert min(
+        region.bbox_px[2] - region.bbox_px[0] for region in plan.regions
+    ) >= config.font_size_min
+    assert min(
+        region.bbox_px[3] - region.bbox_px[1] for region in plan.regions
+    ) >= config.font_size_min
+    # Vertical RTL ordering starts from the right-most dense-grid track.
+    assert plan.regions[0].bbox_px[0] > plan.regions[-1].bbox_px[0]
+
+
 def test_s2_diverse_degradation_is_deterministic_and_preserves_geometry(
     tmp_path: Path,
 ) -> None:
@@ -711,6 +771,19 @@ def test_diverse_split_launcher_writes_reproducible_plan_protocol(tmp_path: Path
     assert protocol["layout_metadata_as_model_input"] is False
     assert len(load_json_records(output / "train" / "plans.jsonl")) == 4
     assert "diverse_synthetic_dataset_prepared" in completed.stdout
+
+
+def test_dense_waiter_limits_formal_generation_to_s3_and_s4() -> None:
+    launcher = (
+        PREPROCESSING_DIR / "launch_dense_synthesis_after_session_tmux.sh"
+    ).read_text(encoding="utf-8")
+    assert (
+        "--target-train-region-exposures 1000000 \\\n"
+        "        --tier s3-ancient-hard --tier s4-mixed"
+    ) in launcher
+    assert "--train-pages-per-tier 12500" in launcher
+    assert "--validation-pages-per-tier 2000" in launcher
+    assert "--test-pages-per-tier 2000" in launcher
 
 
 def test_direction_weights_make_ancient_vertical_dominant(tmp_path: Path) -> None:

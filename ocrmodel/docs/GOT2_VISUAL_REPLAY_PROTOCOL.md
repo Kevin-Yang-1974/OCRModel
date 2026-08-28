@@ -1,8 +1,10 @@
 # GOT2 Visual Replay and High-Resolution Layout Protocol
 
-更新日期：2026-08-26
+更新日期：2026-08-27
 
 本文是新视觉解冻实验的执行协议。它只定义代码、数据和验证契约；在完成本地测试、数据生成、manifest 审计并得到确认前，不启动正式训练、validation、test 或远端长程作业。
+
+正式主线与历史数据 pilot 的完整、隔离配置登记见 `docs/LAVP_EXPERIMENT_CONFIGURATION_REGISTER.md`。后者记录 pilot 的 run ID、锁定 validation、已知失败和结果解释边界；不得将其与正式主线混用。
 
 ## 1. 输入与分支边界
 
@@ -19,11 +21,21 @@
 | Vary ViT | 1e-6 | 5e-7 | 2e-7 |
 | mm projector | 1e-5 | 5e-6 | 2e-6 |
 | layout queries/decoder/heads | 1e-4 | 5e-5 | 1e-5 |
-| Qwen decoder | frozen | 25% steps 后解冻，1e-6 | 5e-7 |
+| Qwen decoder | frozen | 全程低学习率解冻，1e-6 | 全程低学习率解冻，5e-7 |
 | residual gate | frozen zero | 1e-5 | 1e-6 |
 | OCR lm head | frozen，除非 GOT2 tied-head 路径要求同步更新 | 同左 | 同左 |
 
 所有组使用相同 optimizer、batch、seed、checkpoint 间隔和 optimizer steps。参数组名称写入 `layout_training_metrics.json`。
+
+### 正式阶段预算
+
+| 阶段 | 主训练数据 | 附加数据 | optimizer steps | checkpoint 间隔 | 初始化来源 | validation 选择目标 |
+|---|---|---|---:|---:|---|---|
+| P1 | S3/S4 train | MTHv2 train OCR replay，7:1 | 12,000 | 2,000 | 冻结 GOT2 | layout stop/count/F1/bbox/duplicate 指标，不读 OCR test |
+| P2 | S3/S4 train | 无 | 30,000 | 2,000 | P1 validation-selected checkpoint | page CER 为主，layout non-collapse 约束 |
+| P3 | MTHv2 train | 无 | 8,000 | 2,000 | P2 validation-selected checkpoint | page CER 为主，layout non-collapse 约束 |
+
+所有阶段固定 seed=`42`、`layout_memory_resolution=64`、`max_regions=512`、`max_layout_records=512` 和 `max_layout_tokens=2048`。每一阶段以全量的 validation-only selection 锁定下游 source checkpoint；P3 selection 完成前不得运行 P2 或 P3 test。
 
 ## 3. 损失与 replay
 
@@ -57,13 +69,15 @@ L_total = L_ocr + 1.0 * L_layout
 
 首版区域数目标分布：1–8 为 10%，9–16 为 15%，17–32 为 25%，33–64 为 30%，65–128 为 15%，>128 为 5%。`>32` 页面至少占 50%。
 
+正式 audit 以 train split 的 `33–64`、`65–128`、`>128` 三个 bucket 总和计算 `train_high_region_page_fraction`，并硬性要求其不低于 `0.50`。审计 summary 同时保存各 split 的完整 bucket 计数；低于该比例时，即使总页数达到 10,000 也不得创建正式训练。
+
 每条记录保存 image、HTML、page transcription、region bbox/order/direction、content/source hash、font/version、browser version/hash、degradation parameters、column count、region count 和 difficulty tier。
 
 审计包括 source/content split isolation、重复与近重复页面、列数/区域数、bbox 面积与 aspect、direction、字体、退化强度、文本长度和 `>32` 页面比例。
 
 ### 数据规模硬门槛
 
-由于 P1/P2/P3 会解冻视觉塔、projector、layout branch 和部分 Qwen，合成数据不能继续停留在 3,600 页或数千页规模。新主线的最低目标是：train 至少 10,000 张唯一渲染页面，且 train manifest 审计后的 region exposure 至少 1,000,000；默认五个 tier 使用 20,000/2,000/2,000 的 train/validation/test 页面配额，即 100,000/10,000/10,000 张页面。后续可扩展到百万级页面或更高 region exposure，但必须保持 source/content split 隔离。
+由于 P1/P2/P3 会解冻视觉塔、projector、layout branch 和部分 Qwen，合成数据不能继续停留在 3,600 页或数千页规模。新主线的最低硬门槛是 train 至少 10,000 张唯一渲染页面；region exposure 作为训练预算和数据覆盖报告项，不再单独设置一百万的启动阻断门槛。当前 S3/S4 正式集使用每 tier 12,500 张 train 页、每 tier 2,000 张 validation/test 页，即 25,000/4,000/4,000 张页面；渲染前和渲染后都必须记录确定性布局计划与实际 region exposure，并保持 source/content split 隔离。后续可扩展到百万级页面或更高 region exposure，但不得以重复布局冒充独立内容实例。
 
 这里的三个数量必须分开记录：
 
@@ -84,6 +98,12 @@ L_total = L_ocr + 1.0 * L_layout
 | All | on | 0.25 | on |
 
 M4 只允许自由生成的 predicted layout evidence。validation 必须同时运行 normal、`alpha=0` 和 shuffled evidence；normal 未在 validation 上稳定优于两者时，不形成 M4 OCR 结论。
+
+正式入口在 M4/All 的 P2 validation selection 后执行三个 routing controls。controls 必须验证 selection 是 validation-only、选中 `config.json` 与 `model.safetensors` 的 SHA-256 未改变、布局 metadata 未进入模型输入，且 normal 的 page CER 严格低于 `alpha=0` 和 shuffled evidence；任一条件不成立时，该组不进入 P3 或任何 test。
+
+所有 P2 组必须使用相同 S3/S4 manifests、P1/P2 steps、参数解冻范围、参数组学习率、batch、seed、checkpoint 间隔、validation selection 和测试锁定规则。Legacy 是必保留对照，不得用 M2/M3/M4 的 checkpoint 替代它。M4 routing 的 OCR Value 继续来自 16×16 visual tokens；预测 layout 只能调制 token 间 routing 或 reliability gate。
+
+正式编排顺序为 `legacy -> m2 -> m3 -> m4 -> all`。每组创建独立的 P1/P2/P3 run、validation selection 和 test 输出；P1 一律以相同 Legacy 预训练配置运行，以消除 P2 扩展在上游 P1 造成的混杂。P2 接收该组完整的 spatial memory、gradient scale 和 predicted-layout routing 参数；P3 仅沿用前两项，routing 保持 P2-only。每一组的 P2 只能读取同组 P1 validation-selected checkpoint，P3 只能读取同组 P2 validation-selected checkpoint。
 
 ## 6. Selection 与 test
 
@@ -111,6 +131,10 @@ P1 选择布局质量，P2/P3 以页面 CER 为主并设置 layout non-collapse 
 7. S3/S4 数据生成、manifest 审计和近重复检查。
 
 未完成上述检查前，不得启动正式训练或任何新的远端长程作业。
+
+### 已完成的有界测量
+
+完整 GOT2 单步 A100 smoke 已在相同批和模型加载路径下完成：16×16 layout memory 峰值约 `10487.59 MiB`、`0.443 steps/s`、vision gradient norm `0.01961`；64×64 layout memory 峰值约 `10485.46 MiB`、`0.454 steps/s`、vision gradient norm `0.02281`。这证明 64×64 layout-only memory 的 forward/backward/reload/DDP/evaluator 链路可运行，不构成正式 OCR 或布局效果结论。正式数据完成后仍须对同一 selection-locked 协议报告实际训练吞吐、峰值显存、页面 CER、布局 F1、bbox IoU、EOS/count 和复杂页面分桶结果。
 
 ## 8. GPU 准入与旧 checkpoint 清理
 
