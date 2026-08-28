@@ -233,6 +233,8 @@ class GeneratorConfig:
     dense_gap_probability: float = 0.0
     dense_gap_min: int = 0
     dense_gap_max: int = 0
+    dense_grid_min_regions: int = 33
+    dense_grid_max_tracks: int = 20
     region_extent_weight_min: float = 1.0
     region_extent_weight_max: float = 1.0
     line_height_min: float = 1.35
@@ -309,6 +311,8 @@ class GeneratorConfig:
             "region_padding",
             "dense_gap_min",
             "dense_gap_max",
+            "dense_grid_min_regions",
+            "dense_grid_max_tracks",
             "s2_stain_count_min",
             "s2_stain_count_max",
         )
@@ -336,6 +340,10 @@ class GeneratorConfig:
             raise ValueError("Dense gaps must be non-negative and ordered.")
         if not 0 <= self.dense_gap_probability <= 1:
             raise ValueError("dense_gap_probability must be in [0, 1].")
+        if self.dense_grid_min_regions < 2:
+            raise ValueError("dense_grid_min_regions must be at least 2.")
+        if self.dense_grid_max_tracks < 2:
+            raise ValueError("dense_grid_max_tracks must be at least 2.")
         ordered_nonnegative_ranges = (
             ("region_extent_weight", self.region_extent_weight_min, self.region_extent_weight_max),
             ("line_height", self.line_height_min, self.line_height_max),
@@ -472,6 +480,32 @@ class PagePlan:
     def page_text(self) -> str:
         return self.page_text_separator.join(region.item.text for region in self.regions)
 
+    def _track_count(self, starts: Sequence[float]) -> int:
+        if not starts:
+            return 0
+        tracks = 1
+        previous = sorted(starts)[0]
+        # Region insets add a few pixels of jitter to a shared grid line.
+        # A 1% page-axis tolerance keeps those positions in one track while
+        # preserving every intended dense-grid row or column.
+        for value in sorted(starts)[1:]:
+            if value - previous > max(1.0, 0.01 * max(self.page_size)):
+                tracks += 1
+            previous = value
+        return tracks
+
+    @property
+    def column_count(self) -> int:
+        return self._track_count([region.bbox_px[0] for region in self.regions])
+
+    @property
+    def row_count(self) -> int:
+        return self._track_count([region.bbox_px[1] for region in self.regions])
+
+    @property
+    def layout_geometry(self) -> str:
+        return "dense_grid" if self.column_count > 1 and self.row_count > 1 else "strip"
+
 
 def derive_page_seed(base_seed: int, split: str, page_index: int) -> int:
     payload = f"{base_seed}:{split}:{page_index}".encode("utf-8")
@@ -498,6 +532,68 @@ def _plan_boxes(
     margin_x = rng.randint(config.margin_min, config.margin_max)
     margin_y = rng.randint(config.margin_min, config.margin_max)
     boxes_visual_order: list[tuple[float, float, float, float]] = []
+
+    # A one-dimensional strip layout has no usable glyph area once a page has
+    # dozens of regions.  High-density pages instead use compact blocks in a
+    # two-dimensional grid.  The returned order remains the reading order;
+    # grid geometry is only a training label, never a model input.
+    if count >= config.dense_grid_min_regions:
+        usable_width = width - 2 * margin_x
+        usable_height = height - 2 * margin_y
+        if usable_width <= 0 or usable_height <= 0:
+            raise ValueError("Margins leave no page content area.")
+
+        # Keep cells near-square while respecting the page aspect ratio.  The
+        # cap prevents a pathological one-pixel track on very large counts.
+        tracks = max(2, round(math.sqrt(count * usable_width / usable_height)))
+        tracks = min(config.dense_grid_max_tracks, tracks, count)
+        lanes = math.ceil(count / tracks)
+        if direction.startswith("vertical"):
+            columns, rows = tracks, lanes
+        else:
+            columns, rows = lanes, tracks
+
+        gap_x = (
+            rng.randint(config.dense_gap_min, config.dense_gap_max)
+            if rng.random() < config.dense_gap_probability
+            else rng.randint(config.gap_min, config.gap_max)
+        )
+        gap_y = (
+            rng.randint(config.dense_gap_min, config.dense_gap_max)
+            if rng.random() < config.dense_gap_probability
+            else rng.randint(config.gap_min, config.gap_max)
+        )
+        cell_width = (usable_width - gap_x * (columns - 1)) / columns
+        cell_height = (usable_height - gap_y * (rows - 1)) / rows
+        minimum = 2 * (config.region_inset_max + config.region_padding) + 4
+        if cell_width <= minimum or cell_height <= minimum:
+            raise ValueError("Dense grid cells leave no usable text area.")
+
+        def cell_box(column: int, row: int) -> tuple[float, float, float, float]:
+            x0 = margin_x + column * (cell_width + gap_x)
+            y0 = margin_y + row * (cell_height + gap_y)
+            return (
+                x0 + rng.randint(config.region_inset_min, config.region_inset_max),
+                y0 + rng.randint(config.region_inset_min, config.region_inset_max),
+                x0 + cell_width - rng.randint(config.region_inset_min, config.region_inset_max),
+                y0 + cell_height - rng.randint(config.region_inset_min, config.region_inset_max),
+            )
+
+        if direction.startswith("vertical"):
+            column_order = range(columns - 1, -1, -1) if direction == "vertical_rtl" else range(columns)
+            for column in column_order:
+                for row in range(rows):
+                    if len(boxes_visual_order) == count:
+                        return boxes_visual_order
+                    boxes_visual_order.append(cell_box(column, row))
+        else:
+            for row in range(rows):
+                column_order = range(columns - 1, -1, -1) if direction == "horizontal_rtl" else range(columns)
+                for column in column_order:
+                    if len(boxes_visual_order) == count:
+                        return boxes_visual_order
+                    boxes_visual_order.append(cell_box(column, row))
+        return boxes_visual_order
 
     if config.dense_gap_probability == 0:
         shared_gap = rng.randint(config.gap_min, config.gap_max)
@@ -680,8 +776,23 @@ def build_page_plan(
     last_fit_error: ValueError | None = None
     for candidate_count in range(sampled_count, config.min_regions - 1, -1):
         try:
-            selected = rng.sample(eligible, candidate_count)
             boxes = _plan_boxes(config, rng, direction, candidate_count)
+            if candidate_count >= config.dense_grid_min_regions:
+                # Dense cells are deliberately populated from short text and
+                # real crops first.  This preserves the requested region count
+                # rather than silently falling back to a sparse strip page.
+                ranked = sorted(
+                    eligible,
+                    key=lambda item: (
+                        0 if item.kind == "image" else 1,
+                        len(item.text),
+                        item.content_id,
+                    ),
+                )
+                pool_size = min(len(ranked), max(candidate_count, candidate_count * 6))
+                selected = rng.sample(ranked[:pool_size], candidate_count)
+            else:
+                selected = rng.sample(eligible, candidate_count)
             candidate_regions: list[RegionPlan] = []
             for reading_order, item in enumerate(selected):
                 bbox_px = boxes[reading_order]

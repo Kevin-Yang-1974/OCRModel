@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from array import array
 import json
 import math
 import sys
@@ -23,6 +24,36 @@ from synthetic_layout_common import (
 LAYOUT_ANNOTATION_STATUSES = {"complete", "partial", "none"}
 
 
+def iter_manifest_records(path: Path) -> Any:
+    """Yield JSONL records without materialising million-region manifests."""
+    if path.suffix.lower() != ".jsonl":
+        yield from load_json_records(path)
+        return
+    with path.open(encoding="utf-8-sig") as handle:
+        for line_number, line in enumerate(handle, start=1):
+            if not line.strip():
+                continue
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"Invalid JSONL at {path}:{line_number}: {exc}") from exc
+            if not isinstance(record, dict):
+                raise TypeError(f"JSONL record at {path}:{line_number} is not an object.")
+            yield record
+
+
+def count_bbox_tracks(starts: list[float]) -> int:
+    if not starts:
+        return 0
+    tracks = 1
+    previous = sorted(starts)[0]
+    for value in sorted(starts)[1:]:
+        if value - previous > 0.01:
+            tracks += 1
+        previous = value
+    return tracks
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
@@ -40,6 +71,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--summary-json", type=Path)
     parser.add_argument("--skip-image-hash", action="store_true")
     parser.add_argument("--skip-html-check", action="store_true")
+    parser.add_argument(
+        "--min-train-high-region-page-fraction",
+        type=float,
+        default=None,
+        help="Optional minimum train-page fraction with more than 32 regions.",
+    )
     parser.add_argument("--max-errors", type=int, default=50)
     return parser.parse_args()
 
@@ -347,6 +384,19 @@ def audit_record(
 
     if regions and separator.join(region_texts) != page_text:
         raise ValueError(f"{context}.page_text does not match ordered region text concatenation.")
+    column_count = count_bbox_tracks([float(region["bbox"][0]) for region in regions])
+    row_count = count_bbox_tracks([float(region["bbox"][1]) for region in regions])
+    layout_geometry = "dense_grid" if column_count > 1 and row_count > 1 else "strip"
+    if is_synthetic and "layout_geometry" in generator:
+        if (
+            generator.get("region_count") != len(regions)
+            or generator.get("column_count") != column_count
+            or generator.get("row_count") != row_count
+            or generator.get("layout_geometry") != layout_geometry
+        ):
+            raise ValueError(
+                f"{context}.generator layout counts do not match rendered bbox geometry."
+            )
     declared_groups = record.get("source_group_ids")
     if regions and (not isinstance(declared_groups, list) or declared_groups != sorted(source_groups)):
         raise ValueError(
@@ -374,6 +424,9 @@ def audit_record(
         "perceptual_hash": perceptual_hash(image_path),
         "page_text": page_text,
         "regions": region_summaries,
+        "column_count": column_count,
+        "row_count": row_count,
+        "layout_geometry": layout_geometry,
         "source_group_id": sorted(source_groups)[0] if source_groups else None,
     }
 
@@ -382,37 +435,13 @@ def main() -> int:
     args = parse_args()
     if args.max_errors < 1:
         raise ValueError("--max-errors must be positive.")
+    if args.min_train_high_region_page_fraction is not None and not (
+        0.0 <= args.min_train_high_region_page_fraction <= 1.0
+    ):
+        raise ValueError("--min-train-high-region-page-fraction must be in [0, 1].")
 
     errors: list[str] = []
-    audited: list[dict[str, Any]] = []
     page_ids: set[str] = set()
-    for manifest_path_input in args.manifest:
-        manifest_path = manifest_path_input.resolve()
-        dataset_root = manifest_path.parent
-        try:
-            records = load_json_records(manifest_path)
-        except Exception as exc:
-            errors.append(f"{manifest_path}: {exc}")
-            continue
-        for record_index, record in enumerate(records):
-            context = f"{manifest_path.name}[{record_index}]"
-            if len(errors) >= args.max_errors:
-                break
-            try:
-                summary = audit_record(
-                    record=record,
-                    dataset_root=dataset_root,
-                    context=context,
-                    skip_image_hash=args.skip_image_hash,
-                    skip_html_check=args.skip_html_check,
-                )
-                if summary["page_id"] in page_ids:
-                    raise ValueError(f"Duplicate page_id across manifests: {summary['page_id']!r}.")
-                page_ids.add(summary["page_id"])
-                audited.append(summary)
-            except Exception as exc:
-                errors.append(f"{context}: {exc}")
-
     content_splits: dict[str, str] = {}
     content_fingerprints: dict[str, tuple[str, str]] = {}
     group_splits: dict[str, str] = {}
@@ -421,76 +450,130 @@ def main() -> int:
     text_hash_splits: dict[str, str] = {}
     page_text_hash_splits: dict[str, str] = {}
     perceptual_hash_splits: dict[tuple[str, str], str] = {}
+    split_counts: Counter[str] = Counter()
+    tier_counts: Counter[str] = Counter()
+    template_counts: Counter[str] = Counter()
+    direction_counts: Counter[str] = Counter()
+    region_bucket_counts: Counter[str] = Counter()
+    split_region_bucket_counts: dict[str, Counter[str]] = {}
+    column_count_counts: Counter[int] = Counter()
+    row_count_counts: Counter[int] = Counter()
+    layout_geometry_counts: Counter[str] = Counter()
+    bbox_areas = array("d")
+    bbox_aspects = array("d")
+    page_count = 0
+    region_count = 0
 
     def enforce_single_split(mapping: dict[Any, str], key: Any, split: str, label: str) -> None:
         previous = mapping.setdefault(key, split)
         if previous != split:
             errors.append(f"{label} occurs in multiple splits: {key!r} -> {previous!r}, {split!r}")
 
-    for page in audited:
-        split = page["split"]
-        image_sha256 = page["image_sha256"]
-        if image_sha256:
-            enforce_single_split(page_hash_splits, image_sha256, split, "page image hash")
-        normalized_page_text = " ".join(page["page_text"].casefold().split())
-        enforce_single_split(
-            page_text_hash_splits, normalized_page_text, split, "normalized page text"
-        )
-        enforce_single_split(
-            perceptual_hash_splits,
-            (page["perceptual_hash"], normalized_page_text),
-            split,
-            "perceptual image/text near-duplicate",
-        )
-        for region in page["regions"]:
-            content_id = region["content_id"]
-            enforce_single_split(content_splits, content_id, split, "content_id")
-            enforce_single_split(
-                group_splits, region["source_group_id"], split, "source_group_id"
-            )
-            fingerprint = (region["text"], region["source_kind"])
-            normalized_text = " ".join(region["text"].casefold().split())
-            enforce_single_split(text_hash_splits, normalized_text, split, "normalized text")
-            previous_fingerprint = content_fingerprints.setdefault(content_id, fingerprint)
-            if previous_fingerprint != fingerprint:
-                errors.append(
-                    f"content_id has inconsistent text/kind: {content_id!r} -> "
-                    f"{previous_fingerprint!r}, {fingerprint!r}"
-                )
-            if region["source_sha256"]:
+    for manifest_path_input in args.manifest:
+        manifest_path = manifest_path_input.resolve()
+        dataset_root = manifest_path.parent
+        records = iter_manifest_records(manifest_path)
+        try:
+            for record_index, record in enumerate(records):
+                context = f"{manifest_path.name}[{record_index}]"
+                if len(errors) >= args.max_errors:
+                    break
+                try:
+                    summary = audit_record(
+                        record=record,
+                        dataset_root=dataset_root,
+                        context=context,
+                        skip_image_hash=args.skip_image_hash,
+                        skip_html_check=args.skip_html_check,
+                    )
+                    if summary["page_id"] in page_ids:
+                        raise ValueError(
+                            f"Duplicate page_id across manifests: {summary['page_id']!r}."
+                        )
+                except Exception as exc:
+                    errors.append(f"{context}: {exc}")
+                    continue
+                page_ids.add(summary["page_id"])
+                page_count += 1
+                split = summary["split"]
+                image_sha256 = summary["image_sha256"]
+                if image_sha256:
+                    enforce_single_split(page_hash_splits, image_sha256, split, "page image hash")
+                normalized_page_text = " ".join(summary["page_text"].casefold().split())
                 enforce_single_split(
-                    crop_hash_splits,
-                    region["source_sha256"],
-                    split,
-                    "source crop hash",
+                    page_text_hash_splits, normalized_page_text, split, "normalized page text"
                 )
-            if len(errors) >= args.max_errors:
-                break
+                enforce_single_split(
+                    perceptual_hash_splits,
+                    (summary["perceptual_hash"], normalized_page_text),
+                    split,
+                    "perceptual image/text near-duplicate",
+                )
+                split_counts[split] += 1
+                tier_counts[summary["tier"]] += 1
+                template_counts[summary["template_id"]] += 1
+                column_count_counts[summary["column_count"]] += 1
+                row_count_counts[summary["row_count"]] += 1
+                layout_geometry_counts[summary["layout_geometry"]] += 1
+                regions = summary["regions"]
+                region_count += len(regions)
+                region_bucket = (
+                    "1-8" if len(regions) <= 8 else
+                    "9-16" if len(regions) <= 16 else
+                    "17-32" if len(regions) <= 32 else
+                    "33-64" if len(regions) <= 64 else
+                    "65-128" if len(regions) <= 128 else ">128"
+                )
+                region_bucket_counts[region_bucket] += 1
+                split_region_bucket_counts.setdefault(split, Counter())[region_bucket] += 1
+                for region in regions:
+                    content_id = region["content_id"]
+                    enforce_single_split(content_splits, content_id, split, "content_id")
+                    enforce_single_split(
+                        group_splits, region["source_group_id"], split, "source_group_id"
+                    )
+                    fingerprint = (region["text"], region["source_kind"])
+                    normalized_text = " ".join(region["text"].casefold().split())
+                    enforce_single_split(text_hash_splits, normalized_text, split, "normalized text")
+                    previous_fingerprint = content_fingerprints.setdefault(content_id, fingerprint)
+                    if previous_fingerprint != fingerprint:
+                        errors.append(
+                            f"content_id has inconsistent text/kind: {content_id!r} -> "
+                            f"{previous_fingerprint!r}, {fingerprint!r}"
+                        )
+                    if region["source_sha256"]:
+                        enforce_single_split(
+                            crop_hash_splits, region["source_sha256"], split, "source crop hash"
+                        )
+                    direction_counts[region["direction"]] += 1
+                    bbox_areas.append(region["bbox_area"])
+                    bbox_aspects.append(region["bbox_aspect"])
+        except Exception as exc:
+            errors.append(f"{manifest_path}: {exc}")
         if len(errors) >= args.max_errors:
             break
-
-    split_counts = Counter(page["split"] for page in audited)
-    tier_counts = Counter(page["tier"] for page in audited)
-    template_counts = Counter(page["template_id"] for page in audited)
-    direction_counts = Counter(
-        region["direction"] for page in audited for region in page["regions"]
+    train_pages = split_counts.get("train", 0)
+    train_high_region_pages = sum(
+        split_region_bucket_counts.get("train", Counter()).get(bucket, 0)
+        for bucket in ("33-64", "65-128", ">128")
     )
-    region_bucket_counts = Counter(
-        "1-8" if len(page["regions"]) <= 8 else
-        "9-16" if len(page["regions"]) <= 16 else
-        "17-32" if len(page["regions"]) <= 32 else
-        "33-64" if len(page["regions"]) <= 64 else
-        "65-128" if len(page["regions"]) <= 128 else ">128"
-        for page in audited
+    train_high_region_fraction = (
+        train_high_region_pages / train_pages if train_pages else 0.0
     )
-    bbox_areas = [region["bbox_area"] for page in audited for region in page["regions"]]
-    bbox_aspects = [region["bbox_aspect"] for page in audited for region in page["regions"]]
-    region_count = sum(len(page["regions"]) for page in audited)
+    if (
+        args.min_train_high_region_page_fraction is not None
+        and train_high_region_fraction < args.min_train_high_region_page_fraction
+    ):
+        errors.append(
+            "train high-region page fraction is below minimum: "
+            f"observed={train_high_region_fraction:.6f}, "
+            f"required={args.min_train_high_region_page_fraction:.6f}"
+        )
     summary_payload = {
         "schema_version": SCHEMA_VERSION,
         "status": "error" if errors else "ok",
         "manifest_count": len(args.manifest),
-        "page_count": len(audited),
+        "page_count": page_count,
         "region_count": region_count,
         "unique_content_count": len(content_splits),
         "unique_source_group_count": len(group_splits),
@@ -499,6 +582,21 @@ def main() -> int:
         "template_counts": dict(sorted(template_counts.items())),
         "direction_counts": dict(sorted(direction_counts.items())),
         "region_count_bucket_counts": dict(sorted(region_bucket_counts.items())),
+        "split_region_count_bucket_counts": {
+            split: dict(sorted(counts.items()))
+            for split, counts in sorted(split_region_bucket_counts.items())
+        },
+        "train_high_region_page_fraction": train_high_region_fraction,
+        "minimum_train_high_region_page_fraction": (
+            args.min_train_high_region_page_fraction
+        ),
+        "column_count_counts": {
+            str(count): pages for count, pages in sorted(column_count_counts.items())
+        },
+        "row_count_counts": {
+            str(count): pages for count, pages in sorted(row_count_counts.items())
+        },
+        "layout_geometry_counts": dict(sorted(layout_geometry_counts.items())),
         "bbox_area": {
             "min": min(bbox_areas) if bbox_areas else 0.0,
             "median": sorted(bbox_areas)[len(bbox_areas) // 2] if bbox_areas else 0.0,
@@ -526,7 +624,7 @@ def main() -> int:
         return 1
 
     print("SYNTHETIC_LAYOUT_AUDIT_OK")
-    print(f"pages={len(audited)}")
+    print(f"pages={page_count}")
     print(f"regions={region_count}")
     print(f"splits={json.dumps(dict(sorted(split_counts.items())), ensure_ascii=False)}")
     print(f"tiers={json.dumps(dict(sorted(tier_counts.items())), ensure_ascii=False)}")

@@ -40,6 +40,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dataset-root", type=Path, required=True)
     parser.add_argument("--manifest", type=Path, required=True)
     parser.add_argument("--validation-manifest", type=Path, required=True)
+    parser.add_argument(
+        "--validation-image-root",
+        type=Path,
+        help="Image root for validation manifest; defaults to the manifest directory.",
+    )
     parser.add_argument("--test-manifest", type=Path, required=True)
     parser.add_argument("--source-model", type=Path, required=True)
     parser.add_argument("--tokenizer-model", type=Path, required=True)
@@ -72,6 +77,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pvld-predicted-layout-routing", action="store_true")
     parser.add_argument("--per-device-batch-size", type=int, default=1)
     parser.add_argument("--gradient-accumulation-steps", type=int, default=1)
+    parser.add_argument("--max-grad-norm", type=float, default=1.0)
     parser.add_argument("--p1-learning-rate", type=float, default=1e-4)
     parser.add_argument("--p2-learning-rate", type=float, default=5e-5)
     parser.add_argument("--vision-learning-rate", type=float, default=1e-6)
@@ -111,6 +117,11 @@ def parse_args() -> argparse.Namespace:
         help="Disable NCCL GPU P2P for the known A100 topology issue.",
     )
     parser.add_argument("--run-id", required=True)
+    parser.add_argument(
+        "--source-validation-selection",
+        type=Path,
+        help="Validation-only selection whose selected model initializes a standalone P2 or P3 stage.",
+    )
     parser.add_argument("--resume-existing-run", action="store_true")
     parser.add_argument(
         "--skip-p1-validation-selection",
@@ -218,23 +229,28 @@ def training_command(
     shared_gradient_scale = args.pvld_shared_gradient_scale if stage == "p2" else 1.0
     record_gradient_scale = args.pvld_record_gradient_scale if stage == "p2" else 1.0
     predicted_layout_routing = args.pvld_predicted_layout_routing and stage == "p2"
-    torchrun = Path(sys.executable).with_name("torchrun")
     checkpoint_retention = args.checkpoint_retention
     if stage == "p1":
         checkpoint_retention = max(
             checkpoint_retention,
             math.ceil(args.p1_max_steps / checkpoint_steps),
         )
-    command = [
-        str(torchrun), "--standalone", "--nproc_per_node",
-        str(len(gpu_ids)), "--master_port", str(free_port()),
-        str(args.project_root / "scripts" / "train_GOT_layout.py"),
-    ]
     if args.distributed_strategy == "deepspeed_zero2":
-        command.extend(
-            ["--deepspeed", str(args.project_root / "zero_config" / "zero2.json")]
-        )
+        deepspeed = Path(sys.executable).with_name("deepspeed")
+        if not deepspeed.is_file():
+            raise RuntimeError(f"DeepSpeed launcher is missing: {deepspeed}")
+        command = [
+            str(deepspeed), "--num_gpus", str(len(gpu_ids)), "--master_port",
+            str(free_port()), str(args.project_root / "scripts" / "train_GOT_layout.py"),
+            "--deepspeed", str(args.project_root / "zero_config" / "zero2.json"),
+        ]
     else:
+        torchrun = Path(sys.executable).with_name("torchrun")
+        command = [
+            str(torchrun), "--standalone", "--nproc_per_node",
+            str(len(gpu_ids)), "--master_port", str(free_port()),
+            str(args.project_root / "scripts" / "train_GOT_layout.py"),
+        ]
         # PVLD P2 can legitimately leave visual-routing parameters unused
         # while residual_gate is initialized at zero. Let DDP detect and
         # reduce only parameters participating in each step; otherwise the
@@ -276,6 +292,7 @@ def training_command(
         "--bf16", "True",
         "--fp16", "False",
         "--gradient_accumulation_steps", str(args.gradient_accumulation_steps),
+        "--max_grad_norm", str(args.max_grad_norm),
         "--per_device_train_batch_size", str(args.per_device_batch_size),
         "--optim", "adamw_torch",
         "--evaluation_strategy", "no",
@@ -315,9 +332,11 @@ def training_command(
         command.extend(["--replay_layout_manifest", str(args.replay_manifest)])
         if args.replay_image_root is not None:
             command.extend(["--replay_layout_image_root", str(args.replay_image_root)])
-    if stage == "p2" and args.ablation == "vlqa_layout_p1_p2":
+    if stage in {"p2", "p3"} and args.ablation == "vlqa_layout_p1_p2":
         if source_validation_selection is None:
-            raise ValueError("PVLD C5 P2 requires its validation-only P1 selection.")
+            raise ValueError(
+                f"PVLD C5 {stage.upper()} requires its validation-only preceding-stage selection."
+            )
         command.extend(
             ["--source_validation_selection", str(source_validation_selection)]
         )
@@ -339,7 +358,9 @@ def p1_selection_command(
         "--selection-purpose", "p1_layout",
         "--tokenizer-model", str(args.tokenizer_model),
         "--validation-manifest", str(args.validation_manifest),
-        "--validation-image-root", str(args.validation_manifest.parent),
+        "--validation-image-root", str(
+            (args.validation_image_root or args.validation_manifest.parent).resolve()
+        ),
         "--output-dir", str(output_dir),
         "--project-root", str(args.project_root),
         "--max-regions", str(args.max_layout_records),
@@ -356,6 +377,10 @@ def p1_selection_command(
 
 def main() -> int:
     args = parse_args()
+    if args.source_validation_selection is not None and args.stages not in {"p2", "p3"}:
+        raise ValueError(
+            "--source-validation-selection is only valid for a standalone P2 or P3 stage."
+        )
     if args.skip_p1_validation_selection and (
         args.stages != "p1" or args.p1_max_steps > 10
     ):
@@ -382,6 +407,10 @@ def main() -> int:
         "train_manifest": str(args.manifest.resolve()),
         "validation_manifest": str(args.validation_manifest.resolve()),
         "test_manifest": str(args.test_manifest.resolve()),
+        "source_validation_selection": (
+            str(args.source_validation_selection.resolve())
+            if args.source_validation_selection is not None else None
+        ),
         "resumed_from_existing_run": args.resume_existing_run,
         "p1_max_steps": args.p1_max_steps,
         "p2_max_steps": args.p2_max_steps,
@@ -417,7 +446,10 @@ def main() -> int:
     if args.nccl_p2p_disable and len(ids) > 1:
         environment["NCCL_P2P_DISABLE"] = "1"
     source = args.source_model.resolve()
-    p1_selection_path: Path | None = None
+    source_selection_path: Path | None = (
+        args.source_validation_selection.resolve()
+        if args.source_validation_selection is not None else None
+    )
     stage_metrics: dict[str, Any] = {}
     if args.resume_existing_run:
         p1_metrics = run_root / "p1" / "model" / "layout_training_metrics.json"
@@ -431,8 +463,8 @@ def main() -> int:
                 "reused_completed_stage": True,
             }
         candidate_selection = run_root / "p1" / "validation_selection" / "selection.json"
-        if candidate_selection.is_file():
-            p1_selection_path = candidate_selection.resolve()
+        if candidate_selection.is_file() and source_selection_path is None:
+            source_selection_path = candidate_selection.resolve()
     for stage in args.stages.split(","):
         output = run_root / stage / "model"
         output.mkdir(parents=True, exist_ok=args.resume_existing_run)
@@ -444,7 +476,7 @@ def main() -> int:
                 training_command(
                     args, stage, source, output,
                     ids,
-                    source_validation_selection=p1_selection_path,
+                    source_validation_selection=source_selection_path,
                 ),
                 cwd=args.project_root.resolve(),
                 env=environment,
@@ -477,13 +509,26 @@ def main() -> int:
         ):
             selection_dir = run_root / "p1" / "validation_selection"
             selection_log = run_root / "p1" / "validation_selection.log"
-            status.update({"stage": "p1_validation_selection", "stage_status": "running"})
+            # Admission is intentionally repeated here.  A long P1 can change
+            # the set of cards below the utilization threshold before its
+            # validation-only selection begins.
+            selection_gpu_ids, selection_utilization = target_gpus(
+                args.gpu_ids, args.gpu_utilization_limit
+            )
+            status.update(
+                {
+                    "stage": "p1_validation_selection",
+                    "stage_status": "running",
+                    "p1_selection_physical_gpu_ids": selection_gpu_ids,
+                    "p1_selection_gpu_utilization_at_admission": selection_utilization,
+                }
+            )
             (metadata / "status.txt").write_text(
                 compact(status) + "\n", encoding="utf-8"
             )
             with selection_log.open("a", encoding="utf-8") as log:
                 selected = subprocess.run(
-                    p1_selection_command(args, output, selection_dir, ids),
+                    p1_selection_command(args, output, selection_dir, selection_gpu_ids),
                     cwd=Path(__file__).resolve().parents[2],
                     env=dict(os.environ),
                     stdout=log,
@@ -511,7 +556,7 @@ def main() -> int:
             ) is not False:
                 raise RuntimeError("P1 selection did not preserve validation-only protocol.")
             source = Path(selection["selected"]["model_path"]).resolve()
-            p1_selection_path = selection_path.resolve()
+            source_selection_path = selection_path.resolve()
             stage_metrics["p1"].update(
                 {
                     "validation_selection": str(selection_path),
@@ -519,6 +564,8 @@ def main() -> int:
                     "selected_optimizer_step": int(
                         selection["selected"]["optimizer_step"]
                     ),
+                    "selection_physical_gpu_ids": list(selection_gpu_ids),
+                    "selection_gpu_utilization_at_admission": selection_utilization,
                     "p2_source_is_validation_selected_p1": True,
                 }
             )

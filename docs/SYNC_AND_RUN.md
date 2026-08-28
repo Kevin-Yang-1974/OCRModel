@@ -462,6 +462,33 @@ sbatch --export=ALL,PVLD_M4_CONTROL_RUN_ID=mthv2_pvld_m4_validation_controls_202
 
 若正式 M4 run ID 不是默认的 `mthv2_pvld_m4_predrouting_20260826_v1`，须同时显式传入 `PVLD_M4_FORMAL_RUN_ID`。作业启动前一次性核验三张 Slurm 分配卡的瞬时 utilization 均 `<50%`；任一卡不合格时，在启动任何 evaluator 前整体退出。
 
+## 17. 新视觉梯度 P1-P3 自动串联
+
+`run_lavp_p1_p3_formal_tmux.sh` 是新的 S3/S4 合成数据主线入口。它不轮询也不后台等待：每次调用只检查一次同一数据根中的 train、validation、test 三份 manifest。manifest 全部就绪后，重新执行全量 image/hash、近重复、content/source leakage 审计，并要求 `dataset_protocol.json.status=ready`、全量审计通过以及不少于 10,000 张 train 页面。train region exposure 必须记录为覆盖指标，但不再要求不少于 1,000,000 才能创建训练 run。该 gate 未通过时不会创建训练 run；通过后默认只返回 `ready_for_user_confirmation`，不会启动训练。
+
+通过后，入口固定以 GOT2 whole-page 图像和 `layout_memory_resolution=64` 运行 P1、P2、P3：P1 在 S3/S4 train 上使用仅 MTHv2 train 的 `7:1` OCR replay（replay OCR weight `0.25`）；P1 layout validation selection 的 selected checkpoint 初始化 P2；P2 OCR validation selection 的 selected checkpoint 初始化 P3；P3 selection 后才依次执行 P2 synthetic-ID 与 P3 MTHv2 Real-OOD selection-locked test。两个 test 都只读取各自已生成的 selection JSON，禁止参与选点。每个训练、selection 和 test 阶段都会重新使用所有瞬时 utilization 严格小于 50% 的 GPU；已有或忙碌的卡不等待、不抢占。
+
+```bash
+bash tools/training/run_lavp_p1_p3_formal_tmux.sh \
+  --session lavp_p1_p3_formal_20260827_v3 \
+  --run-prefix lavp_p1_p3_formal_20260827_v3 \
+  --layout-memory-resolution 64
+```
+
+上述调用只完成一次数据门控和审计。审计结果向用户提交并获得确认后，才可在新的调用中附加 `--confirm-formal-training` 创建正式 P1/P2/P3 及其 validation selection 和 selection-locked test。该入口拒绝已有 run、selection 或 test 输出目录，不能用于恢复或覆盖历史任务。只读取新 S3/S4 数据和 MTHv2 官方 whole-page split；不读取 MTHv2 validation/test 作为 P1 replay。状态只查看 `tmux has-session`、pipeline log 最后 20 行和各 run 的 `metadata/status.txt`，不要重启合成 tmux 或重复启动本入口。
+
+## 18. 历史 S3/S4 P1-P2 Pilot
+
+该 pilot 只用于工程与方向性验证，与 v4/v5 正式主线完全隔离。它从历史 `ancient_photo_diverse_formal_s3s4_20260826_v1` 的 validation split 预先锁定按 tier、region bucket 与 direction 分层的 256 页清单，然后执行 P1 2,000 steps、validation-only P1 selection、P2 5,000 steps 和 validation-only P2 selection。P1 使用 MTHv2 train-only OCR replay，固定 `7:1` 和 `0.25`；输入保持 whole-page、64×64 layout memory、256 个 Qwen OCR visual tokens。该入口不运行 P3 或 test：
+
+```bash
+bash tools/training/run_historical_s3s4_p1_p2_pilot_tmux.sh \
+  --session lavp_historical_s3s4_pilot_20260827_v3 \
+  --run-prefix lavp_historical_s3s4_pilot_20260827_v3
+```
+
+每次重试都必须使用新的 session/run prefix；不得恢复、覆盖或删除 v1/v2 记录。启动后应先在 `p1/train.log` 核验 optimizer group LR：P1 vision/projector/layout 分别为 `1e-6/1e-5/1e-4`，而非通用 `--learning_rate`。完整配置、validation 清单哈希、隔离边界和已知失败记录见 `docs/LAVP_EXPERIMENT_CONFIGURATION_REGISTER.md`。
+
 成功条件为控制 run 根目录存在 `summary.json`，其中 `status=ok`、`selection_split=validation`、`test_used_for_selection=false`、`test_manifest_read=false`，且三个 condition 均有 240 页指标。完整 predictions 和单项日志保留在各 condition 子目录；终端只回传：
 
 ```bash

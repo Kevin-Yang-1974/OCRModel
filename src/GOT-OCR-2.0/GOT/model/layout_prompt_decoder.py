@@ -1069,7 +1069,14 @@ class PromptedVariableLayoutAdapter(nn.Module):
             # visual-value route remains active so low-confidence/free-layout
             # pages cannot disconnect OCR gradients from visual tokens.
             routed = routed + predicted_condition.unsqueeze(1) * routing_reliability.view(-1, 1, 1)
-        visual_output = visual_tokens + torch.tanh(self.residual_gate) * self.writeback_output(routed)
+        # Reliability is intentionally computed in float32.  Cast only at the
+        # BF16 writeback boundary so free-layout routing stays numerically stable
+        # while the OCR visual-token interface preserves its original dtype.
+        writeback = self.writeback_output(
+            routed.to(dtype=self.writeback_output.weight.dtype)
+        ).to(dtype=visual_tokens.dtype)
+        gate = torch.tanh(self.residual_gate).to(dtype=visual_tokens.dtype)
+        visual_output = visual_tokens + gate * writeback
 
         decoder_output = None
         record_output = None

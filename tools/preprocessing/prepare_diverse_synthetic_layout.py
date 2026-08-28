@@ -9,6 +9,8 @@ import sys
 from pathlib import Path
 from typing import Sequence
 
+from synthetic_layout_common import GeneratorConfig, build_page_plan, load_content_items
+
 
 TIERS = (
     "s0-html-text", "s1-html-crop", "s2-hard", "s3-ancient-hard", "s4-mixed"
@@ -74,6 +76,34 @@ def write_json(path: Path, payload: object) -> None:
     )
 
 
+def planned_train_region_exposures(
+    *,
+    content_manifest: Path,
+    content_root: Path | None,
+    config: Path,
+    tiers: Sequence[str],
+    pages_per_tier: int,
+    seed: int,
+) -> int:
+    """Count deterministic train regions before expensive browser rendering."""
+    items = load_content_items(content_manifest, content_root)
+    generator_config = GeneratorConfig.from_json(config)
+    return sum(
+        len(
+            build_page_plan(
+                items=items,
+                config=generator_config,
+                split="train",
+                tier=tier,
+                base_seed=seed,
+                page_index=page_index,
+            ).regions
+        )
+        for tier in tiers
+        for page_index in range(pages_per_tier)
+    )
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
     if args.seed < 0:
@@ -94,10 +124,26 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     tiers = args.tier or list(TIERS)
     requested_train_pages = len(tiers) * args.train_pages_per_tier
-    if requested_train_pages < args.min_train_pages_total:
+    # Small plan-only invocations are used to validate deterministic planning without
+    # rendering a formal corpus. The registered formal thresholds still apply before
+    # every rendered dataset is allowed to proceed.
+    if not args.plan_only and requested_train_pages < args.min_train_pages_total:
         raise ValueError(
             "The formal synthesis target requires at least "
             f"{args.min_train_pages_total} train pages; requested={requested_train_pages}."
+        )
+    planned_train_regions = planned_train_region_exposures(
+        content_manifest=content_manifest,
+        content_root=content_root,
+        config=config,
+        tiers=tiers,
+        pages_per_tier=args.train_pages_per_tier,
+        seed=args.seed,
+    )
+    if not args.plan_only and planned_train_regions < args.target_train_region_exposures:
+        raise RuntimeError(
+            "The deterministic pre-render train plan is below the registered region target: "
+            f"{planned_train_regions} < {args.target_train_region_exposures}."
         )
     pages = {
         "train": args.train_pages_per_tier,
@@ -179,6 +225,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "total_pages": len(tiers) * sum(pages.values()),
         "minimum_train_pages_total": args.min_train_pages_total,
         "target_train_region_exposures": args.target_train_region_exposures,
+        "planned_train_region_exposures": planned_train_regions,
         "train_page_count": requested_train_pages,
         "train_region_exposures": train_regions,
         "input_level": "whole_page_image",

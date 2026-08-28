@@ -495,27 +495,25 @@ def main() -> None:
 
     html_dir = output_dir / "html"
     html_dir.mkdir()
-    plans = [
-        build_page_plan(
-            items=items,
-            config=config,
-            split=args.split,
-            tier=tier,
-            base_seed=args.seed,
-            page_index=page_index,
-        )
-        for tier in args.tier
-        for page_index in range(args.num_pages)
+    total_pages = len(args.tier) * args.num_pages
+
+    def iter_page_plans() -> Any:
+        for tier in args.tier:
+            for page_index in range(args.num_pages):
+                yield build_page_plan(
+                    items=items,
+                    config=config,
+                    split=args.split,
+                    tier=tier,
+                    base_seed=args.seed,
+                    page_index=page_index,
+                )
+
+    eligible_items = [
+        item
+        for item in items
+        if item.split == args.split
     ]
-    html_paths: list[Path] = []
-    for plan in plans:
-        html_path = html_dir / f"{plan.page_id}.html"
-        html_path.write_text(
-            render_page_html(plan, config, debug_outlines=args.debug_outlines),
-            encoding="utf-8",
-            newline="\n",
-        )
-        html_paths.append(html_path)
 
     common_metadata = {
         "schema_version": SCHEMA_VERSION,
@@ -525,39 +523,25 @@ def main() -> None:
         "split": args.split,
         "tiers": args.tier,
         "num_pages_per_tier": args.num_pages,
-        "num_pages": len(plans),
+        "num_pages": total_pages,
         "base_seed": args.seed,
         "generator_config": config.to_dict(),
         "planned_distribution": {
-            "languages": sorted(
-                {
-                    region.item.language
-                    for plan in plans
-                    for region in plan.regions
-                }
-            ),
-            "writing_directions": sorted(
-                {
-                    region.writing_direction
-                    for plan in plans
-                    for region in plan.regions
-                }
-            ),
-            "font_families": sorted(
-                {region.font_family for plan in plans for region in plan.regions}
-            ),
-            "backgrounds": sorted({plan.background for plan in plans}),
+            "languages": sorted({item.language for item in eligible_items}),
+            "writing_directions": sorted(config.directions),
+            "font_families": sorted(config.font_families or [config.font_family]),
+            "backgrounds": sorted(config.backgrounds),
             "font_size_range": [
-                min(region.font_size for plan in plans for region in plan.regions),
-                max(region.font_size for plan in plans for region in plan.regions),
+                config.font_size_min,
+                config.font_size_max,
             ],
             "line_height_range": [
-                min(region.line_height for plan in plans for region in plan.regions),
-                max(region.line_height for plan in plans for region in plan.regions),
+                config.line_height_min,
+                config.line_height_max,
             ],
             "letter_spacing_range": [
-                min(region.letter_spacing for plan in plans for region in plan.regions),
-                max(region.letter_spacing for plan in plans for region in plan.regions),
+                config.letter_spacing_min,
+                config.letter_spacing_max,
             ],
         },
         "python_version": platform.python_version(),
@@ -573,13 +557,22 @@ def main() -> None:
     }
 
     if args.plan_only:
-        write_jsonl(output_dir / "plans.jsonl", (plan_to_record(plan) for plan in plans))
+        def iter_plan_records() -> Any:
+            for plan in iter_page_plans():
+                html_path = html_dir / f"{plan.page_id}.html"
+                html_path.write_text(
+                    render_page_html(plan, config, debug_outlines=args.debug_outlines),
+                    encoding="utf-8",
+                )
+                yield plan_to_record(plan)
+
+        write_jsonl(output_dir / "plans.jsonl", iter_plan_records())
         write_json(
             output_dir / "dataset_meta.json",
             {**common_metadata, "status": "plan_only", "formal_manifest_emitted": False},
         )
         print("SYNTHETIC_LAYOUT_PLAN_OK")
-        print(f"pages={len(plans)}")
+        print(f"pages={total_pages}")
         print(f"output_dir={output_dir}")
         print(f"plans={output_dir / 'plans.jsonl'}")
         return
@@ -587,9 +580,9 @@ def main() -> None:
     sync_playwright = import_playwright()
     images_dir = output_dir / "images"
     images_dir.mkdir()
-    manifest_records: list[dict[str, Any]] = []
     manifest_path = output_dir / "manifest.jsonl"
     browser_version = ""
+    rendered_count = 0
     playwright_version = importlib.metadata.version("playwright")
 
     with sync_playwright() as playwright:
@@ -633,9 +626,13 @@ def main() -> None:
                     },
                 )
                 with manifest_path.open("x", encoding="utf-8", newline="\n") as manifest_handle:
-                    for rendered_index, (plan, html_path) in enumerate(
-                        zip(plans, html_paths), start=1
-                    ):
+                    for rendered_index, plan in enumerate(iter_page_plans(), start=1):
+                        html_path = html_dir / f"{plan.page_id}.html"
+                        html_path.write_text(
+                            render_page_html(plan, config, debug_outlines=args.debug_outlines),
+                            encoding="utf-8",
+                            newline="\n",
+                        )
                         page.goto(html_path.resolve().as_uri(), wait_until="load")
                         page.evaluate("() => document.fonts.ready")
                         page.wait_for_function(
@@ -733,23 +730,26 @@ def main() -> None:
                                     "33-64" if len(plan.regions) <= 64 else
                                     "65-128" if len(plan.regions) <= 128 else ">128"
                                 ),
-                                "column_count": len(plan.regions),
+                                "region_count": len(plan.regions),
+                                "column_count": plan.column_count,
+                                "row_count": plan.row_count,
+                                "layout_geometry": plan.layout_geometry,
                                 "difficulty_tier": plan.tier,
                             },
                             degradation=degradation,
                         )
-                        manifest_records.append(record)
                         manifest_handle.write(
                             json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n"
                         )
                         manifest_handle.flush()
+                        rendered_count = rendered_index
                         if (
                             rendered_index % args.progress_every == 0
-                            or rendered_index == len(plans)
+                            or rendered_index == total_pages
                         ):
                             print(
                                 f"SYNTHETIC_LAYOUT_PROGRESS "
-                                f"rendered={rendered_index} total={len(plans)}"
+                                f"rendered={rendered_index} total={total_pages}"
                             )
                             sys.stdout.flush()
             finally:
@@ -771,7 +771,7 @@ def main() -> None:
         },
     )
     print("SYNTHETIC_LAYOUT_GENERATION_OK")
-    print(f"pages={len(manifest_records)}")
+    print(f"pages={rendered_count}")
     print(f"tiers={','.join(args.tier)}")
     print(f"chromium_version={browser_version}")
     print(f"output_dir={output_dir}")

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import importlib.util
+import os
+import subprocess
 import sys
 from unittest.mock import patch
 from pathlib import Path
@@ -39,23 +41,42 @@ def test_p1_checkpoints_are_queued_every_2000_steps_and_selected_on_validation()
     assert 'selection.get("selection_split") != "validation"' in source
     assert 'selection.get(\n                "test_used_for_selection"\n            ) is not False' in source
     assert 'source = Path(selection["selected"]["model_path"]).resolve()' in source
-    assert 'p1_selection_path = selection_path.resolve()' in source
+    assert 'source_selection_path = selection_path.resolve()' in source
     assert '"--source_validation_selection", str(source_validation_selection)' in source
+    assert 'selection_gpu_ids, selection_utilization = target_gpus(' in source
+    assert 'p1_selection_command(args, output, selection_dir, selection_gpu_ids)' in source
+    assert '"selection_physical_gpu_ids": list(selection_gpu_ids)' in source
 
 
 def test_c5_recovery_reuses_selection_without_modifying_checkpoint() -> None:
     source = MODULE_PATH.read_text(encoding="utf-8")
     assert 'candidate_selection = run_root / "p1" / "validation_selection" / "selection.json"' in source
-    assert 'PVLD C5 P2 requires its validation-only P1 selection.' in source
+    assert 'PVLD C5 {stage.upper()} requires its validation-only preceding-stage selection.' in source
 
     trainer_source = (
         Path(__file__).resolve().parents[1]
         / "src" / "GOT-OCR-2.0" / "scripts" / "train_GOT_layout.py"
     ).read_text(encoding="utf-8")
-    assert 'selection.get("selection_purpose") != "p1_layout"' in trainer_source
+    assert 'selection.get("selection_purpose") != expected_selection_purpose' in trainer_source
     assert 'selection.get("test_used_for_selection") is not False' in trainer_source
     assert 'selected_model != source_model.resolve()' in trainer_source
     assert 'selected.get("weights_sha256") != file_sha256(weights_path)' in trainer_source
+
+
+def test_p3_requires_p2_ocr_selection_and_preserves_selection_provenance() -> None:
+    source = MODULE_PATH.read_text(encoding="utf-8")
+    assert 'parser.add_argument(\n        "--source-validation-selection"' in source
+    assert 'if stage in {"p2", "p3"} and args.ablation == "vlqa_layout_p1_p2"' in source
+    assert '"--source_validation_selection", str(source_validation_selection)' in source
+
+    trainer_source = (
+        Path(__file__).resolve().parents[1]
+        / "src" / "GOT-OCR-2.0" / "scripts" / "train_GOT_layout.py"
+    ).read_text(encoding="utf-8")
+    assert '"p2": "p1_layout"' in trainer_source
+    assert '"p3": "ocr"' in trainer_source
+    assert 'def validate_pvld_source_selection(' in trainer_source
+    assert '"source_validation_selection": (' in trainer_source
 
 
 def test_runner_propagates_m1_boundary_configuration_and_parallel_selection() -> None:
@@ -66,6 +87,9 @@ def test_runner_propagates_m1_boundary_configuration_and_parallel_selection() ->
     assert '"--nproc_per_node",' in source
     assert 'environment["CUDA_VISIBLE_DEVICES"] = ",".join(ids)' in source
     assert 'choices=("deepspeed_zero2", "ddp")' in source
+    assert 'str(deepspeed), "--num_gpus", str(len(gpu_ids)), "--master_port"' in source
+    assert 'DeepSpeed launcher is missing' in source
+    assert 'str(torchrun), "--standalone", "--nproc_per_node"' in source
     assert '["--ddp_find_unused_parameters", "True"]' in source
     assert '"distributed_strategy": args.distributed_strategy' in source
     assert '"--nccl-p2p-disable"' in source
@@ -94,10 +118,11 @@ def test_runner_propagates_m1_boundary_configuration_and_parallel_selection() ->
     assert 'parser.add_argument("--tensor-mib", type=int, default=0)' in nccl_source
     assert 'dist.broadcast(payload, src=0)' in nccl_source
     assert 'torch.cuda.set_device(local_rank)' in train_source
-    assert 'adapter.visual_routing,' in train_source
+    assert 'getattr(adapter, "visual_routing", None),' in train_source
     assert 'adapter.residual_gate.requires_grad_(False)' in train_source
-    assert 'configure_ddp_frozen_parameter_ignores(model, training_args)' in train_source
-    assert '_set_params_and_buffers_to_ignore_for_model' in train_source
+    assert 'audit_ddp_frozen_parameters(model, training_args)' in train_source
+    assert '"ddp_private_ignore_applied": False' in train_source
+    assert '_set_params_and_buffers_to_ignore_for_model' not in train_source
     assert '"first_training_step_complete"' in train_source
     smoke_source = (
         Path(__file__).resolve().parents[1]
@@ -183,3 +208,83 @@ def test_stage_learning_rates_are_differentiated() -> None:
     assert p1["vision"] > p2["vision"] > p3["vision"]
     assert p1["layout"] > p2["layout"] > p3["layout"]
     assert p2["qwen"] > p3["qwen"]
+
+
+def test_formal_p1_p3_pipeline_keeps_data_and_selection_gates() -> None:
+    pipeline = (
+        Path(__file__).resolve().parents[1]
+        / "tools"
+        / "training"
+        / "run_lavp_p1_p3_formal_tmux.sh"
+    ).read_text(encoding="utf-8")
+    assert "wait_for_synthetic_manifests" not in pipeline
+    assert "sleep \"${interval_seconds}\"" not in pipeline
+    assert '"lavp_formal_data_not_ready"' in pipeline
+    assert '"lavp_formal_data_ready_for_user_confirmation"' in pipeline
+    assert "--confirm-formal-training" in pipeline
+    assert "if (( ! confirm_formal_training )); then" in pipeline
+    assert pipeline.index("if (( ! confirm_formal_training )); then") < pipeline.index("command -v tmux")
+    assert '"${synthetic_root}/train/manifest.jsonl"' in pipeline
+    assert '"${synthetic_root}/validation/manifest.jsonl"' in pipeline
+    assert '"${synthetic_root}/test/manifest.jsonl"' in pipeline
+    assert "--min-train-high-region-page-fraction 0.50" in pipeline
+    assert '"train_high_region_page_fraction"' in pipeline
+    assert "train_region_exposures" in pipeline
+    assert "train regions are below the formal minimum" not in pipeline
+    assert '--layout-memory-resolution "${layout_memory_resolution}"' in pipeline
+    assert '--replay-manifest "${mthv2_root}/train/manifest.jsonl"' in pipeline
+    assert '--source-validation-selection "${p1_selection}"' in pipeline
+    assert '--source-validation-selection "${p2_selection}"' in pipeline
+    assert 'select_checkpoint "${p2_root}/p2/model"' in pipeline
+    assert 'select_checkpoint "${p3_root}/p3/model"' in pipeline
+    assert "for group in legacy m2 m3 m4 all; do" in pipeline
+    assert "group_flags()" in pipeline
+    assert "legacy) printf '%s\\n' 'false 1.0 1.0 false'" in pipeline
+    assert "all) printf '%s\\n' 'true 0.25 0.25 true'" in pipeline
+    assert 'local group_prefix="${run_prefix}_${group}"' in pipeline
+    assert '"${runner_flags[@]}"' in pipeline
+    assert "run_m4_validation_controls()" in pipeline
+    assert "normal alpha_zero shuffled_evidence" in pipeline
+    assert '"test_manifest_read": False' in pipeline
+    assert 'normal < metrics["alpha_zero"]["page_cer"]' in pipeline
+    assert '"M4 controls require a validation-only selection"' in pipeline
+    assert '"selected checkpoint hash changed: {filename}"' in pipeline
+    assert 'run_m4_validation_controls "${group}" "${p2_selection}" "${m4_controls_root}"' in pipeline
+    assert 'Synthetic-ID 512' in pipeline
+    assert 'Real-OOD 512' in pipeline
+    assert pipeline.index('--source-validation-selection "${p2_selection}"') < pipeline.index('Synthetic-ID 512')
+    assert pipeline.index('select_checkpoint "${p3_root}/p3/model"') < pipeline.index('Synthetic-ID 512')
+
+
+def test_formal_gate_returns_without_tmux_when_manifests_are_absent(tmp_path: Path) -> None:
+    pipeline = (
+        Path(__file__).resolve().parents[1]
+        / "tools"
+        / "training"
+        / "run_lavp_p1_p3_formal_tmux.sh"
+    )
+    environment = dict(os.environ)
+    environment.update(
+        {
+            "OCR_WORKSPACE": str(tmp_path / "workspace"),
+            "GOT_TRAINING_RUNS": str(tmp_path / "training_runs"),
+            "GOT_EVALUATION_RUNS": str(tmp_path / "evaluation_runs"),
+            "GOT_SOURCE_MODEL": str(tmp_path / "source_model"),
+        }
+    )
+    completed = subprocess.run(
+        [
+            "bash", str(pipeline), "--session-inner",
+            "--synthetic-root", str(tmp_path / "missing_data"),
+            "--mthv2-root", str(tmp_path / "unused_mthv2"),
+            "--session", "formal_gate_contract",
+            "--run-prefix", "formal_gate_contract",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=environment,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert '"event":"lavp_formal_data_not_ready"' in completed.stdout
+    assert not (tmp_path / "training_runs").exists()
