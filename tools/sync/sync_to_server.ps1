@@ -36,7 +36,7 @@ foreach ($commandName in $requiredCommands) {
 
 $relativeFiles = @(
     & git.exe -C $repository ls-files --cached --others --exclude-standard -- `
-        src tools config references
+        src tools config
 )
 if ($LASTEXITCODE -ne 0) {
     throw 'git ls-files failed.'
@@ -86,7 +86,7 @@ try {
     }
 
     $uploadRoots = @(
-        'src', 'tools', 'config', 'references' |
+        'src', 'tools', 'config' |
             ForEach-Object { Join-Path $temporaryRoot $_ } |
             Where-Object { Test-Path -LiteralPath $_ }
     )

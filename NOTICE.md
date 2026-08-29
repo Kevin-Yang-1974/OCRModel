@@ -23,6 +23,6 @@
 
 ## 历史 AncientDoc 兼容评估
 
-`references/legacy-ancientdoc-eval` 保存项目早期共享环境中的四个评估脚本快照，用于核对历史 AncientDoc split5 解码和指标口径。它们不是当前活动源码，可能包含旧路径、旧参数和历史注释；不得直接作为当前 LAVP/PVLD 入口。活动包装器位于 `tools/evaluation`。
+历史 AncientDoc、VLQA/VQLCA、Chunk 和 SOTA 评估脚本不属于当前共享主线；整理前版本保存在远程 `archive/legacy-vlqa-chunk-20260829` 分支，仅用于历史结果复现和口径核对，不得直接作为当前 PVLD 入口。
 
 模型权重、数据集和历史完整预测均未包含在共享仓库中，其访问和使用仍受各自来源条款约束。

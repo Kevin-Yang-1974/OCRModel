@@ -51,9 +51,9 @@ numpy 1.26.4
 4. `setup_server_envs.sh` 不下载模型权重、不复制数据集、不修改系统 Python、系统 CUDA或 shell 启动文件。
 5. 权重、数据和运行目录由机器本地的 `config/paths.env` 指定，不在代码中保存个人绝对路径。只读共享资产不得由安装或运行脚本修改。
 
-## 整页合成与 VLQA 依赖状态
+## 整页合成与 PVLD 依赖状态
 
-整页合成器已实现于 `tools/preprocessing/generate_synthetic_layout.py`，当前使用 Playwright/Chromium 读取 DOM bbox，并使用 NumPy/Pillow 完成保持几何不变的退化。Python 依赖已固定在 `tools/environment/requirements-layout-synthesis.lock.txt`：
+整页合成器已实现于 `tools/preprocessing/generate_synthetic_layout.py`，当前使用 Playwright/Chromium 读取 DOM bbox，并使用 NumPy/Pillow 完成保持几何不变的退化。生成的页面供 whole-page PVLD 训练；bbox 只写入 manifest，不进入推理接口。Python 依赖已固定在 `tools/environment/requirements-layout-synthesis.lock.txt`：
 
 ```text
 numpy==2.1.3

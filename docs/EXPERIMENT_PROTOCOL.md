@@ -1,95 +1,33 @@
-# 正式实验协议
+# 当前实验协议
 
-> **方案口径更新（2026-08-25）**：当前论文方法名为 **LAVP（Layout-Aware Visual Prompting）**，其当前工程实现包含 global visual/layout prompts、causal PVLD 布局重建与 `visual_value_layout_routing`。下文 `A0`–`A5` 中的 `vlqa_*` 组属于已完成/已注册的 **Fixed-Slot VLQA 历史消融协议**；VQLCA 是该旧架构的历史写回变体。二者均不再是当前主方案，也不是 LAVP 的别名。当前 LAVP/PVLD 必须另行注册配置并与这些历史基线公平比较。
+## 研究对象与输入
 
-## 1. 研究问题
+当前研究对象是面向多场景、小样本条件的通用符号识别模型。正式样本单位为完整页面，模型输入固定为 `whole_page_image + ocr_prompt`。布局区域、bbox、书写方向和阅读顺序只作为训练期辅助监督或离线评测真值，不作为推理输入；line-level 或 oracle chunk 只属于独立诊断，不能与页面结果混比。
 
-正式实验回答：在整页 GOT2 上加入少量受布局监督的视觉 queries，能否在小样本条件下提高页面符号转写、阅读顺序和跨域鲁棒性，并将收益与额外参数、视觉重采样或外部布局输入区分开。
+## 阶段流程
 
-## 2. 输入与样本单位
-
-- 正式样本单位是完整页面。
-- 训练、验证和推理输入为原始整页图像与统一 OCR prompt。
-- 页面经 GOT2 原生 1024×1024 预处理后进入 Vary ViT。
-- bbox、方向、顺序和区域转写是可选监督或评测真值，不是推理输入。
-- line-level 图像只能用于兼容诊断、独立 baseline 或生成合成页面。
-
-每条页面记录至少包含：
-
-```json
-{
-  "page_id": "page_001",
-  "source_group_id": "source_001",
-  "split": "train",
-  "image": "images/page_001.png",
-  "page_text": "按真值阅读顺序拼接的页面转写",
-  "regions": []
-}
+```text
+P1 layout training
+ -> validation-only P1 selection
+P2 OCR + layout training (from selected P1)
+ -> validation-only P2 selection
+P3 domain adaptation (from selected P2)
+ -> validation-only P3 selection
+ -> selection-locked test
 ```
 
-可选 `regions` 字段包含归一化 bbox、`reading_order`、`writing_direction` 和区域转写。没有区域标注的真实页面仍可参与 OCR loss，对应布局损失必须通过 mask 跳过。
+每个阶段的选择只读取 validation。test 不得参与训练、checkpoint 选择、阈值、prompt 或后处理调整；每次选择必须记录 checkpoint、数据清单和协议哈希。
 
-## 3. 数据划分
+## 数据划分与少样本
 
-必须先按来源分组划分 train/validation/test，再生成页面或增强。分组单位根据数据至少包含书手、版本、馆藏、来源文档、内容 ID 或符号类型之一。
+划分先于页面渲染和增强，按书手、版本、馆藏、来源文档、内容 ID 或符号类型等来源组进行。禁止同一源页、同一内容、近重复页面或 crop 跨 split。领域级少样本限制独立来源组的标注页数/比例；稀有符号级 K-shot 限制每个符号的独立来源实例数，增强版本不增加 K。报告必须给出 split、来源组、页面数、区域数、manifest SHA-256 和近重复审计状态。
 
-禁止以下泄漏：
+S3/S4 正式 validation 固定 400 页（每个 tier 200 页），P1/P2/P3 共用。MTHv2 `train` 仅用于 P1 replay/P3 训练，`validation` 不进入训练，`test` 仅用于最终 locked test；其 `label_textline` 是有序候选，不宣称严格列真值。详见 [`BRANCH_AND_DATA_LAYOUT.md`](BRANCH_AND_DATA_LAYOUT.md)。
 
-- 同页或同一原页面 crop 跨 split；
-- 同版本或近重复页面跨 split；
-- 同一内容的不同模板、字体、位置或退化版本跨 split；
-- 从验证/测试内容生成训练合成页面；
-- 先生成页面再随机按页面划分。
+## 目标函数与指标
 
-所有 manifest 必须一起通过内容哈希、来源组和页面哈希审计。
+P1 训练 causal PVLD 的布局 token、REGION/EOS、bbox、方向和 count 监督；P2/P3 联合 OCR 与布局损失，OCR Value 通过 `visual_value_layout_routing` 保持来自视觉 token。报告页面 CER、编辑距离、页面精确匹配、区域 P/R/F1、bbox IoU、方向/顺序指标、EOS/count 截断、训练稳定性、可训练参数量、峰值显存和吞吐。
 
-## 4. 小样本设置
+## 历史方案边界
 
-领域级少样本限制新书手、新版本、新馆藏或新符号场景的标注页面数或比例。每个设置报告可用页面数、区域数、独立来源组数和标注比例。
-
-稀有符号级 K-shot 限制每个低频符号的独立来源实例数。同一实例生成多个布局或退化版本不能增加 K。报告每个 K 的符号集合、独立来源计数、宏平均召回和频次分层结果。
-
-## 5. 历史 Fixed-Slot VLQA 模型对照
-
-| 编号 | 配置 | 归因目的 |
-|---|---|---|
-| `A0` | `got2_zero_shot` | 不训练的原始整页 GOT2 参考 |
-| `A1` | `projector_only` | 控制合成域与原始 projector 适配 |
-| `A2` | `generic_adapter_projector` | 以等参数普通 Transformer adaptor 控制新增容量 |
-| `A3` | `vlqa_ocr_only` | 历史 Fixed-Slot VLQA OCR-only 对照 |
-| `A4` | `vlqa_layout_direct` | 历史 Fixed-Slot VLQA 直接 P2 布局监督对照 |
-| `A5` | `vlqa_layout_p1_p2` | 历史 Fixed-Slot VLQA P1→P2 对照，并单独报告总预算 |
-
-oracle/pseudo-layout region-token adaptor、外部轻量检测器和双 GOT2 两阶段系统继续作为独立扩展对照，不占用本轮 `A0`–`A5` 编号。只有输入页面、数据划分、训练预算、解码与页面级指标一致时才比较最终结果。
-
-## 6. 训练公平性
-
-历史 `A0`–`A5` 复现固定：
-
-- 相同 train/validation/test 页面及 manifest 版本；
-- 相同图像预处理、OCR prompt、tokenizer 和解码参数；
-- 相同有效 batch size、优化步数和数据重复规则；
-- 尽量相同的可训练参数量；无法等参数时同时报告差值；
-- 相同 checkpoint 选择规则和 early stopping 信息；
-- 至少报告预先固定的 seed，正式结论应包含多 seed 波动。
-
-P1 两样本 overfit 和单步 smoke 是实现门槛，不计入训练预算，也不能用于选取正式结果。
-
-## 7. 指标
-
-主 OCR 指标：页面 CER、页面编辑距离、完整页面精确匹配率和稀有符号召回率。
-
-布局诊断指标：区域召回、bbox IoU/mAP、书写方向准确率、成对阅读顺序准确率和 Kendall's tau。区域级 CER 只用于定位错误，不替代页面指标。
-
-泛化与成本：跨书手、跨版本、跨馆藏、跨符号类型、跨模板表现，以及可训练参数量、峰值显存、吞吐量和单页延迟。独立双 GOT2 系统还需分别报告上游分割与下游识别成本及错误传播。
-
-## 8. 结论门槛
-
-历史 Fixed-Slot 结论只有在 A4/A5 于真实整页、小样本划分和统一预算下稳定优于 A1、A2 与 A3 时，才能分别讨论布局监督和 P1 预热贡献；A0 仅为零样本参考。当前 LAVP 的性能主张必须由 LAVP/PVLD 在同协议下相对原始 GOT2、等参数量普通 adaptor 和 Fixed-Slot VLQA/VQLCA baseline 的独立结果支持，不能复用旧 A3–A5 数字。论文摘要中的 “improved recognition performance” 仅可在对应 validation 选点和锁定 test 结果确实成立后保留。以下结果不足以支持该结论：
-
-- 仅合成训练集 loss 下降；
-- 仅两样本 overfit 通过；
-- 仅 bbox 或方向辅助指标改善而页面 OCR 不改善；
-- 使用有泄漏的 AncientDoc 旧 split；
-- 用单列 CER 对比页面 CER；
-- 仅增加参数量或输入分辨率后提升。
+Fixed-Slot VLQA/VQLCA、Chunk、AncientDoc、BSCC、SOTA、M2/M3/M4/All 和双 GOT2 均不属于当前协议。其脚本、报告和测试保存在 `archive/legacy-vlqa-chunk-20260829`，仅用于复现和溯源。不同输入粒度、split、预算或 checkpoint 选择规则的结果不得直接比较，也不得把历史数值写成 PVLD 主线结论。

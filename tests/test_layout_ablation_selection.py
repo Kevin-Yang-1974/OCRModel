@@ -9,7 +9,6 @@ from pathlib import Path
 from unittest import mock
 
 MODULE_PATH = Path(__file__).resolve().parents[1] / "tools" / "evaluation" / "select_layout_ablation_checkpoint.py"
-AUTO_EVAL_PATH = Path(__file__).resolve().parents[1] / "tools" / "training" / "run_pvld_p2_auto_eval_tmux.sh"
 SPEC = importlib.util.spec_from_file_location("layout_ablation_selection_under_test", MODULE_PATH)
 selection = importlib.util.module_from_spec(SPEC)
 assert SPEC.loader is not None
@@ -88,13 +87,6 @@ class LayoutAblationSelectionTests(unittest.TestCase):
         (partial / "evaluator.log").write_text("failed\n", encoding="utf-8")
         with self.assertRaisesRegex(FileExistsError, "use --resume"):
             selection.candidate_output_dir(output, 7500, resume=False)
-
-    def test_auto_eval_uses_resume_and_session_scoped_log(self) -> None:
-        source = AUTO_EVAL_PATH.read_text(encoding="utf-8")
-        self.assertIn("--gpu-utilization-limit 50 --resume", source)
-        self.assertIn('--parallel-gpu-ids "${gpu_ids}"', source)
-        self.assertIn('pipeline_log="${log_root}/${session}.log"', source)
-        self.assertNotIn('>"${log_root}/pipeline.log"', source)
 
     def test_selection_uses_page_cer_then_whitespace_then_step(self) -> None:
         candidates = [
