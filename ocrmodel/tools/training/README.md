@@ -62,6 +62,8 @@ P1 默认每 `2000` steps 保存 checkpoint，全部 P1 checkpoints 作为 valid
 
 历史合成数据工程 pilot 使用 `run_historical_s3s4_p1_p2_pilot_tmux.sh`。它只读 `ancient_photo_diverse_formal_s3s4_20260826_v1`，独立锁定 256 页 `tier × region bucket × direction` validation，运行 P1 2,000 steps -> P1 validation-only selection -> P2 5,000 steps -> P2 validation-only selection，每 1,000 steps 保存。它永远不执行 P3 或 test，且其 run、checkpoint 和 selection 不得进入正式主线。完整配置与已知失败记录见 `docs/LAVP_EXPERIMENT_CONFIGURATION_REGISTER.md`。
 
+时间受限的 Legacy PVLD 冻结/训练策略验证使用 `run_time_constrained_pvld_baseline.sh`。该入口不启用 M2、M3、M4、All 或其他新增结构，直接复用 v9 Legacy P1 checkpoint；从正式 S3/S4 validation split 按 `tier × region-count bucket × complexity tertile` 固定选择 400 页，S3/S4 各 200 页。P1、P2、P3 的 validation 均使用同一 manifest，P2/P3 的参数范围、数据方式和分组学习率保持 v9 Legacy 配置，不新增逐步解冻。P2 只保存并评估 `10000/20000/30000`，P3 只保存并评估 `8000`；P3 validation 锁定后继续使用 v9 的 MTHv2 test 做一次 selection-locked test。当前 v9 P1 实际不存在要求的 `checkpoint-9000`，因此入口在创建新 run 前硬失败；不得用 8000 或 10000 静默替代，也不得重训 P1。
+
 selection 的 `--resume` 只复用通过模型路径、manifest、split、解码参数和 whole-page prompt-only 输入协议校验的既有 candidate summary；不一致时拒绝继续。指标兼容层把 evaluator 的 `character_edits`、`reference_characters`、`page_exact_matches` 规范化为 selection/test 的稳定总量字段。用 `tools/evaluation/run_layout_ablation_selection_smoke.sh <training-run-id> <dataset-id> <checkpoint-step>` 做 1 页断点续跑工程验证；该结果不能代替正式 validation 选点。
 
 多样化 synthetic A5 到 AncientDoc C0/C1/C4/C5/C6 的阶段化入口为 `run_diverse_synthetic_ancientdoc.sh`。默认 synthetic P1/P2 为 12000/24000 steps、每 2000 steps 保存并在 synthetic validation 选 P2-best；C4 必须通过 `--source-selection` 从该 selected checkpoint 启动。AncientDoc 继续先选 C4-best，再独立训练 C5/C6，最后分开执行 Ancient validation selection 与 frozen test。

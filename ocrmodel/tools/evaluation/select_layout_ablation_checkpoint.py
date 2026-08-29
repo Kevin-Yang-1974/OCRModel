@@ -75,8 +75,14 @@ def require_gpus_free(
         )
     return utilization
 
-def discover_candidates(model_root: Path, *, zero_shot: bool = False,
-                         expected_ablation: str | None = None) -> list[tuple[int, Path]]:
+def discover_candidates(
+    model_root: Path,
+    *,
+    zero_shot: bool = False,
+    expected_ablation: str | None = None,
+    candidate_steps: set[int] | None = None,
+    prefer_periodic_checkpoint: bool = False,
+) -> list[tuple[int, Path]]:
     metrics_path = model_root / "layout_training_metrics.json"
     if zero_shot:
         if not (model_root / "model.safetensors").is_file():
@@ -91,11 +97,27 @@ def discover_candidates(model_root: Path, *, zero_shot: bool = False,
     # The final export and the last periodic checkpoint can represent the same
     # optimizer step while having different serialized hashes. Keep one model
     # per step and prefer the final export for the final step.
-    candidates_by_step: dict[int, Path] = {final_step: model_root.resolve()}
+    candidates_by_step: dict[int, Path] = {}
+    if candidate_steps is None or final_step in candidate_steps:
+        candidates_by_step[final_step] = model_root.resolve()
     for path in sorted(model_root.glob("checkpoint-*")):
         match = STEP_PATTERN.search(path.name)
-        if match and (path / "model.safetensors").is_file() and (path / "config.json").is_file():
-            candidates_by_step.setdefault(int(match.group(1)), path.resolve())
+        if not match:
+            continue
+        step = int(match.group(1))
+        if candidate_steps is not None and step not in candidate_steps:
+            continue
+        if (path / "model.safetensors").is_file() and (path / "config.json").is_file():
+            if prefer_periodic_checkpoint:
+                candidates_by_step[step] = path.resolve()
+            else:
+                candidates_by_step.setdefault(step, path.resolve())
+    if candidate_steps is not None:
+        missing = sorted(candidate_steps - set(candidates_by_step))
+        if missing:
+            raise FileNotFoundError(
+                f"Requested validation checkpoint steps are missing: {missing}"
+            )
     unique: dict[str, tuple[int, Path]] = {}
     for step, path in sorted(candidates_by_step.items()):
         digest = sha256(path / "model.safetensors")
@@ -305,6 +327,18 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--gpu-utilization-limit", type=int, default=DEFAULT_GPU_UTILIZATION_LIMIT)
     parser.add_argument("--resume", action="store_true")
     parser.add_argument(
+        "--candidate-steps",
+        help="Comma-separated optimizer steps; reject the run if any requested checkpoint is missing.",
+    )
+    parser.add_argument(
+        "--prefer-periodic-checkpoint",
+        action="store_true",
+        help="For the final step, select checkpoint-N instead of the duplicate final export.",
+    )
+    parser.add_argument("--protocol-version")
+    parser.add_argument("--variant")
+    parser.add_argument("--expected-validation-page-count", type=int)
+    parser.add_argument(
         "--selection-purpose", choices=("ocr", "p1_layout"), default="ocr"
     )
     return parser.parse_args(argv)
@@ -349,6 +383,27 @@ def evaluate_worker_queue(
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
+    candidate_steps = None
+    if args.candidate_steps:
+        fields = [field.strip() for field in args.candidate_steps.split(",")]
+        if not fields or any(not field.isdigit() or int(field) < 1 for field in fields):
+            raise ValueError("--candidate-steps must be positive comma-separated integers.")
+        candidate_steps = {int(field) for field in fields}
+        if len(candidate_steps) != len(fields):
+            raise ValueError("--candidate-steps must not contain duplicates.")
+    validation_page_count = sum(
+        1
+        for line in args.validation_manifest.read_text(encoding="utf-8-sig").splitlines()
+        if line.strip()
+    )
+    if (
+        args.expected_validation_page_count is not None
+        and validation_page_count != args.expected_validation_page_count
+    ):
+        raise ValueError(
+            "Validation manifest page count mismatch: "
+            f"{validation_page_count} != {args.expected_validation_page_count}."
+        )
     output = args.output_dir.resolve()
     selection_path = output / "selection.json"
     if selection_path.is_file():
@@ -362,6 +417,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     candidates = discover_candidates(
         args.model_root.resolve(), zero_shot=args.ablation == "got2_zero_shot",
         expected_ablation=(None if args.ablation == "got2_zero_shot" else args.ablation),
+        candidate_steps=candidate_steps,
+        prefer_periodic_checkpoint=args.prefer_periodic_checkpoint,
     )
     prepared: list[tuple[int, Path, Path, Path, list[str]]] = []
     summaries: dict[int, tuple[Path, Path]] = {}
@@ -472,6 +529,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         "tie_breakers": tie_breakers,
         "validation_manifest": str(args.validation_manifest.resolve()),
         "validation_manifest_sha256": sha256(args.validation_manifest.resolve()),
+        "validation_page_count": validation_page_count,
+        "protocol_version": args.protocol_version,
+        "variant": args.variant,
         "locked_object_threshold": selected["validation_object_threshold"],
         "selection_physical_gpu": gpu_ids[0],
         "selection_physical_gpus": list(gpu_ids),
