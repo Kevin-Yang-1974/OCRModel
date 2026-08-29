@@ -5,7 +5,6 @@
 - `src/`
 - `tools/`
 - `config/`
-- `references/`
 
 `config/paths.env` 被 `.gitignore` 排除，不会覆盖服务器的机器本地配置。脚本也不会同步或删除以下内容：
 

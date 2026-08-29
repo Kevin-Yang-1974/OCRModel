@@ -13,7 +13,7 @@
 - 通用运行工具放在 `tools`，不要把一次性 run 命令写入活动入口。
 - 机器路径只写入未提交的 `config/paths.env` 或命令行参数。
 - 权重、数据、checkpoint、完整预测和日志必须放在仓库外。
-- `references/legacy-ancientdoc-eval` 是历史兼容评估的只读快照；如需修正，应在 `tools/evaluation` 新增或修改包装器。
+- 历史 AncientDoc、VLQA/VQLCA、Chunk、BSCC 和 SOTA 实现位于远程 `archive/legacy-vlqa-chunk-20260829` 分支；主线只提交当前 whole-page PVLD 入口。
 
 ## 变更要求
 

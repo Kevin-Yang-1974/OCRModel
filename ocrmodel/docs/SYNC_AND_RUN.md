@@ -1,10 +1,10 @@
-# LAVP/PVLD、历史基线与 AncientDoc 同步运行
+# 主线同步与运行
 
-> **命名边界（2026-08-25）**：当前论文方法为 LAVP，当前布局重建工程模块为 causal PVLD，写回模式为 `visual_value_layout_routing`。本文出现的 Fixed-Slot VLQA、VQLCA、`vlqa_*` 配置和 AncientDoc C4–C6 均为历史方案或历史实验入口，只用于复现、溯源与 baseline，不得作为 LAVP 的别名或当前主方案。运行命令中的旧 ID 为兼容性接口，不代表当前论文命名。
+本文只描述共享 `main` 的 GOT2 whole-page PVLD 主线。旧 VLQA/VQLCA、Chunk、AncientDoc、BSCC、SOTA、M2/M3/M4/All 和历史 pilot 入口位于 `archive/legacy-vlqa-chunk-20260829`，不在主线运行。
 
-正式协议固定使用书籍隔离数据集 `ancientdoc_layout_260707_group_isolated_seed20260815`。模型输入为原始整页图像和 `OCR: ` prompt；布局 metadata 不作为推理输入。
+## 1. 同步源码
 
-## 1. 本地同步
+在 Windows Git 中，从 `ocrmodel` 目录执行：
 
 ```powershell
 Set-Location 'D:\yangky\学推计划\ocrmodel'
@@ -13,504 +13,58 @@ Set-Location 'D:\yangky\学推计划\ocrmodel'
   -RemoteRoot /data3/yky/yangky_ocr_models/ocrmodel
 ```
 
-## 2. 训练阶段边界
+同步白名单只包含活动 `src`、`tools`、`config` 和必要参考文件；数据、权重、checkpoint、日志和本地环境留在源码树外。
 
-旧的“训练 C1/C4 后自动用 C4-final 启动 C5/C6”流程已经废弃。当前只有三个明确阶段：
+## 2. 数据准备与审计
 
-1. `train-core`：训练 C1 和 C4，然后停止。
-2. `select-c4`：只在 validation 评估 C4 周期 checkpoints，冻结 C4-best。
-3. `train-replay`：从同一个 C4-best 独立训练 C5 和 C6。
-
-`test` 不参与 C4 分支点选择。
-
-## 3. Train Core
-
-新实验使用：
+本地生成 S3/S4 whole-page 数据并对 train/validation/test 三份 manifest 一起审计：
 
 ```bash
-cd /data3/yky/yangky_ocr_models/ocrmodel
-source config/paths.env
-
-bash tools/training/run_ancientdoc.sh train-core \
-  --ancient-dataset-id ancientdoc_layout_260707_group_isolated_seed20260815 \
-  --steps 12000 \
-  --checkpoint-steps 2000 \
-  --learning-rate 2e-5 \
-  --gpu-id 1 \
-  --run-prefix ancientdoc_12k_seed20260815
+python tools/preprocessing/prepare_diverse_synthetic_layout.py \
+  --content-manifest <content.jsonl> \
+  --content-root <content-root> \
+  --output-root <dataset-root>
+python tools/preprocessing/audit_synthetic_layout.py \
+  --manifest <dataset-root>/train/manifest.jsonl \
+  --manifest <dataset-root>/validation/manifest.jsonl \
+  --manifest <dataset-root>/test/manifest.jsonl \
+  --summary-json <dataset-root>/audit_summary.json
 ```
 
-当前 `ancientdoc_12k_seed20260815` 是由旧入口启动的在途 suite：C1 已完成，C4 正在训练。为保护在途 C4，未重启该 suite；旧 C5 预期路径已放置 `BLOCKED_PENDING_C4_SELECTION`，使旧父入口在 C4 完成后安全退出而不启动 C5/C6。
+数据必须先按来源组划分，再生成页面；禁止同源页、近重复页或同一内容跨 split。正式时间受限运行会由 `prepare_time_constrained_validation.py` 从 S3/S4 validation 锁定 400 页（各 200 页）。
 
-## 4. Select C4
+MTHv2 转换后保持官方 `train/validation/test` split：train 供 P1 replay/P3，validation 不训练，test 仅最终 locked test。`label_textline` 只是有序区域候选。
 
-C4 完成后运行一次：
+## 3. 当前 P1 → P2 → P3 入口
 
-```bash
-cd /data3/yky/yangky_ocr_models/ocrmodel
-source config/paths.env
-
-bash tools/training/run_ancientdoc.sh select-c4 \
-  --c4-run "$GOT_TRAINING_RUNS/ancientdoc_12k_seed20260815_c4_vlqa_ocr_only" \
-  --ancient-dataset-id ancientdoc_layout_260707_group_isolated_seed20260815 \
-  --gpu-ids 0,1,2,3,4 \
-  --output-dir "$GOT_EVALUATION_RUNS/ancientdoc_12k_c4_selection_seed20260815"
-```
-
-该入口固定使用：whole-page、`OCR: `、greedy、`max_new_tokens=2048`、`no_repeat_ngram_size=20`、batch 1、BF16 和同一图像处理器。它自动发现全部 `checkpoint-*`，校验 config、完整权重、trainer step 和哈希；若最终 `p2/model` 与 `checkpoint-12000` 字节一致，只评估一次。
-
-选择规则不可修改：page CER 最低、去空白 page CER 最低、optimizer step 更早。输出包括 `selection.json`、`selected_checkpoint_metadata.json`、`report.md`、`queue.jsonl` 及每个候选的独立 metrics、predictions、`launcher.log`。
-
-## 5. Train Replay
-
-使用新的 run prefix，不能复用被阻断的旧 C5 路径：
-
-```bash
-cd /data3/yky/yangky_ocr_models/ocrmodel
-source config/paths.env
-
-bash tools/training/run_ancientdoc.sh train-replay \
-  --c4-selection "$GOT_EVALUATION_RUNS/ancientdoc_12k_c4_selection_seed20260815/selection.json" \
-  --ancient-dataset-id ancientdoc_layout_260707_group_isolated_seed20260815 \
-  --steps 12000 \
-  --checkpoint-steps 2000 \
-  --learning-rate 2e-5 \
-  --gpu-id 1 \
-  --run-prefix ancientdoc_12k_c4best_seed20260815
-```
-
-入口从 `selection.json` 解析 selected model/step/CER/hash，不接受手工替换路径。C5/C6 从完全相同的 C4-best 独立加载，并分别创建全新的 optimizer 和 scheduler。训练结束后会再次比较两者的分支 provenance；不一致直接失败。
-
-## 6. Final Validation Selection
-
-C1、C5、C6 从各自周期 checkpoints 在 validation 选 best；C4 固定为上一步 C4-best：
-
-```bash
-bash tools/evaluation/run_ancientdoc.sh \
-  --phase select \
-  --c4-selection "$GOT_EVALUATION_RUNS/ancientdoc_12k_c4_selection_seed20260815/selection.json" \
-  --c1-model "$GOT_TRAINING_RUNS/ancientdoc_12k_seed20260815_c1_got2_ocr_only/model" \
-  --training-suite "$GOT_TRAINING_RUNS/ancientdoc_12k_c4best_seed20260815" \
-  --gpu-ids 0,1,2,3,4 \
-  --batch-size 1 \
-  --run-prefix ancientdoc_12k_final_selection_seed20260815
-```
-
-评估入口会检查 C5/C6 metrics 中的 selected C4 step/path/hash 和 selection 路径完全一致，并拒绝 C4 报告 checkpoint 与 replay 分支起点不一致的 suite。
-
-## 7. Frozen Test
-
-```bash
-bash tools/evaluation/run_ancientdoc.sh \
-  --phase test \
-  --c4-selection "$GOT_EVALUATION_RUNS/ancientdoc_12k_c4_selection_seed20260815/selection.json" \
-  --selection "$GOT_EVALUATION_RUNS/ancientdoc_12k_final_selection_seed20260815/selection.json" \
-  --suite-root "$GOT_EVALUATION_RUNS/ancientdoc_12k_final_selection_seed20260815" \
-  --gpu-ids 0,1,2,3,4 \
-  --batch-size 1 \
-  --resume
-```
-
-只有冻结后的 C0、C1-best、C4-best、C5-best、C6-best 进入一次 test。
-
-## 8. 紧凑回传
-
-C4 selection：
-
-```bash
-jq -c '{status,purpose,c4_run_root,selection_split,test_used_for_selection,selected:{step:.selected.optimizer_step,model:.selected.model_path,metrics:.selected.validation_metrics},candidates:[.candidates[]|{step:.optimizer_step,model:.model_path,metrics:.validation_metrics}],excluded_duplicates}' \
-  "$GOT_EVALUATION_RUNS/ancientdoc_12k_c4_selection_seed20260815/selection.json"
-```
-
-最终 test：
-
-```bash
-jq -c '{status,deltas,fairness,c4_branch_selection,replay_branch_consistency}' \
-  "$GOT_EVALUATION_RUNS/ancientdoc_12k_final_selection_seed20260815/summary.json"
-```
-
-失败时只回传对应 `launcher.log` 最后 20 行，不输出完整 predictions 或训练日志。
-
-## 9. GOT2 整页结构消融
-
-本轮 A0–A5 使用统一入口，输入固定为 whole-page image 与 OCR prompt。训练用 `--gpu-id ID` 选择单张物理卡，或用 `--gpu-ids ID[,ID...]` 选择一次 DeepSpeed 数据并行任务使用的多张物理卡；默认允许与其他进程共享瞬时 `utilization.gpu < 50` 的目标卡，达到或超过 50% 或查询失败时立即退出。阈值可用 `--gpu-utilization-limit` 调整。validation/test 使用该组绑定列表中的第一张物理卡。validation 只选择 checkpoint，test 只加载 `selection.json` 中锁定的 checkpoint。A1–A4 的 P2 steps 和优化配置相同；A5 另外执行 P1，因此总 steps 与总页面曝光量更高，不能写成同总预算。
-
-多个消融也可以各绑定一张卡并发训练。下面按列表顺序将 A2、A3、A4、A5 分别绑定到物理 GPU 1、2、3、4；这与单个实验的 `--gpu-ids` 多卡数据并行不同：
-
-```bash
-bash tools/training/run_layout_ablation_suite.sh \
-  --dataset-id formal_pdf_short_seed20260812 \
-  --ablations generic_adapter_projector,vlqa_ocr_only,vlqa_layout_direct,vlqa_layout_p1_p2 \
-  --parallel-gpu-ids 1,2,3,4 \
-  --p1-steps 4000 \
-  --p2-steps 8000 \
-  --checkpoint-steps 2000 \
-  --seed 42 \
-  --run-prefix layout_ablation_formal_v1
-```
-
-启动器在创建任何子任务前检查全部目标 GPU 的瞬时利用率。低于共享阈值时允许继续并保留 GPU 锁、独立 run 和 launcher log；达到或超过阈值、查询失败或参数非法时整体退出。并发失败时不会终止其他已经启动的组，而是等待它们结束后汇总失败状态。
-
-单组训练、选点和 Synthetic-ID test：
-
-```bash
-cd /data3/yky/yangky_ocr_models/ocrmodel
-source config/paths.env
-
-bash tools/training/run_layout_ablation_suite.sh \
-  --dataset-id formal_pdf_short_seed20260812 \
-  --ablations vlqa_layout_direct \
-  --p2-steps 8000 \
-  --checkpoint-steps 2000 \
-  --gpu-ids 0,1 \
-  --seed 42 \
-  --run-prefix layout_ablation_formal_v1
-```
-
-顺序运行 A1–A5，并为 A5 指定 P1：
-
-```bash
-bash tools/training/run_layout_ablation_suite.sh \
-  --dataset-id formal_pdf_short_seed20260812 \
-  --ablations projector_only,generic_adapter_projector,vlqa_ocr_only,vlqa_layout_direct,vlqa_layout_p1_p2 \
-  --p1-steps 4000 \
-  --p2-steps 8000 \
-  --checkpoint-steps 2000 \
-  --gpu-ids 0,1 \
-  --seed 42 \
-  --run-prefix layout_ablation_formal_v1
-```
-
-额外 test 数据集通过可重复的 `--test-set Category:dataset-id` 指定，例如 `--test-set Synthetic-OOD:synthetic_ood_id --test-set Real-OOD:real_ood_id`。不同输入粒度不得加入同一结果比较。已有完成标志时默认退出；确认复用已完成训练、selection 或 test 时显式加 `--resume`。不完整目录不会被自动覆盖。
-
-### 9.1 Selection 断点续跑
-
-`--resume` 发现训练 run 已有 `LAYOUT_A100_FINISHED` 时不会重新训练。若某个 validation candidate 已经写出 `layout_validation_metrics.json`，selector 只在以下字段全部匹配时复用：`status=ok`、模型绝对路径、`model_kind`、validation manifest、`split=validation`、greedy decoding 参数、推理失败数，以及 `whole_page_image`＋`ocr_prompt` 输入协议。`layout_metadata_as_model_input` 必须为 `false`。不匹配时立即退出，不覆盖已有输出，也不把旧配置结果混入本轮选点。
-
-evaluator 当前使用 `character_edits`、`reference_characters` 和 `page_exact_matches`；selector 会将其规范化为稳定的 `total_edit_distance`、`total_reference_characters` 和 `exact_matches`，并兼容历史字段名。该规范化不改变 page CER 主指标、去空白 page CER 次级指标和较早 optimizer step 的选点顺序。
-
-已完成 `projector_only` 训练后，只继续 selection 和 selection-locked test：
-
-```bash
-bash tools/training/run_layout_ablation_suite.sh \
-  --dataset-id formal_pdf_short_seed20260812 \
-  --ablations projector_only \
-  --p2-steps 8000 \
-  --checkpoint-steps 2000 \
-  --gpu-id 0 \
-  --seed 42 \
-  --run-prefix layout_ablation_formal_v1 \
-  --resume
-```
-
-selection resume 的独立工程 smoke 只评估一个 checkpoint 的 1 页，并通过 evaluator 日志哈希确认第二次调用没有重新推理。它不用于选正式 checkpoint，也不产生性能结论：
-
-```bash
-bash tools/evaluation/run_layout_ablation_selection_smoke.sh \
-  layout_ablation_formal_v1_projector_only_seed42 \
-  formal_pdf_short_seed20260812 \
-  2000
-```
-
-成功时最后一行事件为 `layout_ablation_selection_resume_smoke_completed`，且 `evaluator_log_unchanged=true`。正式 run 的 candidate 目录、`selection.json` 和 test 结果不得用该 1 页 smoke 替代。
-
-## 10. MTHv2 原始整页 VQLCA C1–C5
-
-该入口固定读取 `/data3/yky/yangky_ocr_models/datasets/MTHv2/converted/mthv2_layout_page_v1` 的 train/validation/test 原始整页 manifest，不读取 `mthv2_layout_column_chunks16_v1`。C1/C2 保持 projector/普通 adaptor 对照；C3/C4/C5 显式使用 `layout_writeback_mode=vqlca`。`max_regions=512` 只是覆盖当前最多约 407 个 ordered textline/region candidates 的 Fixed-Slot K512 容量设置，不是 PVLD。新版 `run_variable_layout_a100.py` 省略 `--gpu-ids` 时会自动使用所有瞬时 utilization 严格低于 50% 的 GPU；显式传入时只检查指定列表。
-
-```bash
-cd /data3/yky/yangky_ocr_models/ocrmodel
-source config/paths.env
-bash tools/training/run_mthv2_page_vqlca_ablation_tmux.sh \
-  --session mthv2_page_vqlca_train_20260820 \
-  --run-prefix mthv2_page_vqlca_ablation_20260820 \
-  --gpu-id 0 \
-  --ablations C1,C2,C3,C4,C5
-```
-
-启动前只查询实际指定 GPU 的瞬时利用率并要求 `<50%`。训练入口不自动启动 frozen test；训练结束后必须另行执行 validation-only checkpoint selection，再由锁定 selection 启动一次 test。
-
-## 11. 多样化合成数据到 AncientDoc
-
-新协议固定入口为 `tools/training/run_diverse_synthetic_ancientdoc.sh`。历史正式组只有 C0、C1、C4、C5、C6；不存在可直接复跑的 C2/C3。新 synthetic 数据不是 AncientDoc test 的替代品，AncientDoc 的 validation/test 仍使用书籍隔离整页数据。
-
-先在本机用真实内容 manifest 和锁定字体生成数据。默认三 tier 合计 train/validation/test 为 `24000/3000/3000` 页；正式渲染前可把页数改小并加 `--plan-only`：
-
-```powershell
-Set-Location 'D:\yangky\学推计划\ocrmodel'
-& .\.venv\Scripts\python.exe tools\preprocessing\prepare_diverse_synthetic_layout.py `
-  --content-manifest D:\layout_source\content.jsonl `
-  --content-root D:\layout_source `
-  --output-root D:\layout_data\ancient_photo_diverse_v1_seed20260817 `
-  --browser-channel msedge
-```
-
-该总入口在 Windows 当前 `.venv` 中分 split 调用现有生成器并复用系统 Edge。正式运行必须传入锁定字体文件及 SHA-256，并保留 `dataset_protocol.json`、三个 split 的 `dataset_meta.json` 和联合 `audit_summary.json`。A100 不生成页面。
-
-代码仍使用第 1 节的白名单同步命令。数据目录单独上传到 `$GOT_LAYOUT_DATA/ancient_photo_diverse_v1_seed20260817`，不得放入源码树。确认服务器 `train/validation/test/manifest.jsonl` 及对应 `images/`、`html/` 完整后，按以下阶段运行。
-
-1. 更长 synthetic A5 P1/P2，并只在 synthetic validation 选择 P2-best；该命令不运行 synthetic test：
-
-```bash
-cd /data3/yky/yangky_ocr_models/ocrmodel
-source config/paths.env
-bash tools/training/run_diverse_synthetic_ancientdoc.sh train-synthetic \
-  --dataset-id ancient_photo_diverse_v1_seed20260817 \
-  --run-prefix ancient_photo_diverse_v1 \
-  --gpu-ids 0,1
-```
-
-默认 P1/P2 为 `12000/24000` optimizer steps，每 `2000` steps 保存。`selection.json` 的主指标为 synthetic validation page CER，去空白 CER 和较早 step 依次作为 tie-breaker；不是按 final step 或 test 选择。
-
-2. 用被选中的 synthetic P2 checkpoint 启动 AncientDoc C1/C4：
-
-```bash
-bash tools/training/run_diverse_synthetic_ancientdoc.sh train-ancient-core \
-  --synthetic-selection "$GOT_EVALUATION_RUNS/ancient_photo_diverse_v1_vlqa_layout_p1_p2_seed42_selection/selection.json" \
-  --ancient-dataset-id ancientdoc_layout_260707_group_isolated_seed20260815 \
-  --gpu-id 2 \
-  --run-prefix ancient_photo_diverse_v1_ancient
-```
-
-入口通过 `--source-selection` 校验 selected model、config/weights SHA-256、validation-only 标志与 A5 ablation ID；不能手工替换为 synthetic final model。
-
-3. 只在 AncientDoc validation 选择 C4-best：
-
-```bash
-bash tools/training/run_diverse_synthetic_ancientdoc.sh select-c4 \
-  --c4-run "$GOT_TRAINING_RUNS/ancient_photo_diverse_v1_ancient_c4_vlqa_ocr_only" \
-  --ancient-dataset-id ancientdoc_layout_260707_group_isolated_seed20260815 \
-  --gpu-ids 0,1,2,3,4 \
-  --output-dir "$GOT_EVALUATION_RUNS/ancient_photo_diverse_v1_ancient_c4_selection"
-```
-
-4. 从同一个 C4-best 独立训练 C5/C6。新协议默认 AncientDoc:synthetic 为 `7:1`，即请求 replay fraction 12.5%，低于旧实验的 25%：
-
-```bash
-bash tools/training/run_diverse_synthetic_ancientdoc.sh train-replay \
-  --c4-selection "$GOT_EVALUATION_RUNS/ancient_photo_diverse_v1_ancient_c4_selection/selection.json" \
-  --ancient-dataset-id ancientdoc_layout_260707_group_isolated_seed20260815 \
-  --synthetic-dataset-id ancient_photo_diverse_v1_seed20260817 \
-  --gpu-id 3 \
-  --run-prefix ancient_photo_diverse_v1_ancient_replay
-```
-
-5. 选择 C1/C5/C6 checkpoints，C4 固定为第 3 步选择结果；只运行 validation：
-
-```bash
-bash tools/training/run_diverse_synthetic_ancientdoc.sh select-ancient \
-  --c4-selection "$GOT_EVALUATION_RUNS/ancient_photo_diverse_v1_ancient_c4_selection/selection.json" \
-  --c1-model "$GOT_TRAINING_RUNS/ancient_photo_diverse_v1_ancient_c1_got2_ocr_only/model" \
-  --training-suite "$GOT_TRAINING_RUNS/ancient_photo_diverse_v1_ancient_replay" \
-  --gpu-ids 0,1,2,3,4 \
-  --run-prefix ancient_photo_diverse_v1_ancient_selection
-```
-
-6. 只有 validation selection 冻结后才执行一次正式 AncientDoc test：
-
-```bash
-bash tools/training/run_diverse_synthetic_ancientdoc.sh test-ancient \
-  --c4-selection "$GOT_EVALUATION_RUNS/ancient_photo_diverse_v1_ancient_c4_selection/selection.json" \
-  --selection "$GOT_EVALUATION_RUNS/ancient_photo_diverse_v1_ancient_selection/selection.json" \
-  --suite-root "$GOT_EVALUATION_RUNS/ancient_photo_diverse_v1_ancient_selection" \
-  --gpu-ids 0,1,2,3,4 \
-  --resume
-```
-
-旧 AncientDoc test 已被查询过；新模型再次运行同一 test 属于重复 test 查询，不能再用其结果调 synthetic 分布、replay 比例或 checkpoint。后续超参数迭代只能看 validation，并应在新 seed 或新的 Real-OOD 集合上预注册复验。
-### PVLD routing mode (2026-08-20)
-
-Existing C1-C5 VQLCA runs retain their historical `layout_writeback_mode=vqlca`
-identity and must not be relabeled as PVLD. A new PVLD run must explicitly set
-`layout_writeback_mode=visual_value_layout_routing` and
-`layout_writeback_source=layout_evidence`. This mode consumes high-resolution
-Vary ViT features for `A=layout_evidence`, then applies factorized `V_i -> A -> V_i`
-routing; the final OCR Value is always projected from `V_i` and the output
-length remains `L_v`.
-
-## 13. MTHv2 SOTA 对比部署与 smoke（2026-08-23）
-
-SOTA 对比协议、实际 checkpoint revision、参数口径和 B0–B6 注册见 `docs/MTHV2_SOTA_COMPARISON_PROTOCOL.md`。本地白名单同步只上传 `tools/sota/` 源码；模型权重、环境、数据和日志留在服务器源码树外。
-
-服务器部署入口（只创建个人目录，不覆盖已有模型目录）：
-
-```bash
-cd /data3/yky/yangky_ocr_models/ocrmodel
-source config/paths.env
-bash tools/sota/deploy_sota_models.sh
-```
-
-zero-shot smoke 只使用 validation 1–2 页；显式传入 `--split validation`，禁止 test。GLM-OCR 的 fine-tune smoke 最多 1 optimizer step；没有官方微调入口的模型只记录 `official_finetuning_unavailable`，不伪造训练支持。正式总入口 `tools/sota/run_formal_sota_suite.sh` 默认锁定，只有用户明确授权并设置 `ALLOW_FORMAL_SOTA=1` 后才可解除。
-
-## 12. PVLD causal 修复 smoke 与 MTHv2 C3–C5 新流程（2026-08-22）
-
-先使用第 1 节白名单同步工具；同步不包含数据、模型、checkpoint、run、缓存或日志。修复版有界 CUDA smoke 只需一次串行、无伪终端 SSH 调用：
-
-```bash
-cd /data3/yky/yangky_ocr_models/ocrmodel
-source config/paths.env
-bash tools/training/run_pvld_causal_cuda_smoke.sh \
-  0 \
-  pvld_causal_cuda_smoke_20260822_r1
-```
-
-入口只查询显式 GPU 0 的瞬时利用率，要求 `<50%`；使用新 evaluation run 目录，完整日志为 `smoke.log`，终端只打印紧凑 `summary.json`。检查项包括 causal self-attention、cross-attention、token head、coverage、bbox head 和 visual Value routing 的 finite gradient，0/1/多 REGION、FSM、两类 cap、REGION probability、bbox `[0,1]` 与 alpha=0 严格等价。它不加载 test，不启动正式训练。
-
-smoke 成功后，本会话明确授权的新 C3–C5 流程为：
-
-```bash
-bash tools/training/run_mthv2_page_pvld_c3_c5_tmux.sh \
-  --session mthv2_pvld_causal_c3_c5_20260822 \
-  --run-prefix mthv2_pvld_causal_20260822_v1 \
-  --gpu-ids 0,1,2,3,4
-```
-
-启动器固定读取原始整页 `mthv2_layout_page_v1`，不读取 oracle chunk。若可用卡数不少于三个，C3/C4/C5 各绑定一张；不足三个时，全部指定卡组成多卡作业并按 C3→C4→C5 串行。启动前查询命令指定的全部 GPU；任一卡 utilization 达到 50% 时，在创建任何控制任务前整体退出，不等待、不抢占、不停止已有进程。
-
-C3/C4 为 P2 42000 steps；C5 为 P1 12000＋P2 30000 steps。checkpoint 间隔 2000。C5 P1 checkpoints 全部排队做自由生成 validation，预注册 ranking 为：停止错误总和、count MAE、region F1、matched/ordered bbox IoU、duplicate rate、count exact accuracy、较早 step；P2 只从 selected P1 初始化。训练完成后，各控制在 validation 选择 P2 checkpoint，并把 validation 默认未筛选阈值 0.0 写入 `selection.json`；随后 test 只加载锁定 checkpoint 与锁定阈值。test 结果不允许反向调整训练、P1 ranking 或 threshold。
-
-该命令创建全新 run ID 和 tmux 会话，不使用 `--resume`，不覆盖旧 PVLD C1–C5、P1 checkpoints、selection 或 test。失败只查看对应 launcher/control 日志最后 20 行；不得直接输出完整 predictions、trainer state 或训练日志。
-
-causal 首轮中 C3/C4 已完成训练，而 C5 P2 因未显式传递 P1 selection provenance 被契约误拒绝。修复后使用以下 recovery 入口；它不使用 GPU 2，不重训 C3/C4 或 C5 P1，只在 GPU 4 补跑 C5 P2，之后在 GPU 0/1/3 并行执行 C3/C4/C5 validation selection 和 selection-locked test：
-
-```bash
-bash tools/training/run_mthv2_page_pvld_causal_eval_recovery_tmux.sh \
-  --session mthv2_pvld_causal_eval_recovery_20260824_v1 \
-  --run-prefix mthv2_pvld_causal_20260822_v1 \
-  --evaluation-suffix _causal_recovery_20260824_v1 \
-  --gpu-ids 0,1,3,4
-```
-
-P2 通过 `p1/validation_selection/selection.json` 核验 validation-only 用途、选中 checkpoint 绝对路径以及 config/weights SHA-256，不修改已有 P1 checkpoint。launcher 日志为：
-
-```text
-/data3/yky/yangky_ocr_models/training_runs/GOT/mthv2_pvld_causal_20260822_v1_mthv2_pvld_causal_eval_recovery_20260824_v1_logs/launcher.log
-```
-
-该 recovery 于保存 C5 P2 `checkpoint-18000` 时因 `/data3` 空间耗尽结束，未进入 C3-C5 validation/test。`checkpoint-16000` 是最后一个同时具有 model、config、trainer state 和 optimizer state 的完整恢复点；`tmp-checkpoint-18000` 不可使用。恢复前必须先由用户明确授权处理磁盘占用，并使用新的 tmux/session 和 evaluation suffix；不得直接删除约 `72G` 的 OpenDoc run、失败 checkpoint 或旧结果。
-
-用户授权后已清理 oracle-chunk 旧口径的非选中周期 checkpoints，并保留每组 validation-selected checkpoint；`/data3` 恢复为 `228G` 可用。第二次 recovery 使用：
-
-```bash
-bash tools/training/run_mthv2_page_pvld_causal_eval_recovery_tmux.sh \
-  --session mthv2_pvld_causal_eval_recovery_20260824_v2 \
-  --run-prefix mthv2_pvld_causal_20260822_v1 \
-  --evaluation-suffix _causal_recovery_20260824_v2 \
-  --gpu-ids 0,1,3,4
-```
-
-runner 为重复恢复依次使用 `train.recovery.log`、`train.recovery.2.log` 等新文件，不覆盖失败日志。v2 已核验从完整 `checkpoint-16000` 继续，而不是从头训练。
-
-## 14. OpenDoc CPU-only 正式重跑
-
-OpenDoc ONNX provider 在当前服务器缺少 cuDNN 9，固定使用 CPU。不要复用会查询 `0,1,3,4` 的多模型总启动器；使用专用入口：
-
-```bash
-bash tools/sota/run_opendoc_formal_tmux.sh \
-  --session sota_opendoc_formal_20260824_v2 \
-  --run-id sota_opendoc_formal_20260824_v2
-```
-
-该入口不调用 `nvidia-smi`，固定依次执行 240 页 validation、validation-only selection、800 页 selection-locked test 和 unified metrics。状态入口：
-
-```bash
-tmux has-session -t sota_opendoc_formal_20260824_v2 && echo RUNNING || echo ENDED
-tail -n 20 /data3/yky/yangky_ocr_models/evaluation_runs/SOTA/sota_opendoc_formal_20260824_v2/launcher.log
-```
-
-成功必须同时存在 `opendoc_0_1b/finished.json`、`selection.json`、`test/summary.json` 和 `test/unified_metrics.json`。失败查看 `opendoc_0_1b/failed.json` 及对应阶段日志，不能因 tmux 退出直接写成完成。
-
-## 15. PVLD M1a 四卡训练与 validation-only 选点
-
-本地检查和白名单同步完成后，先执行 M1a CUDA bounded smoke；只有 smoke 成功才启动正式 tmux。正式入口固定使用原始整页 MTHv2、GPU `1,2,3,4`，不运行 test：
-
-```bash
-bash tools/training/run_mthv2_pvld_m1_tmux.sh \
-  --session mthv2_pvld_m1_20260825 \
-  --run-id mthv2_pvld_m1_boundary_count_20260825_v1 \
-  --gpu-ids 1,2,3,4
-```
-
-四卡训练的 P1/P2 optimizer steps 为 `3000/7500`，有效 batch 为 4，页面曝光与旧单卡 C5 的 `12000/30000` 相同；它是提高吞吐的 large-batch 协议，不是相同 optimizer trajectory。P1 checkpoints 为 `1000/2000/3000`，P2 为 `2500/5000/7500`，`save_total_limit=3`，全线最多 6 个 checkpoint 目录。P1 与 P2 的三个候选分别使用 `--parallel-gpu-ids 1,2,3,4` 做 validation-only selection；selector 在任何候选启动前只查询这四张卡一次，任一卡 `>=50%` 时整体退出，之后每张卡运行一个顺序 worker queue。
-
-状态入口：
-
-```bash
-tmux has-session -t mthv2_pvld_m1_20260825 && echo RUNNING || echo ENDED
-python - <<'PY'
-import json
-from pathlib import Path
-p = Path('/data3/yky/yangky_ocr_models/training_runs/GOT/mthv2_pvld_m1_boundary_count_20260825_v1/metadata/status.txt')
-print(json.dumps(json.loads(p.read_text()), ensure_ascii=False, separators=(',', ':')))
-PY
-```
-
-完整日志保存在新 run 的 `p1/train.log`、`p1/validation_selection.log`、`p2/train.log` 及独立 P2 validation selection 目录。成功条件是训练 run 存在 `PVLD_TRAINING_FINISHED`，P1/P2 两份 `selection.json` 均为 `selection_split=validation`、`test_used_for_selection=false`，checkpoint 目录不超过 6。本轮没有 selection-locked test；只有 M1a validation 结果足以锁定后续方案后，才另行授权 test。
-### PVLD M2-M4 bounded smoke
-
-After local checks, synchronize only the allow-listed source tree. A100 bounded smoke must use an explicitly permitted idle GPU (currently GPU 0 only while M1 v4 owns GPUs 1-4) and a new run ID; it must not alter M1 artifacts. Invoke `smoke_pvld_causal_decoder_cuda.py --m2 --m3-scale 0.25 --m4` for the combined candidate check. BSCC uses Slurm/srun, never tmux or `/tmp`, with separate run IDs for M1, M2, M3 and M4 component smokes. Neither path starts formal training, validation selection, or MTHv2/frozen test.
-
-## 16. BSCC M4 validation-only routing controls
-
-该入口只能在 M4 正式 pipeline 已产生 P2 `selection.json` 后运行。它读取该 validation-selected checkpoint，在三个独立 GPU 上分别执行 `normal`、`alpha_zero` 和 `shuffled_evidence`；三项均只读取 240 页 validation，固定 batch 2，shuffled 条件在每个 batch 内做循环置换。该诊断不读取 test、不重新选 checkpoint，也不能根据结果修改已经锁定的正式 test。
-
-```bash
-cd /home/bingxing2/home/scx9fxd/yangky_ocr_models_bscc_proto/ocrmodel
-sbatch --export=ALL,PVLD_M4_CONTROL_RUN_ID=mthv2_pvld_m4_validation_controls_20260826_v1 \
-  tools/evaluation/run_bscc_pvld_m4_validation_controls.sbatch
-```
-
-若正式 M4 run ID 不是默认的 `mthv2_pvld_m4_predrouting_20260826_v1`，须同时显式传入 `PVLD_M4_FORMAL_RUN_ID`。作业启动前一次性核验三张 Slurm 分配卡的瞬时 utilization 均 `<50%`；任一卡不合格时，在启动任何 evaluator 前整体退出。
-
-## 17. 新视觉梯度 P1-P3 自动串联
-
-`run_lavp_p1_p3_formal_tmux.sh` 是新的 S3/S4 合成数据主线入口。它不轮询也不后台等待：每次调用只检查一次同一数据根中的 train、validation、test 三份 manifest。manifest 全部就绪后，重新执行全量 image/hash、近重复、content/source leakage 审计，并要求 `dataset_protocol.json.status=ready`、全量审计通过以及不少于 10,000 张 train 页面。train region exposure 必须记录为覆盖指标，但不再要求不少于 1,000,000 才能创建训练 run。该 gate 未通过时不会创建训练 run；通过后默认只返回 `ready_for_user_confirmation`，不会启动训练。
-
-通过后，入口固定以 GOT2 whole-page 图像和 `layout_memory_resolution=64` 运行 P1、P2、P3：P1 在 S3/S4 train 上使用仅 MTHv2 train 的 `7:1` OCR replay（replay OCR weight `0.25`）；P1 layout validation selection 的 selected checkpoint 初始化 P2；P2 OCR validation selection 的 selected checkpoint 初始化 P3；P3 selection 后才依次执行 P2 synthetic-ID 与 P3 MTHv2 Real-OOD selection-locked test。两个 test 都只读取各自已生成的 selection JSON，禁止参与选点。每个训练、selection 和 test 阶段都会重新使用所有瞬时 utilization 严格小于 50% 的 GPU；已有或忙碌的卡不等待、不抢占。
-
-```bash
-bash tools/training/run_lavp_p1_p3_formal_tmux.sh \
-  --session lavp_p1_p3_formal_20260827_v3 \
-  --run-prefix lavp_p1_p3_formal_20260827_v3 \
-  --layout-memory-resolution 64
-```
-
-上述调用只完成一次数据门控和审计。审计结果向用户提交并获得确认后，才可在新的调用中附加 `--confirm-formal-training` 创建正式 P1/P2/P3 及其 validation selection 和 selection-locked test。该入口拒绝已有 run、selection 或 test 输出目录，不能用于恢复或覆盖历史任务。只读取新 S3/S4 数据和 MTHv2 官方 whole-page split；不读取 MTHv2 validation/test 作为 P1 replay。状态只查看 `tmux has-session`、pipeline log 最后 20 行和各 run 的 `metadata/status.txt`，不要重启合成 tmux 或重复启动本入口。
-
-## 18. 历史 S3/S4 P1-P2 Pilot
-
-该 pilot 只用于工程与方向性验证，与 v4/v5 正式主线完全隔离。它从历史 `ancient_photo_diverse_formal_s3s4_20260826_v1` 的 validation split 预先锁定按 tier、region bucket 与 direction 分层的 256 页清单，然后执行 P1 2,000 steps、validation-only P1 selection、P2 5,000 steps 和 validation-only P2 selection。P1 使用 MTHv2 train-only OCR replay，固定 `7:1` 和 `0.25`；输入保持 whole-page、64×64 layout memory、256 个 Qwen OCR visual tokens。该入口不运行 P3 或 test：
-
-```bash
-bash tools/training/run_historical_s3s4_p1_p2_pilot_tmux.sh \
-  --session lavp_historical_s3s4_pilot_20260827_v3 \
-  --run-prefix lavp_historical_s3s4_pilot_20260827_v3
-```
-
-每次重试都必须使用新的 session/run prefix；不得恢复、覆盖或删除 v1/v2 记录。启动后应先在 `p1/train.log` 核验 optimizer group LR：P1 vision/projector/layout 分别为 `1e-6/1e-5/1e-4`，而非通用 `--learning_rate`。完整配置、validation 清单哈希、隔离边界和已知失败记录见 `docs/LAVP_EXPERIMENT_CONFIGURATION_REGISTER.md`。
-
-## 19. 时间受限 Legacy PVLD 策略验证
-
-`lavp_p1_p3_formal_20260828_v9` 的 4000 页 Legacy/P1 validation selection 已停止；tmux session 已结束，既有 run、checkpoint、日志和临时预测文件均保留。新入口只验证 v9 Legacy PVLD 的冻结范围、分组学习率和训练策略，不启用 M2、M3、M4、All 或其他附加结构，也不设计新的逐步解冻。
-
-新协议固定为 `protocol_version=time_constrained_freeze_strategy_v1`、`variant=original_pvld_freeze_strategy`、`validation_page_count=400`、`test_used_for_selection=false`。400 页全部来自正式 validation split，S3/S4 各 200 页，按 region-count bucket 和页复杂度 tertile 分层。P1、P2、P3 的 validation 共享该 manifest；P2 训练 30000 steps，只保存/评估 10000、20000、30000，并沿用 v9 的训练方式；P3 沿用 v9 的 MTHv2 train 数据方式，从 P2 validation-selected checkpoint 训练 8000 steps，只保存/评估最终 checkpoint，validation 使用固定 400 页；test 仍使用 v9 的 MTHv2 test，且只能在 P3 selection 后启动。
-
-预检发现 v9 Legacy P1 只存在 `checkpoint-2000/4000/6000/8000/10000/12000`，不存在注册候选 `checkpoint-9000`，服务器其他 Legacy P1 run 也没有该 checkpoint。入口因此在创建新 run 前拒绝启动，不能把相邻 checkpoint 冒充 9000。用户确认新的三点候选后再修改并运行；其余命令保持：
+在 A100 项目环境中：
 
 ```bash
 cd /data3/yky/yangky_ocr_models/ocrmodel
 source config/paths.env
 bash tools/training/run_time_constrained_pvld_baseline.sh \
-  --session time_constrained_original_pvld_20260829_v1 \
-  --run-prefix time_constrained_original_pvld_20260829_v1 \
-  --p1-candidate-steps 6000,8000,12000
+  --dataset-root "$GOT_LAYOUT_DATA" \
+  --mthv2-root "$MTHV2_LAYOUT_ROOT" \
+  --p1-run-root "$P1_CHECKPOINT_ROOT" \
+  --run-prefix pvld_main_20260829_v1
 ```
 
-入口省略 `--gpu-ids` 时，每个训练、selection 和 test 阶段重新选择全部瞬时 utilization 严格小于 50% 的 GPU；显式传入时只查询并使用指定集合。最终 `summary.json` 汇总 P2 selected step、OCR/layout test 指标和训练稳定性。只有另行传入使用相同 test manifest 的 `--previous-test-summary` 时，才计算新旧策略差值以及 OCR/layout 是否退化；不同 test manifest 的结果拒绝直接比较。
+入口按顺序执行 P1 validation selection、P2、P2 validation selection、P3、P3 validation selection 和 selection-locked MTHv2 test。P2/P3 只能从 selection 文件中的 checkpoint 初始化；已有 run 或输出目录不会被覆盖。
 
-成功条件为控制 run 根目录存在 `summary.json`，其中 `status=ok`、`selection_split=validation`、`test_used_for_selection=false`、`test_manifest_read=false`，且三个 condition 均有 240 页指标。完整 predictions 和单项日志保留在各 condition 子目录；终端只回传：
+GPU 默认只查询本次命令允许集合中瞬时 `utilization.gpu < 50` 的卡。需要固定物理卡时传 `--gpu-ids 0,1`；忙卡不等待、不抢占，查询失败或无合格卡时整体退出。
+
+## 4. 有界检查
 
 ```bash
-jq -c '{status,control_run_id,formal_run_id,selection_split,test_used_for_selection,test_manifest_read,conditions,page_cer_delta_vs_normal}' \
-  /home/bingxing2/home/scx9fxd/yangky_ocr_models_bscc_proto/evaluation_runs/GOT/mthv2_pvld_m4_validation_controls_20260826_v1/summary.json
+bash tools/training/run_pvld_causal_cuda_smoke.sh <gpu-id> <new-run-id>
+python -m compileall -q src tools
+python -m pytest -q tests
 ```
+
+smoke 只验证模型加载、前向/反向和 checkpoint 链路，不能作为正式性能结果。每次重试使用新的 run ID，并保留失败目录。
+
+## 5. 结果回传
+
+只回传 `metadata/status.txt`、完成标志和紧凑 `summary.json` 的必要字段；日志最多回传最后 20 行。不要输出完整训练日志、预测全集、私有路径、凭据或模型权重。
+
+正式发布时从父仓库 `master` 执行 `git subtree split --prefix=ocrmodel`，将生成的 subtree 推送到共享远程 `main`；旧方案 subtree 推送到 `archive/legacy-vlqa-chunk-20260829`。分支、数据和 MTHv2 划分说明见 [`BRANCH_AND_DATA_LAYOUT.md`](BRANCH_AND_DATA_LAYOUT.md)。详细个人发布命令保存在被忽略的本地 `docs/PUBLISHING.md`。

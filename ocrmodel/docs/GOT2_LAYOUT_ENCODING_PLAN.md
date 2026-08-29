@@ -428,7 +428,7 @@ $$\mathcal L_{\mathrm{total}}=\mathcal L_{\mathrm{ocr}}+\lambda_{\mathrm{obj}}\m
 
 ## 6. 训练策略
 
-完整合成数据协议见 `SYNTHETIC_LAYOUT_TRAINING_PLAN.md`。阶段划分如下：
+完整合成数据和 split 协议见 `BRANCH_AND_DATA_LAYOUT.md` 与 `tools/preprocessing/README.md`。阶段划分如下：
 
 1. `P0` 原始整页 GOT2 基线：不增加 VLQA，固定数据划分、解码设置、页面分辨率和训练预算。
 2. `P1` 布局查询预训练：使用 HTML/真实 crop 重排页面，冻结 Vary ViT 和 Qwen，残差门保持 0，只训练 queries、交叉注意力和布局辅助头。
@@ -519,7 +519,7 @@ $$\mathcal L_{\mathrm{total}}=\mathcal L_{\mathrm{ocr}}+\lambda_{\mathrm{obj}}\m
 - VLQA、辅助头、零门控写回和布局损失：`src/GOT-OCR-2.0/GOT/model/layout_query.py`；
 - 页面级 dataset/collator：`src/GOT-OCR-2.0/scripts/layout_page_dataset.py`；
 - `P1/P2` 开发训练入口：`src/GOT-OCR-2.0/scripts/train_GOT_layout.py`；
-- A100 受限 smoke 编排与 checkpoint 验证：`tools/training/run_layout_a100.py`、`src/GOT-OCR-2.0/scripts/verify_layout_checkpoint.py`；
+- A100 受限 smoke 编排与 checkpoint 验证：`tools/training/run_pvld_causal_cuda_smoke.sh`、`tools/training/run_variable_layout_a100.py`；
 - HTML 页面生成和 split 审计：`tools/preprocessing/generate_synthetic_layout.py`、`tools/preprocessing/audit_synthetic_layout.py`；
 - 现有整页兼容数据参考：`src/GOT-OCR-2.0/scripts/ancientdoc_dataset.py`；
 - 现有标准整页 demo：`src/GOT-OCR-2.0/GOT/demo/run_ocr_2.0.py`。
