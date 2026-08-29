@@ -121,6 +121,8 @@ validation/pilot_validation_256.lock.json
 | `lavp_historical_s3s4_pilot_20260827_v7` | stopped, preserved | 原生 DeepSpeed 加 `NCCL_P2P_DISABLE=1` 后已真实运行超过 60 steps，证明多卡前向/反向可行；但当时 replay 指标仅反映 rank 0 本地 batch，不能证明全局 replay，因此停止并保留。v8 加入跨 rank replay audit |
 | `lavp_historical_s3s4_pilot_20260827_v8` | P1 running, engineering-valid | 原生 DeepSpeed、`NCCL_P2P_DISABLE=1`、64×64 layout memory、五卡自动准入。已连续超过 50 steps，无 OOM/NCCL 错误；跨 rank audit 已观察到 replay global samples `1–3`、replay OCR tokens `255–1247`、replay-only OCR loss 为有限正值；vision gradient 和 vision/projector/layout update norm 均为有限正值，P1 residual gate 固定为 `0`。仅证明工程训练路径和方向性诊断可运行，不是正式数据结果 |
 
+`lavp_p1_p3_formal_20260828_v9` 的 Legacy P1 训练已完成 12000 steps，随后进入全量 4000 页 P1 validation selection。按 2026-08-29 时间受限任务要求，该 tmux session 已停止并保留全部产物。现有周期 checkpoint 为 `2000/4000/6000/8000/10000/12000`；注册的新 P1 候选 `6000/9000/12000` 中，`checkpoint-9000` 不存在，因此新的 400 页验证入口当前不会启动 P2。该缺口必须由用户确认候选变更解决，不重训 P1，也不以相邻 checkpoint 代替。
+
 v3-v8 都不是对 v2 的恢复，均从原始 GOT2 重新开始 P1，并各自生成独立写入其 run 根的 validation lock。任何 pilot 的 P2 只能由同一 run prefix 的 P1 validation-selected checkpoint 初始化；当前若 v8 完成 P1，只有 v8 的 selected checkpoint 可以初始化 v8 的 P2。
 
 ## 5. 当前禁止与报告口径

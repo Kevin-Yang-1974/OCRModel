@@ -117,6 +117,9 @@ def parse_args() -> argparse.Namespace:
         help="Disable NCCL GPU P2P for the known A100 topology issue.",
     )
     parser.add_argument("--run-id", required=True)
+    parser.add_argument("--protocol-version")
+    parser.add_argument("--variant")
+    parser.add_argument("--validation-page-count", type=int)
     parser.add_argument(
         "--source-validation-selection",
         type=Path,
@@ -411,6 +414,10 @@ def main() -> int:
             str(args.source_validation_selection.resolve())
             if args.source_validation_selection is not None else None
         ),
+        "protocol_version": args.protocol_version,
+        "variant": args.variant,
+        "validation_page_count": args.validation_page_count,
+        "test_used_for_selection": False,
         "resumed_from_existing_run": args.resume_existing_run,
         "p1_max_steps": args.p1_max_steps,
         "p2_max_steps": args.p2_max_steps,

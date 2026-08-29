@@ -362,6 +362,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             "inference_failures": evaluator.get("inference_failures", 0),
             "evaluator_summary": str(evaluator_summary_path),
             "parallel_shards": len(gpu_ids),
+            "protocol_version": selection.get("protocol_version"),
+            "variant": selection.get("variant"),
+            "validation_page_count": selection.get("validation_page_count"),
+            "test_used_for_selection": False,
         }
         write_json(summary_path, payload)
         (output / "TEST_FINISHED").touch()
@@ -405,6 +409,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         "test_threshold_source": "validation_selection",
         "inference_failures": evaluator.get("inference_failures", 0),
         "evaluator_summary": str(evaluator_summary_path),
+        "protocol_version": selection.get("protocol_version"),
+        "variant": selection.get("variant"),
+        "validation_page_count": selection.get("validation_page_count"),
+        "test_used_for_selection": False,
     }
     summary_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     (output / "TEST_FINISHED").touch()

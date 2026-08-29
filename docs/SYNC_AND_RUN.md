@@ -489,6 +489,25 @@ bash tools/training/run_historical_s3s4_p1_p2_pilot_tmux.sh \
 
 每次重试都必须使用新的 session/run prefix；不得恢复、覆盖或删除 v1/v2 记录。启动后应先在 `p1/train.log` 核验 optimizer group LR：P1 vision/projector/layout 分别为 `1e-6/1e-5/1e-4`，而非通用 `--learning_rate`。完整配置、validation 清单哈希、隔离边界和已知失败记录见 `docs/LAVP_EXPERIMENT_CONFIGURATION_REGISTER.md`。
 
+## 19. 时间受限 Legacy PVLD 策略验证
+
+`lavp_p1_p3_formal_20260828_v9` 的 4000 页 Legacy/P1 validation selection 已停止；tmux session 已结束，既有 run、checkpoint、日志和临时预测文件均保留。新入口只验证 v9 Legacy PVLD 的冻结范围、分组学习率和训练策略，不启用 M2、M3、M4、All 或其他附加结构，也不设计新的逐步解冻。
+
+新协议固定为 `protocol_version=time_constrained_freeze_strategy_v1`、`variant=original_pvld_freeze_strategy`、`validation_page_count=400`、`test_used_for_selection=false`。400 页全部来自正式 validation split，S3/S4 各 200 页，按 region-count bucket 和页复杂度 tertile 分层。P1、P2、P3 的 validation 共享该 manifest；P2 训练 30000 steps，只保存/评估 10000、20000、30000，并沿用 v9 的训练方式；P3 沿用 v9 的 MTHv2 train 数据方式，从 P2 validation-selected checkpoint 训练 8000 steps，只保存/评估最终 checkpoint，validation 使用固定 400 页；test 仍使用 v9 的 MTHv2 test，且只能在 P3 selection 后启动。
+
+预检发现 v9 Legacy P1 只存在 `checkpoint-2000/4000/6000/8000/10000/12000`，不存在注册候选 `checkpoint-9000`，服务器其他 Legacy P1 run 也没有该 checkpoint。入口因此在创建新 run 前拒绝启动，不能把相邻 checkpoint 冒充 9000。用户确认新的三点候选后再修改并运行；其余命令保持：
+
+```bash
+cd /data3/yky/yangky_ocr_models/ocrmodel
+source config/paths.env
+bash tools/training/run_time_constrained_pvld_baseline.sh \
+  --session time_constrained_original_pvld_20260829_v1 \
+  --run-prefix time_constrained_original_pvld_20260829_v1 \
+  --p1-candidate-steps 6000,8000,12000
+```
+
+入口省略 `--gpu-ids` 时，每个训练、selection 和 test 阶段重新选择全部瞬时 utilization 严格小于 50% 的 GPU；显式传入时只查询并使用指定集合。最终 `summary.json` 汇总 P2 selected step、OCR/layout test 指标和训练稳定性。只有另行传入使用相同 test manifest 的 `--previous-test-summary` 时，才计算新旧策略差值以及 OCR/layout 是否退化；不同 test manifest 的结果拒绝直接比较。
+
 成功条件为控制 run 根目录存在 `summary.json`，其中 `status=ok`、`selection_split=validation`、`test_used_for_selection=false`、`test_manifest_read=false`，且三个 condition 均有 240 页指标。完整 predictions 和单项日志保留在各 condition 子目录；终端只回传：
 
 ```bash
