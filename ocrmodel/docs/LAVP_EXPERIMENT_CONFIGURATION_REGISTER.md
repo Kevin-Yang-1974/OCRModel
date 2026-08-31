@@ -223,3 +223,13 @@ P2/P3 继续采用“解冻 Vary ViT、`mm_projector_vary`、PVLD、residual gat
 | P3 | P3 不得从当前 P2 初始化。应从“修复后 P2 validation-selected checkpoint”开始，保留用户已提出的 `40,000` steps、每 `8,000` 保存和候选 `8k/16k/24k/32k/40k`；首轮沿用低 LR：vision `2e-7`、projector `2e-6`、layout `1e-5`、Qwen `5e-7`、gate `1e-6`，同时采用已通过 finite canary 的 warmup/scheduler。P3 首轮不加入 LLRD、routing 或其他结构变化。 | P3 是域适配阶段，新增变量应最少；应把训练稳定性、Real-OOD validation 和 selection-locked test 与 P2 修复效果分开解释。 |
 
 推荐的执行门槛是：先完成 tied-weight 冻结修复和 1k-step finite canary，再决定是否重跑完整 P2；在此之前不启动 P3。P1 的 50k 延长训练可以作为独立 Legacy 对照继续，但其 validation 仍严格限制为 400 页，不能回到 4000 页。
+
+### 7.5 BSCC P2 FP32 bounded canary（2026-08-31）
+
+BSCC 上此前排队但未启动的 4 卡/2 卡 canary 分别为 Slurm job `1467944`、`1468056`、`1468098`，均已取消并保留记录；job `1468102` 曾启动 13 秒后因脚本预先创建 run 根目录而失败，未进入训练。修复脚本后提交的 job `1468124` 使用单卡、32 CPU 核，仅用于数值稳定性诊断。
+
+该 canary 从既有 `bscc_synth_p1_legacy_100000_20260830_v1/p1/model/checkpoint-100000` 直接初始化，source lock 明确标记 `formal_selection=false`、`selection_role=direct_checkpoint_engineering_canary`，因此不能视为 validation-selected P2，也不能用于正式 P3 或 test。配置为 PVLD P2、1000 steps、500/1000 保存、PVLD 参数与辅助计算 FP32、P2 gate LR `1e-6`、cosine、`warmup_ratio=0.001`。
+
+job `1468124` 已完成（`COMPLETED`，耗时 `00:17:22`）。训练到 `global_step=1000`，`train_loss=6.524957466363907`，`train_steps_per_second=1.473`；metrics 全量 finite 检查没有发现 NaN/Inf。两个 checkpoint 的 `checkpoint_health.json` 均为 `status=ok`，模型参数 finite，optimizer state 无非有限值；500 与 1000 step 权重 SHA-256 分别为 `70c3cd89447ad62fa6c8c4297a730d776a76ac08c104e9e0496657fcb14b0ff8` 和 `127f0fda7d45f40e7dbf49153b64116afcfa617dface6b7eed0ea4a9b38f04e`，不是崩坏后静止的同一权重。
+
+运行时审计确认 `lm_head.weight` 与 input embedding 是同一 Parameter（`data_ptr` 相同，`tie_word_embeddings=true`），两者均为 `requires_grad=false` 且不在 optimizer。optimizer 共 9 组、564 个 Parameter、409,124,120 个 elements，无空组、重复参数、冻结参数进入、遗漏 trainable 参数或未注册参数。首步到末步的 OCR/layout loss、vision/projector/layout gradient、feature drift 和 residual gate 均保持有限；末步 OCR loss `3.7697`、layout loss `1.6935`、总 loss `5.4632`，residual gate `-0.0004177`，未出现旧 P2 在 step 685 后的 NaN 模式。该结果只证明 FP32 bounded canary 的工程路径和数值稳定性，不能替代 validation 或性能结论。
