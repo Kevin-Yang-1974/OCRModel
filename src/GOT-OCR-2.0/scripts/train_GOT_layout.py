@@ -56,6 +56,56 @@ OUTPUT_DIAGNOSTIC_FIELDS = {
     "region_count_mae": "layout_region_count_mae",
 }
 
+PERIODIC_HEALTH_FIELDS = (
+    "loss",
+    "ocr_loss",
+    "layout_loss",
+    "residual_gate",
+    "vision_gradient_norm",
+    "projector_gradient_norm",
+    "layout_decoder_gradient_norm",
+    "vision_parameter_update_norm",
+    "projector_parameter_update_norm",
+    "layout_parameter_update_norm",
+    "vision_feature_drift_from_initial",
+)
+
+
+def build_periodic_health_record(
+    stage: str,
+    optimizer_step: int,
+    metrics: dict[str, Any],
+) -> dict[str, Any]:
+    snapshot = {
+        name: metrics[name]
+        for name in PERIODIC_HEALTH_FIELDS
+        if name in metrics
+    }
+    issues: list[str] = []
+    for name, value in snapshot.items():
+        if isinstance(value, (int, float)) and not math.isfinite(float(value)):
+            issues.append(f"nonfinite:{name}")
+    if stage == "p2":
+        for name in ("loss", "ocr_loss", "layout_loss"):
+            value = snapshot.get(name)
+            if not isinstance(value, (int, float)) or float(value) <= 0.0:
+                issues.append(f"nonpositive_or_missing:{name}")
+        for name in (
+            "vision_parameter_update_norm",
+            "projector_parameter_update_norm",
+            "layout_parameter_update_norm",
+        ):
+            value = snapshot.get(name)
+            if not isinstance(value, (int, float)) or float(value) <= 0.0:
+                issues.append(f"no_parameter_update:{name}")
+    return {
+        "status": "ok" if not issues else "abnormal",
+        "stage": stage,
+        "optimizer_step": optimizer_step,
+        "issues": issues,
+        "metrics": snapshot,
+    }
+
 
 def file_sha256(path: Path) -> str:
     digest = hashlib.sha256()
@@ -168,6 +218,7 @@ class LayoutDiagnosticTrainer(GOTTrainer):
         self._last_replay_ocr_loss: torch.Tensor | None = None
         self._first_forward_started = False
         self._first_training_step_started = False
+        self._last_periodic_health_step = -1
         model_base = self.model.get_model()
         self._model_base = model_base
         self._layout_adapter = (
@@ -427,7 +478,42 @@ class LayoutDiagnosticTrainer(GOTTrainer):
             }
         )
         self._latest_gradient_norms.clear()
+        self._write_periodic_health_check(enriched)
         super().log(enriched, *args, **kwargs)
+
+    def _write_periodic_health_check(self, metrics: dict[str, Any]) -> None:
+        interval = int(getattr(self.args, "health_check_steps", 0))
+        step = int(self.state.global_step)
+        if (
+            interval <= 0
+            or step <= 0
+            or step % interval
+            or step == self._last_periodic_health_step
+        ):
+            return
+        self._last_periodic_health_step = step
+        record = build_periodic_health_record(
+            str(getattr(self.args, "layout_stage", "unknown")),
+            step,
+            metrics,
+        )
+        if self.is_world_process_zero():
+            path = Path(self.args.output_dir) / f"{record['stage']}_health_checks.jsonl"
+            with path.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n")
+            print(
+                json.dumps(
+                    {"event": "periodic_training_health_check", **record},
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ),
+                flush=True,
+            )
+        if record["status"] != "ok":
+            raise RuntimeError(
+                "Periodic training health check failed at optimizer_step="
+                f"{step}; issues={record['issues']}."
+            )
 
 
 @dataclass
@@ -534,6 +620,10 @@ class LayoutTrainingArguments:
         default=False,
         metadata={"help": "Keep PVLD parameters and auxiliary computation in float32."},
     )
+    health_check_steps: int = field(
+        default=0,
+        metadata={"help": "Write and enforce a periodic training health record; 0 disables it."},
+    )
 
 
 def validate_layout_args(args: LayoutTrainingArguments) -> None:
@@ -541,6 +631,8 @@ def validate_layout_args(args: LayoutTrainingArguments) -> None:
         raise ValueError("--layout_architecture must be fixed_slot or pvld.")
     if args.layout_stage not in {"p1", "p2", "p3"}:
         raise ValueError("--layout_stage must be p1, p2, or p3.")
+    if args.health_check_steps < 0:
+        raise ValueError("--health_check_steps cannot be negative.")
     if args.layout_memory_resolution not in {"16", "64"}:
         raise ValueError("--layout_memory_resolution must be 16 or 64.")
     if args.p2_train_scope not in {

@@ -7,6 +7,7 @@ import argparse
 import json
 import math
 import os
+import re
 import socket
 import subprocess
 import sys
@@ -104,6 +105,12 @@ def parse_args() -> argparse.Namespace:
         help="Comma-separated P1 optimizer steps to pass to validation-only selection.",
     )
     parser.add_argument("--p2-checkpoint-steps", type=int)
+    parser.add_argument(
+        "--health-check-steps",
+        type=int,
+        default=0,
+        help="Write an in-training health record at this optimizer-step interval; 0 disables it.",
+    )
     parser.add_argument("--checkpoint-retention", type=int, default=2)
     parser.add_argument("--layout-boundary-loss-weight", type=float, default=0.0)
     parser.add_argument("--layout-count-condition-strength", type=float, default=0.0)
@@ -173,6 +180,11 @@ def parse_args() -> argparse.Namespace:
         help="Validation-only selection whose selected model initializes a standalone P2 or P3 stage.",
     )
     parser.add_argument("--resume-existing-run", action="store_true")
+    parser.add_argument(
+        "--p1-validation-selection-name",
+        default="validation_selection",
+        help="P1 selection directory name below <run>/p1; useful when replacing a prior validation set.",
+    )
     parser.add_argument(
         "--skip-p1-validation-selection",
         action="store_true",
@@ -361,6 +373,7 @@ def training_command(
         "--lr_scheduler_type", args.lr_scheduler_type,
         "--warmup_ratio", str(args.warmup_ratio),
         "--layout_module_fp32", str(args.layout_module_fp32),
+        "--health_check_steps", str(args.health_check_steps),
         "--weight_decay", "0",
         "--object_loss_weight", "1" if args.layout_loss_preset == "layout_full" else "0",
         "--bbox_l1_loss_weight", "5" if args.layout_loss_preset == "layout_full" else "0",
@@ -444,6 +457,12 @@ def main() -> int:
         raise ValueError(
             "--source-validation-selection is only valid for a standalone P2 or P3 stage."
         )
+    if args.health_check_steps < 0:
+        raise ValueError("--health-check-steps cannot be negative.")
+    if not re.fullmatch(r"[A-Za-z0-9._-]+", args.p1_validation_selection_name):
+        raise ValueError(
+            "--p1-validation-selection-name must be a single portable directory name."
+        )
     if args.skip_p1_validation_selection and (
         args.stages != "p1" or args.p1_max_steps > 10
     ):
@@ -487,6 +506,8 @@ def main() -> int:
             if args.p1_candidate_steps else None
         ),
         "p2_checkpoint_steps": args.p2_checkpoint_steps or args.checkpoint_steps,
+        "health_check_steps": args.health_check_steps,
+        "p1_validation_selection_name": args.p1_validation_selection_name,
         "checkpoint_retention": args.checkpoint_retention,
         "layout_memory_resolution": args.layout_memory_resolution,
         "replay_protocol": {
@@ -536,7 +557,9 @@ def main() -> int:
                 "metrics": str(p1_metrics),
                 "reused_completed_stage": True,
             }
-        candidate_selection = run_root / "p1" / "validation_selection" / "selection.json"
+        candidate_selection = (
+            run_root / "p1" / args.p1_validation_selection_name / "selection.json"
+        )
         if candidate_selection.is_file() and source_selection_path is None:
             source_selection_path = candidate_selection.resolve()
     for stage in args.stages.split(","):
@@ -598,8 +621,8 @@ def main() -> int:
             and args.ablation == "vlqa_layout_p1_p2"
             and not args.skip_p1_validation_selection
         ):
-            selection_dir = run_root / "p1" / "validation_selection"
-            selection_log = run_root / "p1" / "validation_selection.log"
+            selection_dir = run_root / "p1" / args.p1_validation_selection_name
+            selection_log = run_root / "p1" / f"{args.p1_validation_selection_name}.log"
             # Admission is intentionally repeated here.  A long P1 can change
             # the set of cards below the utilization threshold before its
             # validation-only selection begins.

@@ -96,3 +96,13 @@ def test_training_entry_has_hard_nonfinite_and_scope_audits() -> None:
     assert "_assert_finite_model_parameters" in (
         ROOT / "src/GOT-OCR-2.0/GOT/train/trainer_vit_fixlr.py"
     ).read_text(encoding="utf-8")
+
+
+def test_training_entry_writes_periodic_health_records() -> None:
+    source = (ROOT / "src/GOT-OCR-2.0/scripts/train_GOT_layout.py").read_text(
+        encoding="utf-8"
+    )
+    assert "build_periodic_health_record" in source
+    assert "p2_health_checks.jsonl" not in source
+    assert 'f"{record[\'stage\']}_health_checks.jsonl"' in source
+    assert "Periodic training health check failed" in source

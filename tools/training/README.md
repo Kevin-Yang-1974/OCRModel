@@ -35,6 +35,10 @@ python tools/training/check_checkpoint_health.py /path/to/checkpoint-10000
 
 命令返回 `status=nonfinite_weights` 或非零退出码时，该 checkpoint 不得用于 validation selection 或后续阶段初始化。
 
+## BSCC P1 100k → 250k 与正式 P2
+
+`run_bscc_p1_continue_p2_formal.sbatch` 是当前已登记的一体化 Slurm 入口。它使用 seed 42 锁定 400 页 validation，从既有 P1 `checkpoint-100000` 恢复 DeepSpeed optimizer/trainer state并累计训练到 250000，按 `100000/150000/200000/250000` 做 validation-only selection，然后直接启动 200000-step 正式 P2。P2 每 50000 steps 保存 checkpoint，并每 10000 steps写入并强制检查 `p2_health_checks.jsonl`。入口不运行 P2 selection、P3 或 test，不得重复提交同一 run。
+
 ## BSCC P1 50k 对照
 
 BSCC 数据上的 50,000-step Legacy P1 对照同时提供两个平台入口，训练模式保持一致：

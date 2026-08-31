@@ -21,7 +21,8 @@ def _tensor_status(tensor: Any) -> tuple[bool, int]:
 def inspect_checkpoint(checkpoint: Path) -> dict[str, Any]:
     checkpoint = checkpoint.resolve()
     files = sorted(checkpoint.glob("*.safetensors"))
-    files += sorted(checkpoint.glob("*.bin"))
+    files += sorted(checkpoint.glob("pytorch_model*.bin"))
+    files += sorted(checkpoint.glob("adapter_model*.bin"))
     if not files:
         raise FileNotFoundError(f"no .safetensors or .bin weights in {checkpoint}")
     nonfinite: list[dict[str, Any]] = []
