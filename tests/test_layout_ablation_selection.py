@@ -53,6 +53,28 @@ class LayoutAblationSelectionTests(unittest.TestCase):
         )
         self.assertEqual(candidates, [(7500, self.root.resolve())])
 
+    def test_keeps_different_steps_with_same_base_weights_hash(self) -> None:
+        self.model(self.root, 12000)
+        (self.root / "layout_training_metrics.json").write_text(
+            json.dumps({"global_step": 12000, "ablation_id": "vlqa_layout_p1_p2"}), encoding="utf-8"
+        )
+        for step in (4000, 8000):
+            checkpoint = self.root / f"checkpoint-{step}"
+            checkpoint.mkdir()
+            (checkpoint / "model.safetensors").write_bytes(b"same-base-weights")
+            (checkpoint / "config.json").write_text("{}", encoding="utf-8")
+        final_checkpoint = self.root / "checkpoint-12000"
+        final_checkpoint.mkdir()
+        (final_checkpoint / "model.safetensors").write_bytes(b"same-base-weights")
+        (final_checkpoint / "config.json").write_text("{}", encoding="utf-8")
+        candidates = selection.discover_candidates(
+            self.root,
+            expected_ablation="vlqa_layout_p1_p2",
+            candidate_steps={4000, 8000, 12000},
+            prefer_periodic_checkpoint=True,
+        )
+        self.assertEqual([step for step, _ in candidates], [4000, 8000, 12000])
+
     def test_resume_preserves_partial_candidate_and_uses_retry_directory(self) -> None:
         output = self.root / "selection"
         partial = output / "step-00007500"

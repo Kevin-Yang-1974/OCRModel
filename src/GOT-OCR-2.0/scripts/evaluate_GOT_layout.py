@@ -107,14 +107,32 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 def write_json(path: Path, payload: Any) -> None:
     temporary = path.with_suffix(path.suffix + ".tmp")
     temporary.write_text(
-        json.dumps(payload, ensure_ascii=False, indent=2, allow_nan=False) + "\n",
+        json.dumps(_json_safe(payload), ensure_ascii=False, indent=2, allow_nan=False) + "\n",
         encoding="utf-8",
     )
     temporary.replace(path)
 
 
 def compact_json(payload: Any) -> str:
-    return json.dumps(payload, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
+    return json.dumps(
+        _json_safe(payload),
+        ensure_ascii=False,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+
+
+def _json_safe(value: Any) -> Any:
+    """Convert non-finite diagnostic floats to JSON null before serialization."""
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, dict):
+        return {key: _json_safe(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_json_safe(item) for item in value]
+    if isinstance(value, tuple):
+        return [_json_safe(item) for item in value]
+    return value
 
 
 def resolve_dtype(name: str) -> torch.dtype:
@@ -548,8 +566,17 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
                             .float().argmax(dim=-1).detach().cpu().tolist()
                         )
                         object_scores = (
-                            layout_outputs.layout_region_token_probabilities[row][valid]
-                            .float().detach().cpu().tolist()
+                            torch.nan_to_num(
+                                layout_outputs.layout_region_token_probabilities[row][valid]
+                                .float(),
+                                nan=0.0,
+                                posinf=1.0,
+                                neginf=0.0,
+                            )
+                            .clamp(0.0, 1.0)
+                            .detach()
+                            .cpu()
+                            .tolist()
                         )
                         assert layout_accumulator is not None
                         page_metrics = layout_accumulator.add_page(

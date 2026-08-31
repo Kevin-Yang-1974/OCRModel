@@ -53,7 +53,24 @@ bash tools/training/run_time_constrained_pvld_baseline.sh \
 
 GPU 默认只查询本次命令允许集合中瞬时 `utilization.gpu < 50` 的卡。需要固定物理卡时传 `--gpu-ids 0,1`；忙卡不等待、不抢占，查询失败或无合格卡时整体退出。
 
-## 4. 有界检查
+## 4. 双平台 BSCC P1 对照入口
+
+BSCC 的 50,000-step P1 对照必须与 A100 使用相同训练模式和冻结策略。A100 使用 tmux 入口：
+
+```bash
+bash tools/training/run_bscc_p1_50000_a100.sh \
+  --run-prefix bscc_p1_legacy_50000_a100_20260829_v1
+```
+
+BSCC 使用 Slurm 入口（提交一次，不重复启动）：
+
+```bash
+sbatch tools/training/run_bscc_p1_50000.sbatch
+```
+
+两份脚本均为 `bscc_pvld_p1_legacy`，P1 最大步数为 `50000`，保存间隔为 `10000`，validation 候选严格为 `20000,30000,40000,50000`，并记录 `test_used_for_selection=false`。A100 与 BSCC 只改变调度器和环境初始化，不改变 runner、DeepSpeed ZeRO-2、bf16、whole-page 输入、batch、seed、loss 或参数冻结/学习率。BSCC 默认工作区为 `$HOME/yangky_ocr_models_bscc_proto`；A100 默认读取 `/data3/yky/yangky_ocr_models` 下的 MTHv2 与 `/data4/hyf/backup` 原始 GOT2 权重。
+
+## 5. 有界检查
 
 ```bash
 bash tools/training/run_pvld_causal_cuda_smoke.sh <gpu-id> <new-run-id>
@@ -63,7 +80,7 @@ python -m pytest -q tests
 
 smoke 只验证模型加载、前向/反向和 checkpoint 链路，不能作为正式性能结果。每次重试使用新的 run ID，并保留失败目录。
 
-## 5. 结果回传
+## 6. 结果回传
 
 只回传 `metadata/status.txt`、完成标志和紧凑 `summary.json` 的必要字段；日志最多回传最后 20 行。不要输出完整训练日志、预测全集、私有路径、凭据或模型权重。
 

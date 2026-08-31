@@ -622,7 +622,9 @@ class VariableLayoutDecoder(nn.Module):
                 count_prior=count_prior,
             )
             step_logits = step_output.logits[:, -1]
-            probabilities = step_logits.softmax(dim=-1)
+            # Keep confidence values in FP32. A bf16 softmax can round a
+            # probability just outside [0, 1], which breaks strict evaluators.
+            probabilities = step_logits.float().softmax(dim=-1).clamp_(0.0, 1.0)
             states, counts = self.fsm.states_after_prefix(generated)
             if max_layout_records is not None:
                 for row, (state, count) in enumerate(zip(states, counts)):
@@ -663,11 +665,13 @@ class VariableLayoutDecoder(nn.Module):
             count_prior=count_prior,
         )
         probability_width = max((len(row) for row in region_probabilities), default=0)
-        region_probability_tensor = layout_evidence.new_zeros((batch, probability_width))
+        region_probability_tensor = torch.zeros(
+            (batch, probability_width), dtype=torch.float32, device=device
+        )
         for row, values in enumerate(region_probabilities):
             if values:
                 region_probability_tensor[row, : len(values)] = torch.tensor(
-                    values, dtype=layout_evidence.dtype, device=device
+                    values, dtype=torch.float32, device=device
                 )
         truncated = ~finished
         return VariableLayoutOutput(
@@ -1004,8 +1008,15 @@ class PromptedVariableLayoutAdapter(nn.Module):
         generate_layout: bool = False,
         shuffle_predicted_layout: bool = False,
     ) -> PromptedVariableLayoutOutput:
+        # PVLD is an auxiliary module added on top of GOT2.  When its
+        # parameters are kept in float32, convert both visual interfaces at
+        # entry and restore the OCR interface dtype only at writeback.
+        interface_dtype = visual_tokens.dtype
+        compute_dtype = self.visual_projection.weight.dtype
+        visual_tokens_compute = visual_tokens.to(dtype=compute_dtype)
+        high_resolution_features_compute = high_resolution_features.to(dtype=compute_dtype)
         layout_evidence, _ = self.decoder.prompt_attention(
-            high_resolution_features,
+            high_resolution_features_compute,
             high_resolution_padding_mask,
             return_attention=False,
         )
@@ -1018,7 +1029,7 @@ class PromptedVariableLayoutAdapter(nn.Module):
         if self.predicted_layout_routing:
             with torch.no_grad():
                 predicted_decoder_output = self.decoder.generate(
-                    high_resolution_features,
+                    high_resolution_features_compute,
                     layout_id=self.vocabulary.layout_id,
                     region_id=self.vocabulary.region_id,
                     eos_id=self.vocabulary.eos_id,
@@ -1058,7 +1069,7 @@ class PromptedVariableLayoutAdapter(nn.Module):
             if shuffle_predicted_layout and predicted_condition.shape[0] > 1:
                 predicted_condition = predicted_condition.roll(1, dims=0)
                 routing_reliability = routing_reliability.roll(1, dims=0)
-        projected_visual = self.visual_projection(self.visual_norm(visual_tokens))
+        projected_visual = self.visual_projection(self.visual_norm(visual_tokens_compute))
         routed, _ = self.visual_routing(
             projected_visual,
             layout_evidence,
@@ -1072,10 +1083,8 @@ class PromptedVariableLayoutAdapter(nn.Module):
         # Reliability is intentionally computed in float32.  Cast only at the
         # BF16 writeback boundary so free-layout routing stays numerically stable
         # while the OCR visual-token interface preserves its original dtype.
-        writeback = self.writeback_output(
-            routed.to(dtype=self.writeback_output.weight.dtype)
-        ).to(dtype=visual_tokens.dtype)
-        gate = torch.tanh(self.residual_gate).to(dtype=visual_tokens.dtype)
+        writeback = self.writeback_output(routed).to(dtype=interface_dtype)
+        gate = torch.tanh(self.residual_gate).to(dtype=interface_dtype)
         visual_output = visual_tokens + gate * writeback
 
         decoder_output = None
@@ -1085,7 +1094,7 @@ class PromptedVariableLayoutAdapter(nn.Module):
         if layout_input_ids is not None:
             decoder_output = self.decoder(
                 layout_input_ids,
-                high_resolution_features,
+                high_resolution_features_compute,
                 high_resolution_padding_mask,
                 straight_through_scale(layout_evidence, self.shared_gradient_scale),
                 target_padding_mask=(
@@ -1121,7 +1130,7 @@ class PromptedVariableLayoutAdapter(nn.Module):
                 )
         elif generate_layout:
             decoder_output = self.decoder.generate(
-                high_resolution_features,
+                high_resolution_features_compute,
                 layout_id=self.vocabulary.layout_id,
                 region_id=self.vocabulary.region_id,
                 eos_id=self.vocabulary.eos_id,

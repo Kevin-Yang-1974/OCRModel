@@ -1,6 +1,8 @@
+import json
 import os
 import torch
 import torch.nn as nn
+from pathlib import Path
 
 from transformers import Trainer
 from transformers.trainer_pt_utils import get_parameter_names
@@ -24,8 +26,85 @@ def unwrap_model(model: nn.Module) -> nn.Module:
 
 class GOTTrainer(Trainer):
 
+    @staticmethod
+    def _assert_finite_model_parameters(model: nn.Module) -> None:
+        nonfinite = [
+            name for name, parameter in model.named_parameters()
+            if not torch.isfinite(parameter.detach()).all()
+        ]
+        if nonfinite:
+            raise RuntimeError(
+                f"Non-finite model parameter before checkpoint save: {nonfinite[:8]}"
+            )
+
+    def _audit_optimizer_groups(self, optimizer, model):
+        model_parameter_ids = {id(parameter): (name, parameter) for name, parameter in model.named_parameters()}
+        seen: dict[int, str] = {}
+        groups = []
+        duplicate_parameters = []
+        frozen_parameters = []
+        unregistered_parameters = []
+        for index, group in enumerate(optimizer.param_groups):
+            names = []
+            elements = 0
+            for parameter in group["params"]:
+                identity = id(parameter)
+                name = model_parameter_ids.get(identity, (f"<unregistered:{identity}>", parameter))[0]
+                if identity not in model_parameter_ids:
+                    unregistered_parameters.append(name)
+                names.append(name)
+                elements += parameter.numel()
+                if identity in seen:
+                    duplicate_parameters.append({"parameter": name, "groups": [seen[identity], index]})
+                else:
+                    seen[identity] = index
+                if not parameter.requires_grad:
+                    frozen_parameters.append(name)
+            groups.append({
+                "index": index,
+                "group_name": group.get("group_name", f"group_{index}"),
+                "parameter_count": len(group["params"]),
+                "parameter_elements": elements,
+                "learning_rate": float(group["lr"]),
+                "weight_decay": float(group.get("weight_decay", 0.0)),
+                "parameter_names_sample": names[:8],
+            })
+        return {
+            "groups": groups,
+            "group_count": len(groups),
+            "empty_groups": [group["index"] for group in groups if group["parameter_count"] == 0],
+            "duplicate_parameters": duplicate_parameters,
+            "frozen_parameters_in_optimizer": frozen_parameters,
+            "unregistered_parameters": unregistered_parameters,
+            "missing_trainable_parameters": [
+                name for name, parameter in model.named_parameters()
+                if parameter.requires_grad and id(parameter) not in seen
+            ],
+            "optimizer_parameter_count": len(seen),
+            "optimizer_parameter_elements": sum(parameter.numel() for parameter in model.parameters() if id(parameter) in seen),
+        }
+
+    def _nonfinite_optimizer_state(self) -> list[str]:
+        """Return optimizer-state tensor names containing NaN/Inf values."""
+        optimizer = getattr(self, "optimizer", None)
+        state = getattr(optimizer, "state", None)
+        if not state:
+            return []
+        names_by_id = {
+            id(parameter): name
+            for name, parameter in self.model.named_parameters()
+        }
+        nonfinite: list[str] = []
+        for parameter, values in state.items():
+            parameter_name = names_by_id.get(id(parameter), f"<parameter:{id(parameter)}>")
+            for state_name, value in values.items():
+                if torch.is_tensor(value) and value.is_floating_point() and not torch.isfinite(value).all():
+                    nonfinite.append(f"{parameter_name}.{state_name}")
+        return nonfinite
+
     def _safe_save(self, output_dir: str):
         """Collects the state dict and dump to disk."""
+        self._assert_finite_model_parameters(self.model)
         state_dict = self.model.state_dict()
         if self.args.should_save:
             cpu_state_dict = {
@@ -37,6 +116,13 @@ class GOTTrainer(Trainer):
 
 
     def _save(self, output_dir: Optional[str] = None, state_dict=None):
+        self._assert_finite_model_parameters(self.model)
+        nonfinite_optimizer_state = self._nonfinite_optimizer_state()
+        if nonfinite_optimizer_state:
+            raise RuntimeError(
+                "Non-finite optimizer state before checkpoint save: "
+                f"{nonfinite_optimizer_state[:8]}"
+            )
         if getattr(self.args, 'tune_mm_mlp_adapter', False):
             # Save the model
             _state_dict = state_dict
@@ -61,6 +147,18 @@ class GOTTrainer(Trainer):
                 torch.save(weight_to_save, os.path.join(output_dir, f'mm_projector.bin'))
 
         super(GOTTrainer, self)._save(output_dir, state_dict)
+        if output_dir is not None and self.args.should_save:
+            health = {
+                "status": "ok",
+                "model_parameters_finite": True,
+                "optimizer_state_nonfinite": [],
+                "optimizer_group_audit": getattr(self, "optimizer_group_audit", None),
+            }
+            Path(output_dir).mkdir(parents=True, exist_ok=True)
+            Path(output_dir, "checkpoint_health.json").write_text(
+                json.dumps(health, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
 
     def create_optimizer(self):
         """
@@ -120,5 +218,15 @@ class GOTTrainer(Trainer):
                 )
             optimizer_cls, optimizer_kwargs = Trainer.get_optimizer_cls_and_kwargs(self.args)
             self.optimizer = optimizer_cls(optimizer_grouped_parameters, **optimizer_kwargs)
+            self.optimizer_group_audit = self._audit_optimizer_groups(self.optimizer, opt_model)
+            if self.optimizer_group_audit["duplicate_parameters"]:
+                raise RuntimeError("A parameter was placed in multiple optimizer groups.")
+            if self.optimizer_group_audit["frozen_parameters_in_optimizer"]:
+                raise RuntimeError("A frozen parameter was placed in the optimizer.")
+            if self.optimizer_group_audit["missing_trainable_parameters"]:
+                raise RuntimeError("A trainable parameter was omitted from the optimizer.")
+            if self.optimizer_group_audit["unregistered_parameters"]:
+                raise RuntimeError("An optimizer parameter is not registered on the model.")
+            print(json.dumps({"event": "optimizer_group_audit", **self.optimizer_group_audit}, separators=(",", ":")), flush=True)
 
         return self.optimizer

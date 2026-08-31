@@ -118,11 +118,11 @@ def discover_candidates(
             raise FileNotFoundError(
                 f"Requested validation checkpoint steps are missing: {missing}"
             )
-    unique: dict[str, tuple[int, Path]] = {}
-    for step, path in sorted(candidates_by_step.items()):
-        digest = sha256(path / "model.safetensors")
-        unique.setdefault(digest, (step, path))
-    return sorted(unique.values())
+    # Keep every requested optimizer step.  Some GOT2 checkpoints serialize
+    # the unchanged base model to the same ``model.safetensors`` hash while
+    # storing the trainable adapter state separately; deduplicating by that
+    # hash would silently remove validation candidates.
+    return sorted(candidates_by_step.items())
 
 
 def candidate_output_dir(output: Path, step: int, *, resume: bool) -> tuple[Path, Path]:
