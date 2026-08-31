@@ -19,7 +19,7 @@ run_id="${BSCC_P2_CANARY_RUN_ID:-bscc_p2_canary_from_p1_100000_fp32_20260831_v5}
 run_root="${workspace}/training_runs/GOT/${run_id}"
 runner="${workspace}/ocrmodel/tools/training/run_variable_layout_a100.py"
 project_root="${workspace}/ocrmodel/src/GOT-OCR-2.0"
-source_lock="${run_root}/metadata/direct_canary_source_selection.json"
+source_lock="${workspace}/runs/${run_id}.source_selection.json"
 
 for path in \
     "${dataset_root}/train/manifest.jsonl" \
@@ -36,7 +36,7 @@ IFS=',' read -r -a assigned_gpus <<< "${gpu_ids}"
 [[ "${#assigned_gpus[@]}" -eq 1 ]] || { printf 'ERROR: P2 canary requires one assigned GPU for the BSCC bounded run.\n' >&2; exit 75; }
 
 mkdir -p "${workspace}/training_runs/GOT" "${workspace}/runs" "${workspace}/tmp" \
-    "${workspace}/cache/huggingface" "${workspace}/cache/torch_extensions" "${run_root}/metadata"
+    "${workspace}/cache/huggingface" "${workspace}/cache/torch_extensions"
 export TMPDIR="${workspace}/tmp"
 export HF_HOME="${workspace}/cache/huggingface"
 export TORCH_EXTENSIONS_DIR="${workspace}/cache/torch_extensions"
