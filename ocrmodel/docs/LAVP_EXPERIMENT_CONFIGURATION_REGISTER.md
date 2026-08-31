@@ -233,3 +233,13 @@ BSCC 上此前排队但未启动的 4 卡/2 卡 canary 分别为 Slurm job `1467
 job `1468124` 已完成（`COMPLETED`，耗时 `00:17:22`）。训练到 `global_step=1000`，`train_loss=6.524957466363907`，`train_steps_per_second=1.473`；metrics 全量 finite 检查没有发现 NaN/Inf。两个 checkpoint 的 `checkpoint_health.json` 均为 `status=ok`，模型参数 finite，optimizer state 无非有限值；500 与 1000 step 权重 SHA-256 分别为 `70c3cd89447ad62fa6c8c4297a730d776a76ac08c104e9e0496657fcb14b0ff8` 和 `127f0fda7d45f40e7dbf49153b64116afcfa617dface6b7eed0ea4a9b38f04e`，不是崩坏后静止的同一权重。
 
 运行时审计确认 `lm_head.weight` 与 input embedding 是同一 Parameter（`data_ptr` 相同，`tie_word_embeddings=true`），两者均为 `requires_grad=false` 且不在 optimizer。optimizer 共 9 组、564 个 Parameter、409,124,120 个 elements，无空组、重复参数、冻结参数进入、遗漏 trainable 参数或未注册参数。首步到末步的 OCR/layout loss、vision/projector/layout gradient、feature drift 和 residual gate 均保持有限；末步 OCR loss `3.7697`、layout loss `1.6935`、总 loss `5.4632`，residual gate `-0.0004177`，未出现旧 P2 在 step 685 后的 NaN 模式。该结果只证明 FP32 bounded canary 的工程路径和数值稳定性，不能替代 validation 或性能结论。
+
+### 7.6 BSCC P1 连续训练与正式 P2（2026-08-31 最新执行口径）
+
+用户最新授权取代 7.4 中“先追加 bounded canary”的建议。本轮使用 seed `42` 对原 4000 页 whole-page validation manifest 进行无放回、seed-keyed 随机锁定，得到 400 页清单；SHA-256 为 `5a5d6e36f3cee4136863671a1692c44aba29a922f34dd7d467649e6f613ca564`，S3/S4 为 `196/204` 页，且 `test_used_for_selection=false`。旧 4000 页 validation 输出保留但不参与本轮选点。
+
+P1 在既有 `bscc_synth_p1_legacy_100000_20260830_v1/p1/model/checkpoint-100000` 上恢复。预检确认模型权重 566 个张量全部 finite，checkpoint 含四个 DeepSpeed ZeRO-2 optimizer shards、scheduler、四个 RNG state 和 `latest=global_step100000`；因此恢复 optimizer/trainer state 后将累计训练到 step 250000，而不是只加载权重重新计步。P1 冻结范围、六组 LR、constant scheduler、zero warmup、7:1 replay 和 seed 42 保持原配置；新增 checkpoint 为 150000、200000、250000，并与初始 100000 一起在新 400 页 validation 上按 P1 layout 规则选择。
+
+P1 selection 完成后不再插入 canary，直接创建正式 P2 run `bscc_synth_p2_formal_200000_seed42_20260831_v1`。P2 训练 200000 steps，每 50000 steps 保存；解冻 Vary ViT、projector、PVLD、residual gate 和 Qwen decoder，按 Parameter identity 冻结 tied lm head/input embedding。LR 为 vision `5e-7`、projector `5e-6`、layout `5e-5`、Qwen `1e-6`、gate `1e-6`、lm head `0`，并采用 PVLD FP32、cosine 和 `warmup_ratio=0.001`。每 10000 steps 写入一次 `p2_health_checks.jsonl`；non-finite、非正 OCR/layout loss或 vision/projector/layout 无参数更新时硬失败。该健康记录不替代每 50000-step checkpoint health，也不构成 validation selection。
+
+一体化入口为 `tools/training/run_bscc_p1_continue_p2_formal.sbatch`。Slurm job `1468284` 已唯一提交；截至本次登记为 `PENDING (Priority)`，尚未分配 GPU或开始恢复训练。P2 训练完成后仍需另行执行 validation-only checkpoint selection；当前入口不运行 P2 test、P3 或任何 selection-locked test。

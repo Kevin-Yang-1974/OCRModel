@@ -70,7 +70,17 @@ sbatch tools/training/run_bscc_p1_50000.sbatch
 
 两份脚本均为 `bscc_pvld_p1_legacy`，P1 最大步数为 `50000`，保存间隔为 `10000`，validation 候选严格为 `20000,30000,40000,50000`，并记录 `test_used_for_selection=false`。A100 与 BSCC 只改变调度器和环境初始化，不改变 runner、DeepSpeed ZeRO-2、bf16、whole-page 输入、batch、seed、loss 或参数冻结/学习率。BSCC 默认工作区为 `$HOME/yangky_ocr_models_bscc_proto`；A100 默认读取 `/data3/yky/yangky_ocr_models` 下的 MTHv2 与 `/data4/hyf/backup` 原始 GOT2 权重。
 
-## 5. 有界检查
+## 5. BSCC P1 连续训练与正式 P2
+
+当前登记入口为：
+
+```bash
+sbatch tools/training/run_bscc_p1_continue_p2_formal.sbatch
+```
+
+该入口只提交一次：使用 seed 42 锁定 400 页 validation；从既有 P1 `checkpoint-100000` 恢复 optimizer/trainer state到累计 step 250000；在 `100000/150000/200000/250000` 中完成 validation-only selection；随后不经过额外 bounded pre-run，直接启动 200000-step正式 P2。P2 每 50000 steps 保存 checkpoint，每 10000 steps 写入 `p2_health_checks.jsonl` 并对 non-finite、loss 和参数更新执行硬检查。入口不运行 P2 selection、P3 或 test。
+
+## 6. 有界检查
 
 ```bash
 bash tools/training/run_pvld_causal_cuda_smoke.sh <gpu-id> <new-run-id>
@@ -80,7 +90,7 @@ python -m pytest -q tests
 
 smoke 只验证模型加载、前向/反向和 checkpoint 链路，不能作为正式性能结果。每次重试使用新的 run ID，并保留失败目录。
 
-## 6. 结果回传
+## 7. 结果回传
 
 只回传 `metadata/status.txt`、完成标志和紧凑 `summary.json` 的必要字段；日志最多回传最后 20 行。不要输出完整训练日志、预测全集、私有路径、凭据或模型权重。
 
