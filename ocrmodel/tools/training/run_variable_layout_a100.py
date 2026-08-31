@@ -19,6 +19,23 @@ def compact(payload: Any) -> str:
     return json.dumps(payload, ensure_ascii=False, separators=(",", ":"), default=str)
 
 
+def nonfinite_metric_paths(value: Any, prefix: str = "metrics") -> list[str]:
+    """Return paths of non-finite numeric values in a metrics payload."""
+    if isinstance(value, dict):
+        paths: list[str] = []
+        for key, item in value.items():
+            paths.extend(nonfinite_metric_paths(item, f"{prefix}.{key}"))
+        return paths
+    if isinstance(value, (list, tuple)):
+        paths: list[str] = []
+        for index, item in enumerate(value):
+            paths.extend(nonfinite_metric_paths(item, f"{prefix}[{index}]"))
+        return paths
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return [] if math.isfinite(float(value)) else [prefix]
+    return []
+
+
 def write_json(path: Path, payload: Any) -> None:
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2, default=str) + "\n", encoding="utf-8")
 
@@ -32,6 +49,21 @@ def training_log_path(stage_root: Path, resume: bool) -> Path:
         candidate = stage_root / f"train.recovery.{attempt}.log"
         attempt += 1
     return candidate
+
+
+def log_tail(path: Path, max_bytes: int = 200_000) -> str:
+    """Read only the bounded tail needed to classify a failed stage."""
+    with path.open("rb") as handle:
+        handle.seek(0, os.SEEK_END)
+        handle.seek(max(0, handle.tell() - max_bytes))
+        return handle.read().decode("utf-8", errors="replace")
+
+
+def classify_training_failure(log_path: Path) -> str:
+    tail = log_tail(log_path)
+    if "Non-finite training " in tail or "Non-finite optimizer state" in tail:
+        return "nonfinite_training"
+    return "failed"
 
 
 def parse_args() -> argparse.Namespace:
@@ -67,6 +99,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--p3-max-steps", type=int, default=8000)
     parser.add_argument("--checkpoint-steps", type=int, default=2000)
     parser.add_argument("--p1-checkpoint-steps", type=int)
+    parser.add_argument(
+        "--p1-candidate-steps",
+        help="Comma-separated P1 optimizer steps to pass to validation-only selection.",
+    )
     parser.add_argument("--p2-checkpoint-steps", type=int)
     parser.add_argument("--checkpoint-retention", type=int, default=2)
     parser.add_argument("--layout-boundary-loss-weight", type=float, default=0.0)
@@ -78,6 +114,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--per-device-batch-size", type=int, default=1)
     parser.add_argument("--gradient-accumulation-steps", type=int, default=1)
     parser.add_argument("--max-grad-norm", type=float, default=1.0)
+    parser.add_argument(
+        "--lr-scheduler-type",
+        choices=("constant", "cosine"),
+        default="constant",
+    )
+    parser.add_argument("--warmup-ratio", type=float, default=0.0)
+    parser.add_argument(
+        "--layout-module-fp32",
+        action="store_true",
+        help="Keep PVLD auxiliary parameters/compute in float32 for numerical canaries.",
+    )
     parser.add_argument("--p1-learning-rate", type=float, default=1e-4)
     parser.add_argument("--p2-learning-rate", type=float, default=5e-5)
     parser.add_argument("--vision-learning-rate", type=float, default=1e-6)
@@ -311,8 +358,9 @@ def training_command(
         "--remove_unused_columns", "False",
         "--max_steps", str(steps),
         "--learning_rate", str(learning_rate),
-        "--lr_scheduler_type", "constant",
-        "--warmup_ratio", "0",
+        "--lr_scheduler_type", args.lr_scheduler_type,
+        "--warmup_ratio", str(args.warmup_ratio),
+        "--layout_module_fp32", str(args.layout_module_fp32),
         "--weight_decay", "0",
         "--object_loss_weight", "1" if args.layout_loss_preset == "layout_full" else "0",
         "--bbox_l1_loss_weight", "5" if args.layout_loss_preset == "layout_full" else "0",
@@ -375,11 +423,23 @@ def p1_selection_command(
     ]
     if (output_dir / "selection.json").is_file():
         command.append("--resume")
+    if args.p1_candidate_steps:
+        command.extend(["--candidate-steps", args.p1_candidate_steps])
     return command
 
 
 def main() -> int:
     args = parse_args()
+    if args.p1_candidate_steps:
+        candidate_values = [value.strip() for value in args.p1_candidate_steps.split(",")]
+        if (
+            not candidate_values
+            or any(not value.isdigit() or int(value) <= 0 for value in candidate_values)
+            or len(set(candidate_values)) != len(candidate_values)
+        ):
+            raise ValueError(
+                "--p1-candidate-steps must be unique positive comma-separated integers."
+            )
     if args.source_validation_selection is not None and args.stages not in {"p2", "p3"}:
         raise ValueError(
             "--source-validation-selection is only valid for a standalone P2 or P3 stage."
@@ -422,6 +482,10 @@ def main() -> int:
         "p1_max_steps": args.p1_max_steps,
         "p2_max_steps": args.p2_max_steps,
         "p1_checkpoint_steps": args.p1_checkpoint_steps or args.checkpoint_steps,
+        "p1_candidate_steps": (
+            [int(value.strip()) for value in args.p1_candidate_steps.split(",")]
+            if args.p1_candidate_steps else None
+        ),
         "p2_checkpoint_steps": args.p2_checkpoint_steps or args.checkpoint_steps,
         "checkpoint_retention": args.checkpoint_retention,
         "layout_memory_resolution": args.layout_memory_resolution,
@@ -434,6 +498,9 @@ def main() -> int:
             stage: stage_learning_rates(args, stage)
             for stage in ("p1", "p2", "p3")
         },
+        "lr_scheduler_type": args.lr_scheduler_type,
+        "warmup_ratio": args.warmup_ratio,
+        "layout_module_fp32": args.layout_module_fp32,
         "layout_boundary_loss_weight": args.layout_boundary_loss_weight,
         "layout_count_condition_strength": args.layout_count_condition_strength,
         "pvld_use_spatial_memory": args.pvld_use_spatial_memory,
@@ -493,14 +560,31 @@ def main() -> int:
             )
         metrics_path = output / "layout_training_metrics.json"
         if completed.returncode or not metrics_path.is_file():
-            status.update({"status": "failed", "stage_status": "failed", "log": str(log_path)})
+            status.update({
+                "status": "failed",
+                "stage_status": classify_training_failure(log_path),
+                "log": str(log_path),
+                "returncode": completed.returncode,
+            })
             (metadata / "status.txt").write_text(compact(status) + "\n", encoding="utf-8")
             write_json(run_root / "summary.json", status)
             raise RuntimeError(f"PVLD {stage} failed; see {log_path}")
         metrics = json.loads(metrics_path.read_text(encoding="utf-8"))
         loss = float(metrics.get("train_loss", float("nan")))
-        if int(metrics.get("global_step", 0)) < 1 or not math.isfinite(loss):
-            raise RuntimeError(f"PVLD {stage} produced no finite optimizer step")
+        nonfinite = nonfinite_metric_paths(metrics)
+        if int(metrics.get("global_step", 0)) < 1 or not math.isfinite(loss) or nonfinite:
+            status.update({
+                "status": "failed",
+                "stage_status": "nonfinite_metrics",
+                "nonfinite_metric_paths": nonfinite[:32],
+                "log": str(log_path),
+            })
+            (metadata / "status.txt").write_text(compact(status) + "\n", encoding="utf-8")
+            write_json(run_root / "summary.json", status)
+            raise RuntimeError(
+                f"PVLD {stage} produced no valid finite optimizer step; "
+                f"nonfinite_metrics={nonfinite[:8]}"
+            )
         stage_metrics[stage] = {
             "global_step": int(metrics["global_step"]),
             "train_loss": loss,

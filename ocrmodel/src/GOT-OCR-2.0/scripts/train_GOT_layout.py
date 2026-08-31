@@ -280,6 +280,14 @@ class LayoutDiagnosticTrainer(GOTTrainer):
             self._distributed_event("first_forward_start")
         outputs = model(**inputs)
         loss = outputs["loss"] if isinstance(outputs, dict) else outputs[0]
+        nonfinite_outputs = self._nonfinite_output_fields(outputs)
+        if nonfinite_outputs:
+            page_ids = inputs.get("page_id", inputs.get("page_ids"))
+            raise RuntimeError(
+                "Non-finite training output at optimizer_step="
+                f"{int(self.state.global_step) + 1}; page_id={page_ids!r}; "
+                f"fields={nonfinite_outputs[:16]}."
+            )
         if first_forward:
             self._distributed_event(
                 "first_forward_complete",
@@ -301,6 +309,16 @@ class LayoutDiagnosticTrainer(GOTTrainer):
             self._record_outputs(outputs)
         return (loss, outputs) if return_outputs else loss
 
+    @staticmethod
+    def _nonfinite_output_fields(outputs: Any) -> list[str]:
+        fields = ["loss", "ocr_loss", "layout_loss"] + list(OUTPUT_DIAGNOSTIC_FIELDS.values())
+        result: list[str] = []
+        for field in fields:
+            value = outputs.get(field) if isinstance(outputs, dict) else getattr(outputs, field, None)
+            if torch.is_tensor(value) and value.is_floating_point() and not torch.isfinite(value.detach()).all():
+                result.append(field)
+        return sorted(set(result))
+
     def training_step(
         self,
         model: torch.nn.Module,
@@ -310,7 +328,38 @@ class LayoutDiagnosticTrainer(GOTTrainer):
         if first_step:
             self._first_training_step_started = True
             self._distributed_event("first_training_step_start")
+        nonfinite_optimizer_state = self._nonfinite_optimizer_state()
+        if nonfinite_optimizer_state:
+            page_ids = inputs.get("page_id", inputs.get("page_ids"))
+            raise RuntimeError(
+                "Non-finite optimizer state at optimizer_step="
+                f"{int(self.state.global_step) + 1}; page_id={page_ids!r}; "
+                f"state={nonfinite_optimizer_state[:16]}."
+            )
         loss = super().training_step(model, inputs)
+        if not torch.isfinite(loss.detach()).all():
+            page_ids = inputs.get("page_id", inputs.get("page_ids"))
+            raise RuntimeError(
+                "Non-finite training loss at optimizer_step="
+                f"{int(self.state.global_step) + 1}; page_id={page_ids!r}."
+            )
+        nonfinite_gradients = [
+            name for name, parameter in model.named_parameters()
+            if parameter.requires_grad
+            and parameter.grad is not None
+            and not torch.isfinite(parameter.grad.detach()).all()
+        ]
+        if nonfinite_gradients:
+            page_ids = inputs.get("page_id", inputs.get("page_ids"))
+            optimizer_groups = [
+                group.get("group_name")
+                for group in getattr(self, "optimizer_group_audit", {}).get("groups", [])
+            ]
+            raise RuntimeError(
+                "Non-finite training gradient at optimizer_step="
+                f"{int(self.state.global_step) + 1}; page_id={page_ids!r}; "
+                f"parameters={nonfinite_gradients[:8]}; optimizer_groups={optimizer_groups}."
+            )
         if first_step:
             self._distributed_event(
                 "first_training_step_complete",
@@ -420,8 +469,9 @@ class LayoutTrainingArguments:
         default="adapter_projector",
         metadata={
             "help": (
-                "P2 trainable modules: adapter_projector or "
-                "decoder_adapter_projector. P1 always uses its fixed layout warm-up scope."
+                "Legacy P2 scope label retained for launcher compatibility; PVLD "
+                "P2/P3 train Vary ViT, projector, PVLD, residual gate and Qwen "
+                "decoder while freezing the tied lm_head."
             )
         },
     )
@@ -480,6 +530,10 @@ class LayoutTrainingArguments:
     gate_learning_rate: float = field(default=1e-5)
     lm_head_learning_rate: float = field(default=0.0)
     qwen_unfreeze_fraction: float = field(default=0.25)
+    layout_module_fp32: bool = field(
+        default=False,
+        metadata={"help": "Keep PVLD parameters and auxiliary computation in float32."},
+    )
 
 
 def validate_layout_args(args: LayoutTrainingArguments) -> None:
@@ -911,7 +965,7 @@ def configure_trainable_parameters(
         model_base.vision_tower_high.requires_grad_(True)
         adapter.residual_gate.requires_grad_(True)
         # Qwen decoder is trainable at a deliberately small learning rate;
-        # lm_head remains frozen unless an explicit GOT2 tied-head path needs it.
+        # lm_head and its input embedding are frozen by Parameter identity.
         visual_prefixes = (
             "model.vision_tower_high.",
             "model.mm_projector_vary.",
@@ -919,8 +973,15 @@ def configure_trainable_parameters(
             "model.variable_layout_adapter.",
             "model.generic_adapter.",
         )
+        lm_head_parameter_ids = {
+            id(model.lm_head.weight),
+            id(model.get_input_embeddings().weight),
+        }
         for name, parameter in model.named_parameters():
-            if name.startswith("lm_head."):
+            # named_parameters() de-duplicates tied weights, so freeze by
+            # identity rather than relying on whether lm_head.* is the name
+            # selected for the shared embedding Parameter.
+            if id(parameter) in lm_head_parameter_ids or name.startswith("lm_head."):
                 parameter.requires_grad_(False)
             elif name.startswith("model.") and not name.startswith(visual_prefixes):
                 parameter.requires_grad_(True)
@@ -935,6 +996,26 @@ def configure_trainable_parameters(
     if trainable == 0:
         raise RuntimeError("No parameters are trainable.")
     return trainable, total, trainable_names
+
+
+def audit_lm_head_tying(model: GOTQwenForCausalLM) -> dict[str, Any]:
+    """Record GOT2 lm-head/input-embedding identity before training."""
+    lm_head = model.lm_head.weight
+    input_embedding = model.get_input_embeddings().weight
+    all_names = [
+        name for name, parameter in model.named_parameters(remove_duplicate=False)
+        if id(parameter) in {id(lm_head), id(input_embedding)}
+    ]
+    return {
+        "lm_head_input_embedding_is_same_parameter": lm_head is input_embedding,
+        "lm_head_data_ptr": int(lm_head.data_ptr()),
+        "input_embedding_data_ptr": int(input_embedding.data_ptr()),
+        "lm_head_input_embedding_data_ptr_equal": lm_head.data_ptr() == input_embedding.data_ptr(),
+        "lm_head_parameter_names_remove_duplicate_false": all_names,
+        "tie_word_embeddings_config": getattr(model.config, "tie_word_embeddings", None),
+        "lm_head_requires_grad": bool(lm_head.requires_grad),
+        "input_embedding_requires_grad": bool(input_embedding.requires_grad),
+    }
 
 
 def audit_ddp_frozen_parameters(
@@ -1217,17 +1298,34 @@ def main() -> None:
         device=training_args.device,
     )
     model.to(dtype=dtype, device=training_args.device)
+    if layout_args.layout_module_fp32:
+        layout_module = model.get_model().variable_layout_adapter or model.get_model().layout_adapter
+        if layout_module is not None:
+            layout_module.float()
     trainable, total, trainable_names = configure_trainable_parameters(
         model,
         layout_args.layout_stage,
         layout_args.p2_train_scope,
         layout_args.ablation_id,
     )
+    lm_head_audit = audit_lm_head_tying(model)
     ddp_frozen_audit = audit_ddp_frozen_parameters(model, training_args)
     module_parameters = (
         assert_ablation_trainable_scope(layout_args.ablation_id, layout_args.layout_stage, model)
         if layout_args.ablation_id else module_parameter_report(model)
     )
+    if layout_args.ablation_id == "projector_only":
+        effective_train_scope = "mm_projector_vary_only"
+        effective_frozen_modules = ["qwen_decoder", "qwen_lm_head", "qwen_input_embeddings", "pvld"]
+    elif layout_args.ablation_id == "generic_adapter_projector":
+        effective_train_scope = "mm_projector_vary_generic_adapter_only"
+        effective_frozen_modules = ["qwen_decoder", "qwen_lm_head", "qwen_input_embeddings", "pvld"]
+    elif layout_args.layout_stage in {"p2", "p3"}:
+        effective_train_scope = "vary_vit_mm_projector_pvld_residual_gate_qwen_decoder_lm_head_frozen"
+        effective_frozen_modules = ["qwen_lm_head", "qwen_input_embeddings_if_tied"]
+    else:
+        effective_train_scope = "vary_vit_mm_projector_pvld_qwen_frozen_residual_gate_zero"
+        effective_frozen_modules = ["qwen_decoder", "qwen_lm_head", "qwen_input_embeddings", "residual_gate"]
 
     data_args.image_token_len = 256
     data_args.image_processor = vision["image_processor"]
@@ -1498,17 +1596,10 @@ def main() -> None:
             "trainable_parameter_prefixes": sorted(
                 {".".join(name.split(".")[:3]) for name in trainable_names}
             ),
-            "frozen_modules": (
-                ["model.vision_tower_high"]
-                if layout_args.layout_stage in {"p2", "p3"}
-                and layout_args.p2_train_scope == "decoder_adapter_projector"
-                else ["language_model", "model.vision_tower_high"]
-            ),
-            "train_scope": (
-                layout_args.p2_train_scope
-                if layout_args.layout_stage in {"p2", "p3"}
-                else "p1_visual_replay_layout_warmup"
-            ),
+            "frozen_modules": effective_frozen_modules,
+            "train_scope": effective_train_scope,
+            "declared_p2_train_scope": layout_args.p2_train_scope,
+            "lm_head_tying_audit": lm_head_audit,
             "optimizer": training_args.optim,
             "learning_rate": training_args.learning_rate,
             "learning_rate_groups": {
@@ -1659,6 +1750,7 @@ def main() -> None:
             "layout_manifest": str(manifest),
             "layout_image_root": str(image_root),
             "diagnostics": diagnostics,
+            "optimizer_group_audit": getattr(trainer, "optimizer_group_audit", None),
             "layout_loss_compute_dtype": "float32",
             **layout_initialization,
             **generic_initialization,

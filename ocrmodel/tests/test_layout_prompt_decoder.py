@@ -331,6 +331,7 @@ def test_generation_zero_one_multiple_regions_and_cap_statuses() -> None:
     assert multiple.num_generated_regions.item() == 3
     assert multiple.region_token_probabilities.shape == (1, 3)
     assert torch.all((multiple.region_token_probabilities >= 0) & (multiple.region_token_probabilities <= 1))
+    assert multiple.region_token_probabilities.dtype == torch.float32
     assert multiple.coverage_region_counts.item() == 3
 
 

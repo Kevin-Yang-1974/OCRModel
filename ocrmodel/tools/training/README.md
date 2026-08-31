@@ -27,6 +27,23 @@ bash tools/training/run_time_constrained_pvld_baseline.sh \
 
 `run_variable_layout_a100.py` 负责 GPU 准入、模型加载、阶段步数、保存和 checkpoint 衔接。它支持 `p1`、`p2`、`p3` 阶段及有界 smoke；正式调用必须显式提供 train/validation manifest、source checkpoint 和新的 run ID。selection 使用 `tools/evaluation/select_layout_ablation_checkpoint.py`，locked test 使用 `tools/evaluation/evaluate_layout_ablation_test.py`。
 
+每个 checkpoint 保存前都会检查模型参数和 optimizer state 是否 finite，并写入 `checkpoint_health.json`。可在训练环境中对单个候选 checkpoint 做只读复核：
+
+```bash
+python tools/training/check_checkpoint_health.py /path/to/checkpoint-10000
+```
+
+命令返回 `status=nonfinite_weights` 或非零退出码时，该 checkpoint 不得用于 validation selection 或后续阶段初始化。
+
+## BSCC P1 50k 对照
+
+BSCC 数据上的 50,000-step Legacy P1 对照同时提供两个平台入口，训练模式保持一致：
+
+- A100：`run_bscc_p1_50000_a100.sh`（tmux，自动或显式物理 GPU）；
+- BSCC：`run_bscc_p1_50000.sbatch`（Slurm，四卡）。
+
+两者均使用 whole-page MTHv2 `train/validation/test` manifest、DeepSpeed ZeRO-2、bf16、`NCCL_P2P_DISABLE=1`、batch size 1、seed 42、64×64 layout memory 和同一 P1 冻结/学习率登记：Vary ViT/projector/layout 为 `1e-6/1e-5/1e-4`，Qwen、residual gate、lm head 冻结。BSCC 的 primary 已是 MTHv2 train，不重复启用同一 manifest 的 replay。P1 训练 50,000 steps，每 10,000 steps 保存；validation-only selection 严格只评估 `20,000/30,000/40,000/50,000`，不读取 test。该 BSCC run 是独立历史数据对照，不并入 S3/S4 主线结论。
+
 ## 训练口径
 
 - `P1`：布局 query、causal PVLD 和辅助布局监督；OCR replay 仅按协议计入。
