@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "layout-ocr"
+version = "0.1.0"
+description = "Whole-page layout adapters for few-shot general symbol recognition"
+requires-python = ">=3.10"
+dependencies = ["torch>=2.8", "pillow>=11", "safetensors>=0.4"]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "ruff>=0.6"]
+bscc = ["transformers>=5.3,<5.4", "accelerate>=1.10", "sentencepiece>=0.2"]
+
+[project.scripts]
+layout-ocr-audit = "layout_ocr.protocol:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+addopts = "-q"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"

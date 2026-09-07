@@ -1,0 +1,42 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Literal
+
+FusionMode = Literal["content_only", "attention", "geometry", "layout_ot"]
+
+
+@dataclass(frozen=True)
+class LayoutAdapterConfig:
+    hidden_size: int
+    num_queries: int = 32
+    num_heads: int = 8
+    mode: FusionMode = "layout_ot"
+    dropout: float = 0.0
+    geometry_temperature: float = 0.2
+    ot_epsilon: float = 0.1
+    ot_relaxation: float = 0.5
+    ot_iterations: int = 20
+    num_directions: int = 3
+    max_residual_scale: float | None = None
+
+    def __post_init__(self) -> None:
+        if self.hidden_size <= 0 or self.num_queries <= 0:
+            raise ValueError("hidden_size and num_queries must be positive")
+        if self.hidden_size % self.num_heads:
+            raise ValueError("hidden_size must be divisible by num_heads")
+        if self.mode not in {"content_only", "attention", "geometry", "layout_ot"}:
+            raise ValueError(f"unsupported fusion mode: {self.mode}")
+        if self.ot_epsilon <= 0 or self.ot_relaxation < 0 or self.ot_iterations <= 0:
+            raise ValueError("invalid optimal-transport parameters")
+        if self.max_residual_scale is not None and self.max_residual_scale <= 0:
+            raise ValueError("max_residual_scale must be positive when set")
+
+
+@dataclass(frozen=True)
+class LayoutLossConfig:
+    box: float = 1.0
+    order: float = 0.5
+    direction: float = 0.5
+    assignment: float = 1.0
+    transport_entropy: float = 0.0

@@ -2,4 +2,5 @@
 # directory is eligible for the shared repository snapshot.
 /*
 !/.gitignore
+!/AGENTS.md
 !/ocrmodel/

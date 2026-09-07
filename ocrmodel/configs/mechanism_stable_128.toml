@@ -1,0 +1,46 @@
+[experiment]
+name = "r1_r2_mechanism_stable_128"
+train_pages = 128
+validation_pages = 64
+test_pages = 64
+input_granularity = "whole_page"
+checkpoint_selection = "mean_validation_cer_across_three_seeds"
+test_policy = "do_not_read_in_confirmation"
+seeds = [42, 43, 44]
+max_steps = 1024
+checkpoint_steps = [256, 512, 768, 1024]
+max_regions = 32
+max_pixels = 1003520
+max_eval_new_tokens = 768
+
+[model]
+backbone = "glm_ocr"
+checkpoint_revision = "ca5d8b3e287e52589e37c28385d9655ee4372f9d"
+insertion_point = "pre_merge_visual_content"
+trainable_scope = "pre_merge_adapter_only"
+num_layout_queries = 32
+residual_scale_cap = 0.03
+
+[training]
+modes = ["attention", "geometry"]
+auxiliary_weight = 0.2
+optimizer = "AdamW"
+peak_learning_rate = 5e-5
+warmup_steps = 64
+scheduler = "cosine"
+min_lr_ratio = 0.1
+weight_decay = 0.01
+max_grad_norm = 1.0
+backbone_dtype = "bfloat16"
+adapter_dtype = "float32"
+
+[baseline]
+mode = "content_only"
+eval_only = true
+prompt_only = true
+training_updates = 0
+
+[few_shot]
+r1 = "domain_page_budget"
+r2 = "rare_symbol_k_shot"
+leakage_keys = ["source_group", "duplicate_group"]

@@ -1,0 +1,76 @@
+import pytest
+import torch
+
+from layout_ocr import LayoutAdapterConfig, PreMergeLayoutAdapter
+
+
+@pytest.mark.parametrize("mode", ["content_only", "attention", "geometry", "layout_ot"])
+def test_adapter_forward_backward(mode: str) -> None:
+    torch.manual_seed(7)
+    config = LayoutAdapterConfig(hidden_size=16, num_queries=4, num_heads=4, mode=mode)
+    module = PreMergeLayoutAdapter(config)
+    tokens = torch.randn(2, 9, 16, requires_grad=True)
+    positions = torch.rand(2, 9, 2)
+    output = module(tokens, positions)
+
+    assert output.merged_tokens.shape == tokens.shape
+    assert output.layout_queries.shape == (2, 4, 16)
+    assert output.boxes.shape == (2, 4, 4)
+    if mode != "content_only":
+        assert output.transport is not None
+        expected = torch.full((2, 4), 0.25)
+        torch.testing.assert_close(output.transport.sum(dim=-1), expected, atol=1e-5, rtol=1e-5)
+    else:
+        assert output.transport is None
+
+    (output.merged_tokens.square().mean() + output.boxes.mean()).backward()
+    assert module.query_seed.grad is not None
+
+
+def test_geometry_requires_patch_positions() -> None:
+    module = PreMergeLayoutAdapter(
+        LayoutAdapterConfig(hidden_size=8, num_queries=2, num_heads=2, mode="geometry")
+    )
+    with pytest.raises(ValueError, match="patch_positions"):
+        module(torch.randn(1, 4, 8))
+
+
+def test_zero_gate_preserves_visual_tokens_exactly() -> None:
+    torch.manual_seed(11)
+    module = PreMergeLayoutAdapter(
+        LayoutAdapterConfig(hidden_size=8, num_queries=2, num_heads=2, mode="geometry")
+    )
+    tokens = torch.randn(1, 4, 8)
+    output = module(tokens, torch.rand(1, 4, 2))
+    torch.testing.assert_close(output.merged_tokens, tokens, atol=0.0, rtol=0.0)
+
+
+def test_effective_residual_scale_is_capped() -> None:
+    module = PreMergeLayoutAdapter(
+        LayoutAdapterConfig(
+            hidden_size=8,
+            num_queries=2,
+            num_heads=2,
+            mode="attention",
+            max_residual_scale=0.03,
+        )
+    )
+    for raw_gate, expected in ((100.0, 0.03), (-100.0, -0.03), (0.01, None)):
+        with torch.no_grad():
+            module.content_gate.fill_(raw_gate)
+        effective = float(module.effective_residual_scale().detach())
+        if expected is None:
+            assert abs(effective) < 0.03
+        else:
+            assert effective == pytest.approx(expected)
+
+
+def test_legacy_config_keeps_original_tanh_gate_semantics() -> None:
+    module = PreMergeLayoutAdapter(
+        LayoutAdapterConfig(hidden_size=8, num_queries=2, num_heads=2, mode="attention")
+    )
+    with torch.no_grad():
+        module.content_gate.fill_(2.0)
+    assert float(module.effective_residual_scale().detach()) == pytest.approx(
+        float(torch.tanh(torch.tensor(2.0)))
+    )

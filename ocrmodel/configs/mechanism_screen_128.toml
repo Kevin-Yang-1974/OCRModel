@@ -1,0 +1,33 @@
+[experiment]
+name = "r1_r2_mechanism_screen_128"
+seed = 42
+train_pages = 128
+input_granularity = "whole_page"
+checkpoint_selection = "validation_only"
+test_policy = "selection_locked"
+validation_pages = 64
+test_pages = 64
+max_steps = 256
+max_regions = 32
+max_pixels = 1003520
+
+[model]
+backbone = "glm_ocr"
+checkpoint_revision = "ca5d8b3e287e52589e37c28385d9655ee4372f9d"
+insertion_point = "pre_merge_visual_content"
+num_layout_queries = 32
+
+[ablation]
+modes = ["content_only", "attention", "geometry", "layout_ot"]
+equal_training_budget = true
+shared_split = true
+
+[layout_ot]
+epsilon = 0.1
+relaxation = 0.5
+iterations = 20
+
+[few_shot]
+r1 = "domain_page_budget"
+r2 = "rare_symbol_k_shot"
+leakage_keys = ["source_group", "duplicate_group"]
