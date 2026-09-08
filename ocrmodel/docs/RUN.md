@@ -38,6 +38,8 @@ printf '{"screen_job":"%s","run_id":"mechanism_stable_128_3seed_v1"}\n' "$screen
 
 `screen_job` 是 7 个单卡 array task：前 6 个覆盖 `attention`/`geometry`、固定辅助损失 `0.2` 和 seed `42/43/44`，最后一个运行零训练更新的 `content_only` eval-only 基线。每个训练组运行 1024 steps，使用同一 128 页 train 与 64 页 validation；64 页 test 不在本轮读取。生成上限固定为 768，不读取参考文本长度。
 
+后续 BSCC 训练显式传递 `GLM_OCR_PROCESSOR_MODE=fast`（当前已提交的 1483786 实际加载了 fast processor）。训练 metadata 还会记录 processor 类、解析出的 backend、Transformers/Torchvision/Pillow 版本、模型资源 hash、代码 hash，以及固定 validation 页面输入 fingerprint。slow processor 只能作为单独敏感性实验，不能混入主架构比较。
+
 6 个训练 run 和基线全部完成后汇总 validation-only 结果：
 
 ```bash
@@ -100,6 +102,32 @@ sbatch --parsable tools/bscc/run_geometry_diagnostic.sbatch
 ```
 
 该运行仍只读取 train/validation，不读取 test；`metadata.json`、`diagnostic_summary.json` 和训练指标会记录独立的 `lr_schedule_steps`，用于确认 64/128 步轨迹与前一轮 128-step FP32 对照一致。
+
+## 四组架构收益对照：256 steps
+
+`architecture_256_hungarian_fp32_lr128_v1` 已完成，但属于 processor 未显式锁定且存在 CUDA/attention 非确定性警告的探索性结果，不能直接作为最终架构排名。当前 1483786 正在作为 math-SDP/CuBLAS 固定的中间锚点运行；它完成后仍需先通过 processor 显式锁定和确定性回归，再用原协议的三种子和 256-step 预算比较四组：严格零更新的 `content_only` 基线、`attention`、`geometry`、`layout_ot`。三个训练组统一使用 `auxiliary_weight=0.2`、Hungarian target-slot matching、FP32 adapter/transport/loss；本轮不读取 test。
+
+独立 launcher 共 10 个 array task（3 个训练模式 × 3 个 seed，加 1 个 content-only baseline）：
+
+```bash
+bash tools/sync/sync_to_bscc.sh
+architecture_job=$(GLM_OCR_ARCHITECTURE_ID=architecture_256_hungarian_fp32_lr128_det_procfast_v2 \
+  GLM_OCR_MAX_STEPS=256 \
+  GLM_OCR_LR_SCHEDULE_STEPS=128 \
+  GLM_OCR_PROCESSOR_MODE=fast \
+  sbatch --parsable --exclude=paraai-n32-h-01-agent-4 \
+  tools/bscc/run_architecture_comparison.sbatch)
+printf '{"architecture_job":"%s","run_id":"architecture_256_hungarian_fp32_lr128_det_procfast_v2"}\n' "$architecture_job"
+```
+
+全部完成后只用 validation 汇总架构收益：
+
+```bash
+python tools/summarize_architecture_comparison.py \
+  "$HOME/yangky_ocr_models_bscc_proto/glm_ocr_layout_ot/training_runs/architecture_256_hungarian_fp32_lr128_det_procfast_v2"
+```
+
+汇总器按三种子平均 validation CER 选择模式与 checkpoint，并输出相对 content-only 的 CER gain、exact-page、generation limit/EOS 和标准差；任何选择均不使用 test。
 
 ## 服务器边界
 

@@ -22,6 +22,7 @@ screen_id="${GLM_OCR_DIAGNOSTIC_ID:-geometry_seed42_steps128_v1}"
 adapter_precision="${GLM_OCR_ADAPTER_PRECISION:-mixed_bf16}"
 layout_loss_profile="${GLM_OCR_LAYOUT_LOSS_PROFILE:-full}"
 query_assignment="${GLM_OCR_QUERY_ASSIGNMENT:-fixed_order}"
+processor_mode="${GLM_OCR_PROCESSOR_MODE:-fast}"
 max_steps="${GLM_OCR_MAX_STEPS:-128}"
 lr_schedule_steps="${GLM_OCR_LR_SCHEDULE_STEPS:-}"
 lr_schedule_steps_json="${GLM_OCR_LR_SCHEDULE_STEPS:-null}"
@@ -32,10 +33,14 @@ run_root="${experiment_root}/training_runs/${screen_id}"
 output_dir="${run_root}/seed42/geometry_aux0.2"
 pytorch_package="/home/bingxing2/apps/package/pytorch/2.8.0-cu128_cp311"
 
+[[ "${processor_mode}" == "fast" || "${processor_mode}" == "slow" ]] || {
+    printf 'ERROR: GLM_OCR_PROCESSOR_MODE must be fast or slow.\n' >&2; exit 64;
+}
+
 if [[ "${GLM_OCR_PRINT_TASK_MAP:-0}" == "1" ]]; then
-    printf '{"mode":"geometry","seed":42,"auxiliary_weight":0.2,"max_steps":%s,"lr_schedule_steps":%s,"diagnostic_steps":%s,"adapter_precision":"%s","layout_loss_profile":"%s","query_assignment":"%s","output_dir":"%s","reads_test":false}\n' \
+    printf '{"mode":"geometry","seed":42,"auxiliary_weight":0.2,"max_steps":%s,"lr_schedule_steps":%s,"diagnostic_steps":%s,"adapter_precision":"%s","layout_loss_profile":"%s","query_assignment":"%s","processor_mode":"%s","output_dir":"%s","reads_test":false}\n' \
         "${max_steps}" "${lr_schedule_steps_json}" "${diagnostic_steps_json}" "${adapter_precision}" "${layout_loss_profile}" \
-        "${query_assignment}" "${output_dir}"
+        "${query_assignment}" "${processor_mode}" "${output_dir}"
     exit 0
 fi
 
@@ -43,7 +48,7 @@ fi
     printf 'ERROR: GLM-OCR setup is incomplete.\n' >&2; exit 66;
 }
 [[ -f "${protocol_dir}/protocol.json" && -f "${protocol_dir}/train.jsonl" \
-    && -f "${protocol_dir}/validation.jsonl" ]] || {
+    && -f "${protocol_dir}/validation.jsonl" && -f "${protocol_dir}/test.jsonl" ]] || {
     printf 'ERROR: locked train/validation protocol is missing.\n' >&2; exit 66;
 }
 [[ ! -e "${output_dir}" ]] || {
@@ -54,6 +59,7 @@ mkdir -p "${experiment_root}/training_runs" "${experiment_root}/tmp" "${workspac
 export TMPDIR="${experiment_root}/tmp"
 export HF_HOME="${experiment_root}/cache/huggingface"
 export TOKENIZERS_PARALLELISM=false PYTHONNOUSERSITE=1 HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
+export CUBLAS_WORKSPACE_CONFIG=:4096:8
 source "${pytorch_package}/env.sh"
 source "$(conda info --base)/etc/profile.d/conda.sh"
 set +u
@@ -76,4 +82,5 @@ python -m layout_ocr.train_screen \
     --validation-interval "${validation_interval}" --log-steps 16 --diagnostic-steps "${diagnostic_steps}" \
     --adapter-precision "${adapter_precision}" \
     --layout-loss-profile "${layout_loss_profile}" \
-    --query-assignment "${query_assignment}"
+    --query-assignment "${query_assignment}" \
+    --processor-mode "${processor_mode}"

@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
+import importlib.metadata as importlib_metadata
 import json
 import math
+import os
 import random
 import shutil
 import sys
@@ -30,6 +33,57 @@ LAYOUT_LOSS_KEYS = (
     "layout_assignment",
     "transport_entropy",
 )
+
+
+def configure_deterministic_execution() -> dict[str, Any]:
+    """Pin CUDA/SDPA choices before the model creates any CUDA handles.
+
+    The mechanism comparison is sensitive to very small changes in the frozen
+    backbone activations. ``torch.use_deterministic_algorithms`` alone is not
+    sufficient here: PyTorch can still select a non-deterministic fused SDPA
+    backend, and cuBLAS needs its workspace contract set before the first CUDA
+    handle is created. Keep the report in run metadata so a result cannot be
+    mistaken for a reproducible run when the backend was not pinned.
+    """
+
+    os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+    torch.set_float32_matmul_precision("highest")
+
+    sdp_backend = "unavailable"
+    if hasattr(torch, "backends") and hasattr(torch.backends, "cuda"):
+        # The adapter and the GLM-OCR backbone both use scaled dot-product
+        # attention. Math SDP is slower, but is the deterministic reference
+        # backend for this small, controlled comparison.
+        if hasattr(torch.backends.cuda, "enable_flash_sdp"):
+            torch.backends.cuda.enable_flash_sdp(False)
+        if hasattr(torch.backends.cuda, "enable_mem_efficient_sdp"):
+            torch.backends.cuda.enable_mem_efficient_sdp(False)
+        if hasattr(torch.backends.cuda, "enable_math_sdp"):
+            torch.backends.cuda.enable_math_sdp(True)
+        if hasattr(torch.backends.cuda, "matmul"):
+            torch.backends.cuda.matmul.allow_tf32 = False
+        sdp_backend = "math"
+    if hasattr(torch, "backends") and hasattr(torch.backends, "cudnn"):
+        torch.backends.cudnn.benchmark = False
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.allow_tf32 = False
+
+    # Use strict mode after the backend choices above. If a future dependency
+    # introduces another non-deterministic kernel, fail the run instead of
+    # silently changing the training trajectory.
+    torch.use_deterministic_algorithms(True, warn_only=False)
+    return {
+        "strict_deterministic_algorithms": True,
+        "cublas_workspace_config": os.environ["CUBLAS_WORKSPACE_CONFIG"],
+        "float32_matmul_precision": "highest",
+        "tf32": False,
+        "cudnn_benchmark": False,
+        "cudnn_deterministic": True,
+        "sdp_backend": sdp_backend,
+        "flash_sdp": False,
+        "memory_efficient_sdp": False,
+        "math_sdp": True,
+    }
 
 
 def parse_step_list(value: str) -> tuple[int, ...]:
@@ -400,6 +454,109 @@ def append_jsonl(path: Path, value: Any) -> None:
         handle.write(json.dumps(value, ensure_ascii=False, separators=(",", ":")) + "\n")
 
 
+def sha256_file(path: Path) -> str | None:
+    """Return a file digest without loading the whole file into memory."""
+
+    if not path.is_file():
+        return None
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def package_version(distribution: str) -> str | None:
+    try:
+        return importlib_metadata.version(distribution)
+    except importlib_metadata.PackageNotFoundError:
+        return None
+
+
+def json_compatible(value: Any) -> Any:
+    """Convert processor config values such as tuples/enums to JSON values."""
+
+    return json.loads(json.dumps(value, ensure_ascii=False, default=str))
+
+
+def processor_reproducibility_report(
+    processor: Any,
+    processor_mode: str,
+    model_path: Path,
+) -> dict[str, Any]:
+    """Capture the preprocessing choice that affects frozen vision features."""
+
+    image_processor = getattr(processor, "image_processor", None)
+    if image_processor is None:
+        raise RuntimeError("AutoProcessor did not expose an image_processor")
+    tracked_files = (
+        "preprocessor_config.json",
+        "tokenizer_config.json",
+        "chat_template.jinja",
+        "generation_config.json",
+        "config.json",
+    )
+    backend = getattr(image_processor, "backend", None)
+    backend_resolution = "image_processor.backend" if backend is not None else "not_exposed"
+    if (
+        backend is None
+        and processor_mode == "fast"
+        and type(image_processor).__name__.endswith("Fast")
+    ):
+        # Transformers fast image processors are torchvision-backed.  Some
+        # model-specific classes do not expose the backend attribute, so keep
+        # the inference explicit in metadata rather than recording ambiguity.
+        backend = "torchvision"
+        backend_resolution = "fast_processor_class"
+    return {
+        "requested_mode": processor_mode,
+        "requested_use_fast": processor_mode == "fast",
+        "processor_class": type(processor).__name__,
+        "image_processor_class": type(image_processor).__name__,
+        "backend": json_compatible(backend),
+        "backend_resolution": backend_resolution,
+        "image_processor_size": json_compatible(getattr(image_processor, "size", None)),
+        "resource_hashes": {
+            name: sha256_file(model_path / name)
+            for name in tracked_files
+        },
+    }
+
+
+def tensor_fingerprint(value: torch.Tensor) -> dict[str, Any]:
+    """Hash tensor bytes and shape while supporting BF16 tensors."""
+
+    detached = value.detach().contiguous().cpu()
+    byte_view = detached.view(torch.uint8)
+    digest = hashlib.sha256(byte_view.numpy().tobytes()).hexdigest()
+    return {
+        "dtype": _dtype_name(detached.dtype),
+        "shape": list(detached.shape),
+        "sha256": digest,
+    }
+
+
+def processor_input_fingerprint(processor: Any, record: dict[str, Any]) -> dict[str, Any]:
+    """Fingerprint one fixed-page processor output before model inference."""
+
+    inputs = prepare_inference_inputs(processor, record, torch.device("cpu"))
+    tensors = {
+        key: tensor_fingerprint(value)
+        for key, value in sorted(inputs.items())
+        if isinstance(value, torch.Tensor)
+    }
+    identity = {
+        "page_id": record["page_id"],
+        "tensors": tensors,
+    }
+    digest = hashlib.sha256(
+        json.dumps(identity, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode(
+            "utf-8"
+        )
+    ).hexdigest()
+    return {**identity, "sha256": digest}
+
+
 def configure_processor(processor: Any, max_pixels: int) -> None:
     size = dict(processor.image_processor.size)
     size["longest_edge"] = max_pixels
@@ -409,7 +566,11 @@ def configure_processor(processor: Any, max_pixels: int) -> None:
 def load_model(args: argparse.Namespace, device: torch.device) -> tuple[Any, Any, LayoutAwarePatchMerger]:
     from transformers import AutoModelForImageTextToText, AutoProcessor
 
-    processor = AutoProcessor.from_pretrained(args.model_path, local_files_only=True)
+    processor = AutoProcessor.from_pretrained(
+        args.model_path,
+        use_fast=args.processor_mode == "fast",
+        local_files_only=True,
+    )
     configure_processor(processor, args.max_pixels)
     model = AutoModelForImageTextToText.from_pretrained(
         args.model_path,
@@ -899,6 +1060,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--max-grad-norm", type=float, default=1.0)
     parser.add_argument("--max-pixels", type=int, default=1003520)
+    parser.add_argument(
+        "--processor-mode",
+        choices=["fast", "slow"],
+        default="fast",
+        help="explicitly select the Hugging Face image processor implementation",
+    )
     parser.add_argument("--max-eval-new-tokens", type=int, default=768)
     parser.add_argument("--log-steps", type=int, default=10)
     parser.add_argument("--validation-interval", type=int, default=256)
@@ -943,6 +1110,7 @@ def main() -> None:
         "adapter_precision": args.adapter_precision,
         "layout_loss_profile": args.layout_loss_profile,
         "query_assignment": args.query_assignment,
+        "processor_mode": args.processor_mode,
         "eval_only": args.eval_only,
         "max_eval_new_tokens": args.max_eval_new_tokens,
         "validation_interval": args.validation_interval,
@@ -968,15 +1136,17 @@ def main() -> None:
         },
         "adapter_config": None,
         "model_path": str(args.model_path.resolve()),
+        "code_sha256": sha256_file(Path(__file__).resolve()),
         "protocol": json.loads(args.protocol_file.read_text(encoding="utf-8")),
         "test_used_for_selection": False,
         "versions": {"python": sys.version.split()[0], "torch": torch.__version__},
     }
     write_json(args.output_dir / "metadata.json", metadata)
     try:
+        metadata["reproducibility"] = configure_deterministic_execution()
+        write_json(args.output_dir / "metadata.json", metadata)
         torch.manual_seed(args.seed)
         torch.cuda.manual_seed_all(args.seed)
-        torch.use_deterministic_algorithms(True, warn_only=True)
         device = torch.device("cuda", 0)
         if not torch.cuda.is_available():
             raise RuntimeError("CUDA is unavailable inside the Slurm allocation")
@@ -990,7 +1160,22 @@ def main() -> None:
             )
         model, processor, bridge = load_model(args, device)
         metadata["adapter_config"] = asdict(bridge.adapter.config)
-        metadata["versions"]["transformers"] = __import__("transformers").__version__
+        metadata["versions"].update(
+            {
+                "transformers": __import__("transformers").__version__,
+                "torchvision": package_version("torchvision"),
+                "pillow": package_version("Pillow"),
+            }
+        )
+        metadata["processor"] = processor_reproducibility_report(
+            processor,
+            args.processor_mode,
+            args.model_path.resolve(),
+        )
+        metadata["processor_input_fingerprint"] = processor_input_fingerprint(
+            processor,
+            validation_records[0],
+        )
         metadata["gpu"] = torch.cuda.get_device_name(0)
         write_json(args.output_dir / "metadata.json", metadata)
         if args.eval_only:

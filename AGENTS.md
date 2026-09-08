@@ -12,3 +12,4 @@
 8. 本地默认只做静态检查、CPU 单元测试和小型张量测试。不自动同步、推送、提交或启动正式训练。
 9. A100 入口须显式限定允许的物理 GPU，仅查询该集合的瞬时 `utilization.gpu`。所有目标卡都严格低于 50% 才启动；否则整体退出，不等待、不抢占、不查询集合外 GPU。
 10. 正式训练前必须锁定 train/validation/test 协议；只用 validation 选 checkpoint，然后执行 selection-locked test。test 不参与训练、选点、阈值或后处理调整。
+11. BSCC 任务监控：提交后处于 `PENDING`/排队阶段时每 30 分钟查看一次；首次进入 `RUNNING` 后先每 5 分钟查看一次，确认日志已稳定推进且无启动错误；确认进入稳定训练后，短任务每 30 分钟查看一次，长任务或大规模 array 每 1 小时查看一次。任务完成、失败、异常退出或出现 NaN/Inf、CUDA/OOM/Traceback 时立即查看并处理，不重复提交同一 run ID。

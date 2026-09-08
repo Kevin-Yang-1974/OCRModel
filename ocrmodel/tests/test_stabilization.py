@@ -12,13 +12,42 @@ from layout_ocr import LayoutAdapterConfig, PreMergeLayoutAdapter
 from layout_ocr.glm_bridge import LayoutAwarePatchMerger
 from layout_ocr.train_screen import (
     clone_module_state,
+    configure_deterministic_execution,
     diagnostic_triage,
     learning_rate_at_step,
     load_adapter_checkpoint,
     module_state_matches,
     parse_step_list,
+    processor_reproducibility_report,
     save_adapter_checkpoint,
 )
+
+
+def test_deterministic_execution_pins_reported_backends(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("CUBLAS_WORKSPACE_CONFIG", raising=False)
+    report = configure_deterministic_execution()
+    assert report["strict_deterministic_algorithms"] is True
+    assert report["cublas_workspace_config"] == ":4096:8"
+    assert report["sdp_backend"] in {"math", "unavailable"}
+    assert report["flash_sdp"] is False
+    assert report["memory_efficient_sdp"] is False
+    assert report["math_sdp"] is True
+
+
+def test_processor_report_records_explicit_mode_and_resource_hash(tmp_path: Path) -> None:
+    class DummyImageProcessor:
+        backend = "torchvision"
+        size = {"longest_edge": 100}
+
+    class DummyProcessor:
+        image_processor = DummyImageProcessor()
+
+    (tmp_path / "preprocessor_config.json").write_text("{}", encoding="utf-8")
+    report = processor_reproducibility_report(DummyProcessor(), "fast", tmp_path)
+    assert report["requested_mode"] == "fast"
+    assert report["requested_use_fast"] is True
+    assert report["backend"] == "torchvision"
+    assert report["resource_hashes"]["preprocessor_config.json"]
 
 
 def test_warmup_cosine_schedule_endpoints() -> None:
@@ -145,6 +174,7 @@ def test_slurm_array_maps_six_unique_runs_and_one_baseline() -> None:
     assert len({row["output_dir"] for row in mappings}) == 7
     assert mappings[-1]["mode"] == "content_only"
     assert mappings[-1]["eval_only"] is True
+    assert all(row["processor_mode"] == "fast" for row in mappings)
 
 
 def test_geometry_diagnostic_launcher_is_single_fixed_run() -> None:
@@ -190,4 +220,48 @@ def test_geometry_diagnostic_launcher_supports_fp32_256_points() -> None:
     assert mapping["lr_schedule_steps"] == 128
     assert mapping["diagnostic_steps"] == [0, 64, 128, 256]
     assert mapping["adapter_precision"] == "fp32"
+    assert mapping["processor_mode"] == "fast"
     assert mapping["reads_test"] is False
+
+
+def test_architecture_comparison_launcher_maps_four_groups_at_256() -> None:
+    script = Path(__file__).parents[1] / "tools" / "bscc" / "run_architecture_comparison.sbatch"
+    mappings = []
+    for task_id in range(10):
+        environment = {
+            **os.environ,
+            "SLURM_ARRAY_TASK_ID": str(task_id),
+            "GLM_OCR_PRINT_TASK_MAP": "1",
+            "GLM_OCR_ARCHITECTURE_ID": "architecture_256_hungarian_fp32_lr128_v1",
+            "GLM_OCR_MAX_STEPS": "256",
+            "GLM_OCR_LR_SCHEDULE_STEPS": "128",
+        }
+        completed = subprocess.run(
+            ["bash", str(script)],
+            check=True,
+            capture_output=True,
+            text=True,
+            env=environment,
+        )
+        mappings.append(json.loads(completed.stdout))
+
+    trained = [row for row in mappings if not row["eval_only"]]
+    baseline = [row for row in mappings if row["eval_only"]]
+    assert len(trained) == 9
+    assert len(baseline) == 1
+    assert {
+        (row["mode"], row["seed"], row["auxiliary_weight"])
+        for row in trained
+    } == {
+        (mode, seed, 0.2)
+        for mode in ("attention", "geometry", "layout_ot")
+        for seed in (42, 43, 44)
+    }
+    assert baseline[0]["mode"] == "content_only"
+    assert baseline[0]["seed"] == 42
+    assert baseline[0]["auxiliary_weight"] == 0.0
+    assert all(row["max_steps"] == 256 for row in mappings)
+    assert all(row["lr_schedule_steps"] == 128 for row in mappings)
+    assert all(row["query_assignment"] == "hungarian" for row in mappings)
+    assert all(row["processor_mode"] == "fast" for row in mappings)
+    assert all(row["reads_test"] is False for row in mappings)
