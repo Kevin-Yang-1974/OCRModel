@@ -105,7 +105,7 @@ sbatch --parsable tools/bscc/run_geometry_diagnostic.sbatch
 
 ## 四组架构收益对照：256 steps
 
-`architecture_256_hungarian_fp32_lr128_v1` 已完成，但属于 processor 未显式锁定且存在 CUDA/attention 非确定性警告的探索性结果，不能直接作为最终架构排名。当前 1483786 正在作为 math-SDP/CuBLAS 固定的中间锚点运行；它完成后仍需先通过 processor 显式锁定和确定性回归，再用原协议的三种子和 256-step 预算比较四组：严格零更新的 `content_only` 基线、`attention`、`geometry`、`layout_ot`。三个训练组统一使用 `auxiliary_weight=0.2`、Hungarian target-slot matching、FP32 adapter/transport/loss；本轮不读取 test。
+`architecture_256_hungarian_fp32_lr128_v1` 已完成，但属于 processor 未显式锁定且存在 CUDA/attention 非确定性警告的探索性结果，不能直接作为最终架构排名。job `1483931` 已完成 fast processor 显式锁定和确定性回归：它与 `1483786` 的 0/64/128/192/256 五个 validation 点完全一致，最佳 step192、CER `0.206855`，仍未复现 v6 的 `0.190417`，因此确立为当前 geometry 回归锚点。后续仍需用同一协议、三种子和 256-step 预算比较四组：严格零更新的 `content_only` 基线、`attention`、`geometry`、`layout_ot`。三个训练组统一使用 `auxiliary_weight=0.2`、Hungarian target-slot matching、FP32 adapter/transport/loss；本轮不读取 test。
 
 独立 launcher 共 10 个 array task（3 个训练模式 × 3 个 seed，加 1 个 content-only baseline）：
 
