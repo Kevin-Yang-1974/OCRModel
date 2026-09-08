@@ -13,6 +13,7 @@ __all__ = [
     "LayoutLossConfig",
     "PreMergeLayoutAdapter",
     "compute_layout_losses",
+    "match_layout_targets",
 ]
 
 
@@ -23,6 +24,7 @@ def __getattr__(name: str) -> Any:
         "LayoutAdapterOutput": ".adapter",
         "PreMergeLayoutAdapter": ".adapter",
         "compute_layout_losses": ".losses",
+        "match_layout_targets": ".losses",
     }
     if name not in modules:
         raise AttributeError(name)

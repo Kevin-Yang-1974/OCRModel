@@ -4,6 +4,9 @@ from dataclasses import dataclass
 from typing import Literal
 
 FusionMode = Literal["content_only", "attention", "geometry", "layout_ot"]
+AdapterPrecision = Literal["mixed_bf16", "fp32"]
+LayoutLossProfile = Literal["full", "ocr_only", "no_assignment", "no_geometry"]
+QueryAssignment = Literal["fixed_order", "hungarian"]
 
 
 @dataclass(frozen=True)
@@ -40,3 +43,17 @@ class LayoutLossConfig:
     direction: float = 0.5
     assignment: float = 1.0
     transport_entropy: float = 0.0
+
+
+def layout_loss_config(profile: str) -> LayoutLossConfig:
+    """Return one of the controlled auxiliary-loss ablation profiles."""
+
+    if profile == "full":
+        return LayoutLossConfig()
+    if profile == "ocr_only":
+        return LayoutLossConfig(box=0.0, order=0.0, direction=0.0, assignment=0.0)
+    if profile == "no_assignment":
+        return LayoutLossConfig(assignment=0.0)
+    if profile == "no_geometry":
+        return LayoutLossConfig(box=0.0, order=0.0, direction=0.0)
+    raise ValueError(f"unsupported layout loss profile: {profile}")

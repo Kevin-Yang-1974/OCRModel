@@ -17,3 +17,23 @@ def test_patch_grid_and_bridge_contract() -> None:
     merged = bridge(torch.randn(6, 8))
     assert merged.shape == (6, 8)
     assert bridge.last_output is not None
+    assert bridge.last_visual_tokens is not None
+    assert bridge.last_residual is not None
+    assert bridge.last_writeback_residual is not None
+    assert bridge.last_input_dtype is not None
+    assert bridge.last_adapter_input_dtype == torch.float32
+    assert bridge.last_adapter_output_dtype is not None
+    assert bridge.last_merged_dtype is not None
+
+
+def test_fp32_adapter_precision_is_recorded() -> None:
+    adapter = PreMergeLayoutAdapter(
+        LayoutAdapterConfig(hidden_size=8, num_queries=2, num_heads=2, mode="geometry")
+    )
+    bridge = LayoutAwarePatchMerger(
+        nn.Identity(), adapter, spatial_merge_size=2, adapter_precision="fp32"
+    )
+    assert bridge.adapter_precision == "fp32"
+    bridge.set_grid_thw(torch.tensor([[1, 4, 6]]))
+    bridge(torch.randn(6, 8))
+    assert bridge.last_adapter_output_dtype == torch.float32

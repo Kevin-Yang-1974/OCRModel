@@ -6,7 +6,7 @@ import torch
 from torch import Tensor, nn
 
 from .adapter import LayoutAdapterOutput, PreMergeLayoutAdapter
-from .config import LayoutAdapterConfig
+from .config import AdapterPrecision, LayoutAdapterConfig
 
 
 def patch_grid_positions(grid_thw: Tensor, spatial_merge_size: int) -> Tensor:
@@ -35,14 +35,25 @@ class LayoutAwarePatchMerger(nn.Module):
         base_merger: nn.Module,
         adapter: PreMergeLayoutAdapter,
         spatial_merge_size: int,
+        adapter_precision: AdapterPrecision = "mixed_bf16",
     ) -> None:
         super().__init__()
+        if adapter_precision not in {"mixed_bf16", "fp32"}:
+            raise ValueError(f"unsupported adapter precision: {adapter_precision}")
         self.base_merger = base_merger
         self.adapter = adapter
         self.spatial_merge_size = spatial_merge_size
+        self.adapter_precision = adapter_precision
         self._grid_thw: Tensor | None = None
         self.last_output: LayoutAdapterOutput | None = None
         self.last_patch_positions: Tensor | None = None
+        self.last_visual_tokens: Tensor | None = None
+        self.last_residual: Tensor | None = None
+        self.last_writeback_residual: Tensor | None = None
+        self.last_input_dtype: torch.dtype | None = None
+        self.last_adapter_input_dtype: torch.dtype | None = None
+        self.last_adapter_output_dtype: torch.dtype | None = None
+        self.last_merged_dtype: torch.dtype | None = None
 
     def set_grid_thw(self, grid_thw: Tensor) -> None:
         self._grid_thw = grid_thw
@@ -56,10 +67,22 @@ class LayoutAwarePatchMerger(nn.Module):
             raise RuntimeError(
                 f"pre-merge token mismatch: got {hidden_state.shape[0]}, expected {expected_tokens}"
             )
-        output = self.adapter(hidden_state.unsqueeze(0).float(), positions)
+        adapter_input = hidden_state.unsqueeze(0).float()
+        if self.adapter_precision == "fp32":
+            with torch.autocast(device_type=hidden_state.device.type, enabled=False):
+                output = self.adapter(adapter_input, positions)
+        else:
+            output = self.adapter(adapter_input, positions)
         self.last_output = output
         self.last_patch_positions = positions
         adapted = output.merged_tokens.squeeze(0).to(hidden_state.dtype)
+        self.last_visual_tokens = hidden_state.detach()
+        self.last_residual = (output.merged_tokens.squeeze(0).float() - hidden_state.float()).detach()
+        self.last_writeback_residual = (adapted.float() - hidden_state.float()).detach()
+        self.last_input_dtype = hidden_state.dtype
+        self.last_adapter_input_dtype = adapter_input.dtype
+        self.last_adapter_output_dtype = output.merged_tokens.dtype
+        self.last_merged_dtype = adapted.dtype
         return self.base_merger(adapted)
 
 
@@ -68,6 +91,7 @@ def install_layout_adapter(
     mode: str,
     num_queries: int = 32,
     max_residual_scale: float | None = None,
+    adapter_precision: AdapterPrecision = "mixed_bf16",
 ) -> LayoutAwarePatchMerger:
     """Install the adapter at the verified Transformers GLM-OCR pre-merger seam."""
 
@@ -87,6 +111,7 @@ def install_layout_adapter(
         base_merger=visual.merger,
         adapter=adapter,
         spatial_merge_size=int(visual.spatial_merge_size),
+        adapter_precision=adapter_precision,
     )
     visual.merger = bridge
     return bridge

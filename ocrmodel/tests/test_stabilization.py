@@ -1,3 +1,4 @@
+import argparse
 import json
 import os
 import subprocess
@@ -11,9 +12,11 @@ from layout_ocr import LayoutAdapterConfig, PreMergeLayoutAdapter
 from layout_ocr.glm_bridge import LayoutAwarePatchMerger
 from layout_ocr.train_screen import (
     clone_module_state,
+    diagnostic_triage,
     learning_rate_at_step,
     load_adapter_checkpoint,
     module_state_matches,
+    parse_step_list,
     save_adapter_checkpoint,
 )
 
@@ -32,6 +35,47 @@ def test_warmup_cosine_schedule_endpoints() -> None:
     assert values[0] == pytest.approx(0.0)
     assert values[64] == pytest.approx(5e-5)
     assert values[1024] == pytest.approx(5e-6)
+
+
+def test_diagnostic_step_parser_deduplicates_and_sorts() -> None:
+    assert parse_step_list("128, 0,64,64") == (0, 64, 128)
+    assert parse_step_list("") == ()
+    with pytest.raises(argparse.ArgumentTypeError):
+        parse_step_list("-1")
+
+
+def test_diagnostic_triage_flags_invalid_query_mass_rise() -> None:
+    points = []
+    for step, cer, invalid_mass, residual in (
+        (0, 0.30, 0.20, 0.00),
+        (64, 0.20, 0.25, 0.01),
+        (128, 0.40, 0.40, 0.02),
+    ):
+        points.append(
+            {
+                "step": step,
+                "validation": {
+                    "cer": cer,
+                    "invalid_query_fusion_mass": invalid_mass,
+                    "residual_relative_norm": residual,
+                    "effective_residual_scale": 0.02,
+                    "adapter_dtypes": [],
+                    "layout_loss_dtypes": [],
+                },
+                "training": {
+                    "adapter_dtypes": [],
+                    "loss_dtypes": {key: "float32" for key in (
+                        "layout_box",
+                        "layout_order",
+                        "layout_direction",
+                        "layout_assignment",
+                        "transport_entropy",
+                    )},
+                },
+            }
+        )
+    triage = diagnostic_triage(points)
+    assert triage["rules"]["query_mask_or_no_object"] is True
 
 
 def test_checkpoint_reload_preserves_capped_gate_semantics(tmp_path: Path) -> None:
@@ -101,3 +145,49 @@ def test_slurm_array_maps_six_unique_runs_and_one_baseline() -> None:
     assert len({row["output_dir"] for row in mappings}) == 7
     assert mappings[-1]["mode"] == "content_only"
     assert mappings[-1]["eval_only"] is True
+
+
+def test_geometry_diagnostic_launcher_is_single_fixed_run() -> None:
+    script = Path(__file__).parents[1] / "tools" / "bscc" / "run_geometry_diagnostic.sbatch"
+    environment = {**os.environ, "GLM_OCR_PRINT_TASK_MAP": "1"}
+    completed = subprocess.run(
+        ["bash", str(script)],
+        check=True,
+        capture_output=True,
+        text=True,
+        env=environment,
+    )
+    mapping = json.loads(completed.stdout)
+    assert mapping["mode"] == "geometry"
+    assert mapping["seed"] == 42
+    assert mapping["auxiliary_weight"] == 0.2
+    assert mapping["max_steps"] == 128
+    assert mapping["diagnostic_steps"] == [0, 64, 128]
+    assert mapping["reads_test"] is False
+
+
+def test_geometry_diagnostic_launcher_supports_fp32_256_points() -> None:
+    script = Path(__file__).parents[1] / "tools" / "bscc" / "run_geometry_diagnostic.sbatch"
+    environment = {
+        **os.environ,
+        "GLM_OCR_PRINT_TASK_MAP": "1",
+        "GLM_OCR_DIAGNOSTIC_ID": "geometry_seed42_steps256_fp32_v3",
+        "GLM_OCR_ADAPTER_PRECISION": "fp32",
+        "GLM_OCR_MAX_STEPS": "256",
+        "GLM_OCR_LR_SCHEDULE_STEPS": "128",
+        "GLM_OCR_DIAGNOSTIC_STEPS": "0,64,128,256",
+        "GLM_OCR_DIAGNOSTIC_STEPS_JSON": "[0,64,128,256]",
+    }
+    completed = subprocess.run(
+        ["bash", str(script)],
+        check=True,
+        capture_output=True,
+        text=True,
+        env=environment,
+    )
+    mapping = json.loads(completed.stdout)
+    assert mapping["max_steps"] == 256
+    assert mapping["lr_schedule_steps"] == 128
+    assert mapping["diagnostic_steps"] == [0, 64, 128, 256]
+    assert mapping["adapter_precision"] == "fp32"
+    assert mapping["reads_test"] is False
