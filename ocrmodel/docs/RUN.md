@@ -129,6 +129,12 @@ python tools/summarize_architecture_comparison.py \
 
 汇总器按三种子平均 validation CER 选择模式与 checkpoint，并输出相对 content-only 的 CER gain、exact-page、generation limit/EOS 和标准差；任何选择均不使用 test。
 
+## 全量 MTHv2 validity 诊断现状
+
+全量 MTHv2 使用 2159/240/800 页、512 queries 和五卡同步 DDP。`glmocr_mthv2_no_assignment_256_v4_r2` 已记录到 step 256，但 OCR loss 没有形成下降趋势；`glmocr_mthv2_validity_no_assignment_256_v1` 增加了 Hungarian 后的 valid/no-object head、balanced validity BCE、transport/fusion 门控和 valid coverage 诊断，指标也记录到 step 256。其完整 validation 因耗时按用户要求停止，状态为 `stopped_by_user`，不创建 selection，不读取 test。
+
+该 validity 分支目前只是可选架构候选：后程 matched/no-object `p_valid` 差值约 `0.0101`，gated invalid fusion mass 仍约 `0.946`，不能写成已验证的无效 query 解决方案。后续若继续改动，应先检查 Hungarian query mask、validity head 梯度和 gating 写回路径，再决定是否扩展 seed43/44。
+
 ## 服务器边界
 
 本地 A100 后续运行入口必须从环境变量读取外部资产，且输出位于 `/data3/yky/yangky_ocr_models/glm_ocr_layout_ot`。`/data4/hyf` 始终只读。每次命令只可查询明确允许的物理 GPU；任一目标卡的瞬时利用率达到 50% 时，在启动子任务前整体退出。BSCC 由 Slurm 分配 GPU，不在登录节点查询或抢占物理卡。

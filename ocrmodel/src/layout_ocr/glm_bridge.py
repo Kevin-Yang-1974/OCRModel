@@ -91,6 +91,9 @@ def install_layout_adapter(
     mode: str,
     num_queries: int = 32,
     max_residual_scale: float | None = None,
+    initial_residual_scale: float = 0.0,
+    use_validity_head: bool = False,
+    initial_valid_probability: float = 0.05,
     adapter_precision: AdapterPrecision = "mixed_bf16",
 ) -> LayoutAwarePatchMerger:
     """Install the adapter at the verified Transformers GLM-OCR pre-merger seam."""
@@ -105,6 +108,9 @@ def install_layout_adapter(
         ot_relaxation=0.5,
         ot_iterations=20,
         max_residual_scale=max_residual_scale,
+        initial_residual_scale=initial_residual_scale,
+        use_validity_head=use_validity_head,
+        initial_valid_probability=initial_valid_probability,
     )
     adapter = PreMergeLayoutAdapter(config).to(next(model.parameters()).device)
     bridge = LayoutAwarePatchMerger(

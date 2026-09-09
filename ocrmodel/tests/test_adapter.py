@@ -22,6 +22,8 @@ def test_adapter_forward_backward(mode: str) -> None:
         torch.testing.assert_close(output.transport.sum(dim=-1), expected, atol=1e-5, rtol=1e-5)
     else:
         assert output.transport is None
+    assert output.validity_logits is None
+    assert output.gated_transport is None
 
     (output.merged_tokens.square().mean() + output.boxes.mean()).backward()
     assert module.query_seed.grad is not None
@@ -43,6 +45,23 @@ def test_zero_gate_preserves_visual_tokens_exactly() -> None:
     tokens = torch.randn(1, 4, 8)
     output = module(tokens, torch.rand(1, 4, 2))
     torch.testing.assert_close(output.merged_tokens, tokens, atol=0.0, rtol=0.0)
+
+
+def test_initial_residual_scale_warm_starts_nonzero_fusion() -> None:
+    module = PreMergeLayoutAdapter(
+        LayoutAdapterConfig(
+            hidden_size=8,
+            num_queries=2,
+            num_heads=2,
+            mode="geometry",
+            max_residual_scale=0.03,
+            initial_residual_scale=0.01,
+        )
+    )
+    assert float(module.effective_residual_scale().detach()) == pytest.approx(0.01)
+    tokens = torch.randn(1, 4, 8)
+    output = module(tokens, torch.rand(1, 4, 2))
+    assert not torch.equal(output.merged_tokens, tokens)
 
 
 def test_effective_residual_scale_is_capped() -> None:
@@ -73,4 +92,34 @@ def test_legacy_config_keeps_original_tanh_gate_semantics() -> None:
         module.content_gate.fill_(2.0)
     assert float(module.effective_residual_scale().detach()) == pytest.approx(
         float(torch.tanh(torch.tensor(2.0)))
+    )
+
+
+def test_validity_head_initializes_and_gates_transport() -> None:
+    module = PreMergeLayoutAdapter(
+        LayoutAdapterConfig(
+            hidden_size=8,
+            num_queries=4,
+            num_heads=2,
+            mode="geometry",
+            use_validity_head=True,
+            initial_valid_probability=0.05,
+        )
+    )
+    output = module(torch.randn(1, 6, 8), torch.rand(1, 6, 2))
+    assert output.validity_logits is not None
+    assert output.validity_probs is not None
+    assert output.gated_transport is not None
+    assert output.valid_coverage is not None
+    torch.testing.assert_close(
+        output.validity_probs,
+        torch.full_like(output.validity_probs, 0.05),
+        atol=1e-6,
+        rtol=1e-6,
+    )
+    torch.testing.assert_close(
+        output.valid_coverage,
+        torch.full_like(output.valid_coverage, 0.05),
+        atol=1e-5,
+        rtol=1e-5,
     )

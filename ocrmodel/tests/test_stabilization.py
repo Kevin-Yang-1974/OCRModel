@@ -14,11 +14,13 @@ from layout_ocr.train_screen import (
     clone_module_state,
     configure_deterministic_execution,
     diagnostic_triage,
+    auxiliary_weight_at_step,
     learning_rate_at_step,
     load_adapter_checkpoint,
     module_state_matches,
     parse_step_list,
     processor_reproducibility_report,
+    repeated_trigram_rate,
     save_adapter_checkpoint,
 )
 
@@ -32,6 +34,12 @@ def test_deterministic_execution_pins_reported_backends(monkeypatch: pytest.Monk
     assert report["flash_sdp"] is False
     assert report["memory_efficient_sdp"] is False
     assert report["math_sdp"] is True
+
+
+def test_repeated_trigram_rate_detects_generation_loops() -> None:
+    assert repeated_trigram_rate("甲乙丙丁") == 0.0
+    assert repeated_trigram_rate("甲乙甲乙甲") > 0.0
+    assert repeated_trigram_rate("甲乙") == 0.0
 
 
 def test_processor_report_records_explicit_mode_and_resource_hash(tmp_path: Path) -> None:
@@ -64,6 +72,21 @@ def test_warmup_cosine_schedule_endpoints() -> None:
     assert values[0] == pytest.approx(0.0)
     assert values[64] == pytest.approx(5e-5)
     assert values[1024] == pytest.approx(5e-6)
+
+
+def test_auxiliary_weight_ramp_endpoints() -> None:
+    assert auxiliary_weight_at_step(
+        0, start_weight=0.05, end_weight=0.2, ramp_steps=256
+    ) == pytest.approx(0.05)
+    assert auxiliary_weight_at_step(
+        128, start_weight=0.05, end_weight=0.2, ramp_steps=256
+    ) == pytest.approx(0.125)
+    assert auxiliary_weight_at_step(
+        256, start_weight=0.05, end_weight=0.2, ramp_steps=256
+    ) == pytest.approx(0.2)
+    assert auxiliary_weight_at_step(
+        512, start_weight=0.05, end_weight=0.2, ramp_steps=256
+    ) == pytest.approx(0.2)
 
 
 def test_diagnostic_step_parser_deduplicates_and_sorts() -> None:

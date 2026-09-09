@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 
 import torch
 from torch import Tensor, nn
@@ -17,6 +18,10 @@ class LayoutAdapterOutput:
     order_scores: Tensor
     direction_logits: Tensor
     transport: Tensor | None
+    validity_logits: Tensor | None = None
+    validity_probs: Tensor | None = None
+    gated_transport: Tensor | None = None
+    valid_coverage: Tensor | None = None
 
 
 class PreMergeLayoutAdapter(nn.Module):
@@ -40,7 +45,15 @@ class PreMergeLayoutAdapter(nn.Module):
         self.box_head = nn.Linear(d, 4)
         self.order_head = nn.Linear(d, 1)
         self.direction_head = nn.Linear(d, config.num_directions)
-        self.content_gate = nn.Parameter(torch.tensor(0.0))
+        self.validity_head: nn.Linear | None = None
+        if config.use_validity_head:
+            self.validity_head = nn.Linear(d, 1)
+            nn.init.zeros_(self.validity_head.weight)
+            initial_probability = config.initial_valid_probability
+            initial_logit = math.log(initial_probability / (1.0 - initial_probability))
+            nn.init.constant_(self.validity_head.bias, initial_logit)
+        initial_gate = math.atanh(config.initial_residual_scale)
+        self.content_gate = nn.Parameter(torch.tensor(initial_gate, dtype=torch.float32))
         self.ot = SemiRelaxedTransport(
             config.ot_epsilon, config.ot_relaxation, config.ot_iterations
         )
@@ -89,9 +102,16 @@ class PreMergeLayoutAdapter(nn.Module):
         boxes = torch.cat((xy_min, xy_max), dim=-1)
         order_scores = self.order_head(queries).squeeze(-1)
         direction_logits = self.direction_head(queries)
+        validity_logits = None
+        validity_probs = None
+        if self.validity_head is not None:
+            validity_logits = self.validity_head(queries).squeeze(-1)
+            validity_probs = validity_logits.sigmoid()
 
         if self.config.mode == "content_only":
             transport = None
+            gated_transport = None
+            valid_coverage = None
             merged = visual_tokens
         else:
             scores = self._scores(queries, visual_tokens, boxes, patch_positions)
@@ -99,9 +119,20 @@ class PreMergeLayoutAdapter(nn.Module):
                 transport = self.ot(scores)
             else:
                 transport = scores.softmax(dim=-1) / self.config.num_queries
-            token_weights = transport.transpose(1, 2)
+            gated_transport = None
+            valid_coverage = None
+            fusion_transport = transport
+            if validity_probs is not None:
+                gated_transport = transport * validity_probs.unsqueeze(-1)
+                raw_token_mass = transport.sum(dim=1)
+                gated_token_mass = gated_transport.sum(dim=1)
+                valid_coverage = gated_token_mass / raw_token_mass.clamp_min(1e-12)
+                fusion_transport = gated_transport
+            token_weights = fusion_transport.transpose(1, 2)
             token_weights = token_weights / token_weights.sum(dim=-1, keepdim=True).clamp_min(1e-12)
             layout_context = self.content_norm(torch.matmul(token_weights, queries))
+            if valid_coverage is not None:
+                layout_context = layout_context * valid_coverage.unsqueeze(-1)
             # Keep the zero-initialized gate an exact identity path.  This makes
             # the attention/geometry comparison attributable to the learned
             # layout context instead of an unconditional extra LayerNorm.
@@ -114,4 +145,8 @@ class PreMergeLayoutAdapter(nn.Module):
             order_scores=order_scores,
             direction_logits=direction_logits,
             transport=transport,
+            validity_logits=validity_logits,
+            validity_probs=validity_probs,
+            gated_transport=gated_transport,
+            valid_coverage=valid_coverage,
         )

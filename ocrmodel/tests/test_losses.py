@@ -31,6 +31,7 @@ def test_auxiliary_losses_are_finite() -> None:
         "layout_direction",
         "layout_assignment",
         "transport_entropy",
+        "layout_validity",
     }
     assert all(torch.isfinite(value) for value in losses.values())
     losses["loss"].backward()
@@ -45,8 +46,8 @@ def test_transport_diagnostics_reports_unused_query_mass() -> None:
         output,
         torch.tensor([[True, False, False]]),
     )
-    assert diagnostics["transport_query_mass"] is not None
-    assert diagnostics["fusion_query_mass"] is not None
+    assert diagnostics["transport_query_mass"] is None
+    assert diagnostics["fusion_query_mass"] is None
     assert diagnostics["invalid_query_transport_mass"] >= 0.0
     assert diagnostics["valid_query_transport_mass"] >= 0.0
     assert diagnostics["invalid_query_fusion_mass"] >= 0.0
@@ -94,4 +95,42 @@ def test_layout_loss_profiles_are_explicit() -> None:
     assert layout_loss_config("full").assignment == 1.0
     assert layout_loss_config("ocr_only").box == 0.0
     assert layout_loss_config("no_assignment").assignment == 0.0
+    validity = layout_loss_config("no_assignment_validity")
+    assert validity.assignment == 0.0
+    assert validity.validity == 0.5
     assert layout_loss_config("no_geometry").box == 0.0
+
+
+def test_validity_loss_uses_hungarian_query_mask() -> None:
+    module = PreMergeLayoutAdapter(
+        LayoutAdapterConfig(
+            hidden_size=8,
+            num_queries=4,
+            num_heads=2,
+            mode="geometry",
+            use_validity_head=True,
+            initial_valid_probability=0.05,
+        )
+    )
+    output = module(torch.randn(1, 5, 8), torch.rand(1, 5, 2))
+    assert output.validity_logits is not None
+    assert output.validity_probs is not None
+    assert output.gated_transport is not None
+    assert output.valid_coverage is not None
+    assert float(output.validity_probs.mean()) == torch.sigmoid(
+        torch.tensor(torch.logit(torch.tensor(0.05)))
+    ).item()
+    losses = compute_layout_losses(
+        output,
+        target_boxes=torch.rand(1, 4, 4),
+        target_orders=torch.rand(1, 4),
+        target_directions=torch.tensor([[0, 1, 2, 0]]),
+        query_mask=torch.tensor([[True, False, False, True]]),
+        token_owners=torch.full((1, 5), -1, dtype=torch.long),
+        weights=layout_loss_config("no_assignment_validity"),
+    )
+    assert losses["layout_validity"].item() > 0.0
+    assert torch.isfinite(losses["loss"])
+    losses["loss"].backward()
+    assert module.validity_head is not None
+    assert module.validity_head.weight.grad is not None

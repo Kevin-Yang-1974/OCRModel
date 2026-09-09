@@ -14,7 +14,47 @@ def load_records(path: Path) -> list[dict[str, Any]]:
         records = [json.loads(line) for line in handle if line.strip()]
     if not records:
         raise ValueError(f"empty manifest: {path}")
+    page_ids: set[str] = set()
+    for record in records:
+        page_id = str(record.get("page_id", ""))
+        if not page_id or page_id in page_ids:
+            raise ValueError(f"duplicate or missing page_id in manifest: {path}")
+        page_ids.add(page_id)
+        image = record.get("image_path") or record.get("image")
+        if not image:
+            raise ValueError(f"record {page_id} has no image or image_path: {path}")
+        image_path = Path(str(image))
+        if not image_path.is_absolute():
+            image_path = path.parent / image_path
+        record["image_path"] = str(image_path.resolve())
+        if not isinstance(record.get("page_text"), str) or not record["page_text"]:
+            raise ValueError(f"record {page_id} has no page_text: {path}")
     return records
+
+
+def validate_records(
+    records: list[dict[str, Any]], *, split: str | None = None, num_queries: int | None = None
+) -> None:
+    """Validate the data contracts that affect training correctness."""
+
+    for record in records:
+        page_id = record["page_id"]
+        if split is not None:
+            record_split = record.get("split", record.get("official_split"))
+            if record_split != split:
+                raise ValueError(
+                    f"record {page_id} has split {record_split!r}, expected {split!r}"
+                )
+        image_path = Path(record["image_path"])
+        if not image_path.is_file():
+            raise FileNotFoundError(f"image for {page_id} does not exist: {image_path}")
+        regions = record.get("regions")
+        if not isinstance(regions, list) or not regions:
+            raise ValueError(f"record {page_id} has no regions")
+        if num_queries is not None and len(regions) > num_queries:
+            raise ValueError(
+                f"record {page_id} has {len(regions)} regions, exceeding num_queries={num_queries}"
+            )
 
 
 def _messages(target: str | None = None) -> list[dict[str, Any]]:

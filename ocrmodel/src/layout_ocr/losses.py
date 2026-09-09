@@ -15,6 +15,26 @@ def _masked_mean(values: Tensor, mask: Tensor) -> Tensor:
     return (values * weights).sum() / weights.expand_as(values).sum().clamp_min(1)
 
 
+def _balanced_validity_bce(logits: Tensor, targets: Tensor) -> Tensor:
+    """Give valid and no-object queries equal page-level weight."""
+
+    targets = targets.to(dtype=logits.dtype)
+    elementwise = F.binary_cross_entropy_with_logits(logits, targets, reduction="none")
+    positive = targets.bool()
+    negative = ~positive
+    positive_count = positive.sum(dim=1)
+    negative_count = negative.sum(dim=1)
+    positive_loss = (elementwise * positive).sum(dim=1) / positive_count.clamp_min(1)
+    negative_loss = (elementwise * negative).sum(dim=1) / negative_count.clamp_min(1)
+    class_count = (positive_count > 0).to(elementwise.dtype) + (
+        negative_count > 0
+    ).to(elementwise.dtype)
+    return (
+        positive_loss * (positive_count > 0).to(elementwise.dtype)
+        + negative_loss * (negative_count > 0).to(elementwise.dtype)
+    ).div(class_count.clamp_min(1)).mean()
+
+
 def _hungarian_assignment(cost: Tensor) -> list[tuple[int, int]]:
     """Solve a rectangular target-by-query assignment on a CPU cost matrix.
 
@@ -191,8 +211,12 @@ def compute_layout_losses(
         )
     assignment = zero
     entropy = zero
-    if output.transport is not None:
-        plan = output.transport.clamp_min(1e-12)
+    validity = zero
+    if output.validity_logits is not None:
+        validity = _balanced_validity_bce(output.validity_logits, query_mask)
+    plan_source = output.gated_transport if output.gated_transport is not None else output.transport
+    if plan_source is not None:
+        plan = plan_source.clamp_min(1e-12)
         entropy = -(plan * plan.log()).sum(dim=(1, 2)).mean()
         if token_owners is not None and (token_owners >= 0).any():
             probabilities = plan.transpose(1, 2)
@@ -207,6 +231,7 @@ def compute_layout_losses(
         + weights.direction * direction
         + weights.assignment * assignment
         + weights.transport_entropy * entropy
+        + weights.validity * validity
     )
     return {
         "loss": total,
@@ -215,4 +240,5 @@ def compute_layout_losses(
         "layout_direction": direction,
         "layout_assignment": assignment,
         "transport_entropy": entropy,
+        "layout_validity": validity,
     }

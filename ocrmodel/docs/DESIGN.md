@@ -8,6 +8,8 @@
 
 GLM-OCR 的视觉编码器先生成整页 visual tokens。`PreMergeLayoutAdapter` 使用可学习 seed queries 对这些 tokens 做交叉 attention，得到布局 queries；随后预测区域、顺序和方向，并在视觉内容进入原合并器前回写布局上下文。布局真值不出现在 `forward` 接口中。
 
+当前代码还实现了一个可选的 validity/no-object 分支：Hungarian 对齐后，将匹配到标注区域的 query 标为 valid，未匹配 query 标为 no-object；`validity_head` 从页面相关 query 预测 `p_valid`，再对 query→视觉 transport 和 token 侧融合做门控。该分支目前是待验证架构候选，不是已经确认的默认结构。全量 MTHv2 的 256-step 诊断中，`p_valid` 从约 0.05 整体升至约 0.60，但 valid/no-object 的分离不足，gated invalid fusion mass 仍约 0.95，因此不能把 validity gating 表述为已验证收益。
+
 ## 3. 模块与对照
 
 当前确认实验优先比较 `attention` 与 `geometry`，并保留 `layout_ot` 作为运输约束对照。`geometry` 在内容相似度中加入预测区域中心—patch 中心距离；`layout_ot` 使用同一几何 score，但进一步调用半松弛传输。该实现仍是项目候选设计，不是已验证结论。
@@ -125,7 +127,17 @@ $$W_iq = T_qi / (sum_k T_ki + 1e-12).$$
 
 $$h_i = LN_c(sum_q W_iq z_q).$$
 
-其中 LN_c 对应 content_norm。当前实现没有额外 MLP、concat、第二个 cross-attention block 或 token 数量变化。由于 softmax 权重严格为正，所有 query 默认都能参与融合；query_mask 只用于辅助损失和诊断，不会在 forward 中自动屏蔽未匹配 query。
+其中 LN_c 对应 content_norm。当前实现没有额外 MLP、concat、第二个 cross-attention block 或 token 数量变化。基础 `attention`/`geometry`/`layout_ot` 路径中，由于 softmax 权重严格为正，所有 query 默认都能参与融合；`query_mask` 只用于辅助损失和诊断，不会自动屏蔽未匹配 query。
+
+启用 validity/no-object head 时，先由 query 预测：
+
+$$p_q = sigmoid(l_q^{valid}), \quad T^{gate}_{qi} = T_{qi} p_q.$$
+
+然后按视觉 token 重新归一化 gated transport，并计算有效覆盖率：
+
+$$W^{gate}_{iq} = T^{gate}_{qi} / (sum_k T^{gate}_{ki} + 1e-12), \quad c_i = sum_q T^{gate}_{qi} / (sum_q T_{qi} + 1e-12).$$
+
+融合上下文为 `c_i × LN_c(sum_q W^{gate}_{iq} z_q)`。这一步避免单纯重新归一化抵消 `p_valid` 的门控效果：即便 gated transport 在 token 侧重新归一化，validity 较低仍会通过 `c_i` 减小布局上下文写回。raw transport、gated transport 和 valid coverage 均保留用于诊断。
 
 ### 4.7 受控残差写回
 
@@ -143,15 +155,16 @@ content_gate g 初始化为 0。旧 checkpoint 未设置上限时使用 α = tan
 
 训练总目标写为：
 
-$$L = L_OCR + λ_aux(λ_b L_box + λ_o L_order + λ_d L_direction + λ_a L_assignment + λ_e L_entropy).$$
+$$L = L_OCR + λ_aux(λ_b L_box + λ_o L_order + λ_d L_direction + λ_a L_assignment + λ_e L_entropy + λ_v L_validity).$$
 
-当前 full 配置的权重为 (λ_b, λ_o, λ_d, λ_a, λ_e) = (1, 0.5, 0.5, 1, 0)，稳定性确认使用 λ_aux = 0.2。这些是当前实验协议，不是 geometry score 的必要组成部分。
+当前 `full` 配置的权重为 (λ_b, λ_o, λ_d, λ_a, λ_e, λ_v) = (1, 0.5, 0.5, 1, 0, 0)；`no_assignment_validity` 配置为 (1, 0.5, 0.5, 0, 0, 0.5)。稳定性确认使用 λ_aux = 0.2，MTHv2 validity 诊断使用辅助权重从 0.05 线性 ramp 到 0.2。这些是当前实验协议，不是 geometry score 的必要组成部分。
 
 - L_box：对归一化 xyxy bbox 使用 Smooth L1，并按有效 query mask 平均。
 - L_order：对 order_scores 使用 Smooth L1，reading order 归一化到 [0,1]。
 - L_direction：对 vertical_rtl、horizontal_ltr、unknown 使用交叉熵。
 - L_assignment：把 T 转成 token-first 后，对有 owner 的 patch 使用 NLL；owner = -1 的 patch 忽略。
 - L_entropy：记录 transport 熵，默认权重为 0；geometry 中它作用于 softmax 权重，layout_ot 中才与半松弛 OT 一起解释。
+- L_validity：对 Hungarian 后的 `query_mask` 使用按页面正负类分别归一化的 balanced BCE，使 valid 与 no-object query 在页面内获得相近的类别权重。它只在启用 validity head 时非零。
 
 数据层按 reading_order 排序 regions，并根据 patch center 是否落在 bbox 内生成 token_owners。重叠框当前取排序后的第一个 region，框外 patch 标记为 -1。所有这些 target 都是在 adapter forward 完成后生成，不改变 patch_positions 和 geometry score。
 
@@ -171,6 +184,7 @@ $$C_mq = 0.7 mean(|b_m - b̂_q|) + 0.3 |o_m - sigmoid(ô_q)|.$$
 | attention | e_qi | T = softmax_i(e_qi) / Q |
 | geometry | e_qi − d_qi / τ_g | T = softmax_i(s_qi) / Q |
 | layout_ot | e_qi − d_qi / τ_g | SemiRelaxedTransport(s) |
+| geometry + validity | e_qi − d_qi / τ_g | 对 T 施加 p_valid 门控，并以 valid coverage 保留幅度信息 |
 
 所以 geometry 相对于 attention 的新增量是预测中心距离偏置及其反向梯度；相对于 layout_ot，geometry 不含固定 query 边缘和松弛 token 边缘的迭代更新。比较时必须固定 query 数、训练预算、数据划分、残差约束、精度和 loss profile。
 
@@ -178,7 +192,11 @@ $$C_mq = 0.7 mean(|b_m - b̂_q|) + 0.3 |o_m - sigmoid(ô_q)|.$$
 
 相对于 attention，geometry 主要增加 B×Q×N 的距离矩阵，计算和显存量级约为 O(BQN)。它不增加 geometry 专用的可学习参数；bbox head 在布局模式中共同存在，以保持参数量对等。额外的几何计算通常低于 backbone 和 query–token 相似度计算，但在 N 或 Q 较大时仍需记录实际峰值显存。
 
-论文中应明确以下限制：当前几何项只使用预测 bbox 中心；T 是两次局部归一化后的 softmax 权重而非严格 OT；未匹配 query 不会在 forward 中自动消失；训练早期错误 bbox 可能造成错误空间排斥；τ_g、残差上限和辅助损失权重必须由 validation-only 协议确定。geometry 是否稳定优于 attention 仍需统一多 seed、小样本划分和跨来源验证，不能由单个短程 run 推断。
+论文中应明确以下限制：当前几何项只使用预测 bbox 中心；T 是两次局部归一化后的 softmax 权重而非严格 OT；基础路径中的未匹配 query 不会在 forward 中自动消失；validity 分支虽能对 transport 做门控，但当前 MTHv2 诊断尚未形成 valid/no-object 分离，不能视为已解决无效 query 问题；训练早期错误 bbox 或 validity 概率可能造成错误空间排斥；τ_g、残差上限、validity 权重和辅助损失权重必须由 validation-only 协议确定。geometry 是否稳定优于 attention，以及 validity gating 是否能降低重复生成，仍需统一多 seed、小样本划分和跨来源验证，不能由单个短程 run 推断。
+
+### 4.10.1 Validity 分支的当前证据边界
+
+全量 MTHv2 `glmocr_mthv2_validity_no_assignment_256_v1` 使用 512 queries、五卡同步 DDP、有效 global batch 20、峰值学习率 `2.5e-5`、gate 全程冻结和 `no_assignment_validity` profile。训练指标已记录到 step 256：前 64 步与后 64 步的 OCR loss 中位数约为 `1.3856` 与 `1.4068`，没有形成下降趋势；valid/no-object 的 `p_valid` 差值后程均值约 `0.0101`，step 256 约 `0.0177`，gated invalid fusion mass 仍约 `0.946`。因此该分支目前只能证明实现可运行并且数值有限，不能证明它改善了 OCR 或 query 选择。
 
 ### 4.11 与代码的对应关系
 
@@ -196,11 +214,11 @@ $$C_mq = 0.7 mean(|b_m - b̂_q|) + 0.3 |o_m - sigmoid(ô_q)|.$$
 
 ## 6. 训练策略
 
-首轮三种子结果显示 attention/geometry 均在 step 256 达到最低 validation CER，后续虽有 OCR loss 下降，但残差 gate 与生成触顶率持续增加。该现象当前解释为小样本反复训练下的残差扰动累积与解码漂移，不是 NaN 型故障；这一解释仍需本轮稳定性实验验证。
+确定性 A100 架构对照已经支持 geometry 在 `step 768` 取得当前 validation 最优组合，但这只证明固定小样本协议下的候选可运行性。进入全量 MTHv2 后，`glmocr_mthv2_full_ddp_v1` 因学习率调度过早降至 `5e-6` 停止，gate warm-start 诊断也没有形成可用于正式训练的证据；随后 `no_assignment` 与 validity/no-object 诊断显示，辅助项可以下降，但 OCR loss 仍在约 1.4 附近振荡。因此当前训练策略的重点已从“继续放大训练规模”转为先确认 query target、validity 梯度和 gated fusion 路径。
 
 稳定性确认保持主干、原 patch merger、输入协议和 `auxiliary_weight=0.2` 不变，只训练 pre-merger adapter。学习率先用 64 steps 线性 warmup 至 `5e-5`，再 cosine 衰减，并在 step 1024 到达 `5e-6`。原始 `content_gate` 仍作为 checkpoint 参数保存，实际回写系数采用 `clamp(tanh(content_gate), -0.03, 0.03)`；未配置上限的旧 checkpoint 继续使用原始 `tanh` 语义。受控小残差尺度的设计依据来自 ReZero 的零初始化残差思想和 CaiT LayerScale 的小尺度残差注入，但 `0.03` 是依据本项目首轮最佳 checkpoint 的观察值设定，属于项目修改而非两篇论文的原始超参数[4-5]。
 
-同一 128 页 train、64 页 validation 上运行 attention/geometry × seeds `42/43/44` 共六组，每组 1024 steps；另运行一次不更新参数的严格 prompt-only `content_only` 基线。以三种子平均 validation CER 选择“模式＋step”，不读取 64 页 test。只有稳定性阈值全部满足后，候选才可进入后续 selection-locked test。
+全量 MTHv2 的正式协议仍为 train 2159 页、validation 240 页、test 800 页；正式 selection 和 test 尚未因上述诊断而启动。当前 validity 诊断只使用 seed42，训练阶段不读取 test、不生成 selection；后续是否扩展到 seed43/44，必须先由 validation-only 结果和 query-level 机制证据决定。
 
 ## 7. 轻量化边界
 
@@ -208,7 +226,7 @@ $$C_mq = 0.7 mean(|b_m - b̂_q|) + 0.3 |o_m - sigmoid(ô_q)|.$$
 
 ## 8. 接入与风险
 
-接入点是 GLM-OCR 视觉 tokens 进入视觉—语言合并器之前；当前代码按锁定的 GLM-OCR checkpoint 建立并验证了这一 pre-merger tensor seam，正式实验仍需固定同一 checkpoint、processor 和整页输入协议。主要失败风险是 query collapse、OT 数值敏感、辅助监督压制识别目标，以及不同对照计算量不对等。
+接入点是 GLM-OCR 视觉 tokens 进入视觉—语言合并器之前；当前代码按锁定的 GLM-OCR checkpoint 建立并验证了这一 pre-merger tensor seam，正式实验仍需固定同一 checkpoint、processor 和整页输入协议。主要失败风险是 query collapse、Hungarian target 与 query 表征不一致、validity head 学成全局偏置、gated fusion 被 token 侧归一化抵消、OT 数值敏感、辅助监督压制识别目标，以及不同对照计算量不对等。
 
 ## 9. 方法来源边界
 
@@ -216,7 +234,7 @@ $$C_mq = 0.7 mean(|b_m - b̂_q|) + 0.3 |o_m - sigmoid(ô_q)|.$$
 
 结合项目修改部分：`LayoutAwarePatchMerger` 保留官方 merger，但在其前对下采样 token 执行布局融合。数据使用整页 `Text Recognition:` prompt，不使用官方 SDK 的 PP-DocLayout-V3 裁剪两阶段推理。
 
-项目新增部分：整页布局 queries、预测 bbox 中心的 geometry score、布局条件化半松弛 OT、四种模式对照与布局辅助目标。这些是待实验候选，不归因为 GLM-OCR 原论文方法。
+项目新增部分：整页布局 queries、预测 bbox 中心的 geometry score、布局条件化半松弛 OT、四种模式对照、布局辅助目标，以及可选的 validity/no-object query 门控。这些是项目候选设计；其中 validity 分支已完成代码与五卡诊断，但尚未获得改善 OCR 或降低无效 fusion 的实验支持，不归因为 GLM-OCR 原论文方法。
 
 ## 参考文献
 

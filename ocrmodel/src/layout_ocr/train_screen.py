@@ -20,7 +20,24 @@ import torch
 from safetensors.torch import load_file, save_file
 
 from .config import layout_loss_config
-from .data import layout_targets, load_records, prepare_inference_inputs, prepare_training_inputs
+from .data import (
+    layout_targets,
+    load_records,
+    prepare_inference_inputs,
+    prepare_training_inputs,
+    validate_records,
+)
+from .distributed import (
+    DistributedInfo,
+    all_finite,
+    barrier,
+    destroy_distributed,
+    initialize_distributed,
+    mean_scalar,
+    rank_epoch_indices,
+    unwrap_module,
+    wrap_adapter,
+)
 from .glm_bridge import LayoutAwarePatchMerger, install_layout_adapter
 from .losses import compute_layout_losses, match_layout_targets
 from .metrics import aggregate_ocr_metrics
@@ -32,6 +49,7 @@ LAYOUT_LOSS_KEYS = (
     "layout_direction",
     "layout_assignment",
     "transport_entropy",
+    "layout_validity",
 )
 
 
@@ -103,6 +121,20 @@ def parse_step_list(value: str) -> tuple[int, ...]:
     return tuple(sorted(parsed))
 
 
+def repeated_trigram_rate(text: str) -> float:
+    """Return the fraction of character trigrams repeated in a prediction.
+
+    This is an evaluation diagnostic only.  It is deliberately computed on
+    decoded text and is never used for training, checkpoint selection, or
+    test-time thresholding.
+    """
+
+    if len(text) < 3:
+        return 0.0
+    trigrams = [text[index : index + 3] for index in range(len(text) - 2)]
+    return (len(trigrams) - len(set(trigrams))) / len(trigrams)
+
+
 def _dtype_name(value: torch.dtype | None) -> str | None:
     if value is None:
         return None
@@ -111,10 +143,11 @@ def _dtype_name(value: torch.dtype | None) -> str | None:
 
 def adapter_dtype_report(bridge: LayoutAwarePatchMerger) -> dict[str, str | None]:
     output = bridge.last_output
+    adapter = unwrap_module(bridge.adapter)
     parameter_dtypes = sorted(
         {
             dtype_name
-            for parameter in bridge.adapter.parameters()
+            for parameter in adapter.parameters()
             if (dtype_name := _dtype_name(parameter.dtype)) is not None
         }
     )
@@ -128,6 +161,16 @@ def adapter_dtype_report(bridge: LayoutAwarePatchMerger) -> dict[str, str | None
         "writeback_tokens": _dtype_name(bridge.last_merged_dtype),
         "boxes": _dtype_name(output.boxes.dtype if output is not None else None),
         "transport": _dtype_name(output.transport.dtype if output is not None and output.transport is not None else None),
+        "validity_logits": _dtype_name(
+            output.validity_logits.dtype
+            if output is not None and output.validity_logits is not None
+            else None
+        ),
+        "gated_transport": _dtype_name(
+            output.gated_transport.dtype
+            if output is not None and output.gated_transport is not None
+            else None
+        ),
     }
 
 
@@ -150,7 +193,7 @@ def writeback_residual_relative_norm(bridge: LayoutAwarePatchMerger) -> float | 
 def transport_diagnostics(
     output: Any, query_mask: torch.Tensor
 ) -> dict[str, Any]:
-    """Summarize raw transport and the normalized query contribution to writeback."""
+    """Summarize raw and validity-gated transport without query-sized arrays."""
 
     transport = output.transport
     if transport is None:
@@ -163,32 +206,101 @@ def transport_diagnostics(
             "fusion_query_mass": None,
             "invalid_query_fusion_mass": None,
             "valid_query_fusion_mass": None,
+            "gated_transport_total_mass": None,
+            "invalid_gated_query_transport_mass": None,
+            "valid_gated_query_transport_mass": None,
+            "invalid_gated_fusion_mass": None,
+            "valid_gated_fusion_mass": None,
+            "valid_coverage": None,
+            "mean_p_valid": None,
+            "mean_p_valid_matched": None,
+            "mean_p_valid_no_object": None,
         }
 
-    plan = transport.float().clamp_min(1e-12)
-    query_mass = plan.sum(dim=-1)
-    probabilities = plan / query_mass.unsqueeze(-1).clamp_min(1e-12)
-    entropy_nats = -(probabilities * probabilities.log()).sum(dim=-1)
-    token_weights = plan.transpose(1, 2)
-    token_weights = token_weights / token_weights.sum(dim=-1, keepdim=True).clamp_min(1e-12)
-    fusion_mass = token_weights.sum(dim=1)
-    fusion_mass = fusion_mass / fusion_mass.sum(dim=-1, keepdim=True).clamp_min(1e-12)
     mask = query_mask.to(dtype=torch.bool)
-    invalid_mass = (fusion_mass * (~mask).to(fusion_mass.dtype)).sum(dim=-1)
-    valid_mass = (fusion_mass * mask.to(fusion_mass.dtype)).sum(dim=-1)
-    invalid_transport_mass = (query_mass * (~mask).to(query_mass.dtype)).sum(dim=-1)
-    valid_transport_mass = (query_mass * mask.to(query_mass.dtype)).sum(dim=-1)
-    token_count = max(1, probabilities.shape[-1])
+
+    def summarize(plan_value: torch.Tensor) -> dict[str, Tensor]:
+        plan_value = plan_value.float().clamp_min(1e-12)
+        query_mass = plan_value.sum(dim=-1)
+        total_mass = query_mass.sum(dim=-1).clamp_min(1e-12)
+        normalized_query_mass = query_mass / total_mass.unsqueeze(-1)
+        token_weights = plan_value.transpose(1, 2)
+        token_weights = token_weights / token_weights.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+        fusion_mass = token_weights.sum(dim=1)
+        fusion_mass = fusion_mass / fusion_mass.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+        return {
+            "total_mass": total_mass,
+            "invalid_transport": (
+                normalized_query_mass * (~mask).to(query_mass.dtype)
+            ).sum(dim=-1),
+            "valid_transport": (
+                normalized_query_mass * mask.to(query_mass.dtype)
+            ).sum(dim=-1),
+            "invalid_fusion": (
+                fusion_mass * (~mask).to(fusion_mass.dtype)
+            ).sum(dim=-1),
+            "valid_fusion": (
+                fusion_mass * mask.to(fusion_mass.dtype)
+            ).sum(dim=-1),
+        }
+
+    raw_plan = transport.float().clamp_min(1e-12)
+    raw_query_mass = raw_plan.sum(dim=-1)
+    raw_probabilities = raw_plan / raw_query_mass.unsqueeze(-1).clamp_min(1e-12)
+    entropy_nats = -(raw_probabilities * raw_probabilities.log()).sum(dim=-1)
+    token_count = max(1, raw_probabilities.shape[-1])
     entropy = entropy_nats / math.log(token_count) if token_count > 1 else entropy_nats * 0.0
+    raw = summarize(raw_plan)
+    gated_plan = output.gated_transport
+    gated = summarize(gated_plan) if gated_plan is not None else None
+    validity_probs = output.validity_probs
+    valid_coverage = output.valid_coverage
+
+    def scalar(value: Tensor | None) -> float | None:
+        return None if value is None else float(value.mean().detach())
+
+    if validity_probs is None:
+        mean_p_valid = mean_p_matched = mean_p_no_object = None
+    else:
+        probabilities = validity_probs.float()
+        matched = mask.to(probabilities.dtype)
+        unmatched = (~mask).to(probabilities.dtype)
+        mean_p_valid = scalar(probabilities)
+        mean_p_matched = scalar(
+            (probabilities * matched).sum(dim=-1) / matched.sum(dim=-1).clamp_min(1)
+        )
+        mean_p_no_object = scalar(
+            (probabilities * unmatched).sum(dim=-1) / unmatched.sum(dim=-1).clamp_min(1)
+        )
     return {
         "transport_entropy": float(entropy.mean().detach()),
         "transport_entropy_nats": float(entropy_nats.mean().detach()),
-        "transport_query_mass": query_mass.mean(dim=0).detach().cpu().tolist(),
-        "invalid_query_transport_mass": float(invalid_transport_mass.mean().detach()),
-        "valid_query_transport_mass": float(valid_transport_mass.mean().detach()),
-        "fusion_query_mass": fusion_mass.mean(dim=0).detach().cpu().tolist(),
-        "invalid_query_fusion_mass": float(invalid_mass.mean().detach()),
-        "valid_query_fusion_mass": float(valid_mass.mean().detach()),
+        # Query-sized arrays were the source of the misleading long rows.
+        "transport_query_mass": None,
+        "invalid_query_transport_mass": scalar(raw["invalid_transport"]),
+        "valid_query_transport_mass": scalar(raw["valid_transport"]),
+        "fusion_query_mass": None,
+        "invalid_query_fusion_mass": scalar(raw["invalid_fusion"]),
+        "valid_query_fusion_mass": scalar(raw["valid_fusion"]),
+        "gated_transport_total_mass": (
+            scalar(gated["total_mass"]) if gated is not None else None
+        ),
+        "invalid_gated_query_transport_mass": (
+            scalar(gated["invalid_transport"]) if gated is not None else None
+        ),
+        "valid_gated_query_transport_mass": (
+            scalar(gated["valid_transport"]) if gated is not None else None
+        ),
+        "invalid_gated_fusion_mass": (
+            scalar(gated["invalid_fusion"]) if gated is not None else None
+        ),
+        "valid_gated_fusion_mass": (
+            scalar(gated["valid_fusion"]) if gated is not None else None
+        ),
+        "valid_coverage": scalar(valid_coverage),
+        "mean_p_valid": mean_p_valid,
+        "mean_p_valid_matched": mean_p_matched,
+        "mean_p_valid_no_object": mean_p_no_object,
     }
 
 
@@ -368,7 +480,25 @@ def learning_rate_at_step(
     return peak_learning_rate * (min_lr_ratio + (1.0 - min_lr_ratio) * cosine)
 
 
+def auxiliary_weight_at_step(
+    step: int,
+    *,
+    start_weight: float,
+    end_weight: float,
+    ramp_steps: int,
+) -> float:
+    """Return the optimizer-step auxiliary-loss weight for a linear ramp."""
+
+    if start_weight < 0.0 or end_weight < 0.0 or ramp_steps < 0:
+        raise ValueError("auxiliary weights and ramp steps must be non-negative")
+    if ramp_steps == 0 or start_weight == end_weight:
+        return end_weight
+    progress = min(max(step, 0), ramp_steps) / ramp_steps
+    return start_weight + (end_weight - start_weight) * progress
+
+
 def adapter_finite_report(adapter: torch.nn.Module) -> dict[str, Any]:
+    adapter = unwrap_module(adapter)
     non_finite = [
         name
         for name, value in adapter.state_dict().items()
@@ -378,10 +508,12 @@ def adapter_finite_report(adapter: torch.nn.Module) -> dict[str, Any]:
 
 
 def clone_module_state(module: torch.nn.Module) -> dict[str, torch.Tensor]:
+    module = unwrap_module(module)
     return {key: value.detach().cpu().clone() for key, value in module.state_dict().items()}
 
 
 def module_state_matches(module: torch.nn.Module, expected: dict[str, torch.Tensor]) -> bool:
+    module = unwrap_module(module)
     current = module.state_dict()
     return current.keys() == expected.keys() and all(
         torch.equal(current[key].detach().cpu(), expected[key]) for key in current
@@ -389,14 +521,15 @@ def module_state_matches(module: torch.nn.Module, expected: dict[str, torch.Tens
 
 
 def write_adapter_config(path: Path, bridge: LayoutAwarePatchMerger) -> None:
-    write_json(path, asdict(bridge.adapter.config))
+    write_json(path, asdict(unwrap_module(bridge.adapter).config))
 
 
 def save_adapter_checkpoint(path: Path, bridge: LayoutAwarePatchMerger, step: int) -> dict[str, Any]:
+    adapter = unwrap_module(bridge.adapter)
     report = {
         "step": step,
         "adapter_precision": bridge.adapter_precision,
-        **adapter_finite_report(bridge.adapter),
+        **adapter_finite_report(adapter),
     }
     if not report["parameters_finite"]:
         raise FloatingPointError(
@@ -405,7 +538,7 @@ def save_adapter_checkpoint(path: Path, bridge: LayoutAwarePatchMerger, step: in
         )
     state = {
         key: value.detach().cpu().contiguous()
-        for key, value in bridge.adapter.state_dict().items()
+        for key, value in adapter.state_dict().items()
     }
     save_file(state, path / "adapter.safetensors")
     write_adapter_config(path / "adapter_config.json", bridge)
@@ -424,15 +557,23 @@ def save_adapter_checkpoint(path: Path, bridge: LayoutAwarePatchMerger, step: in
 
 
 def load_adapter_checkpoint(path: Path, bridge: LayoutAwarePatchMerger) -> dict[str, Any]:
+    adapter = unwrap_module(bridge.adapter)
     config_path = path / "adapter_config.json"
-    expected = asdict(bridge.adapter.config)
+    expected = asdict(adapter.config)
     if config_path.is_file():
         recorded = json.loads(config_path.read_text(encoding="utf-8"))
+        # Checkpoints written before gate warm-start support implicitly used
+        # the zero-scale identity initialization.
+        recorded.setdefault("initial_residual_scale", 0.0)
+        # Checkpoints written before validity gating did not serialize these
+        # fields; preserve their raw-transport semantics when reloaded.
+        recorded.setdefault("use_validity_head", False)
+        recorded.setdefault("initial_valid_probability", 0.05)
         if recorded != expected:
             raise ValueError(
                 f"adapter config mismatch for {path}: recorded={recorded}, expected={expected}"
             )
-    elif bridge.adapter.config.max_residual_scale is not None:
+    elif adapter.config.max_residual_scale is not None:
         raise ValueError(
             "legacy checkpoint has no adapter_config.json; load it with "
             "max_residual_scale=None to preserve its original gate semantics"
@@ -441,7 +582,7 @@ def load_adapter_checkpoint(path: Path, bridge: LayoutAwarePatchMerger) -> dict[
     non_finite = [name for name, value in state.items() if not bool(torch.isfinite(value).all())]
     if non_finite:
         raise FloatingPointError(f"non-finite checkpoint tensors in {path}: {non_finite}")
-    bridge.adapter.load_state_dict(state)
+    adapter.load_state_dict(state)
     return state
 
 
@@ -586,6 +727,9 @@ def load_model(args: argparse.Namespace, device: torch.device) -> tuple[Any, Any
         args.mode,
         args.num_queries,
         max_residual_scale=args.residual_scale_cap,
+        initial_residual_scale=args.initial_residual_scale,
+        use_validity_head=getattr(args, "use_validity_head", False),
+        initial_valid_probability=getattr(args, "initial_valid_probability", 0.05),
         adapter_precision=args.adapter_precision,
     )
     model.config.use_cache = False
@@ -599,31 +743,79 @@ def train(
     bridge: LayoutAwarePatchMerger,
     records: list[dict[str, Any]],
     device: torch.device,
+    distributed: DistributedInfo | None = None,
 ) -> dict[str, Any]:
-    optimizer = torch.optim.AdamW(bridge.adapter.parameters(), lr=args.learning_rate, weight_decay=0.01)
+    distributed = distributed or DistributedInfo(
+        strategy="none", rank=0, local_rank=0, world_size=1
+    )
+    adapter = bridge.adapter
+    adapter_module = unwrap_module(adapter)
+    gate_parameter = getattr(adapter_module, "content_gate", None)
+    adapter_parameters = tuple(bridge.adapter.parameters())
+    optimizer_parameters = [
+        parameter for parameter in adapter_parameters if parameter is not gate_parameter
+    ]
+    parameter_groups: list[dict[str, Any]] = [
+        {"params": optimizer_parameters, "weight_decay": 0.01}
+    ]
+    if gate_parameter is not None:
+        # A frozen gate is held exactly at its configured warm-start value;
+        # decoupled weight decay must not move it while its gradient is zeroed.
+        parameter_groups.append({"params": [gate_parameter], "weight_decay": 0.0})
+    optimizer = torch.optim.AdamW(parameter_groups, lr=args.learning_rate)
     loss_weights = layout_loss_config(args.layout_loss_profile)
     lr_schedule_steps = args.lr_schedule_steps or args.max_steps
+    accumulation_steps = args.gradient_accumulation_steps
+    auxiliary_weight_start = (
+        args.auxiliary_weight
+        if args.auxiliary_weight_start is None
+        else args.auxiliary_weight_start
+    )
     rng = random.Random(args.seed)
     order = list(range(len(records)))
     rng.shuffle(order)
+    local_epoch_size = (
+        math.ceil(
+            len(records) / (distributed.world_size * accumulation_steps)
+        )
+        * accumulation_steps
+    )
+    steps_per_epoch = local_epoch_size // accumulation_steps
+    rank_order: list[int] | None = None
+
+    def record_for_micro(micro_index: int) -> dict[str, Any]:
+        nonlocal rank_order
+        if distributed.enabled:
+            epoch = micro_index // local_epoch_size
+            local_step = micro_index % local_epoch_size
+            if rank_order is None or local_step == 0:
+                rank_order = rank_epoch_indices(
+                    len(records),
+                    seed=args.seed,
+                    epoch=epoch,
+                    rank=distributed.rank,
+                    world_size=distributed.world_size,
+                    batch_size=accumulation_steps,
+                )
+            assert rank_order is not None
+            return records[rank_order[local_step]]
+        epoch, offset = divmod(micro_index, len(records))
+        if offset == 0 and epoch > 0:
+            rng.shuffle(order)
+        return records[order[offset]]
+
     # The GLM-OCR backbone stays in evaluation mode while only the adapter is
     # optimized.  This prevents frozen dropout/statistics from adding noise to
     # the mechanism comparison.
     model.eval()
     bridge.adapter.train()
     model.config.use_cache = False
-    adapter_parameters = tuple(bridge.adapter.parameters())
     running: Counter[str] = Counter()
     started = time.time()
     checkpoint_steps: list[int] = []
     checkpoint_health: list[dict[str, Any]] = []
     diagnostic_train: dict[str, dict[str, Any]] = {}
     for step in range(1, args.max_steps + 1):
-        if (step - 1) % len(order) == 0 and step > 1:
-            rng.shuffle(order)
-        record = records[order[(step - 1) % len(order)]]
-        inputs = prepare_training_inputs(processor, record, device)
-        bridge.set_grid_thw(inputs["image_grid_thw"])
         learning_rate = learning_rate_at_step(
             min(step, lr_schedule_steps),
             peak_learning_rate=args.learning_rate,
@@ -633,105 +825,183 @@ def train(
         )
         for parameter_group in optimizer.param_groups:
             parameter_group["lr"] = learning_rate
-        optimizer.zero_grad(set_to_none=True)
-        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-            outputs = model(**inputs)
-        if outputs.loss is None or bridge.last_output is None or bridge.last_patch_positions is None:
-            raise RuntimeError("GLM-OCR forward did not produce OCR loss and layout state")
-        if not torch.isfinite(outputs.loss):
-            raise FloatingPointError(f"non-finite OCR loss at step {step}")
-        targets = layout_targets(record, bridge.last_patch_positions, args.num_queries)
-        targets = match_layout_targets(
-            bridge.last_output,
-            targets,
-            assignment=args.query_assignment,
+        auxiliary_weight = auxiliary_weight_at_step(
+            step,
+            start_weight=auxiliary_weight_start,
+            end_weight=args.auxiliary_weight,
+            ramp_steps=args.auxiliary_ramp_steps,
         )
-        if args.auxiliary_weight > 0.0:
-            auxiliary_losses = compute_layout_losses(
-                bridge.last_output, weights=loss_weights, **targets
-            )
-        else:
-            zero = outputs.loss.float() * 0.0
-            auxiliary_losses = {key: zero for key in (*LAYOUT_LOSS_KEYS, "loss")}
-        auxiliary_loss = auxiliary_losses["loss"].float()
-        if not torch.isfinite(auxiliary_loss):
-            raise FloatingPointError(f"non-finite auxiliary loss at step {step}")
-        loss = outputs.loss.float() + args.auxiliary_weight * auxiliary_loss
-        if not torch.isfinite(loss):
-            raise FloatingPointError(f"non-finite loss at step {step}")
+        gate_frozen = gate_parameter is not None and step <= args.gate_freeze_steps
+        optimizer.zero_grad(set_to_none=True)
         diagnostic = step in args.diagnostic_steps
-        gradient_norms: dict[str, float] = {}
-        if diagnostic:
-            component_losses = {
-                "ocr": outputs.loss.float(),
-                **{
-                    key: auxiliary_losses[key].float()
-                    for key in LAYOUT_LOSS_KEYS
-                },
-                "total": loss,
-            }
-            gradient_norms = {
-                key: gradient_norm_for_loss(value, adapter_parameters)
-                for key, value in component_losses.items()
-            }
-        loss.backward()
+        micro_records: list[dict[str, Any]] = []
+        micro_sums: Counter[str] = Counter()
+        diagnostic_gradient_sums: Counter[str] = Counter()
+        last_outputs = None
+        last_targets = None
+        last_auxiliary_losses = None
+        last_loss = None
+        for accumulation_index in range(accumulation_steps):
+            micro_index = (step - 1) * accumulation_steps + accumulation_index
+            record = record_for_micro(micro_index)
+            micro_records.append(record)
+            inputs = prepare_training_inputs(processor, record, device)
+            bridge.set_grid_thw(inputs["image_grid_thw"])
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                outputs = model(**inputs)
+            if outputs.loss is None or bridge.last_output is None or bridge.last_patch_positions is None:
+                raise RuntimeError("GLM-OCR forward did not produce OCR loss and layout state")
+            if not all_finite(
+                bool(torch.isfinite(outputs.loss).all()), distributed, device
+            ):
+                raise FloatingPointError(f"non-finite OCR loss at step {step}")
+            targets = layout_targets(record, bridge.last_patch_positions, args.num_queries)
+            targets = match_layout_targets(
+                bridge.last_output,
+                targets,
+                assignment=args.query_assignment,
+            )
+            if auxiliary_weight > 0.0:
+                auxiliary_losses = compute_layout_losses(
+                    bridge.last_output, weights=loss_weights, **targets
+                )
+            else:
+                zero = outputs.loss.float() * 0.0
+                auxiliary_losses = {key: zero for key in (*LAYOUT_LOSS_KEYS, "loss")}
+            auxiliary_loss = auxiliary_losses["loss"].float()
+            if not all_finite(
+                bool(torch.isfinite(auxiliary_loss).all()), distributed, device
+            ):
+                raise FloatingPointError(f"non-finite auxiliary loss at step {step}")
+            loss = outputs.loss.float() + auxiliary_weight * auxiliary_loss
+            if not all_finite(bool(torch.isfinite(loss).all()), distributed, device):
+                raise FloatingPointError(f"non-finite loss at step {step}")
+            if diagnostic:
+                component_losses = {
+                    "ocr": outputs.loss.float(),
+                    **{
+                        key: auxiliary_losses[key].float()
+                        for key in LAYOUT_LOSS_KEYS
+                    },
+                    "total": loss,
+                }
+                for key, value in component_losses.items():
+                    diagnostic_gradient_sums[key] += gradient_norm_for_loss(
+                        value, adapter_parameters
+                    )
+            (loss / accumulation_steps).backward()
+            micro_sums["ocr_loss"] += float(outputs.loss.detach())
+            micro_sums["auxiliary_loss"] += float(auxiliary_loss.detach())
+            micro_sums["total_loss"] += float(loss.detach())
+            for key in LAYOUT_LOSS_KEYS:
+                micro_sums[key] += float(auxiliary_losses[key].detach())
+            last_outputs = outputs
+            last_targets = targets
+            last_auxiliary_losses = auxiliary_losses
+            last_loss = loss
+
+        if gate_frozen and gate_parameter is not None and gate_parameter.grad is not None:
+            gate_parameter.grad.zero_()
         gradient_norm = torch.nn.utils.clip_grad_norm_(bridge.adapter.parameters(), args.max_grad_norm)
-        if not torch.isfinite(gradient_norm):
+        if not all_finite(
+            bool(torch.isfinite(gradient_norm).all()), distributed, device
+        ):
             raise FloatingPointError(f"non-finite gradient at step {step}")
         optimizer.step()
-        finite_report = adapter_finite_report(bridge.adapter)
-        if not finite_report["parameters_finite"]:
+        finite_report = adapter_finite_report(adapter)
+        parameters_finite = all_finite(finite_report["parameters_finite"], distributed, device)
+        if not parameters_finite:
             raise FloatingPointError(
                 f"non-finite adapter parameters at step {step}: "
                 f"{finite_report['non_finite_parameters']}"
             )
-        raw_gate = float(bridge.adapter.content_gate.detach())
-        effective_scale = float(bridge.adapter.effective_residual_scale().detach())
+        raw_gate = float(adapter_module.content_gate.detach())
+        effective_scale = float(adapter_module.effective_residual_scale().detach())
+        gradient_norms = {
+            key: mean_scalar(value / accumulation_steps, distributed, device)
+            for key, value in diagnostic_gradient_sums.items()
+        }
+        log_this_step = (
+            step == 1
+            or step % args.log_steps == 0
+            or step == args.max_steps
+            or diagnostic
+        )
+        global_layout_components = (
+            {
+                key: mean_scalar(
+                    micro_sums[key] / accumulation_steps,
+                    distributed,
+                    device,
+                )
+                for key in LAYOUT_LOSS_KEYS
+            }
+            if log_this_step
+            else None
+        )
         metrics = {
-            "ocr_loss": float(outputs.loss.detach()),
-            "auxiliary_loss": float(auxiliary_loss.detach()),
-            "total_loss": float(loss.detach()),
-            "gradient_norm": float(gradient_norm.detach()),
+            "ocr_loss": mean_scalar(micro_sums["ocr_loss"] / accumulation_steps, distributed, device),
+            "auxiliary_loss": mean_scalar(
+                micro_sums["auxiliary_loss"] / accumulation_steps, distributed, device
+            ),
+            "total_loss": mean_scalar(micro_sums["total_loss"] / accumulation_steps, distributed, device),
+            "gradient_norm": mean_scalar(float(gradient_norm.detach()), distributed, device),
             "learning_rate": learning_rate,
+            "auxiliary_weight": auxiliary_weight,
+            "gate_frozen": gate_frozen,
+            "gradient_accumulation_steps": accumulation_steps,
             "raw_content_gate": raw_gate,
             "effective_residual_scale": effective_scale,
-            "parameters_finite": True,
+            "parameters_finite": parameters_finite,
+            "layout_loss_components": global_layout_components,
         }
-        if diagnostic:
-            transport = transport_diagnostics(bridge.last_output, targets["query_mask"])
+        if log_this_step and distributed.is_main:
+            assert last_outputs is not None
+            assert last_targets is not None
+            assert last_auxiliary_losses is not None
+            assert last_loss is not None
+            transport = transport_diagnostics(bridge.last_output, last_targets["query_mask"])
             metrics.update(
                 {
                     "step": step,
                     "page_id": record["page_id"],
+                    "page_ids": [item["page_id"] for item in micro_records],
                     "optimizer_update": True,
                     "loss_components": {
-                        "ocr": float(outputs.loss.detach()),
-                        **{
-                            key: float(auxiliary_losses[key].detach())
-                            for key in LAYOUT_LOSS_KEYS
-                        },
+                        "ocr": metrics["ocr_loss"],
+                        **(global_layout_components or {}),
+                        "total": metrics["total_loss"],
                     },
+                    "loss_component_scope": "global_accumulated_micro_batches",
                     "loss_dtypes": {
-                        "ocr": _dtype_name(outputs.loss.dtype),
+                        "ocr": _dtype_name(last_outputs.loss.dtype),
                         **{
-                            key: _dtype_name(auxiliary_losses[key].dtype)
+                            key: _dtype_name(last_auxiliary_losses[key].dtype)
                             for key in LAYOUT_LOSS_KEYS
                         },
-                        "total": _dtype_name(loss.dtype),
+                        "total": _dtype_name(last_loss.dtype),
                     },
                     "gradient_norms": gradient_norms,
                     "residual_relative_norm": residual_relative_norm(bridge),
                     "writeback_residual_relative_norm": writeback_residual_relative_norm(bridge),
                     "transport": transport,
+                    "transport_scope": "last_micro_page",
                     "adapter_dtypes": adapter_dtype_report(bridge),
-                    "query_count": int(targets["query_mask"].sum()),
+                    "query_count": int(last_targets["query_mask"].sum()),
                     "token_count": int(bridge.last_patch_positions.shape[1]),
                 }
             )
-            diagnostic_train[str(step)] = dict(metrics)
-        for key in ("ocr_loss", "auxiliary_loss", "total_loss", "gradient_norm"):
+            if diagnostic:
+                diagnostic_train[str(step)] = dict(metrics)
+        for key in (
+            "ocr_loss",
+            "auxiliary_loss",
+            "total_loss",
+            "gradient_norm",
+            "auxiliary_weight",
+        ):
             running[key] += metrics[key]
-        if step == 1 or step % args.log_steps == 0 or step == args.max_steps or diagnostic:
+        if distributed.is_main and log_this_step:
             append_jsonl(
                 args.output_dir / "train_metrics.jsonl",
                 {"step": step, "page_id": record["page_id"], **metrics},
@@ -741,22 +1011,29 @@ def train(
             or step == args.max_steps
             or step in args.diagnostic_steps
         ):
-            checkpoint_dir = args.output_dir / f"checkpoint-{step}"
-            checkpoint_dir.mkdir(exist_ok=False)
-            health = save_adapter_checkpoint(checkpoint_dir, bridge, step)
-            health.update(
-                {
-                    "learning_rate": learning_rate,
-                    "raw_content_gate": raw_gate,
-                    "effective_residual_scale": effective_scale,
-                }
-            )
-            write_json(checkpoint_dir / "checkpoint_health.json", health)
-            checkpoint_health.append(health)
+            if distributed.is_main:
+                checkpoint_dir = args.output_dir / f"checkpoint-{step}"
+                checkpoint_dir.mkdir(exist_ok=False)
+                health = save_adapter_checkpoint(checkpoint_dir, bridge, step)
+                health.update(
+                    {
+                        "learning_rate": learning_rate,
+                        "raw_content_gate": raw_gate,
+                        "effective_residual_scale": effective_scale,
+                    }
+                )
+                write_json(checkpoint_dir / "checkpoint_health.json", health)
+                checkpoint_health.append(health)
             checkpoint_steps.append(step)
+            barrier(distributed)
     elapsed = time.time() - started
-    state = {key: value.detach().cpu().contiguous() for key, value in bridge.adapter.state_dict().items()}
-    save_file(state, args.output_dir / "adapter.safetensors")
+    if distributed.is_main:
+        state = {
+            key: value.detach().cpu().contiguous()
+            for key, value in adapter_module.state_dict().items()
+        }
+        save_file(state, args.output_dir / "adapter.safetensors")
+    barrier(distributed)
     return {
         "steps": args.max_steps,
         "seconds": elapsed,
@@ -765,6 +1042,12 @@ def train(
         "checkpoint_health": checkpoint_health,
         "diagnostic_train": diagnostic_train,
         "lr_schedule_steps": lr_schedule_steps,
+        "auxiliary_weight_start": auxiliary_weight_start,
+        "auxiliary_weight_end": args.auxiliary_weight,
+        "auxiliary_weight_ramp_steps": args.auxiliary_ramp_steps,
+        "gate_freeze_steps": args.gate_freeze_steps,
+        "gradient_accumulation_steps": accumulation_steps,
+        "initial_residual_scale": args.initial_residual_scale,
         "final_learning_rate": learning_rate_at_step(
             min(args.max_steps, lr_schedule_steps),
             peak_learning_rate=args.learning_rate,
@@ -772,9 +1055,15 @@ def train(
             max_steps=lr_schedule_steps,
             min_lr_ratio=args.min_lr_ratio,
         ),
-        "final_raw_content_gate": float(bridge.adapter.content_gate.detach()),
+        "final_raw_content_gate": float(adapter_module.content_gate.detach()),
         "final_effective_residual_scale": float(
-            bridge.adapter.effective_residual_scale().detach()
+            adapter_module.effective_residual_scale().detach()
+        ),
+        "steps_per_epoch": steps_per_epoch,
+        "world_size": distributed.world_size,
+        "global_batch_size": distributed.world_size * args.per_device_batch_size,
+        "effective_global_batch_size": (
+            distributed.world_size * args.per_device_batch_size * accumulation_steps
         ),
         **{f"mean_{key}": value / args.max_steps for key, value in running.items()},
     }
@@ -790,11 +1079,12 @@ def evaluate(
     train_records: list[dict[str, Any]],
     device: torch.device,
     output_dir: Path | None = None,
+    split_name: str = "validation",
 ) -> dict[str, Any]:
     model.eval()
     bridge.adapter.eval()
     model.config.use_cache = True
-    predictions_path = (output_dir or args.output_dir) / "validation_predictions.jsonl"
+    predictions_path = (output_dir or args.output_dir) / f"{split_name}_predictions.jsonl"
     predictions_path.parent.mkdir(parents=True, exist_ok=True)
     pairs: list[tuple[str, str]] = []
     box_errors: list[float] = []
@@ -803,6 +1093,7 @@ def evaluate(
     generation_limit_hits = 0
     generation_lengths: list[int] = []
     generation_eos_hits = 0
+    repeated_trigram_rates: list[float] = []
     eos_ids = eos_token_ids(model, processor)
     loss_weights = layout_loss_config(args.layout_loss_profile)
     layout_loss_sums = {key: 0.0 for key in LAYOUT_LOSS_KEYS}
@@ -816,6 +1107,15 @@ def evaluate(
     fusion_query_masses: list[list[float]] = []
     invalid_query_masses: list[float] = []
     valid_query_masses: list[float] = []
+    gated_transport_total_masses: list[float] = []
+    invalid_gated_transport_masses: list[float] = []
+    valid_gated_transport_masses: list[float] = []
+    invalid_gated_fusion_masses: list[float] = []
+    valid_gated_fusion_masses: list[float] = []
+    valid_coverages: list[float] = []
+    mean_p_valid_values: list[float] = []
+    mean_p_valid_matched_values: list[float] = []
+    mean_p_valid_no_object_values: list[float] = []
     annotated_query_counts: list[int] = []
     dtype_signatures: set[str] = set()
     layout_loss_dtype_signatures: set[str] = set()
@@ -865,6 +1165,8 @@ def evaluate(
         if eos_hit:
             generation_eos_hits += 1
         prediction = processor.decode(generated_tokens, skip_special_tokens=True)
+        prediction_repeated_trigram_rate = repeated_trigram_rate(prediction)
+        repeated_trigram_rates.append(prediction_repeated_trigram_rate)
         generation_limit_hit = generation_length >= args.max_eval_new_tokens
         if generation_limit_hit:
             generation_limit_hits += 1
@@ -901,12 +1203,27 @@ def evaluate(
         if transport["transport_entropy"] is not None:
             transport_entropies.append(float(transport["transport_entropy"]))
             transport_entropy_nats.append(float(transport["transport_entropy_nats"]))
-            transport_query_masses.append(transport["transport_query_mass"])
+            if transport["transport_query_mass"] is not None:
+                transport_query_masses.append(transport["transport_query_mass"])
             invalid_transport_masses.append(float(transport["invalid_query_transport_mass"]))
             valid_transport_masses.append(float(transport["valid_query_transport_mass"]))
-            fusion_query_masses.append(transport["fusion_query_mass"])
+            if transport["fusion_query_mass"] is not None:
+                fusion_query_masses.append(transport["fusion_query_mass"])
             invalid_query_masses.append(float(transport["invalid_query_fusion_mass"]))
             valid_query_masses.append(float(transport["valid_query_fusion_mass"]))
+            for key, values in (
+                ("gated_transport_total_mass", gated_transport_total_masses),
+                ("invalid_gated_query_transport_mass", invalid_gated_transport_masses),
+                ("valid_gated_query_transport_mass", valid_gated_transport_masses),
+                ("invalid_gated_fusion_mass", invalid_gated_fusion_masses),
+                ("valid_gated_fusion_mass", valid_gated_fusion_masses),
+                ("valid_coverage", valid_coverages),
+                ("mean_p_valid", mean_p_valid_values),
+                ("mean_p_valid_matched", mean_p_valid_matched_values),
+                ("mean_p_valid_no_object", mean_p_valid_no_object_values),
+            ):
+                if transport[key] is not None:
+                    values.append(float(transport[key]))
         dtype_signatures.add(json.dumps(adapter_dtype_report(bridge), sort_keys=True))
         count = int(targets["query_mask"].sum())
         if count:
@@ -930,6 +1247,7 @@ def evaluate(
                 "generation_length": generation_length,
                 "generation_eos_hit": eos_hit if eos_ids else None,
                 "generation_limit_hit": generation_limit_hit,
+                "repeated_trigram_rate": prediction_repeated_trigram_rate,
             },
         )
     train_counts = Counter(
@@ -955,6 +1273,8 @@ def evaluate(
             "generation_lengths": generation_lengths,
             "generation_mean_new_tokens": sum(generation_lengths) / max(1, len(generation_lengths)),
             "generation_max_new_tokens_observed": max(generation_lengths, default=0),
+            "repeated_trigram_rate": sum(repeated_trigram_rates)
+            / max(1, len(repeated_trigram_rates)),
             "generation_eos_hits": generation_eos_hits,
             "generation_eos_observable": bool(eos_ids),
             "generation_eos_hit_rate": (
@@ -987,31 +1307,73 @@ def evaluate(
             "transport_entropy": sum(transport_entropies) / max(1, len(transport_entropies)),
             "transport_entropy_nats": sum(transport_entropy_nats)
             / max(1, len(transport_entropy_nats)),
-            "transport_query_mass": [
-                sum(values[index] for values in transport_query_masses)
-                / max(1, len(transport_query_masses))
-                for index in range(args.num_queries)
-            ] if transport_query_masses else None,
+            "transport_query_mass": (
+                [
+                    sum(values[index] for values in transport_query_masses)
+                    / max(1, len(transport_query_masses))
+                    for index in range(args.num_queries)
+                ]
+                if transport_query_masses
+                else None
+            ),
             "invalid_query_transport_mass": sum(invalid_transport_masses)
             / max(1, len(invalid_transport_masses)),
             "valid_query_transport_mass": sum(valid_transport_masses)
             / max(1, len(valid_transport_masses)),
-            "fusion_query_mass": [
-                sum(values[index] for values in fusion_query_masses)
-                / max(1, len(fusion_query_masses))
-                for index in range(args.num_queries)
-            ] if fusion_query_masses else None,
+            "fusion_query_mass": (
+                [
+                    sum(values[index] for values in fusion_query_masses)
+                    / max(1, len(fusion_query_masses))
+                    for index in range(args.num_queries)
+                ]
+                if fusion_query_masses
+                else None
+            ),
             "invalid_query_fusion_mass": sum(invalid_query_masses)
             / max(1, len(invalid_query_masses)),
             "valid_query_fusion_mass": sum(valid_query_masses)
             / max(1, len(valid_query_masses)),
+            "gated_transport_total_mass": sum(gated_transport_total_masses)
+            / max(1, len(gated_transport_total_masses))
+            if gated_transport_total_masses
+            else None,
+            "invalid_gated_query_transport_mass": sum(invalid_gated_transport_masses)
+            / max(1, len(invalid_gated_transport_masses))
+            if invalid_gated_transport_masses
+            else None,
+            "valid_gated_query_transport_mass": sum(valid_gated_transport_masses)
+            / max(1, len(valid_gated_transport_masses))
+            if valid_gated_transport_masses
+            else None,
+            "invalid_gated_fusion_mass": sum(invalid_gated_fusion_masses)
+            / max(1, len(invalid_gated_fusion_masses))
+            if invalid_gated_fusion_masses
+            else None,
+            "valid_gated_fusion_mass": sum(valid_gated_fusion_masses)
+            / max(1, len(valid_gated_fusion_masses))
+            if valid_gated_fusion_masses
+            else None,
+            "valid_coverage": sum(valid_coverages) / max(1, len(valid_coverages))
+            if valid_coverages
+            else None,
+            "mean_p_valid": sum(mean_p_valid_values) / max(1, len(mean_p_valid_values))
+            if mean_p_valid_values
+            else None,
+            "mean_p_valid_matched": sum(mean_p_valid_matched_values)
+            / max(1, len(mean_p_valid_matched_values))
+            if mean_p_valid_matched_values
+            else None,
+            "mean_p_valid_no_object": sum(mean_p_valid_no_object_values)
+            / max(1, len(mean_p_valid_no_object_values))
+            if mean_p_valid_no_object_values
+            else None,
             "adapter_dtypes": [json.loads(value) for value in sorted(dtype_signatures)],
             "layout_loss_dtypes": [
                 json.loads(value) for value in sorted(layout_loss_dtype_signatures)
             ],
-            "raw_content_gate": float(bridge.adapter.content_gate.detach()),
+            "raw_content_gate": float(unwrap_module(bridge.adapter).content_gate.detach()),
             "effective_residual_scale": float(
-                bridge.adapter.effective_residual_scale().detach()
+                unwrap_module(bridge.adapter).effective_residual_scale().detach()
             ),
             **adapter_finite_report(bridge.adapter),
             "test_used_for_selection": False,
@@ -1028,6 +1390,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--validation-manifest", type=Path, required=True)
     parser.add_argument("--protocol-file", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument(
+        "--distributed-strategy",
+        choices=["none", "ddp"],
+        default="none",
+        help="use torchrun DDP with one whole page per rank when set to ddp",
+    )
+    parser.add_argument("--per-device-batch-size", type=int, default=1)
+    parser.add_argument("--gradient-accumulation-steps", type=int, default=1)
     parser.add_argument("--max-steps", type=int, default=256)
     parser.add_argument("--num-queries", type=int, default=32)
     parser.add_argument("--seed", type=int, default=42)
@@ -1041,7 +1411,26 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--min-lr-ratio", type=float, default=0.1)
     parser.add_argument("--residual-scale-cap", type=optional_positive_float, default=0.03)
+    parser.add_argument("--initial-residual-scale", type=float, default=0.0)
     parser.add_argument("--auxiliary-weight", type=float, default=0.2)
+    parser.add_argument(
+        "--auxiliary-weight-start",
+        type=float,
+        default=None,
+        help="initial auxiliary-loss weight; defaults to --auxiliary-weight",
+    )
+    parser.add_argument(
+        "--auxiliary-ramp-steps",
+        type=int,
+        default=0,
+        help="optimizer steps used to ramp auxiliary weight to --auxiliary-weight",
+    )
+    parser.add_argument(
+        "--gate-freeze-steps",
+        type=int,
+        default=0,
+        help="keep the non-zero residual gate fixed for this many optimizer steps",
+    )
     parser.add_argument(
         "--adapter-precision",
         choices=["mixed_bf16", "fp32"],
@@ -1050,7 +1439,13 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--layout-loss-profile",
-        choices=["full", "ocr_only", "no_assignment", "no_geometry"],
+        choices=[
+            "full",
+            "ocr_only",
+            "no_assignment",
+            "no_assignment_validity",
+            "no_geometry",
+        ],
         default="full",
     )
     parser.add_argument(
@@ -1059,6 +1454,12 @@ def parse_args() -> argparse.Namespace:
         default="fixed_order",
     )
     parser.add_argument("--max-grad-norm", type=float, default=1.0)
+    parser.add_argument(
+        "--use-validity-head",
+        action="store_true",
+        help="predict valid/no-object probabilities and gate query fusion",
+    )
+    parser.add_argument("--initial-valid-probability", type=float, default=0.05)
     parser.add_argument("--max-pixels", type=int, default=1003520)
     parser.add_argument(
         "--processor-mode",
@@ -1070,18 +1471,31 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--log-steps", type=int, default=10)
     parser.add_argument("--validation-interval", type=int, default=256)
     parser.add_argument("--diagnostic-steps", type=parse_step_list, default=())
+    parser.add_argument(
+        "--skip-selection",
+        action="store_true",
+        help="evaluate all saved checkpoints without writing selection.json",
+    )
     parser.add_argument("--eval-only", action="store_true")
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
+    if args.auxiliary_weight_start is None:
+        args.auxiliary_weight_start = args.auxiliary_weight
     if args.eval_only and args.mode != "content_only":
         raise ValueError("--eval-only is reserved for the prompt-only content_only baseline")
-    if args.eval_only and args.auxiliary_weight != 0.0:
+    if args.eval_only and (
+        args.auxiliary_weight != 0.0 or args.auxiliary_weight_start != 0.0
+    ):
         raise ValueError("the eval-only content_only baseline requires --auxiliary-weight 0")
-    if not args.eval_only and args.auxiliary_weight != 0.2:
-        raise ValueError("the stabilization confirmation fixes --auxiliary-weight at 0.2")
+    if args.auxiliary_weight < 0.0 or args.auxiliary_weight_start < 0.0:
+        raise ValueError("auxiliary weights must be non-negative")
+    if args.auxiliary_ramp_steps < 0:
+        raise ValueError("--auxiliary-ramp-steps must be non-negative")
+    if args.gate_freeze_steps < 0:
+        raise ValueError("--gate-freeze-steps must be non-negative")
     if not 0 <= args.warmup_steps < args.max_steps:
         raise ValueError("--warmup-steps must be non-negative and smaller than --max-steps")
     if args.lr_schedule_steps is not None:
@@ -1091,14 +1505,48 @@ def main() -> None:
             raise ValueError("--warmup-steps must be smaller than --lr-schedule-steps")
     if not 0 <= args.min_lr_ratio <= 1:
         raise ValueError("--min-lr-ratio must be in [0, 1]")
+    if not -1.0 < args.initial_residual_scale < 1.0:
+        raise ValueError("--initial-residual-scale must be strictly between -1 and 1")
+    if not 0.0 < args.initial_valid_probability < 1.0:
+        raise ValueError("--initial-valid-probability must be strictly between 0 and 1")
+    if (
+        args.residual_scale_cap is not None
+        and abs(args.initial_residual_scale) > args.residual_scale_cap
+    ):
+        raise ValueError("--initial-residual-scale must not exceed --residual-scale-cap")
     if any(step > args.max_steps for step in args.diagnostic_steps):
         raise ValueError("diagnostic steps must not exceed --max-steps")
+    if args.auxiliary_ramp_steps > args.max_steps:
+        raise ValueError("--auxiliary-ramp-steps must not exceed --max-steps")
+    if args.gate_freeze_steps > args.max_steps:
+        raise ValueError("--gate-freeze-steps must not exceed --max-steps")
     if args.validation_interval <= 0:
         raise ValueError("--validation-interval must be positive")
+    if args.per_device_batch_size != 1:
+        raise ValueError("the whole-page GLMOCR path currently requires --per-device-batch-size 1")
+    if args.gradient_accumulation_steps <= 0:
+        raise ValueError("--gradient-accumulation-steps must be positive")
+    if args.num_queries <= 0:
+        raise ValueError("--num-queries must be positive")
+    if args.max_eval_new_tokens <= 0:
+        raise ValueError("--max-eval-new-tokens must be positive")
+    if args.log_steps <= 0:
+        raise ValueError("--log-steps must be positive")
+    if args.layout_loss_profile == "no_assignment_validity" and not args.use_validity_head:
+        raise ValueError(
+            "--layout-loss-profile no_assignment_validity requires --use-validity-head"
+        )
     if args.output_dir.exists():
         raise FileExistsError(args.output_dir)
-    args.output_dir.mkdir(parents=True)
+    reproducibility = configure_deterministic_execution()
+    distributed = initialize_distributed(args.distributed_strategy)
+    if args.eval_only and distributed.enabled:
+        raise ValueError("--eval-only must run without DDP")
+    if distributed.is_main:
+        args.output_dir.mkdir(parents=True)
+    barrier(distributed)
     lr_schedule_steps = args.lr_schedule_steps or args.max_steps
+    protocol_metadata = json.loads(args.protocol_file.read_text(encoding="utf-8"))
     metadata = {
         "status": "running",
         "mode": args.mode,
@@ -1107,6 +1555,11 @@ def main() -> None:
         "lr_schedule_steps": lr_schedule_steps,
         "num_queries": args.num_queries,
         "auxiliary_weight": args.auxiliary_weight,
+        "auxiliary_weight_start": args.auxiliary_weight_start,
+        "auxiliary_ramp_steps": args.auxiliary_ramp_steps,
+        "gate_freeze_steps": args.gate_freeze_steps,
+        "use_validity_head": args.use_validity_head,
+        "initial_valid_probability": args.initial_valid_probability,
         "adapter_precision": args.adapter_precision,
         "layout_loss_profile": args.layout_loss_profile,
         "query_assignment": args.query_assignment,
@@ -1115,6 +1568,19 @@ def main() -> None:
         "max_eval_new_tokens": args.max_eval_new_tokens,
         "validation_interval": args.validation_interval,
         "diagnostic_steps": list(args.diagnostic_steps),
+        "skip_selection": args.skip_selection,
+        "distributed_strategy": args.distributed_strategy,
+        "rank": distributed.rank,
+        "local_rank": distributed.local_rank,
+        "world_size": distributed.world_size,
+        "per_device_batch_size": args.per_device_batch_size,
+        "global_batch_size": distributed.world_size * args.per_device_batch_size,
+        "effective_global_batch_size": (
+            distributed.world_size
+            * args.per_device_batch_size
+            * args.gradient_accumulation_steps
+        ),
+        "gradient_accumulation_steps": args.gradient_accumulation_steps,
         "optimizer": {
             "name": "AdamW",
             "peak_learning_rate": args.learning_rate,
@@ -1137,29 +1603,32 @@ def main() -> None:
         "adapter_config": None,
         "model_path": str(args.model_path.resolve()),
         "code_sha256": sha256_file(Path(__file__).resolve()),
-        "protocol": json.loads(args.protocol_file.read_text(encoding="utf-8")),
+        "protocol": protocol_metadata,
+        "test_manifest_read": bool(protocol_metadata.get("test_manifest_read", False)),
         "test_used_for_selection": False,
         "versions": {"python": sys.version.split()[0], "torch": torch.__version__},
     }
-    write_json(args.output_dir / "metadata.json", metadata)
-    try:
-        metadata["reproducibility"] = configure_deterministic_execution()
+    if distributed.is_main:
         write_json(args.output_dir / "metadata.json", metadata)
+    try:
+        metadata["reproducibility"] = reproducibility
+        if distributed.is_main:
+            write_json(args.output_dir / "metadata.json", metadata)
         torch.manual_seed(args.seed)
         torch.cuda.manual_seed_all(args.seed)
-        device = torch.device("cuda", 0)
         if not torch.cuda.is_available():
             raise RuntimeError("CUDA is unavailable inside the Slurm allocation")
+        device = torch.device("cuda", distributed.local_rank)
+        torch.cuda.set_device(device)
         train_records = load_records(args.train_manifest)
         validation_records = load_records(args.validation_manifest)
-        if len(train_records) != 128:
-            raise ValueError(f"mechanism screen requires 128 train pages, got {len(train_records)}")
-        if len(validation_records) != 64:
-            raise ValueError(
-                f"mechanism screen requires 64 validation pages, got {len(validation_records)}"
-            )
+        validate_records(train_records, split="train", num_queries=args.num_queries)
+        validate_records(validation_records, split="validation", num_queries=args.num_queries)
         model, processor, bridge = load_model(args, device)
-        metadata["adapter_config"] = asdict(bridge.adapter.config)
+        if distributed.enabled:
+            bridge.adapter = wrap_adapter(bridge.adapter, distributed)  # type: ignore[assignment]
+        adapter = unwrap_module(bridge.adapter)
+        metadata["adapter_config"] = asdict(adapter.config)
         metadata["versions"].update(
             {
                 "transformers": __import__("transformers").__version__,
@@ -1176,8 +1645,9 @@ def main() -> None:
             processor,
             validation_records[0],
         )
-        metadata["gpu"] = torch.cuda.get_device_name(0)
-        write_json(args.output_dir / "metadata.json", metadata)
+        metadata["gpu"] = torch.cuda.get_device_name(distributed.local_rank)
+        if distributed.is_main:
+            write_json(args.output_dir / "metadata.json", metadata)
         if args.eval_only:
             state_before = clone_module_state(bridge.adapter)
             validation = evaluate(
@@ -1205,6 +1675,7 @@ def main() -> None:
                 "parameters_unchanged": True,
                 "max_eval_new_tokens": args.max_eval_new_tokens,
                 "validation": validation,
+                "test_manifest_read": metadata["test_manifest_read"],
                 "test_used_for_selection": False,
             }
             write_json(args.output_dir / "summary.json", summary)
@@ -1216,31 +1687,51 @@ def main() -> None:
 
         diagnostic_points: list[dict[str, Any]] = []
         if 0 in args.diagnostic_steps:
-            validation0 = evaluate(
-                args,
-                model,
-                processor,
-                bridge,
-                validation_records,
-                train_records,
-                device,
-                output_dir=args.output_dir / "validation-0",
-            )
-            diagnostic_points.append(
-                {
-                    "step": 0,
-                    "training": {
+            # Validation is rank-0-only, so all ranks must rendezvous before
+            # and after it.  Otherwise non-main ranks enter the first DDP
+            # backward while rank 0 is still evaluating, which deadlocks NCCL.
+            barrier(distributed)
+            if distributed.is_main:
+                validation0 = evaluate(
+                    args,
+                    model,
+                    processor,
+                    bridge,
+                    validation_records,
+                    train_records,
+                    device,
+                    output_dir=args.output_dir / "validation-0",
+                )
+                diagnostic_points.append(
+                    {
                         "step": 0,
-                        "optimizer_update": False,
-                        "ocr_loss": validation0["teacher_forced_ocr_loss"],
-                        "layout_loss_means": validation0["teacher_forced_layout_loss_means"],
-                        "gradient_norms": None,
-                    },
-                    "validation": validation0,
-                }
-            )
+                        "training": {
+                            "step": 0,
+                            "optimizer_update": False,
+                            "ocr_loss": validation0["teacher_forced_ocr_loss"],
+                            "layout_loss_means": validation0["teacher_forced_layout_loss_means"],
+                            "gradient_norms": None,
+                        },
+                        "validation": validation0,
+                    }
+                )
+            barrier(distributed)
 
-        training = train(args, model, processor, bridge, train_records, device)
+        training = train(
+            args,
+            model,
+            processor,
+            bridge,
+            train_records,
+            device,
+            distributed=distributed,
+        )
+        # DDP ranks must not independently reload checkpoints or evaluate the
+        # validation split.  Rank 0 owns selection and all run-level artifacts;
+        # the other ranks wait until rank 0 has finished the training barrier.
+        barrier(distributed)
+        if not distributed.is_main:
+            return
         checkpoint_steps = training["checkpoint_steps"]
         candidates = []
         for step in checkpoint_steps:
@@ -1365,6 +1856,13 @@ def main() -> None:
                         }
                         for row in diagnostic_points
                     ],
+                    "repeated_trigram_rate": [
+                        {
+                            "step": row["step"],
+                            "value": row["validation"]["repeated_trigram_rate"],
+                        }
+                        for row in diagnostic_points
+                    ],
                     "teacher_forced_ocr_loss": [
                         {
                             "step": row["step"],
@@ -1455,11 +1953,61 @@ def main() -> None:
             write_json(args.output_dir / "diagnostic_summary.json", diagnostic_summary)
         else:
             diagnostic_summary = None
+        if args.skip_selection:
+            final_candidate = max(candidates, key=lambda row: (row["step"],))
+            final_checkpoint = args.output_dir / f"checkpoint-{final_candidate['step']}"
+            load_adapter_checkpoint(final_checkpoint, bridge)
+            save_file(
+                {
+                    key: value.detach().cpu().contiguous()
+                    for key, value in adapter.state_dict().items()
+                },
+                args.output_dir / "adapter.safetensors",
+            )
+            write_adapter_config(args.output_dir / "adapter_config.json", bridge)
+            summary = {
+                "status": "complete",
+                "mode": args.mode,
+                "seed": args.seed,
+                "auxiliary_weight": args.auxiliary_weight,
+                "adapter_precision": args.adapter_precision,
+                "layout_loss_profile": args.layout_loss_profile,
+                "query_assignment": args.query_assignment,
+                "lr_schedule_steps": training["lr_schedule_steps"],
+                "eval_only": False,
+                "skip_selection": True,
+                "max_eval_new_tokens": args.max_eval_new_tokens,
+                "training": training,
+                "validation": final_candidate,
+                "validation_candidates": candidates,
+                "diagnostic_summary": diagnostic_summary,
+                "test_manifest_read": metadata["test_manifest_read"],
+                "test_used_for_selection": False,
+            }
+            write_json(args.output_dir / "summary.json", summary)
+            (args.output_dir / "COMPLETED").touch()
+            metadata["status"] = "complete"
+            write_json(args.output_dir / "metadata.json", metadata)
+            completion = {
+                "status": "complete",
+                "run_dir": str(args.output_dir),
+                "diagnostic_summary": (
+                    str(args.output_dir / "diagnostic_summary.json")
+                    if args.diagnostic_steps
+                    else None
+                ),
+                "evaluated_steps": [row["step"] for row in candidates],
+                "final_step": final_candidate["step"],
+                "selection_performed": False,
+                "test_used_for_selection": False,
+            }
+            print(json.dumps(completion, ensure_ascii=False, separators=(",", ":")))
+            return
         selected = min(candidates, key=lambda row: (row["cer"], row["step"]))
         selected_checkpoint = args.output_dir / f"checkpoint-{selected['step']}"
         load_adapter_checkpoint(selected_checkpoint, bridge)
         save_file(
-            {key: value.detach().cpu().contiguous() for key, value in bridge.adapter.state_dict().items()},
+            {key: value.detach().cpu().contiguous() for key, value in adapter.state_dict().items()},
             args.output_dir / "adapter.safetensors",
         )
         write_adapter_config(args.output_dir / "adapter_config.json", bridge)
@@ -1486,6 +2034,7 @@ def main() -> None:
                         else None
                     ),
                     "candidates": candidates,
+                    "test_manifest_read": metadata["test_manifest_read"],
                     "test_used_for_selection": False,
                 },
                 ensure_ascii=False,
@@ -1510,6 +2059,7 @@ def main() -> None:
             "validation": validation,
             "selection_candidates": candidates,
             "diagnostic_summary": diagnostic_summary,
+            "test_manifest_read": metadata["test_manifest_read"],
             "test_used_for_selection": False,
         }
         write_json(args.output_dir / "summary.json", summary)
@@ -1530,12 +2080,17 @@ def main() -> None:
         else:
             print(json.dumps(summary, ensure_ascii=False, separators=(",", ":")))
     except Exception as exc:
-        metadata["status"] = "failed"
-        metadata["error_type"] = type(exc).__name__
-        metadata["error"] = str(exc)
-        write_json(args.output_dir / "metadata.json", metadata)
-        (args.output_dir / "error.txt").write_text(traceback.format_exc(), encoding="utf-8")
+        if distributed.is_main:
+            metadata["status"] = "failed"
+            metadata["error_type"] = type(exc).__name__
+            metadata["error"] = str(exc)
+            write_json(args.output_dir / "metadata.json", metadata)
+            (args.output_dir / "error.txt").write_text(
+                traceback.format_exc(), encoding="utf-8"
+            )
         raise
+    finally:
+        destroy_distributed(distributed)
 
 
 if __name__ == "__main__":
