@@ -30,35 +30,19 @@ LayoutAwarePatchMerger 的调用顺序是：整页图像 → GLM-OCR visual enco
 
 ```mermaid
 flowchart LR
-    A[整页图像] --> B[GLM-OCR视觉编码器与空间下采样]
-    B --> C[视觉tokens V]
-    C --> D[patch_grid_positions<br/>归一化patch中心 p_i]
-    C --> E[可学习seed S + MHA]
-    E --> F[页面相关query Z]
-    F --> G[bbox、order、direction预测头]
-    G --> H[bbox中心 c_q]
-    C --> I[内容logit e_qi]
-    F --> I
-    H --> J[欧氏距离 d_qi]
-    D --> J
-    I --> K[geometry logit s_qi]
-    J --> K
-    K --> L[按token softmax并除以Q]
-    L --> M[token侧归一化 W_iq]
-    F --> N[query上下文]
-    M --> N
-    C --> O[content_norm与residual gate]
-    N --> O
-    O --> P[融合视觉tokens Ṽ]
-    P --> Q[原始GLM-OCR merger]
-    Q --> R[语言模型解码]
+    A[整页图像<br/>+ OCR prompt] --> B[GLM-OCR视觉编码器]
+    B --> C[整页视觉 tokens]
+    C --> D[布局适配器<br/>Layout queries]
+    D --> E[几何融合<br/>可选 validity/no-object 门控]
+    C --> E
+    E --> F[原始视觉 merger]
+    F --> G[GLM-OCR语言解码器]
+    G --> H[OCR结果]
 
-    S[训练期布局标注] -.仅训练.-> T[targets与可选Hungarian对齐]
-    D -.生成token owner.-> T
-    G -.预测输出仅用于监督.-> T
-    L -.assignment与entropy诊断.-> T
-    T -.-> U[布局辅助损失]
-    U -.反向传播.-> E
+    I[训练期布局标注] -.仅训练.-> J[Hungarian 对齐<br/>bbox / 顺序 / 方向 / valid mask]
+    J -.辅助损失.-> D
+    J -.validity loss.-> E
+    I -.不进入推理.-> D
 ```
 
 ### 4.2 视觉 patch 的归一化位置
