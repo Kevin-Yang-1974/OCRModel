@@ -154,3 +154,30 @@ def layout_targets(
         "query_mask": mask,
         "token_owners": owners,
     }
+
+
+def region_decoder_targets(
+    record: dict[str, Any], device: torch.device, max_regions: int = 512
+) -> dict[str, Tensor]:
+    """Build ordered region labels for the autoregressive candidate decoder."""
+
+    regions = sorted(record["regions"], key=lambda item: int(item["reading_order"]))
+    if len(regions) > max_regions:
+        raise ValueError(
+            f"{record['page_id']} has {len(regions)} regions for max_regions={max_regions}"
+        )
+    boxes = torch.zeros(1, max_regions, 4, dtype=torch.float32, device=device)
+    directions = torch.zeros(1, max_regions, dtype=torch.long, device=device)
+    mask = torch.zeros(1, max_regions, dtype=torch.bool, device=device)
+    direction_ids = {"vertical_rtl": 0, "horizontal_ltr": 1, "unknown": 2}
+    for index, region in enumerate(regions):
+        boxes[0, index] = torch.tensor(region["bbox"], dtype=torch.float32, device=device)
+        directions[0, index] = direction_ids.get(
+            region.get("writing_direction", "unknown"), 2
+        )
+        mask[0, index] = True
+    return {
+        "target_boxes": boxes,
+        "target_directions": directions,
+        "query_mask": mask,
+    }

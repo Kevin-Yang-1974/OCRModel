@@ -84,6 +84,29 @@ def test_manifest_audit_can_omit_test_without_opening_it(tmp_path: Path) -> None
     assert protocol["test_manifest_read"] is False
 
 
+def test_validation_subset_is_deterministic_and_validation_only(tmp_path: Path) -> None:
+    module = _module("subset_mthv2_manifest", "tools/subset_mthv2_manifest.py")
+    source = tmp_path / "validation.jsonl"
+    _write_manifest(source, "validation", tmp_path / "images", 8)
+    first = tmp_path / "subset-a.jsonl"
+    second = tmp_path / "subset-b.jsonl"
+
+    first_records = sorted(module.load_records(source), key=lambda record: record["page_id"])
+    selected_a = module.random.Random(42).sample(first_records, 3)
+    selected_a.sort(key=lambda record: record["page_id"])
+    module.write_subset(first, selected_a)
+    selected_b = module.random.Random(42).sample(first_records, 3)
+    selected_b.sort(key=lambda record: record["page_id"])
+    module.write_subset(second, selected_b)
+
+    assert first.read_bytes() == second.read_bytes()
+    assert len(first.read_text(encoding="utf-8").splitlines()) == 3
+    assert all(
+        json.loads(line)["split"] == "validation"
+        for line in first.read_text(encoding="utf-8").splitlines()
+    )
+
+
 def test_full_manifest_audit_rejects_query_overflow(tmp_path: Path) -> None:
     module = _module("audit_mthv2_manifest_overflow", "tools/audit_mthv2_manifest.py")
     manifest = tmp_path / "train.jsonl"

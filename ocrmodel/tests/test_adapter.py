@@ -123,3 +123,28 @@ def test_validity_head_initializes_and_gates_transport() -> None:
         atol=1e-5,
         rtol=1e-5,
     )
+
+
+def test_raw_mass_validity_zero_probability_removes_query_contribution() -> None:
+    module = PreMergeLayoutAdapter(
+        LayoutAdapterConfig(
+            hidden_size=8,
+            num_queries=2,
+            num_heads=2,
+            mode="attention",
+            use_validity_head=True,
+            validity_gating_mode="raw_mass",
+        )
+    )
+    transport = torch.tensor([[[0.25, 0.25], [0.25, 0.25]]])
+    queries = torch.randn(1, 2, 8)
+    probabilities = torch.tensor([[1.0, 0.0]])
+    context, coverage = module._raw_mass_context(transport, queries, probabilities)
+    query_zeroed = queries.clone()
+    query_zeroed[:, 1] = 0.0
+    expected, expected_coverage = module._raw_mass_context(
+        transport, query_zeroed, probabilities
+    )
+    torch.testing.assert_close(context, expected, atol=0.0, rtol=0.0)
+    torch.testing.assert_close(coverage, expected_coverage, atol=0.0, rtol=0.0)
+    torch.testing.assert_close(coverage, torch.full_like(coverage, 0.5))

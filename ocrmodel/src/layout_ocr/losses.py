@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Any
+
 import torch
 import torch.nn.functional as F
 from torch import Tensor
@@ -15,24 +17,45 @@ def _masked_mean(values: Tensor, mask: Tensor) -> Tensor:
     return (values * weights).sum() / weights.expand_as(values).sum().clamp_min(1)
 
 
-def _balanced_validity_bce(logits: Tensor, targets: Tensor) -> Tensor:
-    """Give valid and no-object queries equal page-level weight."""
+def _validity_bce(logits: Tensor, targets: Tensor) -> Tensor:
+    """Train valid/no-object as a real query classification problem.
 
-    targets = targets.to(dtype=logits.dtype)
-    elementwise = F.binary_cross_entropy_with_logits(logits, targets, reduction="none")
-    positive = targets.bool()
-    negative = ~positive
-    positive_count = positive.sum(dim=1)
-    negative_count = negative.sum(dim=1)
-    positive_loss = (elementwise * positive).sum(dim=1) / positive_count.clamp_min(1)
-    negative_loss = (elementwise * negative).sum(dim=1) / negative_count.clamp_min(1)
-    class_count = (positive_count > 0).to(elementwise.dtype) + (
-        negative_count > 0
-    ).to(elementwise.dtype)
-    return (
-        positive_loss * (positive_count > 0).to(elementwise.dtype)
-        + negative_loss * (negative_count > 0).to(elementwise.dtype)
-    ).div(class_count.clamp_min(1)).mean()
+    The reduction is over all queries, so the optimum for a constant predictor
+    follows the page-level valid prior instead of the balanced-BCE value 0.5.
+    """
+
+    return F.binary_cross_entropy_with_logits(
+        logits, targets.to(dtype=logits.dtype), reduction="mean"
+    )
+
+
+def _balanced_validity_bce(logits: Tensor, targets: Tensor) -> Tensor:
+    """Compatibility wrapper for callers of the pre-fix private helper."""
+
+    return _validity_bce(logits, targets)
+
+
+def _validity_cardinality_loss(logits: Tensor, targets: Tensor) -> Tensor:
+    predicted_fraction = logits.sigmoid().mean(dim=-1)
+    target_fraction = targets.to(dtype=logits.dtype).mean(dim=-1)
+    return (predicted_fraction - target_fraction).square().mean()
+
+
+def _validity_ranking_loss(logits: Tensor, targets: Tensor, margin: float = 1.0) -> Tensor:
+    """Separate matched queries from no-object queries by a positive margin."""
+
+    targets = targets.to(dtype=torch.bool)
+    page_losses: list[Tensor] = []
+    for page_logits, page_targets in zip(logits, targets):
+        positive = page_logits[page_targets]
+        negative = page_logits[~page_targets]
+        if positive.numel() and negative.numel():
+            page_losses.append(
+                F.softplus(margin - positive[:, None] + negative[None, :]).mean()
+            )
+    if page_losses:
+        return torch.stack(page_losses).mean()
+    return logits.sum() * 0.0
 
 
 def _hungarian_assignment(cost: Tensor) -> list[tuple[int, int]]:
@@ -110,7 +133,9 @@ def match_layout_targets(
     output: LayoutAdapterOutput,
     targets: dict[str, Tensor],
     assignment: QueryAssignment = "fixed_order",
-) -> dict[str, Tensor]:
+    *,
+    return_info: bool = False,
+) -> dict[str, Tensor] | tuple[dict[str, Tensor], dict[str, Any]]:
     """Align region targets to predicted query slots without label leakage.
 
     ``fixed_order`` preserves the original reading-order slot contract. The
@@ -120,6 +145,19 @@ def match_layout_targets(
     """
 
     if assignment == "fixed_order":
+        if return_info:
+            matched_query_indices = [
+                torch.nonzero(mask, as_tuple=False).flatten().detach().cpu().tolist()
+                for mask in targets["query_mask"]
+            ]
+            return targets, {
+                "matched_query_indices": matched_query_indices,
+                "matched_pairs": [
+                    [[index, index] for index in indices]
+                    for indices in matched_query_indices
+                ],
+                "matching_costs": [[] for _ in matched_query_indices],
+            }
         return targets
     if assignment != "hungarian":
         raise ValueError(f"unsupported query assignment: {assignment}")
@@ -136,10 +174,16 @@ def match_layout_targets(
     matched_directions = torch.zeros_like(targets["target_directions"])
     matched_mask = torch.zeros_like(query_mask)
     matched_owners = torch.full_like(targets["token_owners"], -1)
+    matched_query_indices: list[list[int]] = []
+    matched_pairs: list[list[list[int]]] = []
+    matching_costs: list[list[float]] = []
 
     for batch_index in range(output_batch):
         target_indices = torch.nonzero(query_mask[batch_index], as_tuple=False).flatten()
         if target_indices.numel() == 0:
+            matched_query_indices.append([])
+            matched_pairs.append([])
+            matching_costs.append([])
             continue
         target_boxes = targets["target_boxes"][batch_index, target_indices].detach().float()
         predicted_boxes = output.boxes[batch_index].detach().float()
@@ -147,8 +191,37 @@ def match_layout_targets(
         target_orders = targets["target_orders"][batch_index, target_indices].detach().float()
         predicted_orders = output.order_scores[batch_index].detach().float().sigmoid()
         order_cost = (target_orders[:, None] - predicted_orders[None, :]).abs()
-        cost = 0.7 * box_cost + 0.3 * order_cost
+        base_cost = 0.7 * box_cost + 0.3 * order_cost
+        cost = base_cost
+        if output.transport is not None:
+            owners = targets["token_owners"][batch_index]
+            raw_transport = output.transport[batch_index].detach().float()
+            raw_transport = raw_transport / raw_transport.sum(dim=-1, keepdim=True).clamp_min(
+                1e-12
+            )
+            support_cost = torch.zeros_like(box_cost)
+            has_support = torch.zeros(
+                target_indices.shape[0], dtype=torch.bool, device=box_cost.device
+            )
+            for target_local, target_index in enumerate(target_indices.tolist()):
+                region_tokens = owners == target_index
+                if bool(region_tokens.any()):
+                    support = raw_transport[:, region_tokens].mean(dim=-1)
+                    support_cost[target_local] = 1.0 - support
+                    has_support[target_local] = True
+            cost = torch.where(
+                has_support[:, None],
+                0.6 * box_cost + 0.2 * order_cost + 0.2 * support_cost,
+                base_cost,
+            )
         pairs = _hungarian_assignment(cost)
+        matched_query_indices.append([query_index for _, query_index in pairs])
+        matched_pairs.append(
+            [[int(target_indices[target_local]), query_index] for target_local, query_index in pairs]
+        )
+        matching_costs.append(
+            [float(cost[target_local, query_index]) for target_local, query_index in pairs]
+        )
 
         target_to_query = torch.full(
             (query_count,), -1, dtype=torch.long, device=query_mask.device
@@ -172,13 +245,38 @@ def match_layout_targets(
         if bool(valid_owners.any()):
             matched_owners[batch_index, valid_owners] = target_to_query[owners[valid_owners]]
 
-    return {
+    result = {
         "target_boxes": matched_boxes,
         "target_orders": matched_orders,
         "target_directions": matched_directions,
         "query_mask": matched_mask,
         "token_owners": matched_owners,
     }
+    if return_info:
+        return result, {
+            "matched_query_indices": matched_query_indices,
+            "matched_pairs": matched_pairs,
+            "matching_costs": matching_costs,
+        }
+    return result
+
+
+def _assignment_nll(
+    output: LayoutAdapterOutput,
+    token_owners: Tensor,
+) -> Tensor:
+    """Compete for each owned token, including validity in the query softmax."""
+
+    if output.transport is None:
+        return output.boxes.sum() * 0.0
+    transport = output.transport.clamp_min(1e-12)
+    query_token_logits = transport.log()
+    if output.validity_probs is not None:
+        query_token_logits = query_token_logits + output.validity_probs.clamp_min(1e-12).log().unsqueeze(-1)
+    log_probabilities = F.log_softmax(query_token_logits.transpose(1, 2), dim=-1)
+    return F.nll_loss(
+        log_probabilities.flatten(0, 1), token_owners.flatten(), ignore_index=-1
+    )
 
 
 def compute_layout_losses(
@@ -212,18 +310,18 @@ def compute_layout_losses(
     assignment = zero
     entropy = zero
     validity = zero
+    validity_cardinality = zero
+    validity_ranking = zero
     if output.validity_logits is not None:
-        validity = _balanced_validity_bce(output.validity_logits, query_mask)
+        validity = _validity_bce(output.validity_logits, query_mask)
+        validity_cardinality = _validity_cardinality_loss(output.validity_logits, query_mask)
+        validity_ranking = _validity_ranking_loss(output.validity_logits, query_mask)
     plan_source = output.gated_transport if output.gated_transport is not None else output.transport
     if plan_source is not None:
         plan = plan_source.clamp_min(1e-12)
         entropy = -(plan * plan.log()).sum(dim=(1, 2)).mean()
         if token_owners is not None and (token_owners >= 0).any():
-            probabilities = plan.transpose(1, 2)
-            probabilities = probabilities / probabilities.sum(dim=-1, keepdim=True).clamp_min(1e-12)
-            assignment = F.nll_loss(
-                probabilities.log().flatten(0, 1), token_owners.flatten(), ignore_index=-1
-            )
+            assignment = _assignment_nll(output, token_owners)
 
     total = (
         weights.box * box
@@ -232,6 +330,8 @@ def compute_layout_losses(
         + weights.assignment * assignment
         + weights.transport_entropy * entropy
         + weights.validity * validity
+        + weights.validity_cardinality * validity_cardinality
+        + weights.validity_ranking * validity_ranking
     )
     return {
         "loss": total,
@@ -241,4 +341,7 @@ def compute_layout_losses(
         "layout_assignment": assignment,
         "transport_entropy": entropy,
         "layout_validity": validity,
+        "layout_validity_bce": validity,
+        "layout_validity_cardinality": validity_cardinality,
+        "layout_validity_ranking": validity_ranking,
     }

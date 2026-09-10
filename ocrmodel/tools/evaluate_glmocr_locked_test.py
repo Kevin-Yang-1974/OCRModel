@@ -116,6 +116,9 @@ def main() -> None:
     torch.cuda.set_device(device)
     torch.manual_seed(args.seed)
     torch.cuda.manual_seed_all(args.seed)
+    adapter_config = metadata.get("adapter_config") or {}
+    if not isinstance(adapter_config, dict):
+        raise ValueError("metadata.adapter_config must be an object")
     model_args = argparse.Namespace(
         model_path=args.model_path,
         processor_mode=args.processor_mode,
@@ -123,6 +126,16 @@ def main() -> None:
         mode=args.mode,
         num_queries=args.num_queries,
         residual_scale_cap=args.residual_scale_cap,
+        use_validity_head=bool(adapter_config.get("use_validity_head", False)),
+        initial_valid_probability=float(
+            adapter_config.get("initial_valid_probability", 0.05)
+        ),
+        validity_gating_mode=adapter_config.get(
+            "validity_gating_mode", "legacy_normalized"
+        ),
+        validity_use_transport_evidence=bool(
+            adapter_config.get("validity_use_transport_evidence", False)
+        ),
         adapter_precision=args.adapter_precision,
     )
     model, processor, bridge = load_model(model_args, device)
@@ -131,8 +144,8 @@ def main() -> None:
     eval_args = argparse.Namespace(
         mode=args.mode,
         num_queries=args.num_queries,
-        layout_loss_profile=args.layout_loss_profile,
-        query_assignment=args.query_assignment,
+        layout_loss_profile=metadata.get("layout_loss_profile", args.layout_loss_profile),
+        query_assignment=metadata.get("query_assignment", args.query_assignment),
         max_eval_new_tokens=args.max_eval_new_tokens,
         output_dir=output_dir,
         diagnostic_steps=(),

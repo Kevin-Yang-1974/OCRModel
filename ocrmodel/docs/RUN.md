@@ -129,11 +129,19 @@ python tools/summarize_architecture_comparison.py \
 
 汇总器按三种子平均 validation CER 选择模式与 checkpoint，并输出相对 content-only 的 CER gain、exact-page、generation limit/EOS 和标准差；任何选择均不使用 test。
 
-## 全量 MTHv2 validity 诊断现状
+## 全量 MTHv2 validity/no-object 修复现状
 
-全量 MTHv2 使用 2159/240/800 页、512 queries 和五卡同步 DDP。`glmocr_mthv2_no_assignment_256_v4_r2` 已记录到 step 256，但 OCR loss 没有形成下降趋势；`glmocr_mthv2_validity_no_assignment_256_v1` 增加了 Hungarian 后的 valid/no-object head、balanced validity BCE、transport/fusion 门控和 valid coverage 诊断，指标也记录到 step 256。其完整 validation 因耗时按用户要求停止，状态为 `stopped_by_user`，不创建 selection，不读取 test。
+全量 MTHv2 使用 2159/240/800 页、512 queries 和五卡同步 DDP。`glmocr_mthv2_no_assignment_256_v4_r2` 与 `glmocr_mthv2_validity_no_assignment_256_v1` 均已记录到 step 256，但 OCR loss 没有形成下降趋势；后者的 matched/no-object `p_valid` 差值约 `0.0101`，gated invalid fusion mass 约 `0.946`。该旧分支完整 validation 因耗时按用户要求停止，状态为 `stopped_by_user`，不创建 selection，不读取 test。
 
-该 validity 分支目前只是可选架构候选：后程 matched/no-object `p_valid` 差值约 `0.0101`，gated invalid fusion mass 仍约 `0.946`，不能写成已验证的无效 query 解决方案。后续若继续改动，应先检查 Hungarian query mask、validity head 梯度和 gating 写回路径，再决定是否扩展 seed43/44。
+修复已在代码中落地为独立的 `validity_assignment` profile：
+
+- Hungarian 仍只在训练后对齐 target，但代价变为 `0.6 box + 0.2 order + 0.2 detached raw-transport region support`，不使用 validity 参与匹配。
+- validity head 使用 detached raw-transport visual evidence；目标改为全 query `BCEWithLogitsLoss`，并加入页面 cardinality 与 matched/no-object ranking。
+- assignment 对有 owner 的 patch 使用 `softmax_q(log T + log p_valid)`。
+- `raw_mass` gating 保留无效 query 的质量为 implicit null sink，不再对 gated transport 重新沿 query 归一化；诊断新增 p gap、AUROC/AP、invalid context share、foreground/background coverage、matcher signature/churn 和 assignment 正负 query 梯度。
+- 训练入口固定支持 `initial_residual_scale=0`、前 64 steps gate freeze、FP32 adapter/BF16 backbone、fast processor、math SDP、Hungarian、whole-page 和 no-test 协议；旧 checkpoint 默认仍加载 legacy gating。
+
+对应的 bounded seed42 入口为 `tools/training/run_glmocr_mthv2_validity_assignment_256.sh`。入口在全量 train manifest 上训练，但自动从 official validation manifest 确定性抽取 32 页子集，并生成独立的 train/validation-only protocol；因此不会为机制验证打开 test，也不会把 validation 子集误当成正式选点。验证前不扩展 seed43/44，不执行 selection-locked test。验收以 step 128/256 的 `p` gap、AUROC、no-object/matched 概率和 invalid context share 为准，并同时检查 zero-gate、zero-validity、单 query `p=0` 与 checkpoint finite。可用 `GLMOCR_VALIDATION_SUBSET_PAGES` 调整子集页数，但每次重试必须使用新的 run ID。
 
 ## 服务器边界
 

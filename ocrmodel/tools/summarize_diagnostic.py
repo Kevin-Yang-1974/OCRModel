@@ -55,6 +55,13 @@ def _compact_point(point: dict[str, Any], identity_cer: float | None) -> dict[st
         "fusion_query_mass": validation.get("fusion_query_mass"),
         "invalid_query_transport_mass": validation.get("invalid_query_transport_mass"),
         "invalid_query_fusion_mass": validation.get("invalid_query_fusion_mass"),
+        "validity_p_gap": validation.get("validity_p_gap"),
+        "validity_auroc": validation.get("validity_auroc"),
+        "validity_average_precision": validation.get("validity_average_precision"),
+        "invalid_gated_context_share": validation.get("invalid_gated_context_share"),
+        "valid_coverage_foreground": validation.get("valid_coverage_foreground"),
+        "valid_coverage_background": validation.get("valid_coverage_background"),
+        "matcher_mean_cost": validation.get("matcher_mean_cost"),
         "training_dtypes": {
             "adapter": training.get("adapter_dtypes"),
             "loss": training.get("loss_dtypes"),
@@ -100,6 +107,13 @@ def summarize(source: Path) -> dict[str, Any]:
         "transport_entropy",
         "invalid_query_transport_mass",
         "invalid_query_fusion_mass",
+        "validity_p_gap",
+        "validity_auroc",
+        "validity_average_precision",
+        "invalid_gated_context_share",
+        "valid_coverage_foreground",
+        "valid_coverage_background",
+        "matcher_mean_cost",
     ):
         curves[key] = [
             {"step": point["step"], "value": compact_point[key]}
@@ -145,6 +159,8 @@ def summarize(source: Path) -> dict[str, Any]:
         "points": compact_points,
         "curves": curves,
         "triage": data.get("triage"),
+        "matcher_churn": data.get("matcher_churn"),
+        "validity_mechanism_acceptance": data.get("validity_mechanism_acceptance"),
         "test_used_for_selection": False,
     }
 

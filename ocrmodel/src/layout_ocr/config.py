@@ -5,11 +5,13 @@ from typing import Literal
 
 FusionMode = Literal["content_only", "attention", "geometry", "layout_ot"]
 AdapterPrecision = Literal["mixed_bf16", "fp32"]
+ValidityGatingMode = Literal["legacy_normalized", "raw_mass"]
 LayoutLossProfile = Literal[
     "full",
     "ocr_only",
     "no_assignment",
     "no_assignment_validity",
+    "validity_assignment",
     "no_geometry",
 ]
 QueryAssignment = Literal["fixed_order", "hungarian"]
@@ -31,6 +33,15 @@ class LayoutAdapterConfig:
     initial_residual_scale: float = 0.0
     use_validity_head: bool = False
     initial_valid_probability: float = 0.05
+    validity_gating_mode: ValidityGatingMode = "legacy_normalized"
+    validity_use_transport_evidence: bool = False
+    region_autoregressive: bool = False
+    region_decoder_hidden_size: int = 256
+    region_decoder_layers: int = 2
+    region_decoder_num_heads: int = 8
+    region_pointer_mask: bool = True
+    region_spatial_penalty: float = 4.0
+    region_spatial_iou_threshold: float = 0.8
 
     def __post_init__(self) -> None:
         if self.hidden_size <= 0 or self.num_queries <= 0:
@@ -47,6 +58,16 @@ class LayoutAdapterConfig:
             raise ValueError("initial_residual_scale must be strictly between -1 and 1")
         if not 0.0 < self.initial_valid_probability < 1.0:
             raise ValueError("initial_valid_probability must be strictly between 0 and 1")
+        if self.validity_gating_mode not in {"legacy_normalized", "raw_mass"}:
+            raise ValueError(f"unsupported validity gating mode: {self.validity_gating_mode}")
+        if self.region_autoregressive and self.num_queries != 512:
+            raise ValueError("region_autoregressive requires exactly 512 candidate queries")
+        if self.region_decoder_hidden_size <= 0 or self.region_decoder_layers <= 0:
+            raise ValueError("region decoder size must be positive")
+        if self.region_decoder_hidden_size % self.region_decoder_num_heads:
+            raise ValueError("region decoder hidden size must be divisible by its head count")
+        if self.region_spatial_penalty < 0 or not 0.0 < self.region_spatial_iou_threshold <= 1.0:
+            raise ValueError("invalid region spatial duplicate penalty")
         if (
             self.max_residual_scale is not None
             and abs(self.initial_residual_scale) > self.max_residual_scale
@@ -62,6 +83,8 @@ class LayoutLossConfig:
     assignment: float = 1.0
     transport_entropy: float = 0.0
     validity: float = 0.0
+    validity_cardinality: float = 0.0
+    validity_ranking: float = 0.0
 
 
 def layout_loss_config(profile: str) -> LayoutLossConfig:
@@ -75,6 +98,16 @@ def layout_loss_config(profile: str) -> LayoutLossConfig:
         return LayoutLossConfig(assignment=0.0)
     if profile == "no_assignment_validity":
         return LayoutLossConfig(assignment=0.0, validity=0.5)
+    if profile == "validity_assignment":
+        return LayoutLossConfig(
+            box=1.0,
+            order=0.5,
+            direction=0.5,
+            assignment=0.25,
+            validity=1.0,
+            validity_cardinality=0.5,
+            validity_ranking=0.1,
+        )
     if profile == "no_geometry":
         return LayoutLossConfig(box=0.0, order=0.0, direction=0.0)
     raise ValueError(f"unsupported layout loss profile: {profile}")

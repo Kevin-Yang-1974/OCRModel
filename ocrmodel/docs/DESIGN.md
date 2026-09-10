@@ -117,11 +117,23 @@ $$h_i = LN_c(sum_q W_iq z_q).$$
 
 $$p_q = sigmoid(l_q^{valid}), \quad T^{gate}_{qi} = T_{qi} p_q.$$
 
-然后按视觉 token 重新归一化 gated transport，并计算有效覆盖率：
+旧 checkpoint 默认保持 `legacy_normalized` 语义：按视觉 token 重新归一化 gated transport，并计算有效覆盖率：
 
 $$W^{gate}_{iq} = T^{gate}_{qi} / (sum_k T^{gate}_{ki} + 1e-12), \quad c_i = sum_q T^{gate}_{qi} / (sum_q T_{qi} + 1e-12).$$
 
-融合上下文为 `c_i × LN_c(sum_q W^{gate}_{iq} z_q)`。这一步避免单纯重新归一化抵消 `p_valid` 的门控效果：即便 gated transport 在 token 侧重新归一化，validity 较低仍会通过 `c_i` 减小布局上下文写回。raw transport、gated transport 和 valid coverage 均保留用于诊断。
+融合上下文为 `c_i × LN_c(sum_q W^{gate}_{iq} z_q)`。raw transport、gated transport 和 valid coverage 均保留用于诊断。
+
+新 `validity_assignment` profile 使用 `raw_mass` 语义，不对 gated transport 再做 query 维归一化：
+
+$$W^{raw}_{iq} = T_{qi} / (sum_k T_{ki} + 1e-12), \quad c_i = sum_q W^{raw}_{iq}p_q,$$
+
+$$h_i = c_i × LN_c(sum_q W^{raw}_{iq}p_q z_q), \quad ṽ_i = v_i + αh_i.$$
+
+因此 `p_q=0` 时 query q 对视觉上下文的贡献严格为零，损失掉的质量进入 implicit null sink，而不是被 token 侧重新分配给其它 query。为使 validity 不再只读取 query 的 common-mode 表征，该 profile 还计算 detached raw-transport 视觉证据：
+
+$$r_q = sum_i (Q T_{qi})v_i, \quad u_q = LN(q_q + stopgrad(LN(r_q))), \quad p_q = sigmoid(head(u_q)).$$
+
+这里没有新增大规模可学习投影；validity head 仍为单个线性层，输出接口和 whole-page 推理接口不变。
 
 ### 4.7 受控残差写回
 
@@ -139,22 +151,30 @@ content_gate g 初始化为 0。旧 checkpoint 未设置上限时使用 α = tan
 
 训练总目标写为：
 
-$$L = L_OCR + λ_aux(λ_b L_box + λ_o L_order + λ_d L_direction + λ_a L_assignment + λ_e L_entropy + λ_v L_validity).$$
+$$L = L_OCR + λ_aux(λ_b L_box + λ_o L_order + λ_d L_direction + λ_a L_assignment + λ_e L_entropy + λ_v L_obj + λ_c L_count + λ_r L_rank).$$
 
-当前 `full` 配置的权重为 (λ_b, λ_o, λ_d, λ_a, λ_e, λ_v) = (1, 0.5, 0.5, 1, 0, 0)；`no_assignment_validity` 配置为 (1, 0.5, 0.5, 0, 0, 0.5)。稳定性确认使用 λ_aux = 0.2，MTHv2 validity 诊断使用辅助权重从 0.05 线性 ramp 到 0.2。这些是当前实验协议，不是 geometry score 的必要组成部分。
+当前 `full` 配置的权重为 (1, 0.5, 0.5, 1, 0, 0, 0, 0)；旧 `no_assignment_validity` 配置保留 assignment=0 与旧 validity 权重的接口兼容性，但实现中的 validity BCE 已改为全 query reduction。新 `validity_assignment` 首轮固定为：
+
+$$L_{aux} = L_{box} + 0.5L_{order} + 0.5L_{direction} + 0.25L_{assignment} + 1.0L_{obj} + 0.5L_{count} + 0.1L_{rank}.$$
+
+其中 validity 初始概率按全量 MTHv2 训练集 valid 先验设置为约 `0.066`；稳定性确认使用的其它 profile 不因本修复改变。
 
 - L_box：对归一化 xyxy bbox 使用 Smooth L1，并按有效 query mask 平均。
 - L_order：对 order_scores 使用 Smooth L1，reading order 归一化到 [0,1]。
 - L_direction：对 vertical_rtl、horizontal_ltr、unknown 使用交叉熵。
-- L_assignment：把 T 转成 token-first 后，对有 owner 的 patch 使用 NLL；owner = -1 的 patch 忽略。
+- L_assignment：把 `log T + log p_valid` 在 query 维做 softmax，再对有 owner 的 patch 使用 NLL；owner = -1 的 patch 忽略。没有 validity head 时退化为 raw `T` 的 token-first NLL。
 - L_entropy：记录 transport 熵，默认权重为 0；geometry 中它作用于 softmax 权重，layout_ot 中才与半松弛 OT 一起解释。
-- L_validity：对 Hungarian 后的 `query_mask` 使用按页面正负类分别归一化的 balanced BCE，使 valid 与 no-object query 在页面内获得相近的类别权重。它只在启用 validity head 时非零。
+- L_obj：对 Hungarian 后的 `query_mask` 使用全 query 的 `BCEWithLogitsLoss`，使常数预测的最优点服从页面 valid 先验，而不是固定为 0.5。
+- L_count：约束 `mean(sigmoid(l_valid))` 接近页面 `K/Q`。
+- L_rank：对 matched/no-object query 使用 `softplus(1 - l_pos + l_neg)`，直接建立正负 margin。
 
 数据层按 reading_order 排序 regions，并根据 patch center 是否落在 bbox 内生成 token_owners。重叠框当前取排序后的第一个 region，框外 patch 标记为 -1。所有这些 target 都是在 adapter forward 完成后生成，不改变 patch_positions 和 geometry score。
 
-若使用 hungarian query assignment，代码只用 detached 的预测框和 sigmoid 后的 order score 对 query slot 进行匹配，代价为：
+若使用 hungarian query assignment，代码只用 detached 的预测框、sigmoid 后的 order score 和 detached raw transport 对 query slot 进行匹配，代价为：
 
-$$C_mq = 0.7 mean(|b_m - b̂_q|) + 0.3 |o_m - sigmoid(ô_q)|.$$
+$$C_mq = 0.6 C_{box} + 0.2 C_{order} + 0.2 C_{support}.$$
+
+其中 `C_support` 是目标区域内 raw transport 的平均 query 质量；目标区域没有覆盖 patch 时回退到原来的 `0.7 C_box + 0.3 C_order`。validity 不参与匹配，避免错误 validity 预测与 target slot 自强化。
 
 匹配结果只重排辅助监督目标，不把 GT 框、GT 顺序或匹配索引回填到 forward。因此 hungarian 不构成 label leakage，推理仍然是整页、无布局标注的路径。
 
@@ -168,7 +188,8 @@ $$C_mq = 0.7 mean(|b_m - b̂_q|) + 0.3 |o_m - sigmoid(ô_q)|.$$
 | attention | e_qi | T = softmax_i(e_qi) / Q |
 | geometry | e_qi − d_qi / τ_g | T = softmax_i(s_qi) / Q |
 | layout_ot | e_qi − d_qi / τ_g | SemiRelaxedTransport(s) |
-| geometry + validity | e_qi − d_qi / τ_g | 对 T 施加 p_valid 门控，并以 valid coverage 保留幅度信息 |
+| geometry + validity (legacy) | e_qi − d_qi / τ_g | 对 T 施加 p_valid 门控，token 侧重归一化并以 valid coverage 保留幅度信息 |
+| geometry + validity (raw_mass) | e_qi − d_qi / τ_g | 使用 `W_raw × p_valid`，不重新归一化 gated query 质量；无效质量进入 implicit null sink |
 
 所以 geometry 相对于 attention 的新增量是预测中心距离偏置及其反向梯度；相对于 layout_ot，geometry 不含固定 query 边缘和松弛 token 边缘的迭代更新。比较时必须固定 query 数、训练预算、数据划分、残差约束、精度和 loss profile。
 
@@ -176,11 +197,13 @@ $$C_mq = 0.7 mean(|b_m - b̂_q|) + 0.3 |o_m - sigmoid(ô_q)|.$$
 
 相对于 attention，geometry 主要增加 B×Q×N 的距离矩阵，计算和显存量级约为 O(BQN)。它不增加 geometry 专用的可学习参数；bbox head 在布局模式中共同存在，以保持参数量对等。额外的几何计算通常低于 backbone 和 query–token 相似度计算，但在 N 或 Q 较大时仍需记录实际峰值显存。
 
-论文中应明确以下限制：当前几何项只使用预测 bbox 中心；T 是两次局部归一化后的 softmax 权重而非严格 OT；基础路径中的未匹配 query 不会在 forward 中自动消失；validity 分支虽能对 transport 做门控，但当前 MTHv2 诊断尚未形成 valid/no-object 分离，不能视为已解决无效 query 问题；训练早期错误 bbox 或 validity 概率可能造成错误空间排斥；τ_g、残差上限、validity 权重和辅助损失权重必须由 validation-only 协议确定。geometry 是否稳定优于 attention，以及 validity gating 是否能降低重复生成，仍需统一多 seed、小样本划分和跨来源验证，不能由单个短程 run 推断。
+论文中应明确以下限制：当前几何项只使用预测 bbox 中心；T 是两次局部归一化后的 softmax 权重而非严格 OT；legacy validity 分支不能让未匹配 query 在 forward 中真正消失。新 `validity_assignment` 的 raw-mass gate、视觉证据和 no-object 目标已实现，但尚未由 bounded A100 run 验证达到 query-level 阈值；训练早期错误 bbox 或 validity 概率仍可能造成错误空间排斥；τ_g、残差上限、validity 权重和辅助损失权重必须由 validation-only 协议确定。geometry 是否稳定优于 attention，以及 validity gating 是否能降低重复生成，仍需统一多 seed、小样本划分和跨来源验证，不能由单个短程 run 推断。
 
 ### 4.10.1 Validity 分支的当前证据边界
 
 全量 MTHv2 `glmocr_mthv2_validity_no_assignment_256_v1` 使用 512 queries、五卡同步 DDP、有效 global batch 20、峰值学习率 `2.5e-5`、gate 全程冻结和 `no_assignment_validity` profile。训练指标已记录到 step 256：前 64 步与后 64 步的 OCR loss 中位数约为 `1.3856` 与 `1.4068`，没有形成下降趋势；valid/no-object 的 `p_valid` 差值后程均值约 `0.0101`，step 256 约 `0.0177`，gated invalid fusion mass 仍约 `0.946`。因此该分支目前只能证明实现可运行并且数值有限，不能证明它改善了 OCR 或 query 选择。
+
+针对上述退化已新增 `validity_assignment` profile：Hungarian 保留并加入 detached raw-transport region support，validity 改为全 query object BCE＋cardinality＋ranking，assignment 纳入 `log p_valid`，前向切换到 `raw_mass`，并支持 64 steps 零残差 gate freeze。该 profile 的本地测试与 `a100-yky` 五卡 smoke 已通过；seed42/256-step 机制验证当前使用全量 train 加 32 页 validation 子集运行中。在 `Δp≥0.10`、AUROC≥0.80、invalid context share<0.50 等 validation-only 指标通过前，不扩展 seed43/44，也不执行 selection-locked test。
 
 ### 4.11 与代码的对应关系
 
@@ -188,9 +211,9 @@ $$C_mq = 0.7 mean(|b_m - b̂_q|) + 0.3 |o_m - sigmoid(ô_q)|.$$
 - glm_bridge.py::LayoutAwarePatchMerger.forward：在原始 merger 前建立 batch 维、调用适配器、记录诊断量，并把融合结果转回 backbone dtype。
 - adapter.py::PreMergeLayoutAdapter._queries：执行 seed query 到视觉 token 的多头交叉注意力。
 - adapter.py::PreMergeLayoutAdapter._scores：计算 e_qi；在 geometry/layout_ot 模式下计算 cdist 并减去 d_qi / τ_g。
-- adapter.py::PreMergeLayoutAdapter.forward：预测 bbox/order/direction，执行 geometry softmax 或 layout_ot transport，完成 token 侧归一化、content_norm 和残差写回。
+- adapter.py::PreMergeLayoutAdapter.forward：预测 bbox/order/direction，执行 geometry softmax 或 layout_ot transport；validity profile 读取 detached transport evidence，并在 `raw_mass` 模式完成不再归一化的 query gate、content_norm 和残差写回。
 - data.py::layout_targets：根据标注 bbox、reading_order 和 patch center 生成辅助监督 target；该函数在 forward 之后调用。
-- losses.py::match_layout_targets 与 compute_layout_losses：执行可选 Hungarian target-slot 对齐和布局辅助损失，不改变 geometry forward。
+- losses.py::match_layout_targets 与 compute_layout_losses：执行 detached raw-transport support 的 Hungarian target-slot 对齐、object/cardinality/ranking/assignment 辅助损失，不改变 geometry forward 的标签隔离边界。
 
 ## 5. 目标函数
 

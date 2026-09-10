@@ -16,15 +16,18 @@ from layout_ocr.distributed import (
     initialize_distributed,
     unwrap_module,
     wrap_adapter,
+    wrap_model,
 )
 from layout_ocr.train_screen import (
     configure_deterministic_execution,
     load_adapter_checkpoint,
     load_model,
+    load_decoder_lora_checkpoint,
     save_adapter_checkpoint,
     train,
     write_json,
 )
+from layout_ocr.lora import inject_decoder_lora
 
 
 def parse_args() -> argparse.Namespace:
@@ -35,6 +38,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mode", choices=["geometry"], default="geometry")
     parser.add_argument("--num-queries", type=int, default=512)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--decoder-adaptation", choices=["frozen", "lora"], default="frozen")
+    parser.add_argument("--decoder-lora-rank", type=int, default=8)
+    parser.add_argument("--decoder-lora-alpha", type=float, default=8.0)
+    parser.add_argument("--decoder-lora-dropout", type=float, default=0.0)
+    parser.add_argument("--decoder-learning-rate", type=float, default=1e-6)
     parser.add_argument("--steps", type=int, default=8)
     parser.add_argument("--adapter-precision", choices=["fp32"], default="fp32")
     parser.add_argument(
@@ -44,6 +52,7 @@ def parse_args() -> argparse.Namespace:
             "ocr_only",
             "no_assignment",
             "no_assignment_validity",
+            "validity_assignment",
             "no_geometry",
         ],
         default="full",
@@ -52,18 +61,54 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--residual-scale-cap", type=float, default=0.03)
     parser.add_argument("--initial-residual-scale", type=float, default=0.0)
     parser.add_argument("--use-validity-head", action="store_true")
-    parser.add_argument("--initial-valid-probability", type=float, default=0.05)
+    parser.add_argument("--initial-valid-probability", type=float, default=None)
+    parser.add_argument(
+        "--validity-gating-mode",
+        choices=["legacy_normalized", "raw_mass"],
+        default="legacy_normalized",
+    )
+    parser.add_argument("--validity-use-transport-evidence", action="store_true")
     parser.add_argument("--max-pixels", type=int, default=1003520)
     parser.add_argument("--processor-mode", choices=["fast"], default="fast")
+    parser.add_argument("--text-repeat-suppression", action="store_true")
+    parser.add_argument("--text-ul-weight", type=float, default=0.1)
+    parser.add_argument("--text-eos-loss-weight", type=float, default=0.05)
+    parser.add_argument("--repeat-recent-window", type=int, default=96)
+    parser.add_argument("--repeat-min-cycle-length", type=int, default=8)
+    parser.add_argument("--repeat-max-cycle-length", type=int, default=32)
+    parser.add_argument("--repeat-cycle-repeats", type=int, default=3)
+    parser.add_argument("--repeat-cycle-penalty", type=float, default=2.0)
+    parser.add_argument("--repeat-force-eos-steps", type=int, default=16)
+    parser.add_argument("--region-autoregressive", action="store_true")
+    parser.add_argument("--region-decoder-hidden-size", type=int, default=256)
+    parser.add_argument("--region-decoder-layers", type=int, default=2)
+    parser.add_argument("--region-decoder-num-heads", type=int, default=8)
+    parser.add_argument("--region-pointer-mask", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--region-spatial-penalty", type=float, default=4.0)
+    parser.add_argument("--region-spatial-iou-threshold", type=float, default=0.8)
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
+    if args.layout_loss_profile == "validity_assignment":
+        args.use_validity_head = True
+        args.validity_gating_mode = "raw_mass"
+        args.validity_use_transport_evidence = True
+    if args.initial_valid_probability is None:
+        args.initial_valid_probability = (
+            0.066 if args.layout_loss_profile == "validity_assignment" else 0.05
+        )
     if args.steps <= 0:
         raise ValueError("--steps must be positive")
+    if args.decoder_lora_rank <= 0 or args.decoder_lora_alpha <= 0:
+        raise ValueError("decoder LoRA rank and alpha must be positive")
+    if not 0.0 <= args.decoder_lora_dropout < 1.0:
+        raise ValueError("decoder LoRA dropout must be in [0, 1)")
     if args.num_queries <= 0:
         raise ValueError("--num-queries must be positive")
+    if args.region_autoregressive and args.num_queries != 512:
+        raise ValueError("--region-autoregressive requires --num-queries 512")
     if args.output_dir.exists():
         raise FileExistsError(args.output_dir)
 
@@ -103,10 +148,29 @@ def main() -> None:
             initial_residual_scale=args.initial_residual_scale,
             use_validity_head=args.use_validity_head,
             initial_valid_probability=args.initial_valid_probability,
+            validity_gating_mode=args.validity_gating_mode,
+            validity_use_transport_evidence=args.validity_use_transport_evidence,
             adapter_precision=args.adapter_precision,
+            region_autoregressive=args.region_autoregressive,
+            region_decoder_hidden_size=args.region_decoder_hidden_size,
+            region_decoder_layers=args.region_decoder_layers,
+            region_decoder_num_heads=args.region_decoder_num_heads,
+            region_pointer_mask=args.region_pointer_mask,
+            region_spatial_penalty=args.region_spatial_penalty,
+            region_spatial_iou_threshold=args.region_spatial_iou_threshold,
         )
         model, processor, bridge = load_model(model_args, device)
-        bridge.adapter = wrap_adapter(bridge.adapter, distributed)  # type: ignore[assignment]
+        decoder_lora_config = {"enabled": False, "target_count": 0}
+        if args.decoder_adaptation == "lora":
+            decoder_lora_config = inject_decoder_lora(
+                model,
+                rank=args.decoder_lora_rank,
+                alpha=args.decoder_lora_alpha,
+                dropout=args.decoder_lora_dropout,
+            )
+            model = wrap_model(model, distributed)
+        else:
+            bridge.adapter = wrap_adapter(bridge.adapter, distributed)  # type: ignore[assignment]
         train_args = argparse.Namespace(
             seed=args.seed,
             max_steps=args.steps,
@@ -129,6 +193,24 @@ def main() -> None:
             num_queries=args.num_queries,
             per_device_batch_size=1,
             gradient_accumulation_steps=1,
+            decoder_adaptation=args.decoder_adaptation,
+            decoder_learning_rate=args.decoder_learning_rate,
+            text_repeat_suppression=args.text_repeat_suppression,
+            text_ul_weight=args.text_ul_weight,
+            text_eos_loss_weight=args.text_eos_loss_weight,
+            repeat_recent_window=args.repeat_recent_window,
+            repeat_min_cycle_length=args.repeat_min_cycle_length,
+            repeat_max_cycle_length=args.repeat_max_cycle_length,
+            repeat_cycle_repeats=args.repeat_cycle_repeats,
+            repeat_cycle_penalty=args.repeat_cycle_penalty,
+            repeat_force_eos_steps=args.repeat_force_eos_steps,
+            region_autoregressive=args.region_autoregressive,
+            region_decoder_hidden_size=args.region_decoder_hidden_size,
+            region_decoder_layers=args.region_decoder_layers,
+            region_decoder_num_heads=args.region_decoder_num_heads,
+            region_pointer_mask=args.region_pointer_mask,
+            region_spatial_penalty=args.region_spatial_penalty,
+            region_spatial_iou_threshold=args.region_spatial_iou_threshold,
         )
         training = train(
             train_args,
@@ -143,6 +225,8 @@ def main() -> None:
         if distributed.is_main:
             checkpoint_dir = args.output_dir / f"checkpoint-{args.steps}"
             load_adapter_checkpoint(checkpoint_dir, bridge)
+            if args.decoder_adaptation == "lora":
+                load_decoder_lora_checkpoint(checkpoint_dir, model)
             reloaded = unwrap_module(bridge.adapter)
             finite = all(bool(torch.isfinite(value).all()) for value in reloaded.state_dict().values())
             summary = {
@@ -158,7 +242,9 @@ def main() -> None:
                 "parameters_finite": finite,
                 "test_used_for_selection": False,
                 "training": training,
-            }
+                "decoder_adaptation": args.decoder_adaptation,
+                "decoder_lora_config": decoder_lora_config,
+                }
             write_json(args.output_dir / "smoke_summary.json", summary)
             (args.output_dir / "SMOKE_COMPLETED").touch()
             print(json.dumps(summary, ensure_ascii=False, separators=(",", ":")))

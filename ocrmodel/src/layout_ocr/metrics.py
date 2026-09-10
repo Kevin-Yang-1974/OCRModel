@@ -36,6 +36,48 @@ def levenshtein_alignment(reference: str, prediction: str) -> tuple[int, Counter
     return costs[-1][-1], matches
 
 
+def levenshtein_error_counts(reference: str, prediction: str) -> Counter[str]:
+    """Return insertion, deletion, and substitution counts for one pair.
+
+    The tie-breaking order intentionally matches :func:`levenshtein_alignment`
+    so the component totals sum to the same CER edit distance used by the
+    existing summaries.
+    """
+
+    rows = len(reference) + 1
+    cols = len(prediction) + 1
+    costs = [[0] * cols for _ in range(rows)]
+    moves = [[""] * cols for _ in range(rows)]
+    for i in range(1, rows):
+        costs[i][0], moves[i][0] = i, "D"
+    for j in range(1, cols):
+        costs[0][j], moves[0][j] = j, "I"
+    for i in range(1, rows):
+        for j in range(1, cols):
+            substitution = costs[i - 1][j - 1] + (reference[i - 1] != prediction[j - 1])
+            deletion = costs[i - 1][j] + 1
+            insertion = costs[i][j - 1] + 1
+            costs[i][j], moves[i][j] = min(
+                (substitution, "M"), (deletion, "D"), (insertion, "I")
+            )
+    counts: Counter[str] = Counter()
+    i, j = len(reference), len(prediction)
+    while i or j:
+        move = moves[i][j]
+        if move == "M":
+            if reference[i - 1] != prediction[j - 1]:
+                counts["substitutions"] += 1
+            i -= 1
+            j -= 1
+        elif move == "D":
+            counts["deletions"] += 1
+            i -= 1
+        else:
+            counts["insertions"] += 1
+            j -= 1
+    return counts
+
+
 def aggregate_ocr_metrics(
     pairs: Iterable[tuple[str, str]], train_character_counts: Counter[str]
 ) -> dict[str, float | int | None]:
@@ -48,6 +90,7 @@ def aggregate_ocr_metrics(
     pairs = list(pairs)
     total_edits = 0
     total_characters = 0
+    error_counts: Counter[str] = Counter()
     exact = 0
     rare_reference = {k: 0 for k in (1, 3, 5)}
     rare_matches = {k: 0 for k in (1, 3, 5)}
@@ -56,6 +99,7 @@ def aggregate_ocr_metrics(
         prediction = "".join(prediction.split())
         edits, matches = levenshtein_alignment(reference, prediction)
         total_edits += edits
+        error_counts.update(levenshtein_error_counts(reference, prediction))
         total_characters += len(reference)
         exact += reference == prediction
         reference_counts = Counter(reference)
@@ -67,6 +111,12 @@ def aggregate_ocr_metrics(
         "pages": len(pairs),
         "reference_characters": total_characters,
         "character_errors": total_edits,
+        "insertions": error_counts["insertions"],
+        "deletions": error_counts["deletions"],
+        "substitutions": error_counts["substitutions"],
+        "insertion_errors": error_counts["insertions"],
+        "deletion_errors": error_counts["deletions"],
+        "substitution_errors": error_counts["substitutions"],
         "cer": total_edits / max(1, total_characters),
         "exact_page_rate": exact / max(1, len(pairs)),
     }
