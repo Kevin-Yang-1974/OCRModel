@@ -120,7 +120,10 @@ runs = []
 for label in ("A0", "A1", "B1"):
     # The launcher keeps each run directly under training_runs, while root
     # contains the fixed subset/protocol and the aggregate screen summary.
-    run = root.parent / f"{root.name}_{label}" / "summary.json"
+    # Each run's metadata lives below its seed directory.  The old path
+    # omitted ``seed42`` and made the three runs finish successfully while
+    # silently failing to write the aggregate screen summary.
+    run = root.parent / f"{root.name}_{label}" / "seed42" / "summary.json"
     if not run.is_file():
         raise SystemExit(f"missing completed summary: {run}")
     payload = json.loads(run.read_text(encoding="utf-8"))
