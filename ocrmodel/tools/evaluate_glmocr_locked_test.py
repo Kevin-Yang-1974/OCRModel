@@ -45,6 +45,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--protocol-file", type=Path, required=True)
     parser.add_argument("--run-dir", type=Path, required=True)
     parser.add_argument(
+        "--output-dir",
+        type=Path,
+        help="output directory; defaults to run-dir/locked-test",
+    )
+    parser.add_argument(
         "--selection-file",
         type=Path,
         help="validation-only selection file; defaults to run-dir/selection.json",
@@ -59,6 +64,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-pixels", type=int, default=1003520)
     parser.add_argument("--processor-mode", choices=["fast"], default="fast")
     parser.add_argument("--max-eval-new-tokens", type=int, default=1536)
+    parser.add_argument(
+        "--test-shard-index",
+        type=int,
+        default=0,
+        help="zero-based test shard index for parallel locked-test evaluation",
+    )
+    parser.add_argument(
+        "--test-shard-count",
+        type=int,
+        default=1,
+        help="number of disjoint test shards for parallel locked-test evaluation",
+    )
     return parser.parse_args()
 
 
@@ -68,9 +85,15 @@ def main() -> None:
     summary_path = run_dir / "summary.json"
     metadata_path = run_dir / "metadata.json"
     selection_path = (args.selection_file or (run_dir / "selection.json")).resolve()
-    output_dir = run_dir / "locked-test"
+    output_dir = (args.output_dir or (run_dir / "locked-test")).resolve()
     if output_dir.exists():
         raise FileExistsError(output_dir)
+    if args.test_shard_count <= 0:
+        raise ValueError("test-shard-count must be positive")
+    if not 0 <= args.test_shard_index < args.test_shard_count:
+        raise ValueError(
+            "test-shard-index must satisfy 0 <= index < test-shard-count"
+        )
     if not (run_dir / "COMPLETED").is_file():
         raise RuntimeError(f"training run is not complete: {run_dir}")
     summary = _read_json(summary_path)
@@ -108,6 +131,14 @@ def main() -> None:
             f"test page count mismatch: protocol={expected_test_pages}, "
             f"manifest={len(test_records)}"
         )
+    test_pages_total = len(test_records)
+    if args.test_shard_count > 1:
+        test_records = test_records[args.test_shard_index :: args.test_shard_count]
+        if not test_records:
+            raise ValueError(
+                f"test shard {args.test_shard_index} is empty for "
+                f"{test_pages_total} pages and {args.test_shard_count} shards"
+            )
 
     configure_deterministic_execution()
     if not torch.cuda.is_available():
@@ -181,6 +212,9 @@ def main() -> None:
         "selection_metric": selection.get("selection_metric", "validation_cer"),
         "train_pages": len(train_records),
         "test_pages": len(test_records),
+        "test_pages_total": test_pages_total,
+        "test_shard_index": args.test_shard_index,
+        "test_shard_count": args.test_shard_count,
         "num_queries": args.num_queries,
         "max_eval_new_tokens": args.max_eval_new_tokens,
         "metrics": metrics,

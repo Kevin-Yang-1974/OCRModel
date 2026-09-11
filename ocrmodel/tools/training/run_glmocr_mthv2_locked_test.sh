@@ -14,6 +14,7 @@ protocol_file="${GLMOCR_A100_MTHV2_PROTOCOL:-${remote_root}/protocols/mthv2_full
 run_id="glmocr_mthv2_full_ddp_v1"
 seed=42
 gpu_id=0
+gpu_ids=""
 session=""
 foreground=0
 
@@ -22,6 +23,7 @@ while [[ $# -gt 0 ]]; do
         --run-id) run_id="$2"; shift 2 ;;
         --seed) seed="$2"; shift 2 ;;
         --gpu-id) gpu_id="$2"; shift 2 ;;
+        --gpu-ids) gpu_ids="$2"; shift 2 ;;
         --session) session="$2"; shift 2 ;;
         --foreground) foreground=1; shift ;;
         --remote-root) remote_root="$2"; shift 2 ;;
@@ -34,10 +36,22 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-[[ "${run_id}" =~ ^[A-Za-z0-9_.-]+$ && "${seed}" =~ ^[0-9]+$ && "${gpu_id}" =~ ^[0-9]+$ ]] || {
-    printf '{"event":"glmocr_locked_test_failed","error":"invalid_run_seed_or_gpu"}\n' >&2
+[[ -z "${gpu_ids}" ]] && gpu_ids="${gpu_id}"
+[[ "${run_id}" =~ ^[A-Za-z0-9_.-]+$ && "${seed}" =~ ^[0-9]+$ && "${gpu_ids}" =~ ^[0-9]+(,[0-9]+)*$ ]] || {
+    printf '{"event":"glmocr_locked_test_failed","error":"invalid_run_seed_or_gpu_ids"}\n' >&2
     exit 64
 }
+IFS=',' read -r -a gpu_array <<< "${gpu_ids}"
+gpu_count="${#gpu_array[@]}"
+declare -A seen_gpus=()
+for gpu in "${gpu_array[@]}"; do
+    [[ -z "${seen_gpus[${gpu}]+x}" ]] || {
+        printf '{"event":"glmocr_locked_test_failed","error":"duplicate_gpu_id","gpu":%s}\n' "${gpu}" >&2
+        exit 64
+    }
+    seen_gpus["${gpu}"]=1
+done
+gpu_id="${gpu_array[0]}"
 [[ -z "${session}" ]] && session="${run_id}_test_seed${seed}"
 [[ "${session}" =~ ^[A-Za-z0-9_.-]+$ ]] || {
     printf '{"event":"glmocr_locked_test_failed","error":"invalid_session"}\n' >&2
@@ -90,53 +104,130 @@ preflight_paths() {
         printf '{"event":"glmocr_locked_test_failed","error":"locked_test_output_already_exists"}\n' >&2
         exit 74
     }
+    [[ ! -e "${run_dir}/locked-test-shards" ]] || {
+        printf '{"event":"glmocr_locked_test_failed","error":"locked_test_shards_already_exists"}\n' >&2
+        exit 74
+    }
 }
 
-query_gpu() {
+query_gpus() {
     command -v nvidia-smi >/dev/null 2>&1 || {
         printf '{"event":"glmocr_locked_test_failed","error":"nvidia_smi_missing"}\n' >&2
         exit 69
     }
-    row="$(nvidia-smi -i "${gpu_id}" --query-gpu=index,utilization.gpu --format=csv,noheader,nounits)"
-    IFS=',' read -r observed_id utilization <<< "${row}"
-    observed_id="${observed_id//[[:space:]]/}"
-    utilization="${utilization//[[:space:]]/}"
-    [[ "${observed_id}" == "${gpu_id}" && "${utilization}" =~ ^[0-9]+$ ]] || {
-        printf '{"event":"glmocr_locked_test_failed","error":"cannot_parse_gpu_utilization"}\n' >&2
-        exit 69
-    }
-    (( utilization < 50 )) || {
-        printf '{"event":"glmocr_locked_test_failed","error":"gpu_admission_failed","gpu":%s,"utilization":%s}\n' "${gpu_id}" "${utilization}" >&2
-        exit 75
-    }
-    printf '{"event":"glmocr_locked_test_gpu_admission_ok","gpu":%s,"utilization":%s}\n' "${gpu_id}" "${utilization}"
+    utilization_json=""
+    for gpu in "${gpu_array[@]}"; do
+        row="$(nvidia-smi -i "${gpu}" --query-gpu=index,utilization.gpu --format=csv,noheader,nounits)"
+        IFS=',' read -r observed_id utilization <<< "${row}"
+        observed_id="${observed_id//[[:space:]]/}"
+        utilization="${utilization//[[:space:]]/}"
+        [[ "${observed_id}" == "${gpu}" && "${utilization}" =~ ^[0-9]+$ ]] || {
+            printf '{"event":"glmocr_locked_test_failed","error":"cannot_parse_gpu_utilization","gpu":%s}\n' "${gpu}" >&2
+            exit 69
+        }
+        (( utilization < 50 )) || {
+            printf '{"event":"glmocr_locked_test_failed","error":"gpu_admission_failed","gpu":%s,"utilization":%s}\n' "${gpu}" "${utilization}" >&2
+            exit 75
+        }
+        utilization_json+="${gpu}:${utilization},"
+    done
+    utilization_json="${utilization_json%,}"
+    printf '{"event":"glmocr_locked_test_gpu_admission_ok","gpu_ids":"%s","utilization":"%s"}\n' "${gpu_ids}" "${utilization_json}"
 }
 
 run_inner() {
     preflight_paths
-    query_gpu
+    query_gpus
     mkdir -p "${group_root}/logs" "${group_root}/tmp" "${remote_root}/runs"
-    export CUDA_VISIBLE_DEVICES="${gpu_id}"
-    export TMPDIR="${group_root}/tmp/test-seed${seed}"
-    export HF_HOME="${TMPDIR}/huggingface"
-    export TRANSFORMERS_CACHE="${HF_HOME}"
-    export PYTHONPATH="${code_root}/src:${code_root}${PYTHONPATH:+:${PYTHONPATH}}"
-    export LD_LIBRARY_PATH="${cuda_library_path}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
-    export TOKENIZERS_PARALLELISM=false PYTHONNOUSERSITE=1
-    export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
-    export CUBLAS_WORKSPACE_CONFIG=:4096:8
-    export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1
-    mkdir -p "${TMPDIR}" "${HF_HOME}"
-    cd "${code_root}"
-    "${python}" -m tools.evaluate_glmocr_locked_test \
-        --model-path "${model_dir}" \
-        --train-manifest "${train_manifest}" \
-        --test-manifest "${test_manifest}" \
-        --protocol-file "${protocol_file}" \
-        --run-dir "${run_dir}" \
-        --selection-file "${selection_file}" \
-        --seed "${seed}" \
-        > "${test_log}" 2>&1
+    if (( gpu_count == 1 )); then
+        export CUDA_VISIBLE_DEVICES="${gpu_id}"
+        export TMPDIR="${group_root}/tmp/test-seed${seed}"
+        export HF_HOME="${TMPDIR}/huggingface"
+        export TRANSFORMERS_CACHE="${HF_HOME}"
+        export PYTHONPATH="${code_root}/src:${code_root}${PYTHONPATH:+:${PYTHONPATH}}"
+        export LD_LIBRARY_PATH="${cuda_library_path}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+        export TOKENIZERS_PARALLELISM=false PYTHONNOUSERSITE=1
+        export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
+        export CUBLAS_WORKSPACE_CONFIG=:4096:8
+        export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1
+        mkdir -p "${TMPDIR}" "${HF_HOME}"
+        cd "${code_root}"
+        "${python}" -m tools.evaluate_glmocr_locked_test \
+            --model-path "${model_dir}" \
+            --train-manifest "${train_manifest}" \
+            --test-manifest "${test_manifest}" \
+            --protocol-file "${protocol_file}" \
+            --run-dir "${run_dir}" \
+            --selection-file "${selection_file}" \
+            --seed "${seed}" \
+            > "${test_log}" 2>&1
+    else
+        shard_root="${run_dir}/locked-test-shards"
+        mkdir -p "${shard_root}"
+        shard_pids=()
+        for shard_index in "${!gpu_array[@]}"; do
+            gpu="${gpu_array[${shard_index}]}"
+            shard_dir="${shard_root}/shard${shard_index}"
+            shard_tmp="${group_root}/tmp/test-seed${seed}-shard${shard_index}"
+            shard_log="${group_root}/logs/seed${seed}.locked-test.shard${shard_index}.log"
+            (
+                export CUDA_VISIBLE_DEVICES="${gpu}"
+                export TMPDIR="${shard_tmp}"
+                export HF_HOME="${TMPDIR}/huggingface"
+                export TRANSFORMERS_CACHE="${HF_HOME}"
+                export PYTHONPATH="${code_root}/src:${code_root}${PYTHONPATH:+:${PYTHONPATH}}"
+                export LD_LIBRARY_PATH="${cuda_library_path}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+                export TOKENIZERS_PARALLELISM=false PYTHONNOUSERSITE=1
+                export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
+                export CUBLAS_WORKSPACE_CONFIG=:4096:8
+                export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1
+                mkdir -p "${TMPDIR}" "${HF_HOME}"
+                cd "${code_root}"
+                exec "${python}" -m tools.evaluate_glmocr_locked_test \
+                    --model-path "${model_dir}" \
+                    --train-manifest "${train_manifest}" \
+                    --test-manifest "${test_manifest}" \
+                    --protocol-file "${protocol_file}" \
+                    --run-dir "${run_dir}" \
+                    --output-dir "${shard_dir}" \
+                    --selection-file "${selection_file}" \
+                    --seed "${seed}" \
+                    --test-shard-index "${shard_index}" \
+                    --test-shard-count "${gpu_count}"
+            ) > "${shard_log}" 2>&1 &
+            shard_pids+=("$!")
+        done
+        failed=0
+        for pid in "${shard_pids[@]}"; do
+            if ! wait "${pid}"; then
+                failed=1
+            fi
+        done
+        (( failed == 0 )) || {
+            printf '{"event":"glmocr_locked_test_failed","error":"test_shard_failed","gpu_ids":"%s"}\n' "${gpu_ids}" >&2
+            exit 1
+        }
+        export PYTHONPATH="${code_root}/src:${code_root}${PYTHONPATH:+:${PYTHONPATH}}"
+        export LD_LIBRARY_PATH="${cuda_library_path}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+        export HF_HOME="${group_root}/tmp/merge-test-seed${seed}/huggingface"
+        export TRANSFORMERS_CACHE="${HF_HOME}"
+        export TMPDIR="${group_root}/tmp/merge-test-seed${seed}"
+        export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
+        export TOKENIZERS_PARALLELISM=false PYTHONNOUSERSITE=1
+        mkdir -p "${TMPDIR}" "${HF_HOME}"
+        cd "${code_root}"
+        "${python}" -m tools.merge_glmocr_locked_test \
+            --run-dir "${run_dir}" \
+            --shards-dir "${shard_root}" \
+            --output-dir "${run_dir}/locked-test" \
+            --train-manifest "${train_manifest}" \
+            --test-manifest "${test_manifest}" \
+            --protocol-file "${protocol_file}" \
+            --selection-file "${selection_file}" \
+            --seed "${seed}" \
+            --gpu-ids "${gpu_ids}" \
+            > "${test_log}" 2>&1
+    fi
     printf '{"event":"glmocr_locked_test_complete","run_id":"%s","seed":%s,"test_used_for_selection":false,"summary":"%s"}\n' \
         "${run_id}" "${seed}" "${run_dir}/locked-test/locked_test_summary.json"
 }
@@ -153,10 +244,10 @@ if (( foreground == 0 )); then
     }
     mkdir -p "${remote_root}/runs"
     script_path="$(realpath -- "${BASH_SOURCE[0]}")"
-    command_line="$(printf '%q ' bash "${script_path}" --foreground --run-id "${run_id}" --seed "${seed}" --gpu-id "${gpu_id}" --remote-root "${remote_root}" --code-root "${code_root}" --env-dir "${env_dir}" --model-dir "${model_dir}" --dataset-root "${dataset_root}" --protocol-file "${protocol_file}")"
+    command_line="$(printf '%q ' bash "${script_path}" --foreground --run-id "${run_id}" --seed "${seed}" --gpu-ids "${gpu_ids}" --remote-root "${remote_root}" --code-root "${code_root}" --env-dir "${env_dir}" --model-dir "${model_dir}" --dataset-root "${dataset_root}" --protocol-file "${protocol_file}")"
     tmux new-session -d -s "${session}" "cd $(printf '%q' "${code_root}") && exec ${command_line} >$(printf '%q' "${launcher_log}") 2>&1"
-    printf '{"event":"glmocr_locked_test_armed","session":"%s","run_id":"%s","seed":%s,"gpu":%s,"test_used_for_selection":false,"log":"%s"}\n' \
-        "${session}" "${run_id}" "${seed}" "${gpu_id}" "${launcher_log}"
+    printf '{"event":"glmocr_locked_test_armed","session":"%s","run_id":"%s","seed":%s,"gpu_ids":"%s","test_used_for_selection":false,"log":"%s"}\n' \
+        "${session}" "${run_id}" "${seed}" "${gpu_ids}" "${launcher_log}"
 else
     run_inner
 fi
