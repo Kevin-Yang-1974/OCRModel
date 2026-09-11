@@ -3551,6 +3551,12 @@ def parse_args() -> argparse.Namespace:
         help="load adapter/decoder LoRA tensors from this checkpoint for eval-only audit",
     )
     parser.add_argument(
+        "--init-checkpoint-dir",
+        type=Path,
+        default=None,
+        help="initialize a training run from an adapter/decoder LoRA checkpoint",
+    )
+    parser.add_argument(
         "--region-autoregressive",
         action="store_true",
         help="use the 512-query autoregressive region decoder",
@@ -3603,6 +3609,10 @@ def main() -> None:
         args.auxiliary_weight_start = args.auxiliary_weight
     if args.eval_checkpoint_dir is not None and not args.eval_only:
         raise ValueError("--eval-checkpoint-dir is only valid with --eval-only")
+    if args.init_checkpoint_dir is not None and args.eval_only:
+        raise ValueError("--init-checkpoint-dir is only valid for training runs")
+    if args.init_checkpoint_dir is not None and args.eval_checkpoint_dir is not None:
+        raise ValueError("--init-checkpoint-dir and --eval-checkpoint-dir are mutually exclusive")
     if args.eval_only and args.eval_checkpoint_dir is None:
         if args.mode != "content_only":
             raise ValueError(
@@ -3796,6 +3806,7 @@ def main() -> None:
         "eval_disable_repeat_guard": args.eval_disable_repeat_guard,
         "audit_prompt_prefix": args.audit_prompt_prefix,
         "eval_checkpoint_dir": str(args.eval_checkpoint_dir) if args.eval_checkpoint_dir else None,
+        "init_checkpoint_dir": str(args.init_checkpoint_dir) if args.init_checkpoint_dir else None,
         "loop_escape_training": args.loop_escape_training,
         "loop_escape_config": {
             "cycle_length": args.loop_escape_cycle_length,
@@ -3918,6 +3929,16 @@ def main() -> None:
                 load_decoder_lora_checkpoint(args.eval_checkpoint_dir, model)
             if continuation_head is not None:
                 load_continuation_head_checkpoint(args.eval_checkpoint_dir, continuation_head)
+        if args.init_checkpoint_dir is not None:
+            if not args.init_checkpoint_dir.is_dir():
+                raise FileNotFoundError(
+                    f"training initialization checkpoint directory is missing: {args.init_checkpoint_dir}"
+                )
+            load_adapter_checkpoint(args.init_checkpoint_dir, bridge)
+            if args.decoder_adaptation == "lora":
+                load_decoder_lora_checkpoint(args.init_checkpoint_dir, model)
+            if continuation_head is not None:
+                load_continuation_head_checkpoint(args.init_checkpoint_dir, continuation_head)
         adapter = unwrap_module(bridge.adapter)
         metadata["adapter_config"] = asdict(adapter.config)
         metadata["decoder_lora_config"] = decoder_lora_config

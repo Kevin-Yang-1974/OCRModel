@@ -12,6 +12,7 @@ model_dir="${GLMOCR_A100_MODEL:-/data3/yky/yangky_ocr_models/models/sota/glm_ocr
 dataset_root="${GLMOCR_A100_MTHV2_ROOT:-/data3/yky/yangky_ocr_models/datasets/MTHv2/converted/mthv2_layout_page_v1}"
 protocol_file="${GLMOCR_A100_MTHV2_PROTOCOL:-${remote_root}/protocols/mthv2_full_2159_240_800_v1.json}"
 validation_manifest_override=""
+init_checkpoint_dir=""
 run_id="glmocr_mthv2_full_ddp_v1"
 experiment_group="custom"
 seed=42
@@ -191,6 +192,7 @@ while [[ $# -gt 0 ]]; do
         --dataset-root) dataset_root="$2"; shift 2 ;;
         --protocol-file) protocol_file="$2"; shift 2 ;;
         --validation-manifest) validation_manifest_override="$2"; shift 2 ;;
+        --init-checkpoint-dir) init_checkpoint_dir="$2"; shift 2 ;;
         *) printf '{"event":"glmocr_mthv2_ddp_failed","error":"unknown_argument","argument":"%s"}\n' "$1" >&2; exit 64 ;;
     esac
 done
@@ -730,6 +732,7 @@ run_inner() {
         --region-spatial-penalty "${region_spatial_penalty}"
         --region-spatial-iou-threshold "${region_spatial_iou_threshold}"
     )
+    [[ -n "${init_checkpoint_dir}" ]] && method_args+=(--init-checkpoint-dir "${init_checkpoint_dir}")
     (( text_repeat_suppression == 1 )) && method_args+=(--text-repeat-suppression)
     (( natural_loop_loss == 1 )) && method_args+=(--natural-loop-loss)
     (( no_validation == 1 )) && method_args+=(--no-validation)
@@ -912,6 +915,7 @@ if (( foreground == 0 )); then
         --env-dir "${env_dir}" --model-dir "${model_dir}"
         --dataset-root "${dataset_root}" --protocol-file "${protocol_file}"
     )
+    [[ -n "${init_checkpoint_dir}" ]] && child_args+=(--init-checkpoint-dir "${init_checkpoint_dir}")
     [[ -n "${validation_manifest_override}" ]] && child_args+=(--validation-manifest "${validation_manifest_override}")
     (( use_validity_head == 1 )) && child_args+=(--use-validity-head)
     (( validity_use_transport_evidence == 1 )) && child_args+=(--validity-use-transport-evidence)
