@@ -20,10 +20,14 @@ from layout_ocr.distributed import (
 )
 from layout_ocr.train_screen import (
     configure_deterministic_execution,
+    ContinuationStopHead,
     load_adapter_checkpoint,
     load_model,
     load_decoder_lora_checkpoint,
+    load_continuation_head_checkpoint,
+    natural_loop_config,
     save_adapter_checkpoint,
+    save_continuation_head_checkpoint,
     train,
     write_json,
 )
@@ -79,6 +83,29 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--repeat-cycle-repeats", type=int, default=3)
     parser.add_argument("--repeat-cycle-penalty", type=float, default=2.0)
     parser.add_argument("--repeat-force-eos-steps", type=int, default=16)
+    parser.add_argument("--natural-loop-loss", action="store_true")
+    parser.add_argument("--natural-loop-weight", type=float, default=0.05)
+    parser.add_argument("--natural-loop-recent-window", type=int, default=96)
+    parser.add_argument("--natural-loop-min-cycle-length", type=int, default=8)
+    parser.add_argument("--natural-loop-max-cycle-length", type=int, default=32)
+    parser.add_argument("--natural-loop-cycle-repeats", type=int, default=3)
+    parser.add_argument("--continuation-escape", action="store_true")
+    parser.add_argument("--escape-budget", type=int, default=16)
+    parser.add_argument("--escape-clear-steps", type=int, default=4)
+    parser.add_argument("--escape-eos-suppression", type=float, default=1.0)
+    parser.add_argument("--escape-eos-boost", type=float, default=0.5)
+    parser.add_argument("--loop-escape-training", action="store_true")
+    parser.add_argument("--loop-escape-cycle-length", type=int, default=8)
+    parser.add_argument("--loop-escape-horizon", type=int, default=8)
+    parser.add_argument("--loop-escape-ramp-steps", type=int, default=128)
+    parser.add_argument("--loop-escape-weight", type=float, default=0.1)
+    parser.add_argument("--loop-escape-margin", type=float, default=0.5)
+    parser.add_argument("--loop-escape-margin-weight", type=float, default=0.05)
+    parser.add_argument("--loop-continue-weight", type=float, default=0.05)
+    parser.add_argument("--continuation-head", action="store_true")
+    parser.add_argument("--continuation-head-hidden-size", type=int, default=32)
+    parser.add_argument("--continuation-head-weight", type=float, default=0.05)
+    parser.add_argument("--continuation-head-learning-rate", type=float, default=5e-4)
     parser.add_argument("--region-autoregressive", action="store_true")
     parser.add_argument("--region-decoder-hidden-size", type=int, default=256)
     parser.add_argument("--region-decoder-layers", type=int, default=2)
@@ -160,6 +187,11 @@ def main() -> None:
             region_spatial_iou_threshold=args.region_spatial_iou_threshold,
         )
         model, processor, bridge = load_model(model_args, device)
+        continuation_head = (
+            ContinuationStopHead(hidden_size=args.continuation_head_hidden_size).to(device)
+            if args.continuation_head
+            else None
+        )
         decoder_lora_config = {"enabled": False, "target_count": 0}
         if args.decoder_adaptation == "lora":
             decoder_lora_config = inject_decoder_lora(
@@ -171,6 +203,8 @@ def main() -> None:
             model = wrap_model(model, distributed)
         else:
             bridge.adapter = wrap_adapter(bridge.adapter, distributed)  # type: ignore[assignment]
+        if continuation_head is not None:
+            continuation_head = wrap_model(continuation_head, distributed)
         train_args = argparse.Namespace(
             seed=args.seed,
             max_steps=args.steps,
@@ -204,6 +238,27 @@ def main() -> None:
             repeat_cycle_repeats=args.repeat_cycle_repeats,
             repeat_cycle_penalty=args.repeat_cycle_penalty,
             repeat_force_eos_steps=args.repeat_force_eos_steps,
+            natural_loop_loss=args.natural_loop_loss,
+            natural_loop_weight=args.natural_loop_weight,
+            natural_loop_recent_window=args.natural_loop_recent_window,
+            natural_loop_min_cycle_length=args.natural_loop_min_cycle_length,
+            natural_loop_max_cycle_length=args.natural_loop_max_cycle_length,
+            natural_loop_cycle_repeats=args.natural_loop_cycle_repeats,
+            continuation_escape=args.continuation_escape,
+            escape_budget=args.escape_budget,
+            escape_clear_steps=args.escape_clear_steps,
+            escape_eos_suppression=args.escape_eos_suppression,
+            escape_eos_boost=args.escape_eos_boost,
+            loop_escape_training=args.loop_escape_training,
+            loop_escape_cycle_length=args.loop_escape_cycle_length,
+            loop_escape_horizon=args.loop_escape_horizon,
+            loop_escape_ramp_steps=args.loop_escape_ramp_steps,
+            loop_escape_weight=args.loop_escape_weight,
+            loop_escape_margin=args.loop_escape_margin,
+            loop_escape_margin_weight=args.loop_escape_margin_weight,
+            loop_continue_weight=args.loop_continue_weight,
+            continuation_head_learning_rate=args.continuation_head_learning_rate,
+            continuation_head_weight=args.continuation_head_weight,
             region_autoregressive=args.region_autoregressive,
             region_decoder_hidden_size=args.region_decoder_hidden_size,
             region_decoder_layers=args.region_decoder_layers,
@@ -217,6 +272,7 @@ def main() -> None:
             model,
             processor,
             bridge,
+            continuation_head,
             records,
             device,
             distributed=distributed,
@@ -227,6 +283,8 @@ def main() -> None:
             load_adapter_checkpoint(checkpoint_dir, bridge)
             if args.decoder_adaptation == "lora":
                 load_decoder_lora_checkpoint(checkpoint_dir, model)
+            if continuation_head is not None:
+                load_continuation_head_checkpoint(checkpoint_dir, continuation_head)
             reloaded = unwrap_module(bridge.adapter)
             finite = all(bool(torch.isfinite(value).all()) for value in reloaded.state_dict().values())
             summary = {
@@ -244,6 +302,7 @@ def main() -> None:
                 "training": training,
                 "decoder_adaptation": args.decoder_adaptation,
                 "decoder_lora_config": decoder_lora_config,
+                "natural_loop_config": natural_loop_config(args),
                 }
             write_json(args.output_dir / "smoke_summary.json", summary)
             (args.output_dir / "SMOKE_COMPLETED").touch()

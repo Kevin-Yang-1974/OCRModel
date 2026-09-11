@@ -12,11 +12,12 @@ import sys
 import time
 import traceback
 from collections import Counter
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from pathlib import Path
 from typing import Any
 
 import torch
+import torch.nn.functional as F
 from safetensors.torch import load_file, save_file
 
 from .config import layout_loss_config
@@ -36,6 +37,7 @@ from .distributed import (
     initialize_distributed,
     mean_scalar,
     rank_epoch_indices,
+    sum_scalar,
     unwrap_module,
     wrap_adapter,
     wrap_model,
@@ -54,9 +56,15 @@ from .losses import compute_layout_losses, match_layout_targets
 from .metrics import aggregate_ocr_metrics
 from .autoregressive_region import box_iou, compute_region_losses
 from .stabilization import (
-    AdaptiveCycleLogitsProcessor,
+    ContinuationStopHead,
     RepeatSuppressionConfig,
+    continuation_head_loss,
+    cycle_escape_losses,
     eos_focus_loss,
+    generate_with_loop_recovery,
+    loop_continuation_diagnostics,
+    natural_predicted_loop_loss,
+    repeated_cycle_positions,
     repetition_diagnostics,
     unlikelihood_loss,
 )
@@ -84,7 +92,7 @@ REGION_LOSS_KEYS = (
     "region_objectness",
     "region_count",
 )
-TEXT_LOSS_KEYS = ("text_unlikelihood", "text_eos")
+TEXT_LOSS_KEYS = ("text_unlikelihood", "text_eos", "natural_loop")
 
 
 def configure_deterministic_execution() -> dict[str, Any]:
@@ -723,6 +731,11 @@ def repeat_suppression_config(args: argparse.Namespace) -> RepeatSuppressionConf
         cycle_repeats=int(getattr(args, "repeat_cycle_repeats", 3)),
         cycle_penalty=float(getattr(args, "repeat_cycle_penalty", 2.0)),
         force_eos_steps=int(getattr(args, "repeat_force_eos_steps", 16)),
+        continuation_escape=bool(getattr(args, "continuation_escape", False)),
+        escape_budget=int(getattr(args, "escape_budget", 16)),
+        escape_clear_steps=int(getattr(args, "escape_clear_steps", 4)),
+        escape_eos_suppression=float(getattr(args, "escape_eos_suppression", 1.0)),
+        escape_eos_boost=float(getattr(args, "escape_eos_boost", 0.5)),
     )
 
 
@@ -747,6 +760,283 @@ def text_repeat_losses(
             recent_window=config.recent_window,
         ),
         "text_eos": eos_focus_loss(logits, labels, eos_ids),
+    }
+
+
+def text_repeat_activation_stats(
+    args: argparse.Namespace,
+    labels: torch.Tensor,
+    eos_ids: set[int],
+) -> tuple[float, float]:
+    """Return active-token ratios for the optional UL and EOS branches."""
+
+    valid = labels != -100
+    valid_count = int(valid.sum().detach().item())
+    if valid_count == 0 or not getattr(args, "text_repeat_suppression", False):
+        return 0.0, 0.0
+    config = repeat_suppression_config(args)
+    repeated = repeated_cycle_positions(
+        labels,
+        min_cycle_length=config.min_cycle_length,
+        max_cycle_length=config.max_cycle_length,
+        cycle_repeats=config.cycle_repeats,
+        recent_window=config.recent_window,
+    ) & valid
+    eos_mask = torch.zeros_like(valid)
+    for eos_id in eos_ids:
+        eos_mask |= labels == int(eos_id)
+    return (
+        float(repeated.sum().detach().item()) / valid_count,
+        float((eos_mask & valid).sum().detach().item()) / valid_count,
+    )
+
+
+def natural_loop_config(args: argparse.Namespace) -> dict[str, Any]:
+    """Return the loss-only natural prediction loop configuration."""
+
+    return {
+        "enabled": bool(getattr(args, "natural_loop_loss", False)),
+        "weight": float(getattr(args, "natural_loop_weight", 0.05)),
+        "recent_window": int(getattr(args, "natural_loop_recent_window", 96)),
+        "min_cycle_length": int(getattr(args, "natural_loop_min_cycle_length", 8)),
+        "max_cycle_length": int(getattr(args, "natural_loop_max_cycle_length", 32)),
+        "cycle_repeats": int(getattr(args, "natural_loop_cycle_repeats", 3)),
+        "single_forward": True,
+        "synthetic_prefix": False,
+        "inference_intervention": False,
+    }
+
+
+def natural_loop_loss_for_batch(
+    args: argparse.Namespace,
+    outputs: Any,
+    labels: torch.Tensor,
+) -> dict[str, torch.Tensor]:
+    """Compute natural predicted-cycle diagnostics from the normal forward."""
+
+    logits = getattr(outputs, "logits", None)
+    if logits is None:
+        zero = outputs.loss.float() * 0.0
+        empty = torch.zeros((), device=zero.device, dtype=torch.float32)
+        return {
+            "loss": zero,
+            "active_tokens": empty,
+            "cycle_tokens": empty,
+            "active_pages": empty,
+            "valid_tokens": empty,
+        }
+    config = natural_loop_config(args)
+    return natural_predicted_loop_loss(
+        logits,
+        labels,
+        min_cycle_length=config["min_cycle_length"],
+        max_cycle_length=config["max_cycle_length"],
+        cycle_repeats=config["cycle_repeats"],
+        recent_window=config["recent_window"],
+    )
+
+
+def optional_model_loss_components(outputs: Any) -> dict[str, float]:
+    """Expose optional model-owned loss components without changing weighting."""
+
+    components: dict[str, float] = {}
+    for name in ("mtp_loss", "lm_loss", "language_model_loss", "ce_loss"):
+        value = getattr(outputs, name, None)
+        if isinstance(value, torch.Tensor) and value.numel() == 1:
+            components[name] = float(value.detach().float())
+    return components
+
+
+def scheduled_sampling_probability(args: argparse.Namespace, step: int) -> float:
+    """Return the bounded mixed-prefix probability for one optimizer step.
+
+    The probability is deliberately zero through the first warm-up window and
+    reaches at most ten percent.  This keeps the first forward teacher-forced
+    while introducing only a small exposure-bias probe later in the run.
+    """
+
+    if not bool(getattr(args, "scheduled_sampling", False)):
+        return 0.0
+    warmup_steps = int(getattr(args, "scheduled_sampling_warmup_steps", 64))
+    ramp_steps = int(getattr(args, "scheduled_sampling_ramp_steps", 64))
+    maximum = float(getattr(args, "scheduled_sampling_max_probability", 0.1))
+    if step <= warmup_steps:
+        return 0.0
+    if ramp_steps <= 0 or step >= warmup_steps + ramp_steps:
+        return maximum
+    return maximum * (step - warmup_steps) / ramp_steps
+
+
+def token_weighted_loss_stats(outputs: Any, labels: torch.Tensor) -> tuple[torch.Tensor, int]:
+    """Compute causal CE numerator and token count without materializing fp32 logits."""
+
+    logits = getattr(outputs, "logits", None)
+    if logits is None or logits.ndim != 3 or labels.shape != logits.shape[:2]:
+        raise ValueError("outputs.logits and labels must have compatible [batch, sequence] shapes")
+    shift_logits = logits[..., :-1, :]
+    shift_labels = labels[..., 1:]
+    valid = shift_labels != -100
+    count = int(valid.sum().detach().item())
+    if count == 0:
+        return logits.sum() * 0.0, 0
+    selected_logits = shift_logits[valid].float()
+    selected_labels = shift_labels[valid].long()
+    return F.cross_entropy(selected_logits, selected_labels, reduction="sum"), count
+
+
+def build_mixed_prefix_inputs(
+    inputs: dict[str, Any],
+    outputs: Any,
+    probability: float,
+) -> tuple[dict[str, Any], int, int]:
+    """Replace a small fraction of target-prefix tokens with detached argmaxes.
+
+    Prompt/image tensors and the first OCR target token are never replaced.
+    The returned counts are diagnostic only and the labels stay identical to
+    the teacher-forced batch.
+    """
+
+    if probability <= 0.0:
+        return dict(inputs), 0, 0
+    input_ids = inputs["input_ids"]
+    labels = inputs["labels"]
+    logits = getattr(outputs, "logits", None)
+    if logits is None or logits.shape[:2] != input_ids.shape:
+        raise ValueError("model logits must align with input_ids for scheduled sampling")
+    predicted = logits[:, :-1].detach().argmax(dim=-1)
+    mixed_input_ids = input_ids.clone()
+    replaced = 0
+    eligible_count = 0
+    for batch_index in range(input_ids.shape[0]):
+        valid_positions = torch.nonzero(labels[batch_index] != -100, as_tuple=False).flatten()
+        if not valid_positions.numel():
+            continue
+        first_target = int(valid_positions[0].item())
+        last_target = int(valid_positions[-1].item())
+        eligible = labels[batch_index] != -100
+        eligible[: first_target + 1] = False
+        eligible_positions = torch.nonzero(eligible, as_tuple=False).flatten()
+        if eligible_positions.numel() <= 1:
+            continue
+        # A contiguous prefix corruption is closer to an autoregressive error
+        # than independently replacing scattered teacher-forced tokens.
+        span = min(8, int(eligible_positions.numel()))
+        max_start = min(int(eligible_positions[-1]), last_target - span + 1)
+        start = random.randint(int(eligible_positions[0]), max_start)
+        choose_length = min(span, last_target - start + 1)
+        eligible_count += choose_length
+        choose = torch.zeros_like(eligible)
+        if choose_length > 0 and random.random() < probability:
+            choose[start : start + choose_length] = True
+        chosen_positions = torch.nonzero(choose, as_tuple=False).flatten()
+        if chosen_positions.numel():
+            mixed_input_ids[batch_index, chosen_positions] = predicted[
+                batch_index, chosen_positions - 1
+            ]
+            replaced += int(chosen_positions.numel())
+    mixed_inputs = dict(inputs)
+    mixed_inputs["input_ids"] = mixed_input_ids
+    return mixed_inputs, replaced, eligible_count
+
+
+def build_loop_escape_inputs(
+    inputs: dict[str, Any],
+    *,
+    cycle_length: int = 8,
+    escape_horizon: int = 8,
+) -> tuple[dict[str, Any], torch.Tensor, torch.Tensor, int]:
+    """Create a same-length prefix containing a random internal three-cycle.
+
+    The labels remain the original OCR target.  Only the decoder prefix is
+    corrupted, so the second forward teaches the model to recover the real
+    continuation instead of choosing EOS as an escape.  Sampling the cycle
+    after a valid prefix matches the arbitrary point at which free-running
+    generation can enter a loop.  ``loop_mask`` marks the first continuation
+    positions and ``negative_token_ids`` contains the token that would extend
+    the synthetic cycle.
+    """
+
+    if cycle_length <= 0 or escape_horizon <= 0:
+        raise ValueError("loop escape cycle length and horizon must be positive")
+    input_ids = inputs["input_ids"]
+    labels = inputs["labels"]
+    if input_ids.ndim != 2 or labels.shape != input_ids.shape:
+        raise ValueError("loop escape inputs and labels must be aligned rank-2 tensors")
+    looped_input_ids = input_ids.clone()
+    loop_mask = torch.zeros_like(labels, dtype=torch.bool)
+    negative_token_ids = torch.full_like(labels, -1)
+    active_positions = 0
+    for batch_index in range(labels.shape[0]):
+        valid_positions = torch.nonzero(labels[batch_index] != -100, as_tuple=False).flatten()
+        if valid_positions.numel() < cycle_length * 3 + escape_horizon + 1:
+            continue
+        first_target = int(valid_positions[0].item())
+        last_target = int(valid_positions[-1].item())
+        # Sample an internal location so the training corruption matches the
+        # arbitrary point at which a free-running decoder can enter a loop.
+        min_source = first_target + cycle_length
+        # Keep the recovery window before the final EOS target so the
+        # non-EOS objective cannot accidentally train on the stop position.
+        max_source = last_target - cycle_length * 3 - escape_horizon
+        if max_source < min_source:
+            continue
+        source_start = random.randint(min_source, max_source)
+        paste_start = source_start + cycle_length
+        paste_end = paste_start + cycle_length * 2
+        escape_start = paste_end
+        escape_end = min(last_target + 1, escape_start + escape_horizon)
+        if escape_end <= escape_start or paste_end >= input_ids.shape[1]:
+            continue
+        cycle = input_ids[batch_index, source_start : source_start + cycle_length].clone()
+        looped_input_ids[batch_index, paste_start : paste_start + cycle_length] = cycle
+        looped_input_ids[batch_index, paste_start + cycle_length : paste_end] = cycle
+        span = escape_end - escape_start
+        loop_mask[batch_index, escape_start:escape_end] = True
+        negative_token_ids[batch_index, escape_start:escape_end] = cycle.repeat(
+            (span + cycle_length - 1) // cycle_length
+        )[:span]
+        active_positions += span
+    looped_inputs = dict(inputs)
+    looped_inputs["input_ids"] = looped_input_ids
+    return looped_inputs, loop_mask, negative_token_ids, active_positions
+
+
+def prompt_target_audit(
+    processor: Any,
+    prompt_inputs: dict[str, Any],
+    training_inputs: dict[str, Any],
+    eos_ids: set[int],
+) -> dict[str, Any]:
+    """Audit the exact prompt/target boundary used by training and generation."""
+
+    prompt_ids = prompt_inputs["input_ids"]
+    full_ids = training_inputs["input_ids"]
+    labels = training_inputs["labels"]
+    prompt_length = int(prompt_ids.shape[1])
+    prefix_match = bool(
+        full_ids.shape[1] > prompt_length
+        and torch.equal(full_ids[:, :prompt_length], prompt_ids)
+    )
+    target_positions = torch.nonzero(labels[0] != -100, as_tuple=False).flatten()
+    target_count = int(target_positions.numel())
+    eos_count = int(sum(int(token) in eos_ids for token in labels[0].tolist() if int(token) != -100))
+    first_target_ids = (
+        labels[0, target_positions[:8]].detach().cpu().tolist()
+        if target_positions.numel()
+        else []
+    )
+    try:
+        first_target_text = processor.decode(first_target_ids, skip_special_tokens=False)
+    except Exception:
+        first_target_text = None
+    return {
+        "prompt_length": prompt_length,
+        "full_length": int(full_ids.shape[1]),
+        "target_token_count": target_count,
+        "eos_label_count": eos_count,
+        "prefix_match": prefix_match,
+        "first_target_token_ids": first_target_ids,
+        "first_target_text": first_target_text,
     }
 
 
@@ -1015,6 +1305,50 @@ def load_decoder_lora_checkpoint(path: Path, model: Any) -> dict[str, torch.Tens
     return state
 
 
+def save_continuation_head_checkpoint(
+    path: Path, continuation_head: torch.nn.Module, step: int
+) -> dict[str, Any]:
+    """Serialize the small loop continuation/stop head with a checkpoint."""
+
+    module = unwrap_module(continuation_head)
+    state = {
+        name: value.detach().cpu().contiguous()
+        for name, value in module.state_dict().items()
+    }
+    non_finite = [name for name, value in state.items() if not bool(torch.isfinite(value).all())]
+    report = {
+        "step": step,
+        "enabled": True,
+        "tensor_count": len(state),
+        "parameters_finite": not non_finite,
+        "non_finite_parameters": non_finite,
+    }
+    if non_finite:
+        raise FloatingPointError(f"non-finite continuation head at checkpoint {step}: {non_finite}")
+    save_file(state, path / "continuation_head.safetensors")
+    return report
+
+
+def load_continuation_head_checkpoint(
+    path: Path, continuation_head: torch.nn.Module
+) -> dict[str, Tensor]:
+    checkpoint_path = path / "continuation_head.safetensors"
+    if not checkpoint_path.is_file():
+        raise FileNotFoundError(f"continuation head checkpoint is missing: {checkpoint_path}")
+    state = load_file(str(checkpoint_path), device="cpu")
+    module = unwrap_module(continuation_head)
+    expected = module.state_dict()
+    if set(expected) != set(state):
+        missing = sorted(set(expected) - set(state))
+        unexpected = sorted(set(state) - set(expected))
+        raise ValueError(
+            f"continuation head checkpoint keys do not match: missing={missing[:3]}, "
+            f"unexpected={unexpected[:3]}"
+        )
+    module.load_state_dict(state)
+    return state
+
+
 def load_adapter_checkpoint(path: Path, bridge: LayoutAwarePatchMerger) -> dict[str, Any]:
     adapter = unwrap_module(bridge.adapter)
     config_path = path / "adapter_config.json"
@@ -1217,6 +1551,7 @@ def train(
     model: Any,
     processor: Any,
     bridge: LayoutAwarePatchMerger,
+    continuation_head: torch.nn.Module | None,
     records: list[dict[str, Any]],
     device: torch.device,
     distributed: DistributedInfo | None = None,
@@ -1256,11 +1591,23 @@ def train(
                 "group_name": "decoder_lora",
             }
         )
+    continuation_parameters = (
+        tuple(continuation_head.parameters()) if continuation_head is not None else ()
+    )
+    if continuation_parameters:
+        parameter_groups.append(
+            {
+                "params": list(continuation_parameters),
+                "weight_decay": 0.01,
+                "lr": args.continuation_head_learning_rate,
+                "group_name": "continuation_head",
+            }
+        )
     if not parameter_groups:
         raise RuntimeError("no trainable parameters were found for the optimization run")
     trainable_parameters = tuple(
         parameter for parameter in model_module.parameters() if parameter.requires_grad
-    )
+    ) + tuple(parameter for parameter in continuation_parameters if parameter.requires_grad)
     parameter_report = trainable_parameter_report(model_module)
     lora_report = decoder_lora_finite_report(model_module)
     optimizer = torch.optim.AdamW(parameter_groups, lr=args.learning_rate)
@@ -1310,6 +1657,8 @@ def train(
     # eval mode so the adapter-only/LoRA comparison does not add dropout noise.
     model.eval()
     bridge.adapter.train()
+    if continuation_head is not None:
+        continuation_head.train()
     set_lora_modules_training(model_module, bool(lora_parameters))
     model_module.config.use_cache = False
     eos_ids = eos_token_ids(model_module, processor)
@@ -1321,6 +1670,11 @@ def train(
             print(f"[glmocr-train-debug rank={distributed.rank}] {message}", flush=True)
 
     running: Counter[str] = Counter()
+    ocr_ema_16: float | None = None
+    token_weighted_sum_total = 0.0
+    token_count_total = 0.0
+    mixed_token_weighted_sum_total = 0.0
+    mixed_token_count_total = 0.0
     started = time.time()
     checkpoint_steps: list[int] = []
     checkpoint_health: list[dict[str, Any]] = []
@@ -1343,6 +1697,14 @@ def train(
         for parameter_group in optimizer.param_groups:
             if parameter_group.get("group_name") == "decoder_lora":
                 parameter_group["lr"] = decoder_step_learning_rate
+            elif parameter_group.get("group_name") == "continuation_head":
+                parameter_group["lr"] = learning_rate_at_step(
+                    min(step, lr_schedule_steps),
+                    peak_learning_rate=args.continuation_head_learning_rate,
+                    warmup_steps=args.warmup_steps,
+                    max_steps=lr_schedule_steps,
+                    min_lr_ratio=args.min_lr_ratio,
+                )
             elif parameter_group.get("group_name") != "content_gate":
                 parameter_group["lr"] = learning_rate
         auxiliary_weight = auxiliary_weight_at_step(
@@ -1371,7 +1733,7 @@ def train(
             record = record_for_micro(micro_index)
             micro_records.append(record)
             debug(f"step={step} micro={accumulation_index} record={record['page_id']} prepare")
-            inputs = prepare_training_inputs(processor, record, device)
+            inputs = prepare_training_inputs(processor, record, device, eos_ids)
             bridge.set_grid_thw(inputs["image_grid_thw"])
             bridge.set_region_targets(
                 region_decoder_targets(record, device, args.num_queries)
@@ -1388,6 +1750,10 @@ def train(
                 bool(torch.isfinite(outputs.loss).all()), distributed, device
             ):
                 raise FloatingPointError(f"non-finite OCR loss at step {step}")
+            tf_token_loss_sum, tf_token_count = token_weighted_loss_stats(
+                outputs, inputs["labels"]
+            )
+            layout_output = bridge.last_output
             targets = layout_targets(record, bridge.last_patch_positions, args.num_queries)
             targets, matching_info = match_layout_targets(
                 bridge.last_output,
@@ -1434,6 +1800,10 @@ def train(
             ):
                 raise FloatingPointError(f"non-finite auxiliary loss at step {step}")
             repeat_losses = text_repeat_losses(args, outputs, inputs["labels"], eos_ids)
+            repeat_activation_ratio, eos_activation_ratio = text_repeat_activation_stats(
+                args, inputs["labels"], eos_ids
+            )
+            natural_loop = natural_loop_loss_for_batch(args, outputs, inputs["labels"])
             debug(f"step={step} micro={accumulation_index} losses_done")
             repeat_loss = (
                 float(getattr(args, "text_ul_weight", 0.1)) * repeat_losses["text_unlikelihood"]
@@ -1441,12 +1811,135 @@ def train(
                 if getattr(args, "text_repeat_suppression", False)
                 else outputs.loss.float() * 0.0
             )
-            loss = outputs.loss.float() + auxiliary_weight * auxiliary_loss + repeat_loss
+            scheduled_probability = scheduled_sampling_probability(args, step)
+            mixed_prefix_loss = outputs.loss.float() * 0.0
+            mixed_token_loss_sum = outputs.loss.float() * 0.0
+            mixed_token_count = 0
+            replaced_tokens = 0
+            eligible_tokens = 0
+            mixed_outputs = None
+            loop_escape_mask = torch.zeros_like(inputs["labels"], dtype=torch.bool)
+            loop_negative_ids = torch.full_like(inputs["labels"], -1)
+            loop_escape_active = 0
+            escape_losses = {
+                "escape": outputs.loss.float() * 0.0,
+                "margin": outputs.loss.float() * 0.0,
+                "continue": outputs.loss.float() * 0.0,
+                "active": outputs.loss.float() * 0.0,
+            }
+            head_loss = outputs.loss.float() * 0.0
+            prefix_inputs = dict(inputs)
+            if scheduled_probability > 0.0:
+                prefix_inputs, replaced_tokens, eligible_tokens = build_mixed_prefix_inputs(
+                    prefix_inputs, outputs, scheduled_probability
+                )
+            if getattr(args, "loop_escape_training", False):
+                prefix_inputs, loop_escape_mask, loop_negative_ids, loop_escape_active = (
+                    build_loop_escape_inputs(
+                        prefix_inputs,
+                        cycle_length=args.loop_escape_cycle_length,
+                        escape_horizon=args.loop_escape_horizon,
+                    )
+                )
+            # Every DDP rank must traverse the same second-forward path.  A
+            # short page can have no eligible synthetic loop positions while
+            # another rank does; gating this forward on the local active
+            # count then leaves ranks with different autograd graphs and can
+            # hang the first all-reduce.  The zero-active branch contributes
+            # a zero escape loss but still keeps the model/head collectives
+            # aligned.
+            prefix_forward_enabled = scheduled_probability > 0.0 or getattr(
+                args, "loop_escape_training", False
+            )
+            if prefix_forward_enabled:
+                # The second forward is OCR-only.  Layout supervision and its
+                # matching path remain tied to the first teacher-forced forward.
+                bridge.set_grid_thw(inputs["image_grid_thw"])
+                bridge.set_region_targets(
+                    region_decoder_targets(record, device, args.num_queries)
+                    if region_enabled
+                    else None
+                )
+                bridge.set_region_decode_controls()
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                    mixed_outputs = model(**prefix_inputs)
+                if mixed_outputs.loss is None:
+                    raise RuntimeError("loop-escape forward did not produce OCR loss")
+                if not all_finite(
+                    bool(torch.isfinite(mixed_outputs.loss).all()), distributed, device
+                ):
+                    raise FloatingPointError(f"non-finite loop-escape OCR loss at step {step}")
+                mixed_prefix_loss = mixed_outputs.loss.float()
+                mixed_token_loss_sum, mixed_token_count = token_weighted_loss_stats(
+                    mixed_outputs, prefix_inputs["labels"]
+                )
+                if getattr(args, "loop_escape_training", False):
+                    escape_losses = cycle_escape_losses(
+                        mixed_outputs.logits,
+                        prefix_inputs["labels"],
+                        loop_escape_mask,
+                        loop_negative_ids,
+                        eos_ids,
+                        margin=args.loop_escape_margin,
+                    )
+            if continuation_head is not None:
+                head_loss = continuation_head_loss(
+                    continuation_head,
+                    outputs.logits,
+                    inputs["labels"],
+                    eos_ids,
+                )
+                if mixed_outputs is not None:
+                    head_loss = 0.5 * (
+                        head_loss
+                        + continuation_head_loss(
+                            continuation_head,
+                            mixed_outputs.logits,
+                            prefix_inputs["labels"],
+                            eos_ids,
+                            loop_mask=loop_escape_mask,
+                            negative_token_ids=loop_negative_ids,
+                        )
+                    )
+            ocr_objective_loss = (
+                outputs.loss.float()
+                + scheduled_probability * (mixed_prefix_loss - outputs.loss.float())
+            )
+            escape_ramp = min(
+                1.0,
+                step / max(1, args.loop_escape_ramp_steps),
+            )
+            loop_loss = escape_ramp * (
+                args.loop_escape_weight * escape_losses["escape"]
+                + args.loop_escape_margin_weight * escape_losses["margin"]
+                + args.loop_continue_weight * escape_losses["continue"]
+            )
+            natural_loop_weight = (
+                float(getattr(args, "natural_loop_weight", 0.05))
+                if bool(getattr(args, "natural_loop_loss", False))
+                else 0.0
+            )
+            natural_loop_term = natural_loop_weight * natural_loop["loss"]
+            loss = (
+                ocr_objective_loss
+                + auxiliary_weight * auxiliary_loss
+                + repeat_loss
+                + loop_loss
+                + natural_loop_term
+                + args.continuation_head_weight * head_loss
+            )
             if not all_finite(bool(torch.isfinite(loss).all()), distributed, device):
                 raise FloatingPointError(f"non-finite loss at step {step}")
             if diagnostic:
                 component_losses = {
                     "ocr": outputs.loss.float(),
+                    "mixed_prefix": mixed_prefix_loss,
+                    "ocr_objective": ocr_objective_loss,
+                    "loop_escape": escape_losses["escape"],
+                    "loop_margin": escape_losses["margin"],
+                    "loop_continue": escape_losses["continue"],
+                    "natural_loop": natural_loop_term,
+                    "continuation_head": head_loss,
                     **{
                         key: auxiliary_losses[key].float()
                         for key in (*LAYOUT_LOSS_KEYS, *REGION_LOSS_KEYS)
@@ -1460,16 +1953,47 @@ def train(
                     )
                 for key, value in validity_assignment_gradient_diagnostics(
                     auxiliary_losses["layout_assignment"],
-                    bridge.last_output.validity_logits,
+                    layout_output.validity_logits,
                     targets["query_mask"],
                 ).items():
                     diagnostic_gradient_sums[key] += value
             (loss / accumulation_steps).backward()
             debug(f"step={step} micro={accumulation_index} backward_done")
             micro_sums["ocr_loss"] += float(outputs.loss.detach())
+            micro_sums["mixed_prefix_loss"] += float(mixed_prefix_loss.detach())
+            micro_sums["ocr_objective_loss"] += float(ocr_objective_loss.detach())
+            micro_sums["token_weighted_ocr_numerator"] += float(tf_token_loss_sum.detach())
+            micro_sums["token_weighted_ocr_tokens"] += float(tf_token_count)
+            micro_sums["mixed_prefix_numerator"] += float(mixed_token_loss_sum.detach())
+            micro_sums["mixed_prefix_tokens"] += float(mixed_token_count)
+            micro_sums["scheduled_sampling_replaced_tokens"] += float(replaced_tokens)
+            micro_sums["scheduled_sampling_eligible_tokens"] += float(eligible_tokens)
+            micro_sums["loop_escape_active"] += float(loop_escape_active)
+            micro_sums["loop_escape_loss"] += float(escape_losses["escape"].detach())
+            micro_sums["loop_margin_loss"] += float(escape_losses["margin"].detach())
+            micro_sums["loop_continue_loss"] += float(escape_losses["continue"].detach())
+            micro_sums["continuation_head_loss"] += float(head_loss.detach())
+            micro_sums["loop_escape_ramp"] += escape_ramp
             micro_sums["auxiliary_loss"] += float(auxiliary_loss.detach())
             micro_sums["text_unlikelihood"] += float(repeat_losses["text_unlikelihood"].detach())
             micro_sums["text_eos"] += float(repeat_losses["text_eos"].detach())
+            micro_sums["text_unlikelihood_activation_ratio"] += repeat_activation_ratio
+            micro_sums["text_eos_activation_ratio"] += eos_activation_ratio
+            micro_sums["official_base_loss"] += float(outputs.loss.detach())
+            micro_sums["natural_loop_loss"] += float(natural_loop["loss"].detach())
+            micro_sums["natural_loop_term"] += float(natural_loop_term.detach())
+            micro_sums["natural_loop_active_tokens"] += float(
+                natural_loop["active_tokens"]
+            )
+            micro_sums["natural_loop_cycle_tokens"] += float(
+                natural_loop["cycle_tokens"]
+            )
+            micro_sums["natural_loop_active_pages"] += float(
+                natural_loop["active_pages"]
+            )
+            micro_sums["natural_loop_valid_tokens"] += float(
+                natural_loop["valid_tokens"]
+            )
             micro_sums["total_loss"] += float(loss.detach())
             for key in (*LAYOUT_LOSS_KEYS, *REGION_LOSS_KEYS):
                 micro_sums[key] += float(auxiliary_losses[key].detach())
@@ -1492,8 +2016,15 @@ def train(
         debug(f"step={step} optimizer_done")
         finite_report = adapter_finite_report(adapter_module)
         lora_finite_report = decoder_lora_finite_report(model_module)
+        continuation_finite = (
+            adapter_finite_report(continuation_head)["parameters_finite"]
+            if continuation_head is not None
+            else True
+        )
         parameters_finite = all_finite(
-            finite_report["parameters_finite"] and lora_finite_report["parameters_finite"],
+            finite_report["parameters_finite"]
+            and lora_finite_report["parameters_finite"]
+            and continuation_finite,
             distributed,
             device,
         )
@@ -1501,7 +2032,8 @@ def train(
             raise FloatingPointError(
                 f"non-finite trainable parameters at step {step}: adapter="
                 f"{finite_report['non_finite_parameters']}, decoder_lora="
-                f"{lora_finite_report['non_finite_parameters']}"
+                f"{lora_finite_report['non_finite_parameters']}, continuation_head="
+                f"{adapter_finite_report(continuation_head).get('non_finite_parameters', []) if continuation_head is not None else []}"
             )
         raw_gate = float(adapter_module.content_gate.detach())
         effective_scale = float(adapter_module.effective_residual_scale().detach())
@@ -1515,6 +2047,51 @@ def train(
             or step == args.max_steps
             or diagnostic
         )
+        global_token_loss_sum = sum_scalar(
+            micro_sums["token_weighted_ocr_numerator"], distributed, device
+        )
+        global_token_count = sum_scalar(
+            micro_sums["token_weighted_ocr_tokens"], distributed, device
+        )
+        token_weighted_ocr_loss = global_token_loss_sum / max(1.0, global_token_count)
+        global_mixed_token_loss_sum = sum_scalar(
+            micro_sums["mixed_prefix_numerator"], distributed, device
+        )
+        global_mixed_token_count = sum_scalar(
+            micro_sums["mixed_prefix_tokens"], distributed, device
+        )
+        mixed_prefix_token_weighted_loss = global_mixed_token_loss_sum / max(
+            1.0, global_mixed_token_count
+        )
+        global_natural_active_tokens = sum_scalar(
+            micro_sums["natural_loop_active_tokens"], distributed, device
+        )
+        global_natural_cycle_tokens = sum_scalar(
+            micro_sums["natural_loop_cycle_tokens"], distributed, device
+        )
+        global_natural_active_pages = sum_scalar(
+            micro_sums["natural_loop_active_pages"], distributed, device
+        )
+        global_natural_valid_tokens = sum_scalar(
+            micro_sums["natural_loop_valid_tokens"], distributed, device
+        )
+        natural_loop_activation_ratio = global_natural_active_tokens / max(
+            1.0, global_natural_valid_tokens
+        )
+        natural_loop_candidate_mismatch_ratio = global_natural_active_tokens / max(
+            1.0, global_natural_cycle_tokens
+        )
+        token_weighted_sum_total += global_token_loss_sum
+        token_count_total += global_token_count
+        mixed_token_weighted_sum_total += global_mixed_token_loss_sum
+        mixed_token_count_total += global_mixed_token_count
+        teacher_forced_step_loss = mean_scalar(
+            micro_sums["ocr_loss"] / accumulation_steps, distributed, device
+        )
+        if ocr_ema_16 is None:
+            ocr_ema_16 = teacher_forced_step_loss
+        else:
+            ocr_ema_16 = (15.0 / 16.0) * ocr_ema_16 + (1.0 / 16.0) * teacher_forced_step_loss
         global_layout_components = (
             {
                 key: mean_scalar(
@@ -1530,7 +2107,59 @@ def train(
             else None
         )
         metrics = {
-            "ocr_loss": mean_scalar(micro_sums["ocr_loss"] / accumulation_steps, distributed, device),
+            # ``ocr_loss`` remains the teacher-forced loss for compatibility;
+            # the explicit names below prevent a current-batch endpoint from
+            # being mistaken for a run-level trend.
+            "ocr_loss": teacher_forced_step_loss,
+            "last_batch_ocr_loss": teacher_forced_step_loss,
+            "official_base_loss": mean_scalar(
+                micro_sums["official_base_loss"] / accumulation_steps,
+                distributed,
+                device,
+            ),
+            "official_loss_components": optional_model_loss_components(last_outputs)
+            if last_outputs is not None and log_this_step
+            else {},
+            "ema_ocr_loss_16": ocr_ema_16,
+            "token_weighted_ocr_loss": token_weighted_ocr_loss,
+            "mixed_prefix_token_weighted_loss": mixed_prefix_token_weighted_loss,
+            "mixed_prefix_loss": mean_scalar(
+                micro_sums["mixed_prefix_loss"] / accumulation_steps,
+                distributed,
+                device,
+            ),
+            "ocr_objective_loss": mean_scalar(
+                micro_sums["ocr_objective_loss"] / accumulation_steps,
+                distributed,
+                device,
+            ),
+            "scheduled_sampling_probability": scheduled_sampling_probability(args, step),
+            "scheduled_sampling_replaced_tokens": sum_scalar(
+                micro_sums["scheduled_sampling_replaced_tokens"], distributed, device
+            ),
+            "scheduled_sampling_eligible_tokens": sum_scalar(
+                micro_sums["scheduled_sampling_eligible_tokens"], distributed, device
+            ),
+            "loop_escape_active_tokens": sum_scalar(
+                micro_sums["loop_escape_active"], distributed, device
+            ),
+            "loop_escape_loss": mean_scalar(
+                micro_sums["loop_escape_loss"] / accumulation_steps, distributed, device
+            ),
+            "loop_margin_loss": mean_scalar(
+                micro_sums["loop_margin_loss"] / accumulation_steps, distributed, device
+            ),
+            "loop_continue_loss": mean_scalar(
+                micro_sums["loop_continue_loss"] / accumulation_steps, distributed, device
+            ),
+            "continuation_head_loss": mean_scalar(
+                micro_sums["continuation_head_loss"] / accumulation_steps,
+                distributed,
+                device,
+            ),
+            "loop_escape_ramp": mean_scalar(
+                micro_sums["loop_escape_ramp"] / accumulation_steps, distributed, device
+            ),
             "auxiliary_loss": mean_scalar(
                 micro_sums["auxiliary_loss"] / accumulation_steps, distributed, device
             ),
@@ -1540,6 +2169,30 @@ def train(
             "text_eos": mean_scalar(
                 micro_sums["text_eos"] / accumulation_steps, distributed, device
             ),
+            "text_unlikelihood_activation_ratio": mean_scalar(
+                micro_sums["text_unlikelihood_activation_ratio"] / accumulation_steps,
+                distributed,
+                device,
+            ),
+            "text_eos_activation_ratio": mean_scalar(
+                micro_sums["text_eos_activation_ratio"] / accumulation_steps,
+                distributed,
+                device,
+            ),
+            "natural_loop_loss": mean_scalar(
+                micro_sums["natural_loop_loss"] / accumulation_steps,
+                distributed,
+                device,
+            ),
+            "natural_loop_weighted_loss": mean_scalar(
+                micro_sums["natural_loop_term"] / accumulation_steps,
+                distributed,
+                device,
+            ),
+            "natural_loop_active_tokens": global_natural_active_tokens,
+            "natural_loop_active_pages": global_natural_active_pages,
+            "natural_loop_activation_ratio": natural_loop_activation_ratio,
+            "natural_loop_candidate_mismatch_ratio": natural_loop_candidate_mismatch_ratio,
             "total_loss": mean_scalar(micro_sums["total_loss"] / accumulation_steps, distributed, device),
             "gradient_norm": mean_scalar(float(gradient_norm.detach()), distributed, device),
             "learning_rate": learning_rate,
@@ -1574,17 +2227,36 @@ def train(
                     "optimizer_update": True,
                     "loss_components": {
                         "ocr": metrics["ocr_loss"],
+                        "official_base": metrics["official_base_loss"],
+                        "mixed_prefix": metrics["mixed_prefix_loss"],
+                        "ocr_objective": metrics["ocr_objective_loss"],
                         **(global_layout_components or {}),
                         # These values were already reduced above on every
                         # rank.  Never launch an extra rank-0-only collective
                         # while building the JSON row.
                         "text_unlikelihood": metrics["text_unlikelihood"],
                         "text_eos": metrics["text_eos"],
+                        "text_unlikelihood_activation_ratio": metrics[
+                            "text_unlikelihood_activation_ratio"
+                        ],
+                        "text_eos_activation_ratio": metrics["text_eos_activation_ratio"],
+                        "natural_loop": metrics["natural_loop_weighted_loss"],
+                        "natural_loop_raw": metrics["natural_loop_loss"],
+                        "loop_escape": metrics["loop_escape_loss"],
+                        "loop_margin": metrics["loop_margin_loss"],
+                        "loop_continue": metrics["loop_continue_loss"],
+                        "continuation_head": metrics["continuation_head_loss"],
                         "total": metrics["total_loss"],
                     },
                     "loss_component_scope": "global_accumulated_micro_batches",
+                    "ocr_loss_scope": "teacher_forced_current_optimizer_batch",
+                    "official_base_loss_scope": "teacher_forced_current_optimizer_batch",
+                    "token_weighted_ocr_loss_scope": "all_valid_ocr_tokens_in_current_optimizer_batch",
                     "loss_dtypes": {
                         "ocr": _dtype_name(last_outputs.loss.dtype),
+                        "mixed_prefix": _dtype_name(
+                            (mixed_outputs.loss if mixed_outputs is not None else last_outputs.loss).dtype
+                        ),
                         **{
                             key: _dtype_name(last_auxiliary_losses[key].dtype)
                             for key in (*LAYOUT_LOSS_KEYS, *REGION_LOSS_KEYS)
@@ -1593,6 +2265,7 @@ def train(
                             repeat_losses["text_unlikelihood"].dtype
                         ),
                         "text_eos": _dtype_name(repeat_losses["text_eos"].dtype),
+                        "natural_loop": _dtype_name(natural_loop["loss"].dtype),
                         "total": _dtype_name(last_loss.dtype),
                     },
                     "gradient_norms": gradient_norms,
@@ -1617,12 +2290,30 @@ def train(
                 diagnostic_train[str(step)] = dict(metrics)
         for key in (
             "ocr_loss",
+            "official_base_loss",
+            "token_weighted_ocr_loss",
+            "mixed_prefix_token_weighted_loss",
+            "mixed_prefix_loss",
+            "ocr_objective_loss",
+            "ema_ocr_loss_16",
+            "loop_escape_loss",
+            "loop_margin_loss",
+            "loop_continue_loss",
+            "continuation_head_loss",
             "auxiliary_loss",
             "total_loss",
             "gradient_norm",
             "auxiliary_weight",
             "text_unlikelihood",
             "text_eos",
+            "text_unlikelihood_activation_ratio",
+            "text_eos_activation_ratio",
+            "natural_loop_loss",
+            "natural_loop_weighted_loss",
+            "natural_loop_active_tokens",
+            "natural_loop_active_pages",
+            "natural_loop_activation_ratio",
+            "natural_loop_candidate_mismatch_ratio",
         ):
             if key in metrics:
                 running[key] += metrics[key]
@@ -1648,6 +2339,10 @@ def train(
                 health["decoder_lora"] = save_decoder_lora_checkpoint(
                     checkpoint_dir, model_module, step
                 )
+                if continuation_head is not None:
+                    health["continuation_head"] = save_continuation_head_checkpoint(
+                        checkpoint_dir, continuation_head, step
+                    )
                 health.update(
                     {
                         "learning_rate": learning_rate,
@@ -1670,6 +2365,8 @@ def train(
         lora_state = lora_state_dict(model_module)
         if lora_state:
             save_file(lora_state, args.output_dir / "decoder_lora.safetensors")
+        if continuation_head is not None:
+            save_continuation_head_checkpoint(args.output_dir, continuation_head, args.max_steps)
     barrier(distributed)
     return {
         "steps": args.max_steps,
@@ -1687,9 +2384,43 @@ def train(
         "initial_residual_scale": args.initial_residual_scale,
         "decoder_adaptation": getattr(args, "decoder_adaptation", "frozen"),
         "decoder_learning_rate": decoder_learning_rate,
+        "official_base_loss": "outputs.loss",
+        "natural_loop": natural_loop_config(args),
+        "scheduled_sampling": {
+            "enabled": bool(getattr(args, "scheduled_sampling", False)),
+            "warmup_steps": int(getattr(args, "scheduled_sampling_warmup_steps", 64)),
+            "ramp_steps": int(getattr(args, "scheduled_sampling_ramp_steps", 64)),
+            "max_probability": float(
+                getattr(args, "scheduled_sampling_max_probability", 0.1)
+            ),
+        },
+        "loop_escape": {
+            "enabled": bool(getattr(args, "loop_escape_training", False)),
+            "cycle_length": int(getattr(args, "loop_escape_cycle_length", 8)),
+            "horizon": int(getattr(args, "loop_escape_horizon", 8)),
+            "ramp_steps": int(getattr(args, "loop_escape_ramp_steps", 128)),
+            "weight": float(getattr(args, "loop_escape_weight", 0.1)),
+            "margin_weight": float(getattr(args, "loop_escape_margin_weight", 0.05)),
+            "continue_weight": float(getattr(args, "loop_continue_weight", 0.05)),
+        },
+        "continuation_head": {
+            "enabled": continuation_head is not None,
+            "weight": float(getattr(args, "continuation_head_weight", 0.05)),
+            "learning_rate": float(
+                getattr(args, "continuation_head_learning_rate", 5e-4)
+            ),
+        },
+        "token_weighted_ocr_loss": token_weighted_sum_total / max(1.0, token_count_total),
+        "mixed_prefix_token_weighted_loss": mixed_token_weighted_sum_total
+        / max(1.0, mixed_token_count_total),
         "final_decoder_learning_rate": decoder_step_learning_rate,
         "trainable_parameter_report": parameter_report,
         "decoder_lora": decoder_lora_finite_report(model_module),
+        "continuation_head_parameters_finite": (
+            adapter_finite_report(continuation_head)["parameters_finite"]
+            if continuation_head is not None
+            else True
+        ),
         "final_learning_rate": learning_rate_at_step(
             min(args.max_steps, lr_schedule_steps),
             peak_learning_rate=args.learning_rate,
@@ -1717,6 +2448,7 @@ def evaluate(
     model: Any,
     processor: Any,
     bridge: LayoutAwarePatchMerger,
+    continuation_head: torch.nn.Module | None,
     validation_records: list[dict[str, Any]],
     train_records: list[dict[str, Any]],
     device: torch.device,
@@ -1726,6 +2458,8 @@ def evaluate(
     model_module = unwrap_module(model)
     model_module.eval()
     bridge.adapter.eval()
+    if continuation_head is not None:
+        continuation_head.eval()
     model_module.config.use_cache = True
     predictions_path = (output_dir or args.output_dir) / f"{split_name}_predictions.jsonl"
     predictions_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1737,6 +2471,10 @@ def evaluate(
     generation_lengths: list[int] = []
     generation_eos_hits = 0
     repeated_trigram_rates: list[float] = []
+    loop_detected_pages = 0
+    loop_escape_successes = 0
+    loop_post_eos = 0
+    loop_early_eos = 0
     eos_ids = eos_token_ids(model_module, processor)
     loss_weights = layout_loss_config(args.layout_loss_profile)
     layout_loss_sums = {key: 0.0 for key in LAYOUT_LOSS_KEYS}
@@ -1773,9 +2511,18 @@ def evaluate(
     teacher_forced_ocr_losses: list[float] = []
     teacher_forced_layout_loss_sums = {key: 0.0 for key in LAYOUT_LOSS_KEYS}
     teacher_forced_ocr_dtypes: set[str] = set()
-    collect_teacher_forcing = bool(args.diagnostic_steps)
+    teacher_forced_target_tokens = 0
+    teacher_forced_eos_labels = 0
+    teacher_forced_eos_pages = 0
+    prompt_prefix_mismatches = 0
+    prompt_lengths: list[int] = []
+    full_lengths: list[int] = []
+    first_target_audit: dict[str, Any] | None = None
+    collect_teacher_forcing = bool(args.diagnostic_steps) or bool(args.audit_prompt_prefix)
     region_enabled = bool(getattr(args, "region_autoregressive", False))
     repeat_config = repeat_suppression_config(args)
+    if bool(getattr(args, "eval_disable_repeat_guard", False)):
+        repeat_config = replace(repeat_config, enabled=False)
     region_counts: list[int] = []
     region_pointer_reuse_rates: list[float] = []
     region_spatial_duplicate_rates: list[float] = []
@@ -1815,7 +2562,20 @@ def evaluate(
                 if region_enabled
                 else None
             )
-            teacher_inputs = prepare_training_inputs(processor, record, device)
+            teacher_inputs = prepare_training_inputs(processor, record, device, eos_ids)
+            audit = prompt_target_audit(processor, inputs, teacher_inputs, eos_ids)
+            teacher_forced_target_tokens += int(audit["target_token_count"])
+            teacher_forced_eos_labels += int(audit["eos_label_count"])
+            teacher_forced_eos_pages += int(audit["eos_label_count"] > 0)
+            prompt_prefix_mismatches += int(not audit["prefix_match"])
+            prompt_lengths.append(int(audit["prompt_length"]))
+            full_lengths.append(int(audit["full_length"]))
+            if first_target_audit is None:
+                first_target_audit = {
+                    "page_id": record["page_id"],
+                    "first_target_token_ids": audit["first_target_token_ids"],
+                    "first_target_text": audit["first_target_text"],
+                }
             bridge.set_grid_thw(teacher_inputs["image_grid_thw"])
             teacher_outputs = model_module(**teacher_inputs)
             if teacher_outputs.loss is None or bridge.last_output is None or bridge.last_patch_positions is None:
@@ -1837,24 +2597,20 @@ def evaluate(
                 teacher_forced_layout_loss_sums[key] += float(teacher_layout_losses[key].detach())
             bridge.set_grid_thw(inputs["image_grid_thw"])
         bridge.set_region_targets(None)
-        logits_processors = []
-        if repeat_config.enabled:
-            logits_processors.append(
-                AdaptiveCycleLogitsProcessor(
-                    prompt_length=inputs["input_ids"].shape[1],
-                    eos_token_ids=eos_ids,
-                    config=repeat_config,
-                )
-            )
         prompt_length = inputs["input_ids"].shape[1]
-        generated = model_module.generate(
-            **inputs,
-            # Keep generation independent of the reference text.  The target
-            # is only read after generation for scoring.
+        generated = generate_with_loop_recovery(
+            model_module,
+            inputs,
+            prompt_length=prompt_length,
+            eos_token_ids=eos_ids,
+            config=repeat_config,
             max_new_tokens=args.max_eval_new_tokens,
-            do_sample=False,
-            use_cache=True,
-            **({"logits_processor": logits_processors} if logits_processors else {}),
+            mode=args.generation_mode,
+            continuation_head=(
+                unwrap_module(continuation_head)
+                if continuation_head is not None
+                else None
+            ),
         )
         generated_tokens = generated[0, prompt_length:]
         generation_length = int(generated_tokens.shape[0])
@@ -1864,6 +2620,21 @@ def evaluate(
             generation_eos_hits += 1
         prediction = processor.decode(generated_tokens, skip_special_tokens=True)
         prediction_repeated_trigram_rate = repeated_trigram_rate(prediction)
+        loop_continuation = loop_continuation_diagnostics(
+            generated_tokens.tolist(),
+            eos_ids,
+            recent_window=repeat_config.recent_window,
+            min_cycle_length=repeat_config.min_cycle_length,
+            max_cycle_length=repeat_config.max_cycle_length,
+            cycle_repeats=repeat_config.cycle_repeats,
+        )
+        loop_detected_pages += int(bool(loop_continuation["loop_detected"]))
+        loop_escape_successes += int(
+            bool(loop_continuation["loop_detected"])
+            and int(loop_continuation["continued_non_cycle_tokens"]) >= 4
+        )
+        loop_post_eos += int(bool(loop_continuation["post_loop_eos"]))
+        loop_early_eos += int(bool(loop_continuation["post_loop_early_eos"]))
         prediction_repeat_diagnostics = repetition_diagnostics(
             prediction,
             recent_window=repeat_config.recent_window,
@@ -2007,6 +2778,7 @@ def evaluate(
                     "repeated_cycle_detected"
                 ],
                 "repeated_cycle_rate": prediction_repeat_diagnostics["repeated_cycle_rate"],
+                "loop_continuation": loop_continuation,
                 "region_metrics": region_metrics,
             },
         )
@@ -2090,6 +2862,10 @@ def evaluate(
                 )
                 for _, prediction in pairs
             ) / max(1, len(pairs)),
+            "loop_detected_page_rate": loop_detected_pages / max(1, len(pairs)),
+            "loop_escape_success_rate": loop_escape_successes / max(1, loop_detected_pages),
+            "loop_post_eos_rate": loop_post_eos / max(1, loop_detected_pages),
+            "loop_early_eos_rate": loop_early_eos / max(1, loop_detected_pages),
             "region_autoregressive": region_enabled,
             "region_count_mean": sum(region_counts) / max(1, len(region_counts))
             if region_counts
@@ -2147,7 +2923,36 @@ def evaluate(
                 if teacher_forced_ocr_losses
                 else None
             ),
+            "teacher_forced_validation_loss": (
+                sum(teacher_forced_ocr_losses) / len(teacher_forced_ocr_losses)
+                if teacher_forced_ocr_losses
+                else None
+            ),
             "teacher_forced_ocr_loss_dtypes": sorted(teacher_forced_ocr_dtypes),
+            "prompt_target_audit": {
+                "collected": collect_teacher_forcing,
+                "pages": len(teacher_forced_ocr_losses),
+                "prompt_prefix_mismatches": prompt_prefix_mismatches,
+                "prompt_prefix_match_rate": (
+                    1.0 - prompt_prefix_mismatches / max(1, len(teacher_forced_ocr_losses))
+                    if teacher_forced_ocr_losses
+                    else None
+                ),
+                "target_token_count": teacher_forced_target_tokens,
+                "eos_label_count": teacher_forced_eos_labels,
+                "eos_label_page_rate": (
+                    teacher_forced_eos_pages / max(1, len(teacher_forced_ocr_losses))
+                    if teacher_forced_ocr_losses
+                    else None
+                ),
+                "prompt_length_mean": (
+                    sum(prompt_lengths) / max(1, len(prompt_lengths)) if prompt_lengths else None
+                ),
+                "full_length_mean": (
+                    sum(full_lengths) / max(1, len(full_lengths)) if full_lengths else None
+                ),
+                "first_target": first_target_audit,
+            },
             "teacher_forced_layout_loss_means": (
                 {
                     key: value / len(teacher_forced_ocr_losses)
@@ -2396,6 +3201,75 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--repeat-cycle-penalty", type=float, default=2.0)
     parser.add_argument("--repeat-force-eos-steps", type=int, default=16)
     parser.add_argument(
+        "--natural-loop-loss",
+        action="store_true",
+        help="penalize wrong tokens in naturally predicted teacher-forced cycles",
+    )
+    parser.add_argument("--natural-loop-weight", type=float, default=0.05)
+    parser.add_argument("--natural-loop-recent-window", type=int, default=96)
+    parser.add_argument("--natural-loop-min-cycle-length", type=int, default=8)
+    parser.add_argument("--natural-loop-max-cycle-length", type=int, default=32)
+    parser.add_argument("--natural-loop-cycle-repeats", type=int, default=3)
+    parser.add_argument(
+        "--continuation-escape",
+        action="store_true",
+        help="use soft loop escape and continuation-biased EOS adjustment instead of forced EOS",
+    )
+    parser.add_argument("--escape-budget", type=int, default=16)
+    parser.add_argument("--escape-clear-steps", type=int, default=4)
+    parser.add_argument("--escape-eos-suppression", type=float, default=1.0)
+    parser.add_argument("--escape-eos-boost", type=float, default=0.5)
+    parser.add_argument(
+        "--scheduled-sampling",
+        action="store_true",
+        help="mix a bounded fraction of detached argmax OCR prefixes after warm-up",
+    )
+    parser.add_argument("--scheduled-sampling-warmup-steps", type=int, default=64)
+    parser.add_argument("--scheduled-sampling-ramp-steps", type=int, default=64)
+    parser.add_argument("--scheduled-sampling-max-probability", type=float, default=0.1)
+    parser.add_argument(
+        "--loop-escape-training",
+        action="store_true",
+        help="train on synthetic repeated prefixes and real continuations",
+    )
+    parser.add_argument("--loop-escape-cycle-length", type=int, default=8)
+    parser.add_argument("--loop-escape-horizon", type=int, default=8)
+    parser.add_argument("--loop-escape-ramp-steps", type=int, default=128)
+    parser.add_argument("--loop-escape-weight", type=float, default=0.1)
+    parser.add_argument("--loop-escape-margin", type=float, default=0.5)
+    parser.add_argument("--loop-escape-margin-weight", type=float, default=0.05)
+    parser.add_argument("--loop-continue-weight", type=float, default=0.05)
+    parser.add_argument(
+        "--continuation-head",
+        action="store_true",
+        help="train and use the lightweight loop-risk/stop calibration head",
+    )
+    parser.add_argument("--continuation-head-hidden-size", type=int, default=32)
+    parser.add_argument("--continuation-head-weight", type=float, default=0.05)
+    parser.add_argument("--continuation-head-learning-rate", type=float, default=5e-4)
+    parser.add_argument(
+        "--generation-mode",
+        choices=["plain", "loop_recovery"],
+        default="loop_recovery",
+        help="validation decoding mode; loop_recovery uses the stateful cycle controller",
+    )
+    parser.add_argument(
+        "--eval-disable-repeat-guard",
+        action="store_true",
+        help="disable the inference-only cycle logits processor for checkpoint audit",
+    )
+    parser.add_argument(
+        "--audit-prompt-prefix",
+        action="store_true",
+        help="collect prompt/target token-boundary diagnostics during validation",
+    )
+    parser.add_argument(
+        "--eval-checkpoint-dir",
+        type=Path,
+        default=None,
+        help="load adapter/decoder LoRA tensors from this checkpoint for eval-only audit",
+    )
+    parser.add_argument(
         "--region-autoregressive",
         action="store_true",
         help="use the 512-query autoregressive region decoder",
@@ -2436,14 +3310,19 @@ def main() -> None:
         )
     if args.auxiliary_weight_start is None:
         args.auxiliary_weight_start = args.auxiliary_weight
-    if args.eval_only and args.mode != "content_only":
-        raise ValueError("--eval-only is reserved for the prompt-only content_only baseline")
-    if args.eval_only and args.decoder_adaptation != "frozen":
-        raise ValueError("--eval-only baseline must keep the decoder frozen")
-    if args.eval_only and (
-        args.auxiliary_weight != 0.0 or args.auxiliary_weight_start != 0.0
-    ):
-        raise ValueError("the eval-only content_only baseline requires --auxiliary-weight 0")
+    if args.eval_checkpoint_dir is not None and not args.eval_only:
+        raise ValueError("--eval-checkpoint-dir is only valid with --eval-only")
+    if args.eval_only and args.eval_checkpoint_dir is None:
+        if args.mode != "content_only":
+            raise ValueError(
+                "checkpoint-free --eval-only is reserved for the prompt-only content_only baseline"
+            )
+        if args.decoder_adaptation != "frozen":
+            raise ValueError("checkpoint-free --eval-only baseline must keep the decoder frozen")
+        if args.auxiliary_weight != 0.0 or args.auxiliary_weight_start != 0.0:
+            raise ValueError("checkpoint-free eval-only baseline requires --auxiliary-weight 0")
+    if args.eval_only and args.scheduled_sampling:
+        raise ValueError("scheduled sampling is a training-only option")
     if args.auxiliary_weight < 0.0 or args.auxiliary_weight_start < 0.0:
         raise ValueError("auxiliary weights must be non-negative")
     if args.auxiliary_ramp_steps < 0:
@@ -2500,6 +3379,40 @@ def main() -> None:
         raise ValueError("invalid repeat cycle configuration")
     if args.repeat_force_eos_steps < 0:
         raise ValueError("repeat force EOS steps must be non-negative")
+    if args.natural_loop_weight < 0:
+        raise ValueError("natural loop loss weight must be non-negative")
+    if args.natural_loop_recent_window <= 0:
+        raise ValueError("natural loop recent window must be positive")
+    if (
+        args.natural_loop_min_cycle_length <= 0
+        or args.natural_loop_max_cycle_length < args.natural_loop_min_cycle_length
+    ):
+        raise ValueError("invalid natural loop cycle length range")
+    if args.natural_loop_cycle_repeats < 2:
+        raise ValueError("natural loop cycle repeats must be at least two")
+    if args.escape_budget <= 0 or args.escape_clear_steps <= 0:
+        raise ValueError("escape budget and clear steps must be positive")
+    if args.escape_eos_suppression < 0 or args.escape_eos_boost < 0:
+        raise ValueError("escape EOS adjustments must be non-negative")
+    if args.scheduled_sampling_warmup_steps < 0 or args.scheduled_sampling_ramp_steps < 0:
+        raise ValueError("scheduled-sampling warmup and ramp steps must be non-negative")
+    if not 0.0 <= args.scheduled_sampling_max_probability <= 0.1:
+        raise ValueError("scheduled-sampling max probability must be in [0, 0.1]")
+    if args.loop_escape_cycle_length <= 0 or args.loop_escape_horizon <= 0:
+        raise ValueError("loop escape cycle length and horizon must be positive")
+    if args.loop_escape_ramp_steps <= 0:
+        raise ValueError("loop escape ramp steps must be positive")
+    if (
+        args.loop_escape_weight < 0
+        or args.loop_escape_margin < 0
+        or args.loop_escape_margin_weight < 0
+        or args.loop_continue_weight < 0
+    ):
+        raise ValueError("loop escape loss weights and margin must be non-negative")
+    if args.continuation_head_hidden_size <= 0 or args.continuation_head_weight < 0:
+        raise ValueError("continuation head size and weight must be valid")
+    if args.continuation_head_learning_rate <= 0:
+        raise ValueError("continuation head learning rate must be positive")
     if args.region_autoregressive and args.num_queries != 512:
         raise ValueError("--region-autoregressive requires --num-queries 512")
     if args.region_decoder_hidden_size <= 0 or args.region_decoder_layers <= 0:
@@ -2518,6 +3431,13 @@ def main() -> None:
         raise ValueError("--layout-loss-profile validity_assignment requires --query-assignment hungarian")
     if args.output_dir.exists():
         raise FileExistsError(args.output_dir)
+    if args.eval_checkpoint_dir is not None:
+        if not args.eval_checkpoint_dir.is_dir():
+            raise FileNotFoundError(f"evaluation checkpoint directory is missing: {args.eval_checkpoint_dir}")
+        if not (args.eval_checkpoint_dir / "adapter.safetensors").is_file():
+            raise FileNotFoundError(
+                f"evaluation adapter checkpoint is missing: {args.eval_checkpoint_dir / 'adapter.safetensors'}"
+            )
     reproducibility = configure_deterministic_execution()
     distributed = initialize_distributed(args.distributed_strategy)
     if args.eval_only and distributed.enabled:
@@ -2556,11 +3476,38 @@ def main() -> None:
         "processor_mode": args.processor_mode,
         "eval_only": args.eval_only,
         "max_eval_new_tokens": args.max_eval_new_tokens,
+        "generation_mode": args.generation_mode,
         "validation_interval": args.validation_interval,
         "diagnostic_steps": list(args.diagnostic_steps),
         "skip_selection": args.skip_selection,
         "text_repeat_suppression": args.text_repeat_suppression,
         "text_repeat_config": asdict(repeat_suppression_config(args)),
+        "natural_loop_loss": natural_loop_config(args),
+        "eval_disable_repeat_guard": args.eval_disable_repeat_guard,
+        "audit_prompt_prefix": args.audit_prompt_prefix,
+        "eval_checkpoint_dir": str(args.eval_checkpoint_dir) if args.eval_checkpoint_dir else None,
+        "loop_escape_training": args.loop_escape_training,
+        "loop_escape_config": {
+            "cycle_length": args.loop_escape_cycle_length,
+            "horizon": args.loop_escape_horizon,
+            "ramp_steps": args.loop_escape_ramp_steps,
+            "weight": args.loop_escape_weight,
+            "margin": args.loop_escape_margin,
+            "margin_weight": args.loop_escape_margin_weight,
+            "continue_weight": args.loop_continue_weight,
+        },
+        "continuation_head": {
+            "enabled": args.continuation_head,
+            "hidden_size": args.continuation_head_hidden_size,
+            "weight": args.continuation_head_weight,
+            "learning_rate": args.continuation_head_learning_rate,
+        },
+        "scheduled_sampling": {
+            "enabled": args.scheduled_sampling,
+            "warmup_steps": args.scheduled_sampling_warmup_steps,
+            "ramp_steps": args.scheduled_sampling_ramp_steps,
+            "max_probability": args.scheduled_sampling_max_probability,
+        },
         "region_autoregressive": args.region_autoregressive,
         "region_decoder_config": {
             "hidden_size": args.region_decoder_hidden_size,
@@ -2627,6 +3574,11 @@ def main() -> None:
         validate_records(train_records, split="train", num_queries=args.num_queries)
         validate_records(validation_records, split="validation", num_queries=args.num_queries)
         model, processor, bridge = load_model(args, device)
+        continuation_head = (
+            ContinuationStopHead(hidden_size=args.continuation_head_hidden_size).to(device)
+            if args.continuation_head
+            else None
+        )
         if args.decoder_adaptation == "lora":
             decoder_lora_config = inject_decoder_lora(
                 model,
@@ -2648,9 +3600,23 @@ def main() -> None:
                 model = wrap_model(model, distributed)
             else:
                 bridge.adapter = wrap_adapter(bridge.adapter, distributed)  # type: ignore[assignment]
+            if continuation_head is not None:
+                continuation_head = wrap_model(continuation_head, distributed)
+        if args.eval_checkpoint_dir is not None:
+            load_adapter_checkpoint(args.eval_checkpoint_dir, bridge)
+            if args.decoder_adaptation == "lora":
+                load_decoder_lora_checkpoint(args.eval_checkpoint_dir, model)
+            if continuation_head is not None:
+                load_continuation_head_checkpoint(args.eval_checkpoint_dir, continuation_head)
         adapter = unwrap_module(bridge.adapter)
         metadata["adapter_config"] = asdict(adapter.config)
         metadata["decoder_lora_config"] = decoder_lora_config
+        metadata["continuation_head_config"] = {
+            "enabled": continuation_head is not None,
+            "hidden_size": args.continuation_head_hidden_size,
+            "weight": args.continuation_head_weight,
+            "learning_rate": args.continuation_head_learning_rate,
+        }
         metadata["trainable_parameter_report"] = trainable_parameter_report(model)
         metadata["decoder_lora_finite"] = decoder_lora_finite_report(model)
         metadata["versions"].update(
@@ -2679,6 +3645,7 @@ def main() -> None:
                 model,
                 processor,
                 bridge,
+                continuation_head,
                 validation_records,
                 train_records,
                 device,
@@ -2701,6 +3668,13 @@ def main() -> None:
                 "eval_only": True,
                 "training_updates": 0,
                 "parameters_unchanged": True,
+                "eval_checkpoint_dir": (
+                    str(args.eval_checkpoint_dir) if args.eval_checkpoint_dir is not None else None
+                ),
+                "repeat_guard_enabled": bool(
+                    repeat_suppression_config(args).enabled and not args.eval_disable_repeat_guard
+                ),
+                "natural_loop_config": natural_loop_config(args),
                 "max_eval_new_tokens": args.max_eval_new_tokens,
                 "validation": validation,
                 "test_manifest_read": metadata["test_manifest_read"],
@@ -2725,6 +3699,7 @@ def main() -> None:
                     model,
                     processor,
                     bridge,
+                    continuation_head,
                     validation_records,
                     train_records,
                     device,
@@ -2750,6 +3725,7 @@ def main() -> None:
             model,
             processor,
             bridge,
+            continuation_head,
             train_records,
             device,
             distributed=distributed,
@@ -2767,11 +3743,14 @@ def main() -> None:
             load_adapter_checkpoint(checkpoint_dir, bridge)
             if args.decoder_adaptation == "lora":
                 load_decoder_lora_checkpoint(checkpoint_dir, model)
+            if continuation_head is not None:
+                load_continuation_head_checkpoint(checkpoint_dir, continuation_head)
             candidate = evaluate(
                 args,
                 model,
                 processor,
                 bridge,
+                continuation_head,
                 validation_records,
                 train_records,
                 device,
@@ -2798,8 +3777,23 @@ def main() -> None:
                 )
         def training_value(point: dict[str, Any], key: str) -> Any:
             training_row = point.get("training") or {}
-            if key == "ocr_loss":
-                return training_row.get("ocr_loss")
+            if key in {
+                "ocr_loss",
+                "last_batch_ocr_loss",
+                "ema_ocr_loss_16",
+                "token_weighted_ocr_loss",
+                "mixed_prefix_token_weighted_loss",
+                "mixed_prefix_loss",
+                "ocr_objective_loss",
+                "official_base_loss",
+                "text_unlikelihood_activation_ratio",
+                "text_eos_activation_ratio",
+                "natural_loop_loss",
+                "natural_loop_weighted_loss",
+                "natural_loop_activation_ratio",
+                "natural_loop_candidate_mismatch_ratio",
+            }:
+                return training_row.get(key)
             components = training_row.get("loss_components") or training_row.get(
                 "layout_loss_means"
             ) or {}
@@ -2936,6 +3930,94 @@ def main() -> None:
                         {"step": row["step"], "value": training_value(row, "ocr_loss")}
                         for row in diagnostic_points
                     ],
+                    "training_last_batch_ocr_loss": [
+                        {
+                            "step": row["step"],
+                            "value": training_value(row, "last_batch_ocr_loss"),
+                        }
+                        for row in diagnostic_points
+                    ],
+                    "training_ema_ocr_loss_16": [
+                        {
+                            "step": row["step"],
+                            "value": training_value(row, "ema_ocr_loss_16"),
+                        }
+                        for row in diagnostic_points
+                    ],
+                    "training_token_weighted_ocr_loss": [
+                        {
+                            "step": row["step"],
+                            "value": training_value(row, "token_weighted_ocr_loss"),
+                        }
+                        for row in diagnostic_points
+                    ],
+                    "training_mixed_prefix_loss": [
+                        {
+                            "step": row["step"],
+                            "value": training_value(row, "mixed_prefix_loss"),
+                        }
+                        for row in diagnostic_points
+                    ],
+                    "training_ocr_objective_loss": [
+                        {
+                            "step": row["step"],
+                            "value": training_value(row, "ocr_objective_loss"),
+                        }
+                        for row in diagnostic_points
+                    ],
+                    "training_official_base_loss": [
+                        {
+                            "step": row["step"],
+                            "value": training_value(row, "official_base_loss"),
+                        }
+                        for row in diagnostic_points
+                    ],
+                    "training_natural_loop_loss": [
+                        {
+                            "step": row["step"],
+                            "value": training_value(row, "natural_loop_loss"),
+                        }
+                        for row in diagnostic_points
+                    ],
+                    "training_natural_loop_weighted_loss": [
+                        {
+                            "step": row["step"],
+                            "value": training_value(row, "natural_loop_weighted_loss"),
+                        }
+                        for row in diagnostic_points
+                    ],
+                    "training_natural_loop_activation_ratio": [
+                        {
+                            "step": row["step"],
+                            "value": training_value(row, "natural_loop_activation_ratio"),
+                        }
+                        for row in diagnostic_points
+                    ],
+                    "training_natural_loop_candidate_mismatch_ratio": [
+                        {
+                            "step": row["step"],
+                            "value": training_value(
+                                row, "natural_loop_candidate_mismatch_ratio"
+                            ),
+                        }
+                        for row in diagnostic_points
+                    ],
+                    "training_text_unlikelihood_activation_ratio": [
+                        {
+                            "step": row["step"],
+                            "value": training_value(
+                                row, "text_unlikelihood_activation_ratio"
+                            ),
+                        }
+                        for row in diagnostic_points
+                    ],
+                    "training_text_eos_activation_ratio": [
+                        {
+                            "step": row["step"],
+                            "value": training_value(row, "text_eos_activation_ratio"),
+                        }
+                        for row in diagnostic_points
+                    ],
                     **{
                         f"training_{key}_loss": [
                             {"step": row["step"], "value": training_value(row, key)}
@@ -2948,7 +4030,7 @@ def main() -> None:
                             {"step": row["step"], "value": gradient_value(row, key)}
                             for row in diagnostic_points
                         ]
-                        for key in ("ocr", *LAYOUT_LOSS_KEYS, "total")
+                        for key in ("ocr", "mixed_prefix", "ocr_objective", *LAYOUT_LOSS_KEYS, "total")
                     },
                     "assignment_positive_query_grad": [
                         {
@@ -3075,6 +4157,8 @@ def main() -> None:
             load_adapter_checkpoint(final_checkpoint, bridge)
             if args.decoder_adaptation == "lora":
                 load_decoder_lora_checkpoint(final_checkpoint, model)
+            if continuation_head is not None:
+                load_continuation_head_checkpoint(final_checkpoint, continuation_head)
             save_file(
                 {
                     key: value.detach().cpu().contiguous()
@@ -3085,6 +4169,10 @@ def main() -> None:
             final_lora_state = lora_state_dict(model)
             if final_lora_state:
                 save_file(final_lora_state, args.output_dir / "decoder_lora.safetensors")
+            if continuation_head is not None:
+                save_continuation_head_checkpoint(
+                    args.output_dir, continuation_head, final_candidate["step"]
+                )
             write_adapter_config(args.output_dir / "adapter_config.json", bridge)
             summary = {
                 "status": "complete",
@@ -3097,6 +4185,7 @@ def main() -> None:
                 "query_assignment": args.query_assignment,
                 "decoder_adaptation": args.decoder_adaptation,
                 "decoder_lora_config": metadata["decoder_lora_config"],
+                "natural_loop_config": natural_loop_config(args),
                 "trainable_parameter_report": metadata["trainable_parameter_report"],
                 "lr_schedule_steps": training["lr_schedule_steps"],
                 "eval_only": False,
@@ -3133,6 +4222,8 @@ def main() -> None:
         load_adapter_checkpoint(selected_checkpoint, bridge)
         if args.decoder_adaptation == "lora":
             load_decoder_lora_checkpoint(selected_checkpoint, model)
+        if continuation_head is not None:
+            load_continuation_head_checkpoint(selected_checkpoint, continuation_head)
         save_file(
             {key: value.detach().cpu().contiguous() for key, value in adapter.state_dict().items()},
             args.output_dir / "adapter.safetensors",
@@ -3140,6 +4231,8 @@ def main() -> None:
         final_lora_state = lora_state_dict(model)
         if final_lora_state:
             save_file(final_lora_state, args.output_dir / "decoder_lora.safetensors")
+        if continuation_head is not None:
+            save_continuation_head_checkpoint(args.output_dir, continuation_head, selected["step"])
         write_adapter_config(args.output_dir / "adapter_config.json", bridge)
         shutil.copyfile(
             args.output_dir / f"validation-{selected['step']}" / "validation_predictions.jsonl",
@@ -3187,6 +4280,7 @@ def main() -> None:
             "query_assignment": args.query_assignment,
             "decoder_adaptation": args.decoder_adaptation,
             "decoder_lora_config": metadata["decoder_lora_config"],
+            "natural_loop_config": natural_loop_config(args),
             "trainable_parameter_report": metadata["trainable_parameter_report"],
             "lr_schedule_steps": training["lr_schedule_steps"],
             "eval_only": False,

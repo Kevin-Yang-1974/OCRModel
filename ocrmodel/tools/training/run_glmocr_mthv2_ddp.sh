@@ -13,6 +13,7 @@ dataset_root="${GLMOCR_A100_MTHV2_ROOT:-/data3/yky/yangky_ocr_models/datasets/MT
 protocol_file="${GLMOCR_A100_MTHV2_PROTOCOL:-${remote_root}/protocols/mthv2_full_2159_240_800_v1.json}"
 validation_manifest_override=""
 run_id="glmocr_mthv2_full_ddp_v1"
+experiment_group="custom"
 seed=42
 experiment_label=""
 gpu_ids="0,1,2,3,4"
@@ -37,6 +38,7 @@ diagnostic_steps=""
 layout_loss_profile="full"
 validation_interval=432
 max_eval_new_tokens=1536
+generation_mode="loop_recovery"
 log_steps=16
 use_validity_head=0
 initial_valid_probability=""
@@ -56,6 +58,33 @@ repeat_max_cycle_length=32
 repeat_cycle_repeats=3
 repeat_cycle_penalty=2.0
 repeat_force_eos_steps=16
+natural_loop_loss=0
+natural_loop_weight=0.05
+natural_loop_recent_window=96
+natural_loop_min_cycle_length=8
+natural_loop_max_cycle_length=32
+natural_loop_cycle_repeats=3
+continuation_escape=0
+escape_budget=16
+escape_clear_steps=4
+escape_eos_suppression=1.0
+escape_eos_boost=0.5
+scheduled_sampling=0
+scheduled_sampling_warmup_steps=64
+scheduled_sampling_ramp_steps=64
+scheduled_sampling_max_probability=0.1
+loop_escape_training=0
+loop_escape_cycle_length=8
+loop_escape_horizon=8
+loop_escape_ramp_steps=128
+loop_escape_weight=0.1
+loop_escape_margin=0.5
+loop_escape_margin_weight=0.05
+loop_continue_weight=0.05
+continuation_head=0
+continuation_head_hidden_size=32
+continuation_head_weight=0.05
+continuation_head_learning_rate=5e-4
 region_autoregressive=0
 region_decoder_hidden_size=256
 region_decoder_layers=2
@@ -67,6 +96,7 @@ region_spatial_iou_threshold=0.8
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --run-id) run_id="$2"; shift 2 ;;
+        --experiment-group) experiment_group="$2"; shift 2 ;;
         --seed) seed="$2"; shift 2 ;;
         --experiment-label) experiment_label="$2"; shift 2 ;;
         --gpu-ids) gpu_ids="$2"; shift 2 ;;
@@ -91,6 +121,7 @@ while [[ $# -gt 0 ]]; do
         --layout-loss-profile) layout_loss_profile="$2"; shift 2 ;;
         --validation-interval) validation_interval="$2"; shift 2 ;;
         --max-eval-new-tokens) max_eval_new_tokens="$2"; shift 2 ;;
+        --generation-mode) generation_mode="$2"; shift 2 ;;
         --log-steps) log_steps="$2"; shift 2 ;;
         --use-validity-head) use_validity_head=1; shift ;;
         --initial-valid-probability) initial_valid_probability="$2"; shift 2 ;;
@@ -110,6 +141,33 @@ while [[ $# -gt 0 ]]; do
         --repeat-cycle-repeats) repeat_cycle_repeats="$2"; shift 2 ;;
         --repeat-cycle-penalty) repeat_cycle_penalty="$2"; shift 2 ;;
         --repeat-force-eos-steps) repeat_force_eos_steps="$2"; shift 2 ;;
+        --natural-loop-loss) natural_loop_loss=1; shift ;;
+        --natural-loop-weight) natural_loop_weight="$2"; shift 2 ;;
+        --natural-loop-recent-window) natural_loop_recent_window="$2"; shift 2 ;;
+        --natural-loop-min-cycle-length) natural_loop_min_cycle_length="$2"; shift 2 ;;
+        --natural-loop-max-cycle-length) natural_loop_max_cycle_length="$2"; shift 2 ;;
+        --natural-loop-cycle-repeats) natural_loop_cycle_repeats="$2"; shift 2 ;;
+        --continuation-escape) continuation_escape=1; shift ;;
+        --escape-budget) escape_budget="$2"; shift 2 ;;
+        --escape-clear-steps) escape_clear_steps="$2"; shift 2 ;;
+        --escape-eos-suppression) escape_eos_suppression="$2"; shift 2 ;;
+        --escape-eos-boost) escape_eos_boost="$2"; shift 2 ;;
+        --scheduled-sampling) scheduled_sampling=1; shift ;;
+        --scheduled-sampling-warmup-steps) scheduled_sampling_warmup_steps="$2"; shift 2 ;;
+        --scheduled-sampling-ramp-steps) scheduled_sampling_ramp_steps="$2"; shift 2 ;;
+        --scheduled-sampling-max-probability) scheduled_sampling_max_probability="$2"; shift 2 ;;
+        --loop-escape-training) loop_escape_training=1; shift ;;
+        --loop-escape-cycle-length) loop_escape_cycle_length="$2"; shift 2 ;;
+        --loop-escape-horizon) loop_escape_horizon="$2"; shift 2 ;;
+        --loop-escape-ramp-steps) loop_escape_ramp_steps="$2"; shift 2 ;;
+        --loop-escape-weight) loop_escape_weight="$2"; shift 2 ;;
+        --loop-escape-margin) loop_escape_margin="$2"; shift 2 ;;
+        --loop-escape-margin-weight) loop_escape_margin_weight="$2"; shift 2 ;;
+        --loop-continue-weight) loop_continue_weight="$2"; shift 2 ;;
+        --continuation-head) continuation_head=1; shift ;;
+        --continuation-head-hidden-size) continuation_head_hidden_size="$2"; shift 2 ;;
+        --continuation-head-weight) continuation_head_weight="$2"; shift 2 ;;
+        --continuation-head-learning-rate) continuation_head_learning_rate="$2"; shift 2 ;;
         --region-autoregressive) region_autoregressive=1; shift ;;
         --region-pointer-mask) region_pointer_mask=1; shift ;;
         --no-region-pointer-mask) region_pointer_mask=0; shift ;;
@@ -128,6 +186,51 @@ while [[ $# -gt 0 ]]; do
         *) printf '{"event":"glmocr_mthv2_ddp_failed","error":"unknown_argument","argument":"%s"}\n' "$1" >&2; exit 64 ;;
     esac
 done
+
+case "${experiment_group}" in
+    custom) ;;
+    A0|a0)
+        text_repeat_suppression=1; continuation_escape=1
+        repeat_cycle_penalty=1.0; repeat_force_eos_steps=0
+        scheduled_sampling=0; loop_escape_training=0; continuation_head=0
+        max_steps=256; lr_schedule_steps=256; validation_interval=128
+        diagnostic_steps="128,256" ;;
+    A1|a1)
+        text_repeat_suppression=1; continuation_escape=1
+        repeat_cycle_penalty=1.0; repeat_force_eos_steps=0
+        scheduled_sampling=0; loop_escape_training=1; continuation_head=0
+        loop_escape_ramp_steps=64; loop_escape_weight=0.02
+        loop_escape_margin_weight=0.01; loop_continue_weight=0.01
+        max_steps=256; lr_schedule_steps=256; validation_interval=128
+        diagnostic_steps="128,256" ;;
+    A2|a2)
+        text_repeat_suppression=1; continuation_escape=1
+        repeat_cycle_penalty=1.0; repeat_force_eos_steps=0
+        scheduled_sampling=1; scheduled_sampling_warmup_steps=64
+        scheduled_sampling_ramp_steps=64; scheduled_sampling_max_probability=0.05
+        loop_escape_training=1; continuation_head=0
+        loop_escape_ramp_steps=64; loop_escape_weight=0.02
+        loop_escape_margin_weight=0.01; loop_continue_weight=0.01
+        max_steps=256; lr_schedule_steps=256; validation_interval=128
+        diagnostic_steps="128,256" ;;
+    natural_A0|natural_a0|NL0|nl0)
+        text_repeat_suppression=0; continuation_escape=0
+        scheduled_sampling=0; loop_escape_training=0; continuation_head=0
+        natural_loop_loss=0; natural_loop_weight=0.05
+        generation_mode="plain"; repeat_cycle_penalty=0.0; repeat_force_eos_steps=0
+        warmup_steps=32; max_steps=256; lr_schedule_steps=256
+        validation_interval=128; diagnostic_steps="128,256" ;;
+    natural_A1|natural_a1|NL1|nl1)
+        text_repeat_suppression=0; continuation_escape=0
+        scheduled_sampling=0; loop_escape_training=0; continuation_head=0
+        natural_loop_loss=1; natural_loop_weight=0.05
+        generation_mode="plain"; repeat_cycle_penalty=0.0; repeat_force_eos_steps=0
+        warmup_steps=32; max_steps=256; lr_schedule_steps=256
+        validation_interval=128; diagnostic_steps="128,256" ;;
+    *)
+        printf '{"event":"glmocr_mthv2_ddp_failed","error":"invalid_experiment_group","value":"%s"}\n' "${experiment_group}" >&2
+        exit 64 ;;
+esac
 
 [[ "${run_id}" =~ ^[A-Za-z0-9_.-]+$ && "${seed}" =~ ^[0-9]+$ ]] || {
     printf '{"event":"glmocr_mthv2_ddp_failed","error":"invalid_run_or_seed"}\n' >&2
@@ -153,6 +256,10 @@ done
     printf '{"event":"glmocr_mthv2_ddp_failed","error":"invalid_evaluation_configuration"}\n' >&2
     exit 64
 }
+[[ "${generation_mode}" == "plain" || "${generation_mode}" == "loop_recovery" ]] || {
+    printf '{"event":"glmocr_mthv2_ddp_failed","error":"invalid_generation_mode"}\n' >&2
+    exit 64
+}
 [[ "${log_steps}" =~ ^[1-9][0-9]*$ ]] || {
     printf '{"event":"glmocr_mthv2_ddp_failed","error":"invalid_log_steps"}\n' >&2
     exit 64
@@ -163,6 +270,18 @@ done
 }
 [[ "${repeat_recent_window}" =~ ^[1-9][0-9]*$ && "${repeat_min_cycle_length}" =~ ^[1-9][0-9]*$ && "${repeat_max_cycle_length}" =~ ^[1-9][0-9]*$ && "${repeat_cycle_repeats}" =~ ^[2-9][0-9]*$ && "${repeat_cycle_penalty}" =~ ^[0-9]+(\.[0-9]+)?$ && "${repeat_force_eos_steps}" =~ ^[0-9]+$ ]] || {
     printf '{"event":"glmocr_mthv2_ddp_failed","error":"invalid_text_repeat_configuration"}\n' >&2
+    exit 64
+}
+[[ "${escape_budget}" =~ ^[1-9][0-9]*$ && "${escape_clear_steps}" =~ ^[1-9][0-9]*$ && "${escape_eos_suppression}" =~ ^[0-9]+(\.[0-9]+)?$ && "${escape_eos_boost}" =~ ^[0-9]+(\.[0-9]+)?$ ]] || {
+    printf '{"event":"glmocr_mthv2_ddp_failed","error":"invalid_continuation_escape_configuration"}\n' >&2
+    exit 64
+}
+[[ "${scheduled_sampling_warmup_steps}" =~ ^[0-9]+$ && "${scheduled_sampling_ramp_steps}" =~ ^[0-9]+$ && "${scheduled_sampling_max_probability}" =~ ^0(\.[0-9]+)?$|^0\.1$ ]] || {
+    printf '{"event":"glmocr_mthv2_ddp_failed","error":"invalid_scheduled_sampling_configuration"}\n' >&2
+    exit 64
+}
+[[ "${loop_escape_cycle_length}" =~ ^[1-9][0-9]*$ && "${loop_escape_horizon}" =~ ^[1-9][0-9]*$ && "${loop_escape_ramp_steps}" =~ ^[1-9][0-9]*$ && "${loop_escape_weight}" =~ ^[0-9]+(\.[0-9]+)?$ && "${loop_escape_margin}" =~ ^[0-9]+(\.[0-9]+)?$ && "${loop_escape_margin_weight}" =~ ^[0-9]+(\.[0-9]+)?$ && "${loop_continue_weight}" =~ ^[0-9]+(\.[0-9]+)?$ && "${continuation_head_hidden_size}" =~ ^[1-9][0-9]*$ && "${continuation_head_weight}" =~ ^[0-9]+(\.[0-9]+)?$ && "${continuation_head_learning_rate}" =~ ^[0-9]+(\.[0-9]+)?([eE]-?[0-9]+)?$ ]] || {
+    printf '{"event":"glmocr_mthv2_ddp_failed","error":"invalid_loop_escape_training_configuration"}\n' >&2
     exit 64
 }
 (( repeat_max_cycle_length >= repeat_min_cycle_length )) || {
@@ -462,6 +581,25 @@ run_inner() {
             --repeat-cycle-repeats "${repeat_cycle_repeats}"
             --repeat-cycle-penalty "${repeat_cycle_penalty}"
             --repeat-force-eos-steps "${repeat_force_eos_steps}"
+            --natural-loop-weight "${natural_loop_weight}"
+            --natural-loop-recent-window "${natural_loop_recent_window}"
+            --natural-loop-min-cycle-length "${natural_loop_min_cycle_length}"
+            --natural-loop-max-cycle-length "${natural_loop_max_cycle_length}"
+            --natural-loop-cycle-repeats "${natural_loop_cycle_repeats}"
+            --escape-budget "${escape_budget}"
+            --escape-clear-steps "${escape_clear_steps}"
+            --escape-eos-suppression "${escape_eos_suppression}"
+            --escape-eos-boost "${escape_eos_boost}"
+            --loop-escape-cycle-length "${loop_escape_cycle_length}"
+            --loop-escape-horizon "${loop_escape_horizon}"
+            --loop-escape-ramp-steps "${loop_escape_ramp_steps}"
+            --loop-escape-weight "${loop_escape_weight}"
+            --loop-escape-margin "${loop_escape_margin}"
+            --loop-escape-margin-weight "${loop_escape_margin_weight}"
+            --loop-continue-weight "${loop_continue_weight}"
+            --continuation-head-hidden-size "${continuation_head_hidden_size}"
+            --continuation-head-weight "${continuation_head_weight}"
+            --continuation-head-learning-rate "${continuation_head_learning_rate}"
             --region-decoder-hidden-size "${region_decoder_hidden_size}"
             --region-decoder-layers "${region_decoder_layers}"
             --region-decoder-num-heads "${region_decoder_num_heads}"
@@ -471,6 +609,10 @@ run_inner() {
         (( use_validity_head == 1 )) && smoke_args+=(--use-validity-head)
         (( validity_use_transport_evidence == 1 )) && smoke_args+=(--validity-use-transport-evidence)
         (( text_repeat_suppression == 1 )) && smoke_args+=(--text-repeat-suppression)
+        (( natural_loop_loss == 1 )) && smoke_args+=(--natural-loop-loss)
+        (( continuation_escape == 1 )) && smoke_args+=(--continuation-escape)
+        (( loop_escape_training == 1 )) && smoke_args+=(--loop-escape-training)
+        (( continuation_head == 1 )) && smoke_args+=(--continuation-head)
         (( region_autoregressive == 1 )) && smoke_args+=(--region-autoregressive)
         (( region_pointer_mask == 0 )) && smoke_args+=(--no-region-pointer-mask)
         "${torchrun}" --standalone --nnodes=1 --nproc_per_node=5 \
@@ -498,6 +640,7 @@ run_inner() {
     (( validity_use_transport_evidence == 1 )) && validity_args+=(--validity-use-transport-evidence)
     method_args=(
         --text-ul-weight "${text_ul_weight}"
+        --generation-mode "${generation_mode}"
         --text-eos-loss-weight "${text_eos_loss_weight}"
         --repeat-recent-window "${repeat_recent_window}"
         --repeat-min-cycle-length "${repeat_min_cycle_length}"
@@ -505,6 +648,33 @@ run_inner() {
         --repeat-cycle-repeats "${repeat_cycle_repeats}"
         --repeat-cycle-penalty "${repeat_cycle_penalty}"
         --repeat-force-eos-steps "${repeat_force_eos_steps}"
+        --natural-loop-weight "${natural_loop_weight}"
+        --natural-loop-recent-window "${natural_loop_recent_window}"
+        --natural-loop-min-cycle-length "${natural_loop_min_cycle_length}"
+        --natural-loop-max-cycle-length "${natural_loop_max_cycle_length}"
+        --natural-loop-cycle-repeats "${natural_loop_cycle_repeats}"
+        --natural-loop-weight "${natural_loop_weight}"
+        --natural-loop-recent-window "${natural_loop_recent_window}"
+        --natural-loop-min-cycle-length "${natural_loop_min_cycle_length}"
+        --natural-loop-max-cycle-length "${natural_loop_max_cycle_length}"
+        --natural-loop-cycle-repeats "${natural_loop_cycle_repeats}"
+        --escape-budget "${escape_budget}"
+        --escape-clear-steps "${escape_clear_steps}"
+        --escape-eos-suppression "${escape_eos_suppression}"
+        --escape-eos-boost "${escape_eos_boost}"
+        --scheduled-sampling-warmup-steps "${scheduled_sampling_warmup_steps}"
+        --scheduled-sampling-ramp-steps "${scheduled_sampling_ramp_steps}"
+        --scheduled-sampling-max-probability "${scheduled_sampling_max_probability}"
+        --loop-escape-cycle-length "${loop_escape_cycle_length}"
+        --loop-escape-horizon "${loop_escape_horizon}"
+        --loop-escape-ramp-steps "${loop_escape_ramp_steps}"
+        --loop-escape-weight "${loop_escape_weight}"
+        --loop-escape-margin "${loop_escape_margin}"
+        --loop-escape-margin-weight "${loop_escape_margin_weight}"
+        --loop-continue-weight "${loop_continue_weight}"
+        --continuation-head-hidden-size "${continuation_head_hidden_size}"
+        --continuation-head-weight "${continuation_head_weight}"
+        --continuation-head-learning-rate "${continuation_head_learning_rate}"
         --region-decoder-hidden-size "${region_decoder_hidden_size}"
         --region-decoder-layers "${region_decoder_layers}"
         --region-decoder-num-heads "${region_decoder_num_heads}"
@@ -512,6 +682,11 @@ run_inner() {
         --region-spatial-iou-threshold "${region_spatial_iou_threshold}"
     )
     (( text_repeat_suppression == 1 )) && method_args+=(--text-repeat-suppression)
+    (( natural_loop_loss == 1 )) && method_args+=(--natural-loop-loss)
+    (( continuation_escape == 1 )) && method_args+=(--continuation-escape)
+    (( scheduled_sampling == 1 )) && method_args+=(--scheduled-sampling)
+    (( loop_escape_training == 1 )) && method_args+=(--loop-escape-training)
+    (( continuation_head == 1 )) && method_args+=(--continuation-head)
     (( region_autoregressive == 1 )) && method_args+=(--region-autoregressive)
     if (( region_pointer_mask == 1 )); then
         method_args+=(--region-pointer-mask)
@@ -638,6 +813,7 @@ if (( foreground == 0 )); then
         --layout-loss-profile "${layout_loss_profile}"
         --validation-interval "${validation_interval}"
         --max-eval-new-tokens "${max_eval_new_tokens}"
+        --generation-mode "${generation_mode}"
         --log-steps "${log_steps}"
         --initial-valid-probability "${initial_valid_probability}"
         --validity-gating-mode "${validity_gating_mode}"
@@ -648,6 +824,23 @@ if (( foreground == 0 )); then
         --repeat-cycle-repeats "${repeat_cycle_repeats}"
         --repeat-cycle-penalty "${repeat_cycle_penalty}"
         --repeat-force-eos-steps "${repeat_force_eos_steps}"
+        --escape-budget "${escape_budget}"
+        --escape-clear-steps "${escape_clear_steps}"
+        --escape-eos-suppression "${escape_eos_suppression}"
+        --escape-eos-boost "${escape_eos_boost}"
+        --scheduled-sampling-warmup-steps "${scheduled_sampling_warmup_steps}"
+        --scheduled-sampling-ramp-steps "${scheduled_sampling_ramp_steps}"
+        --scheduled-sampling-max-probability "${scheduled_sampling_max_probability}"
+        --loop-escape-cycle-length "${loop_escape_cycle_length}"
+        --loop-escape-horizon "${loop_escape_horizon}"
+        --loop-escape-ramp-steps "${loop_escape_ramp_steps}"
+        --loop-escape-weight "${loop_escape_weight}"
+        --loop-escape-margin "${loop_escape_margin}"
+        --loop-escape-margin-weight "${loop_escape_margin_weight}"
+        --loop-continue-weight "${loop_continue_weight}"
+        --continuation-head-hidden-size "${continuation_head_hidden_size}"
+        --continuation-head-weight "${continuation_head_weight}"
+        --continuation-head-learning-rate "${continuation_head_learning_rate}"
         --region-decoder-hidden-size "${region_decoder_hidden_size}"
         --region-decoder-layers "${region_decoder_layers}"
         --region-decoder-num-heads "${region_decoder_num_heads}"
@@ -661,6 +854,11 @@ if (( foreground == 0 )); then
     (( use_validity_head == 1 )) && child_args+=(--use-validity-head)
     (( validity_use_transport_evidence == 1 )) && child_args+=(--validity-use-transport-evidence)
     (( text_repeat_suppression == 1 )) && child_args+=(--text-repeat-suppression)
+    (( natural_loop_loss == 1 )) && child_args+=(--natural-loop-loss)
+    (( continuation_escape == 1 )) && child_args+=(--continuation-escape)
+    (( scheduled_sampling == 1 )) && child_args+=(--scheduled-sampling)
+    (( loop_escape_training == 1 )) && child_args+=(--loop-escape-training)
+    (( continuation_head == 1 )) && child_args+=(--continuation-head)
     (( region_autoregressive == 1 )) && child_args+=(--region-autoregressive)
     (( region_pointer_mask == 0 )) && child_args+=(--no-region-pointer-mask)
     (( skip_selection == 1 )) && child_args+=(--skip-selection)

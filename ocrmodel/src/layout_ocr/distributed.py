@@ -128,6 +128,16 @@ def mean_scalar(value: float, info: DistributedInfo, device: torch.device) -> fl
     return float((tensor / info.world_size).item())
 
 
+def sum_scalar(value: float, info: DistributedInfo, device: torch.device) -> float:
+    """Sum a scalar across ranks for token-weighted metrics and counts."""
+
+    if not info.enabled:
+        return float(value)
+    tensor = torch.tensor(float(value), dtype=torch.float64, device=device)
+    dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+    return float(tensor.item())
+
+
 def rank_epoch_indices(
     record_count: int,
     *,
