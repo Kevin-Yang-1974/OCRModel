@@ -217,6 +217,7 @@ case "${experiment_group}" in
         text_repeat_suppression=0; continuation_escape=0
         scheduled_sampling=0; loop_escape_training=0; continuation_head=0
         natural_loop_loss=0; natural_loop_weight=0.05
+        decoder_adaptation="lora"
         generation_mode="plain"; repeat_cycle_penalty=0.0; repeat_force_eos_steps=0
         warmup_steps=32; max_steps=256; lr_schedule_steps=256
         validation_interval=128; diagnostic_steps="128,256" ;;
@@ -224,6 +225,7 @@ case "${experiment_group}" in
         text_repeat_suppression=0; continuation_escape=0
         scheduled_sampling=0; loop_escape_training=0; continuation_head=0
         natural_loop_loss=1; natural_loop_weight=0.05
+        decoder_adaptation="lora"
         generation_mode="plain"; repeat_cycle_penalty=0.0; repeat_force_eos_steps=0
         warmup_steps=32; max_steps=256; lr_schedule_steps=256
         validation_interval=128; diagnostic_steps="128,256" ;;
