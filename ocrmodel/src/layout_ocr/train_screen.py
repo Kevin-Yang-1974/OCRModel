@@ -62,8 +62,9 @@ from .stabilization import (
     cycle_escape_losses,
     eos_focus_loss,
     generate_with_loop_recovery,
+    generated_cycle_window,
     loop_continuation_diagnostics,
-    natural_predicted_loop_loss,
+    natural_loop_rollout_loss,
     repeated_cycle_positions,
     repetition_diagnostics,
     unlikelihood_loss,
@@ -792,7 +793,7 @@ def text_repeat_activation_stats(
 
 
 def natural_loop_config(args: argparse.Namespace) -> dict[str, Any]:
-    """Return the loss-only natural prediction loop configuration."""
+    """Return the real-rollout natural prediction loop configuration."""
 
     return {
         "enabled": bool(getattr(args, "natural_loop_loss", False)),
@@ -801,18 +802,191 @@ def natural_loop_config(args: argparse.Namespace) -> dict[str, Any]:
         "min_cycle_length": int(getattr(args, "natural_loop_min_cycle_length", 8)),
         "max_cycle_length": int(getattr(args, "natural_loop_max_cycle_length", 32)),
         "cycle_repeats": int(getattr(args, "natural_loop_cycle_repeats", 3)),
-        "single_forward": True,
+        "max_new_tokens": int(getattr(args, "natural_loop_max_new_tokens", 768)),
+        "continuation_horizon": int(
+            getattr(args, "natural_loop_continuation_horizon", 16)
+        ),
+        "rollout_no_grad": True,
+        "second_forward": True,
+        "single_forward": False,
+        "teacher_forced_detector": False,
         "synthetic_prefix": False,
         "inference_intervention": False,
     }
 
 
-def natural_loop_loss_for_batch(
+def _zero_natural_loop_rollout(inputs: dict[str, Any]) -> dict[str, Any]:
+    """Create a DDP-safe zero rollout result for pages without a loop."""
+
+    input_ids = inputs["input_ids"]
+    labels = inputs["labels"]
+    shifted_shape = (input_ids.shape[0], input_ids.shape[1] - 1)
+    return {
+        "prefix_inputs": {**inputs, "input_ids": input_ids.detach().clone()},
+        "candidate_mask": torch.zeros(
+            shifted_shape, dtype=torch.bool, device=input_ids.device
+        ),
+        "candidate_token_ids": torch.full(
+            shifted_shape, -1, dtype=torch.long, device=input_ids.device
+        ),
+        "continuation_mask": torch.zeros(
+            shifted_shape, dtype=torch.bool, device=input_ids.device
+        ),
+        "continuation_targets": labels[:, 1:].detach().clone(),
+        "active_tokens": 0.0,
+        "candidate_tokens": 0.0,
+        "continuation_tokens": 0.0,
+        "active_pages": 0.0,
+        "detected_pages": 0.0,
+        "cycle_tokens": 0.0,
+        "valid_tokens": float((labels != -100).sum().detach().item()),
+        "rollout_tokens": 0.0,
+        "cycle_length": 0,
+        "cycle_repeats": 0,
+        "generation_length": 0,
+    }
+
+
+def collect_natural_loop_rollout(
+    model: Any,
     args: argparse.Namespace,
+    inputs: dict[str, Any],
+    labels: torch.Tensor,
+    eos_ids: set[int],
+) -> dict[str, Any]:
+    """Generate a real prefix and build the second-forward supervision masks.
+
+    Generation is strictly no-grad and plain greedy decoding.  Only the
+    resulting token IDs are copied into the second-forward input; the copied
+    prefix is detached by construction.  A page without a detected cycle
+    still returns full-shape zero masks so every DDP rank executes the same
+    second-forward path when the option is enabled.
+    """
+
+    if labels.ndim != 2 or labels.shape != inputs["input_ids"].shape:
+        raise ValueError("natural-loop labels and input_ids must have the same rank-2 shape")
+    result = _zero_natural_loop_rollout(inputs)
+    valid_positions = torch.nonzero(labels[0] != -100, as_tuple=False).flatten()
+    if not valid_positions.numel():
+        return result
+
+    config = natural_loop_config(args)
+    prompt_length = int(valid_positions[0].item())
+    target_capacity = int(valid_positions[-1].item()) - prompt_length + 1
+    if target_capacity <= 0:
+        return result
+
+    generation_inputs = {
+        key: value.detach() if isinstance(value, torch.Tensor) else value
+        for key, value in inputs.items()
+        if key != "labels"
+    }
+    # ``prepare_training_inputs`` contains prompt plus the full GT target.
+    # Rollout must start from the prompt only; otherwise the supposedly free
+    # trajectory would still be teacher-forced by the complete OCR target.
+    for key in ("input_ids", "attention_mask", "mm_token_type_ids", "token_type_ids"):
+        value = generation_inputs.get(key)
+        if isinstance(value, torch.Tensor) and value.ndim >= 2:
+            generation_inputs[key] = value[:, :prompt_length]
+    generation_kwargs: dict[str, Any] = {
+        "max_new_tokens": config["max_new_tokens"],
+        "do_sample": False,
+        "use_cache": True,
+    }
+    if eos_ids:
+        generation_kwargs["eos_token_id"] = sorted(eos_ids)
+    previous_use_cache = getattr(getattr(model, "config", None), "use_cache", None)
+    try:
+        if hasattr(model, "config") and previous_use_cache is not None:
+            model.config.use_cache = True
+        with torch.no_grad():
+            generated = model.generate(**generation_inputs, **generation_kwargs)
+    finally:
+        if hasattr(model, "config") and previous_use_cache is not None:
+            model.config.use_cache = previous_use_cache
+    if not isinstance(generated, torch.Tensor):
+        generated = getattr(generated, "sequences", None)
+    if not isinstance(generated, torch.Tensor) or generated.ndim != 2:
+        raise RuntimeError("natural-loop rollout did not return generated token sequences")
+    if generated.shape[0] != inputs["input_ids"].shape[0]:
+        raise RuntimeError("natural-loop rollout batch size does not match training inputs")
+
+    generated_tokens = generated[0, prompt_length:].detach().to("cpu").tolist()
+    result["generation_length"] = int(len(generated_tokens))
+    result["rollout_tokens"] = float(len(generated_tokens))
+    if not generated_tokens:
+        return result
+    detection_tokens = list(generated_tokens)
+    if eos_ids:
+        first_eos = next(
+            (index for index, token in enumerate(detection_tokens) if int(token) in eos_ids),
+            None,
+        )
+        if first_eos is not None:
+            detection_tokens = detection_tokens[:first_eos]
+    cycle = generated_cycle_window(
+        detection_tokens,
+        min_cycle_length=config["min_cycle_length"],
+        max_cycle_length=config["max_cycle_length"],
+        cycle_repeats=config["cycle_repeats"],
+        recent_window=config["recent_window"],
+    )
+    if not cycle["detected"]:
+        return result
+
+    cycle_end = int(cycle["end"])
+    cycle_length = int(cycle["length"])
+    cycle_values = [int(value) for value in cycle["cycle"]]
+    rollout_end = min(
+        len(generated_tokens),
+        target_capacity,
+        cycle_end + config["continuation_horizon"],
+    )
+    if cycle_length <= 0 or rollout_end <= cycle_end:
+        return result
+
+    input_ids = inputs["input_ids"]
+    modified_input_ids = input_ids.detach().clone()
+    generated_prefix = torch.tensor(
+        generated_tokens[:rollout_end], dtype=input_ids.dtype, device=input_ids.device
+    )
+    modified_input_ids[:, prompt_length : prompt_length + rollout_end] = generated_prefix
+    result["prefix_inputs"] = {**inputs, "input_ids": modified_input_ids}
+    result["detected_pages"] = 1.0
+    result["cycle_length"] = cycle_length
+    result["cycle_repeats"] = int(cycle["repeats"])
+    result["cycle_tokens"] = float(cycle_length * int(cycle["repeats"]))
+
+    candidate_mask = result["candidate_mask"]
+    candidate_token_ids = result["candidate_token_ids"]
+    continuation_mask = result["continuation_mask"]
+    for generated_index in range(cycle_end, rollout_end):
+        target_index = prompt_length + generated_index
+        logit_index = target_index - 1
+        if (
+            target_index >= labels.shape[1]
+            or logit_index < 0
+            or logit_index >= input_ids.shape[1] - 1
+        ):
+            continue
+        if int(labels[0, target_index].item()) < 0:
+            continue
+        continuation_mask[0, logit_index] = True
+        expected = cycle_values[(generated_index - cycle_end) % cycle_length]
+        if int(generated_tokens[generated_index]) == expected:
+            candidate_mask[0, logit_index] = True
+            candidate_token_ids[0, logit_index] = expected
+    result["candidate_tokens"] = float(candidate_mask.sum().detach())
+    result["continuation_tokens"] = float(continuation_mask.sum().detach())
+    return result
+
+
+def natural_loop_loss_for_rollout(
     outputs: Any,
     labels: torch.Tensor,
+    rollout: dict[str, Any],
 ) -> dict[str, torch.Tensor]:
-    """Compute natural predicted-cycle diagnostics from the normal forward."""
+    """Compute live-logit loss for a previously collected rollout."""
 
     logits = getattr(outputs, "logits", None)
     if logits is None:
@@ -820,19 +994,20 @@ def natural_loop_loss_for_batch(
         empty = torch.zeros((), device=zero.device, dtype=torch.float32)
         return {
             "loss": zero,
+            "unlikelihood": zero,
+            "continuation": zero,
             "active_tokens": empty,
-            "cycle_tokens": empty,
             "active_pages": empty,
-            "valid_tokens": empty,
+            "candidate_tokens": empty,
+            "continuation_tokens": empty,
         }
-    config = natural_loop_config(args)
-    return natural_predicted_loop_loss(
+    return natural_loop_rollout_loss(
         logits,
         labels,
-        min_cycle_length=config["min_cycle_length"],
-        max_cycle_length=config["max_cycle_length"],
-        cycle_repeats=config["cycle_repeats"],
-        recent_window=config["recent_window"],
+        rollout["candidate_mask"],
+        rollout["candidate_token_ids"],
+        rollout["continuation_targets"],
+        rollout["continuation_mask"],
     )
 
 
@@ -1803,7 +1978,53 @@ def train(
             repeat_activation_ratio, eos_activation_ratio = text_repeat_activation_stats(
                 args, inputs["labels"], eos_ids
             )
-            natural_loop = natural_loop_loss_for_batch(args, outputs, inputs["labels"])
+            natural_rollout = _zero_natural_loop_rollout(inputs)
+            natural_outputs = None
+            natural_loop = {
+                "loss": outputs.loss.float() * 0.0,
+                "unlikelihood": outputs.loss.float() * 0.0,
+                "continuation": outputs.loss.float() * 0.0,
+                "active_tokens": torch.zeros((), device=device, dtype=torch.float32),
+                "active_pages": torch.zeros((), device=device, dtype=torch.float32),
+                "candidate_tokens": torch.zeros((), device=device, dtype=torch.float32),
+                "continuation_tokens": torch.zeros((), device=device, dtype=torch.float32),
+            }
+            if bool(getattr(args, "natural_loop_loss", False)):
+                # The rollout must not see GT region targets.  Restore the
+                # training bridge state before the differentiable second
+                # forward below.
+                bridge.set_grid_thw(inputs["image_grid_thw"])
+                bridge.set_region_targets(None)
+                bridge.set_region_decode_controls()
+                natural_rollout = collect_natural_loop_rollout(
+                    model_module,
+                    args,
+                    inputs,
+                    inputs["labels"],
+                    eos_ids,
+                )
+                bridge.set_grid_thw(inputs["image_grid_thw"])
+                bridge.set_region_targets(
+                    region_decoder_targets(record, device, args.num_queries)
+                    if region_enabled
+                    else None
+                )
+                bridge.set_region_decode_controls()
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                    natural_outputs = model(**natural_rollout["prefix_inputs"])
+                if natural_outputs.loss is None or natural_outputs.logits is None:
+                    raise RuntimeError("natural-loop second forward did not produce OCR logits/loss")
+                if not all_finite(
+                    bool(torch.isfinite(natural_outputs.loss).all()), distributed, device
+                ):
+                    raise FloatingPointError(
+                        f"non-finite natural-loop OCR loss at step {step}"
+                    )
+                natural_loop = natural_loop_loss_for_rollout(
+                    natural_outputs,
+                    inputs["labels"],
+                    natural_rollout,
+                )
             debug(f"step={step} micro={accumulation_index} losses_done")
             repeat_loss = (
                 float(getattr(args, "text_ul_weight", 0.1)) * repeat_losses["text_unlikelihood"]
@@ -1982,17 +2203,35 @@ def train(
             micro_sums["official_base_loss"] += float(outputs.loss.detach())
             micro_sums["natural_loop_loss"] += float(natural_loop["loss"].detach())
             micro_sums["natural_loop_term"] += float(natural_loop_term.detach())
+            micro_sums["natural_loop_unlikelihood"] += float(
+                natural_loop["unlikelihood"].detach()
+            )
+            micro_sums["natural_loop_continuation"] += float(
+                natural_loop["continuation"].detach()
+            )
             micro_sums["natural_loop_active_tokens"] += float(
                 natural_loop["active_tokens"]
             )
+            micro_sums["natural_loop_candidate_tokens"] += float(
+                natural_loop["candidate_tokens"]
+            )
             micro_sums["natural_loop_cycle_tokens"] += float(
-                natural_loop["cycle_tokens"]
+                natural_rollout["cycle_tokens"]
+            )
+            micro_sums["natural_loop_continuation_tokens"] += float(
+                natural_loop["continuation_tokens"]
             )
             micro_sums["natural_loop_active_pages"] += float(
                 natural_loop["active_pages"]
             )
+            micro_sums["natural_loop_detected_pages"] += float(
+                natural_rollout["detected_pages"]
+            )
+            micro_sums["natural_loop_rollout_tokens"] += float(
+                natural_rollout["rollout_tokens"]
+            )
             micro_sums["natural_loop_valid_tokens"] += float(
-                natural_loop["valid_tokens"]
+                natural_rollout["valid_tokens"]
             )
             micro_sums["total_loss"] += float(loss.detach())
             for key in (*LAYOUT_LOSS_KEYS, *REGION_LOSS_KEYS):
@@ -2066,6 +2305,18 @@ def train(
         global_natural_active_tokens = sum_scalar(
             micro_sums["natural_loop_active_tokens"], distributed, device
         )
+        global_natural_candidate_tokens = sum_scalar(
+            micro_sums["natural_loop_candidate_tokens"], distributed, device
+        )
+        global_natural_continuation_tokens = sum_scalar(
+            micro_sums["natural_loop_continuation_tokens"], distributed, device
+        )
+        global_natural_detected_pages = sum_scalar(
+            micro_sums["natural_loop_detected_pages"], distributed, device
+        )
+        global_natural_rollout_tokens = sum_scalar(
+            micro_sums["natural_loop_rollout_tokens"], distributed, device
+        )
         global_natural_cycle_tokens = sum_scalar(
             micro_sums["natural_loop_cycle_tokens"], distributed, device
         )
@@ -2076,10 +2327,10 @@ def train(
             micro_sums["natural_loop_valid_tokens"], distributed, device
         )
         natural_loop_activation_ratio = global_natural_active_tokens / max(
-            1.0, global_natural_valid_tokens
+            1.0, global_natural_candidate_tokens
         )
         natural_loop_candidate_mismatch_ratio = global_natural_active_tokens / max(
-            1.0, global_natural_cycle_tokens
+            1.0, global_natural_candidate_tokens
         )
         token_weighted_sum_total += global_token_loss_sum
         token_count_total += global_token_count
@@ -2189,8 +2440,23 @@ def train(
                 distributed,
                 device,
             ),
+            "natural_loop_unlikelihood": mean_scalar(
+                micro_sums["natural_loop_unlikelihood"] / accumulation_steps,
+                distributed,
+                device,
+            ),
+            "natural_loop_continuation": mean_scalar(
+                micro_sums["natural_loop_continuation"] / accumulation_steps,
+                distributed,
+                device,
+            ),
             "natural_loop_active_tokens": global_natural_active_tokens,
+            "natural_loop_candidate_tokens": global_natural_candidate_tokens,
+            "natural_loop_continuation_tokens": global_natural_continuation_tokens,
             "natural_loop_active_pages": global_natural_active_pages,
+            "natural_loop_detected_pages": global_natural_detected_pages,
+            "natural_loop_rollout_tokens": global_natural_rollout_tokens,
+            "natural_loop_valid_tokens": global_natural_valid_tokens,
             "natural_loop_activation_ratio": natural_loop_activation_ratio,
             "natural_loop_candidate_mismatch_ratio": natural_loop_candidate_mismatch_ratio,
             "total_loss": mean_scalar(micro_sums["total_loss"] / accumulation_steps, distributed, device),
@@ -2242,6 +2508,8 @@ def train(
                         "text_eos_activation_ratio": metrics["text_eos_activation_ratio"],
                         "natural_loop": metrics["natural_loop_weighted_loss"],
                         "natural_loop_raw": metrics["natural_loop_loss"],
+                        "natural_loop_unlikelihood": metrics["natural_loop_unlikelihood"],
+                        "natural_loop_continuation": metrics["natural_loop_continuation"],
                         "loop_escape": metrics["loop_escape_loss"],
                         "loop_margin": metrics["loop_margin_loss"],
                         "loop_continue": metrics["loop_continue_loss"],
@@ -2310,8 +2578,14 @@ def train(
             "text_eos_activation_ratio",
             "natural_loop_loss",
             "natural_loop_weighted_loss",
+            "natural_loop_unlikelihood",
+            "natural_loop_continuation",
             "natural_loop_active_tokens",
+            "natural_loop_candidate_tokens",
+            "natural_loop_continuation_tokens",
             "natural_loop_active_pages",
+            "natural_loop_detected_pages",
+            "natural_loop_rollout_tokens",
             "natural_loop_activation_ratio",
             "natural_loop_candidate_mismatch_ratio",
         ):
@@ -3208,13 +3482,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--natural-loop-loss",
         action="store_true",
-        help="penalize wrong tokens in naturally predicted teacher-forced cycles",
+        help="observe a no-grad greedy rollout and train on its detached loop prefix",
     )
     parser.add_argument("--natural-loop-weight", type=float, default=0.05)
     parser.add_argument("--natural-loop-recent-window", type=int, default=96)
     parser.add_argument("--natural-loop-min-cycle-length", type=int, default=8)
     parser.add_argument("--natural-loop-max-cycle-length", type=int, default=32)
     parser.add_argument("--natural-loop-cycle-repeats", type=int, default=3)
+    parser.add_argument("--natural-loop-max-new-tokens", type=int, default=768)
+    parser.add_argument("--natural-loop-continuation-horizon", type=int, default=16)
     parser.add_argument(
         "--continuation-escape",
         action="store_true",
@@ -3298,6 +3574,11 @@ def parse_args() -> argparse.Namespace:
         help="evaluate all saved checkpoints without writing selection.json",
     )
     parser.add_argument(
+        "--defer-validation",
+        action="store_true",
+        help="finish training after checkpoint writes and defer validation/selection to an external evaluator",
+    )
+    parser.add_argument(
         "--no-validation",
         action="store_true",
         help="skip validation evaluation and mark the fixed final checkpoint for direct test",
@@ -3337,6 +3618,12 @@ def main() -> None:
         raise ValueError("--no-validation is only valid for training runs")
     if args.no_validation and args.diagnostic_steps:
         raise ValueError("--no-validation cannot be combined with diagnostic validation steps")
+    if args.defer_validation and args.eval_only:
+        raise ValueError("--defer-validation is only valid for training runs")
+    if args.defer_validation and args.no_validation:
+        raise ValueError("--defer-validation cannot be combined with --no-validation")
+    if args.defer_validation and args.skip_selection:
+        raise ValueError("--defer-validation cannot be combined with --skip-selection")
     if args.auxiliary_weight < 0.0 or args.auxiliary_weight_start < 0.0:
         raise ValueError("auxiliary weights must be non-negative")
     if args.auxiliary_ramp_steps < 0:
@@ -3404,6 +3691,8 @@ def main() -> None:
         raise ValueError("invalid natural loop cycle length range")
     if args.natural_loop_cycle_repeats < 2:
         raise ValueError("natural loop cycle repeats must be at least two")
+    if args.natural_loop_max_new_tokens <= 0 or args.natural_loop_continuation_horizon <= 0:
+        raise ValueError("natural loop rollout limits must be positive")
     if args.escape_budget <= 0 or args.escape_clear_steps <= 0:
         raise ValueError("escape budget and clear steps must be positive")
     if args.escape_eos_suppression < 0 or args.escape_eos_boost < 0:
@@ -3461,6 +3750,8 @@ def main() -> None:
     barrier(distributed)
     lr_schedule_steps = args.lr_schedule_steps or args.max_steps
     protocol_metadata = json.loads(args.protocol_file.read_text(encoding="utf-8"))
+    if args.defer_validation and protocol_metadata.get("test_manifest_read") is not False:
+        raise ValueError("--defer-validation requires a protocol with test_manifest_read=false")
     metadata = {
         "status": "running",
         "mode": args.mode,
@@ -3494,7 +3785,11 @@ def main() -> None:
         "validation_interval": args.validation_interval,
         "diagnostic_steps": list(args.diagnostic_steps),
         "skip_selection": args.skip_selection,
+        "defer_validation": args.defer_validation,
         "no_validation": args.no_validation,
+        "selection_pending": args.defer_validation,
+        "validation_evaluated": False,
+        "selection_performed": False,
         "text_repeat_suppression": args.text_repeat_suppression,
         "text_repeat_config": asdict(repeat_suppression_config(args)),
         "natural_loop_loss": natural_loop_config(args),
@@ -3679,6 +3974,8 @@ def main() -> None:
                 "query_assignment": args.query_assignment,
                 "decoder_adaptation": args.decoder_adaptation,
                 "decoder_lora_config": decoder_lora_config,
+                "decoder_lora_loaded": args.decoder_adaptation == "lora",
+                "decoder_lora_finite": metadata["decoder_lora_finite"],
                 "trainable_parameter_report": trainable_parameter_report(model),
                 "eval_only": True,
                 "training_updates": 0,
@@ -3752,6 +4049,59 @@ def main() -> None:
         if not distributed.is_main:
             return
         checkpoint_steps = training["checkpoint_steps"]
+        if args.defer_validation:
+            if not checkpoint_steps:
+                raise RuntimeError("deferred-validation training did not save a checkpoint")
+            write_adapter_config(args.output_dir / "adapter_config.json", bridge)
+            if continuation_head is not None:
+                save_continuation_head_checkpoint(args.output_dir, continuation_head, max(checkpoint_steps))
+            summary = {
+                "status": "complete",
+                "mode": args.mode,
+                "experiment_label": args.experiment_label,
+                "seed": args.seed,
+                "auxiliary_weight": args.auxiliary_weight,
+                "adapter_precision": args.adapter_precision,
+                "layout_loss_profile": args.layout_loss_profile,
+                "query_assignment": args.query_assignment,
+                "decoder_adaptation": args.decoder_adaptation,
+                "decoder_lora_config": metadata["decoder_lora_config"],
+                "natural_loop_config": natural_loop_config(args),
+                "trainable_parameter_report": metadata["trainable_parameter_report"],
+                "lr_schedule_steps": training["lr_schedule_steps"],
+                "eval_only": False,
+                "skip_selection": False,
+                "defer_validation": True,
+                "no_validation": False,
+                "selection_pending": True,
+                "validation_evaluated": False,
+                "selection_performed": False,
+                "max_eval_new_tokens": args.max_eval_new_tokens,
+                "training": training,
+                "validation": None,
+                "validation_candidates": [],
+                "selection_candidates": [],
+                "selection": None,
+                "test_manifest_read": metadata["test_manifest_read"],
+                "test_used_for_selection": False,
+            }
+            write_json(args.output_dir / "summary.json", summary)
+            (args.output_dir / "COMPLETED").touch()
+            metadata["status"] = "complete"
+            metadata["selection_pending"] = True
+            metadata["validation_evaluated"] = False
+            metadata["selection_performed"] = False
+            write_json(args.output_dir / "metadata.json", metadata)
+            print(json.dumps({
+                "status": "complete",
+                "run_dir": str(args.output_dir),
+                "checkpoint_steps": checkpoint_steps,
+                "selection_pending": True,
+                "validation_evaluated": False,
+                "selection_performed": False,
+                "test_used_for_selection": False,
+            }, ensure_ascii=False, separators=(",", ":")))
+            return
         if args.no_validation:
             if not checkpoint_steps:
                 raise RuntimeError("no-validation training did not save a final checkpoint")

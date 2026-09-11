@@ -46,6 +46,7 @@ validity_gating_mode="legacy_normalized"
 validity_use_transport_evidence=0
 skip_selection=0
 without_test=0
+defer_validation=0
 session=""
 foreground=0
 smoke=0
@@ -64,6 +65,8 @@ natural_loop_recent_window=96
 natural_loop_min_cycle_length=8
 natural_loop_max_cycle_length=32
 natural_loop_cycle_repeats=3
+natural_loop_max_new_tokens=768
+natural_loop_continuation_horizon=16
 no_validation=0
 continuation_escape=0
 escape_budget=16
@@ -130,6 +133,7 @@ while [[ $# -gt 0 ]]; do
         --validity-use-transport-evidence) validity_use_transport_evidence=1; shift ;;
         --skip-selection) skip_selection=1; shift ;;
         --without-test) without_test=1; shift ;;
+        --defer-validation) defer_validation=1; shift ;;
         --session) session="$2"; shift 2 ;;
         --foreground) foreground=1; shift ;;
         --smoke) smoke=1; shift ;;
@@ -148,6 +152,8 @@ while [[ $# -gt 0 ]]; do
         --natural-loop-min-cycle-length) natural_loop_min_cycle_length="$2"; shift 2 ;;
         --natural-loop-max-cycle-length) natural_loop_max_cycle_length="$2"; shift 2 ;;
         --natural-loop-cycle-repeats) natural_loop_cycle_repeats="$2"; shift 2 ;;
+        --natural-loop-max-new-tokens) natural_loop_max_new_tokens="$2"; shift 2 ;;
+        --natural-loop-continuation-horizon) natural_loop_continuation_horizon="$2"; shift 2 ;;
         --no-validation) no_validation=1; shift ;;
         --continuation-escape) continuation_escape=1; shift ;;
         --escape-budget) escape_budget="$2"; shift 2 ;;
@@ -276,6 +282,10 @@ esac
     printf '{"event":"glmocr_mthv2_ddp_failed","error":"invalid_text_repeat_configuration"}\n' >&2
     exit 64
 }
+[[ "${natural_loop_max_new_tokens}" =~ ^[1-9][0-9]*$ && "${natural_loop_continuation_horizon}" =~ ^[1-9][0-9]*$ ]] || {
+    printf '{"event":"glmocr_mthv2_ddp_failed","error":"invalid_natural_loop_rollout_configuration"}\n' >&2
+    exit 64
+}
 [[ "${escape_budget}" =~ ^[1-9][0-9]*$ && "${escape_clear_steps}" =~ ^[1-9][0-9]*$ && "${escape_eos_suppression}" =~ ^[0-9]+(\.[0-9]+)?$ && "${escape_eos_boost}" =~ ^[0-9]+(\.[0-9]+)?$ ]] || {
     printf '{"event":"glmocr_mthv2_ddp_failed","error":"invalid_continuation_escape_configuration"}\n' >&2
     exit 64
@@ -360,12 +370,27 @@ fi
     printf '{"event":"glmocr_mthv2_ddp_failed","error":"invalid_session"}\n' >&2
     exit 64
 }
+if (( defer_validation == 1 )); then
+    (( without_test == 1 )) || {
+        printf '{"event":"glmocr_mthv2_ddp_failed","error":"defer_validation_requires_without_test"}\n' >&2
+        exit 64
+    }
+    (( no_validation == 0 )) || {
+        printf '{"event":"glmocr_mthv2_ddp_failed","error":"defer_validation_conflicts_with_no_validation"}\n' >&2
+        exit 64
+    }
+    (( skip_selection == 0 )) || {
+        printf '{"event":"glmocr_mthv2_ddp_failed","error":"defer_validation_conflicts_with_skip_selection"}\n' >&2
+        exit 64
+    }
+fi
 
 IFS=',' read -r -a gpu_array <<< "${gpu_ids}"
-(( ${#gpu_array[@]} == 5 )) || {
-    printf '{"event":"glmocr_mthv2_ddp_failed","error":"exactly_five_gpus_required","gpu_ids":"%s"}\n' "${gpu_ids}" >&2
+(( ${#gpu_array[@]} >= 1 )) || {
+    printf '{"event":"glmocr_mthv2_ddp_failed","error":"at_least_one_gpu_required","gpu_ids":"%s"}\n' "${gpu_ids}" >&2
     exit 64
 }
+world_size="${#gpu_array[@]}"
 declare -A seen_gpu=()
 for gpu in "${gpu_array[@]}"; do
     [[ "${gpu}" =~ ^[0-9]+$ ]] || {
@@ -392,7 +417,17 @@ run_log="${group_root}/logs/seed${seed}.ddp.log"
 smoke_dir="${group_root}/smoke/seed${seed}"
 
 torch_lib="${env_dir}/lib/python3.11/site-packages/torch/lib"
-cuda_library_path="/usr/local/cuda/targets/x86_64-linux/lib:${torch_lib}"
+machine_arch="$(uname -m)"
+case "${machine_arch}" in
+    x86_64) cuda_target_arch="x86_64" ;;
+    aarch64|arm64) cuda_target_arch="aarch64" ;;
+    *) cuda_target_arch="${machine_arch}" ;;
+esac
+cuda_library_path="${torch_lib}"
+system_cuda_library="/usr/local/cuda/targets/${cuda_target_arch}-linux/lib"
+if [[ -d "${system_cuda_library}" ]]; then
+    cuda_library_path="${system_cuda_library}:${cuda_library_path}"
+fi
 for component in cudnn nccl cuda_nvrtc cuda_cupti cufft curand cusparse cusolver nvtx nvjitlink; do
     component_lib="${nvidia_env}/lib/python3.11/site-packages/nvidia/${component}/lib"
     if [[ -d "${component_lib}" ]]; then
@@ -507,6 +542,8 @@ write_status() {
     local test_manifest_read_json=true
     local use_validity_head_json=false
     local validity_use_transport_evidence_json=false
+    local defer_validation_json=false
+    local selection_pending_json=false
     local stop_reason_json=null
     local validation_stop_only_json=false
     local status_max_steps="${max_steps}"
@@ -519,13 +556,14 @@ write_status() {
     (( without_test == 1 )) && test_manifest_read_json=false
     (( use_validity_head == 1 )) && use_validity_head_json=true
     (( validity_use_transport_evidence == 1 )) && validity_use_transport_evidence_json=true
+    (( defer_validation == 1 )) && { defer_validation_json=true; selection_pending_json=true; }
     if [[ "${status}" == "stopped_by_user" ]]; then
         stop_reason_json='"user_requested_validation_stop"'
         validation_stop_only_json=true
     fi
     mkdir -p "${group_root}/status"
-    printf '{"status":"%s","run_id":"%s","experiment_label":"%s","seed":%s,"smoke":%s,"world_size":5,"global_batch_size":5,"effective_global_batch_size":%s,"gradient_accumulation_steps":%s,"max_steps":%s,"lr_schedule_steps":%s,"learning_rate":%s,"decoder_adaptation":"%s","decoder_lora_rank":%s,"decoder_lora_alpha":%s,"decoder_lora_dropout":%s,"decoder_learning_rate":%s,"warmup_steps":%s,"min_lr_ratio":%s,"initial_residual_scale":%s,"gate_freeze_steps":%s,"auxiliary_weight_start":%s,"auxiliary_weight":%s,"auxiliary_ramp_steps":%s,"layout_loss_profile":"%s","use_validity_head":%s,"initial_valid_probability":%s,"validity_gating_mode":"%s","validity_use_transport_evidence":%s,"validation_interval":%s,"no_validation":%s,"log_steps":%s,"max_eval_new_tokens":%s,"skip_selection":%s,"test_manifest_read":%s,"test_used_for_selection":false,"stop_reason":%s,"validation_stop_only":%s}\n' \
-        "${status}" "${run_id}" "${experiment_label}" "${seed}" "$([[ ${smoke} -eq 1 ]] && echo true || echo false)" "$((5 * gradient_accumulation_steps))" "${gradient_accumulation_steps}" "${status_max_steps}" "${status_lr_schedule_steps}" "${learning_rate}" "${decoder_adaptation}" "${decoder_lora_rank}" "${decoder_lora_alpha}" "${decoder_lora_dropout}" "${decoder_learning_rate}" "${warmup_steps}" "${min_lr_ratio}" "${initial_residual_scale}" "${gate_freeze_steps}" "${auxiliary_weight_start}" "${auxiliary_weight}" "${auxiliary_ramp_steps}" "${layout_loss_profile}" "${use_validity_head_json}" "${initial_valid_probability}" "${validity_gating_mode}" "${validity_use_transport_evidence_json}" "${validation_interval}" "$([[ ${no_validation} -eq 1 ]] && echo true || echo false)" "${log_steps}" "${max_eval_new_tokens}" "${skip_selection_json}" "${test_manifest_read_json}" "${stop_reason_json}" "${validation_stop_only_json}" > "${group_root}/status/seed${seed}.json"
+    printf '{"status":"%s","run_id":"%s","experiment_label":"%s","seed":%s,"smoke":%s,"world_size":%s,"global_batch_size":%s,"effective_global_batch_size":%s,"gradient_accumulation_steps":%s,"max_steps":%s,"lr_schedule_steps":%s,"learning_rate":%s,"decoder_adaptation":"%s","decoder_lora_rank":%s,"decoder_lora_alpha":%s,"decoder_lora_dropout":%s,"decoder_learning_rate":%s,"warmup_steps":%s,"min_lr_ratio":%s,"initial_residual_scale":%s,"gate_freeze_steps":%s,"auxiliary_weight_start":%s,"auxiliary_weight":%s,"auxiliary_ramp_steps":%s,"layout_loss_profile":"%s","use_validity_head":%s,"initial_valid_probability":%s,"validity_gating_mode":"%s","validity_use_transport_evidence":%s,"validation_interval":%s,"no_validation":%s,"defer_validation":%s,"selection_pending":%s,"log_steps":%s,"max_eval_new_tokens":%s,"skip_selection":%s,"test_manifest_read":%s,"test_used_for_selection":false,"stop_reason":%s,"validation_stop_only":%s}\n' \
+        "${status}" "${run_id}" "${experiment_label}" "${seed}" "$([[ ${smoke} -eq 1 ]] && echo true || echo false)" "${world_size}" "$((world_size))" "$((world_size * gradient_accumulation_steps))" "${gradient_accumulation_steps}" "${status_max_steps}" "${status_lr_schedule_steps}" "${learning_rate}" "${decoder_adaptation}" "${decoder_lora_rank}" "${decoder_lora_alpha}" "${decoder_lora_dropout}" "${decoder_learning_rate}" "${warmup_steps}" "${min_lr_ratio}" "${initial_residual_scale}" "${gate_freeze_steps}" "${auxiliary_weight_start}" "${auxiliary_weight}" "${auxiliary_ramp_steps}" "${layout_loss_profile}" "${use_validity_head_json}" "${initial_valid_probability}" "${validity_gating_mode}" "${validity_use_transport_evidence_json}" "${validation_interval}" "$([[ ${no_validation} -eq 1 ]] && echo true || echo false)" "${defer_validation_json}" "${selection_pending_json}" "${log_steps}" "${max_eval_new_tokens}" "${skip_selection_json}" "${test_manifest_read_json}" "${stop_reason_json}" "${validation_stop_only_json}" > "${group_root}/status/seed${seed}.json"
 }
 
 run_inner() {
@@ -590,6 +628,8 @@ run_inner() {
             --natural-loop-min-cycle-length "${natural_loop_min_cycle_length}"
             --natural-loop-max-cycle-length "${natural_loop_max_cycle_length}"
             --natural-loop-cycle-repeats "${natural_loop_cycle_repeats}"
+            --natural-loop-max-new-tokens "${natural_loop_max_new_tokens}"
+            --natural-loop-continuation-horizon "${natural_loop_continuation_horizon}"
             --escape-budget "${escape_budget}"
             --escape-clear-steps "${escape_clear_steps}"
             --escape-eos-suppression "${escape_eos_suppression}"
@@ -619,7 +659,7 @@ run_inner() {
         (( continuation_head == 1 )) && smoke_args+=(--continuation-head)
         (( region_autoregressive == 1 )) && smoke_args+=(--region-autoregressive)
         (( region_pointer_mask == 0 )) && smoke_args+=(--no-region-pointer-mask)
-        "${torchrun}" --standalone --nnodes=1 --nproc_per_node=5 \
+        "${torchrun}" --standalone --nnodes=1 --nproc_per_node="${world_size}" \
             -m tools.smoke_glmocr_ddp \
             "${smoke_args[@]}" \
             > "${group_root}/logs/seed${seed}.smoke.log" 2>&1
@@ -635,6 +675,9 @@ run_inner() {
     fi
     if (( skip_selection == 1 )); then
         extra_args+=(--skip-selection)
+    fi
+    if (( defer_validation == 1 )); then
+        extra_args+=(--defer-validation)
     fi
     validity_args=(
         --initial-valid-probability "${initial_valid_probability}"
@@ -657,6 +700,8 @@ run_inner() {
         --natural-loop-min-cycle-length "${natural_loop_min_cycle_length}"
         --natural-loop-max-cycle-length "${natural_loop_max_cycle_length}"
         --natural-loop-cycle-repeats "${natural_loop_cycle_repeats}"
+        --natural-loop-max-new-tokens "${natural_loop_max_new_tokens}"
+        --natural-loop-continuation-horizon "${natural_loop_continuation_horizon}"
         --natural-loop-weight "${natural_loop_weight}"
         --natural-loop-recent-window "${natural_loop_recent_window}"
         --natural-loop-min-cycle-length "${natural_loop_min_cycle_length}"
@@ -699,7 +744,7 @@ run_inner() {
         method_args+=(--no-region-pointer-mask)
     fi
     ddp_rc=0
-    if "${torchrun}" --standalone --nnodes=1 --nproc_per_node=5 \
+    if "${torchrun}" --standalone --nnodes=1 --nproc_per_node="${world_size}" \
         -m layout_ocr.train_screen \
         --distributed-strategy ddp \
         --mode geometry \
@@ -753,7 +798,13 @@ run_inner() {
         exit "${ddp_rc}"
     fi
     (( ddp_rc == 0 )) || return "${ddp_rc}"
-    if (( skip_selection == 1 )); then
+    if (( defer_validation == 1 )); then
+        [[ -f "${run_dir}/summary.json" && -f "${run_dir}/COMPLETED" ]] || {
+            write_status failed
+            printf '{"event":"glmocr_mthv2_ddp_failed","error":"deferred_run_completed_without_summary","run_dir":"%s"}\n' "${run_dir}" >&2
+            exit 1
+        }
+    elif (( skip_selection == 1 )); then
         [[ -f "${run_dir}/summary.json" && -f "${run_dir}/COMPLETED" ]] || {
             write_status failed
             printf '{"event":"glmocr_mthv2_ddp_failed","error":"run_completed_without_summary","run_dir":"%s"}\n' "${run_dir}" >&2
@@ -766,13 +817,14 @@ run_inner() {
     fi
     write_status complete
     trap - ERR
-    "${python}" - "${run_dir}/summary.json" "${skip_selection}" <<'PY'
+    "${python}" - "${run_dir}/summary.json" "${skip_selection}" "${defer_validation}" <<'PY'
 import json
 import sys
 payload = json.loads(open(sys.argv[1], encoding="utf-8").read())
 skip_selection = bool(int(sys.argv[2]))
+defer_validation = bool(int(sys.argv[3]))
 selection = None
-if not skip_selection:
+if not skip_selection and not defer_validation:
     selection = json.loads(open(sys.argv[1].replace("summary.json", "selection.json"), encoding="utf-8").read())
 validation = payload.get("validation") or {}
 print(json.dumps({
@@ -781,7 +833,9 @@ print(json.dumps({
     "seed": payload.get("seed"),
     "final_step": validation.get("step") or (selection.get("selected_step") if selection else None),
     "selected_step": selection.get("selected_step") if selection else None,
-    "selection_performed": not skip_selection,
+    "selection_performed": not skip_selection and not defer_validation,
+    "selection_pending": defer_validation,
+    "validation_evaluated": payload.get("validation_evaluated", not defer_validation),
     "test_used_for_selection": payload.get("test_used_for_selection"),
 }, ensure_ascii=False, separators=(",", ":")))
 PY
@@ -830,6 +884,8 @@ if (( foreground == 0 )); then
         --repeat-cycle-repeats "${repeat_cycle_repeats}"
         --repeat-cycle-penalty "${repeat_cycle_penalty}"
         --repeat-force-eos-steps "${repeat_force_eos_steps}"
+        --natural-loop-max-new-tokens "${natural_loop_max_new_tokens}"
+        --natural-loop-continuation-horizon "${natural_loop_continuation_horizon}"
         --escape-budget "${escape_budget}"
         --escape-clear-steps "${escape_clear_steps}"
         --escape-eos-suppression "${escape_eos_suppression}"
@@ -870,11 +926,12 @@ if (( foreground == 0 )); then
     (( region_pointer_mask == 0 )) && child_args+=(--no-region-pointer-mask)
     (( skip_selection == 1 )) && child_args+=(--skip-selection)
     (( without_test == 1 )) && child_args+=(--without-test)
+    (( defer_validation == 1 )) && child_args+=(--defer-validation)
     (( smoke == 1 )) && child_args+=(--smoke)
     command_line="$(printf '%q ' "${child_args[@]}")"
     tmux new-session -d -s "${session}" "cd $(printf '%q' "${code_root}") && exec ${command_line} >$(printf '%q' "${launcher_log}") 2>&1"
-    printf '{"event":"glmocr_mthv2_ddp_armed","session":"%s","run_id":"%s","experiment_label":"%s","seed":%s,"smoke":%s,"gpu_ids":"%s","steps":%s,"lr_schedule_steps":%s,"learning_rate":%s,"decoder_adaptation":"%s","decoder_lora_rank":%s,"decoder_lora_alpha":%s,"decoder_learning_rate":%s,"warmup_steps":%s,"initial_residual_scale":%s,"gate_freeze_steps":%s,"auxiliary_weight_start":%s,"auxiliary_weight":%s,"auxiliary_ramp_steps":%s,"gradient_accumulation_steps":%s,"global_batch_size":5,"effective_global_batch_size":%s,"layout_loss_profile":"%s","use_validity_head":%s,"initial_valid_probability":%s,"validity_gating_mode":"%s","validity_use_transport_evidence":%s,"test_used_for_selection":false,"log":"%s"}\n' \
-        "${session}" "${run_id}" "${experiment_label}" "${seed}" "$([[ ${smoke} -eq 1 ]] && echo true || echo false)" "${gpu_ids}" "${max_steps}" "${lr_schedule_steps}" "${learning_rate}" "${decoder_adaptation}" "${decoder_lora_rank}" "${decoder_lora_alpha}" "${decoder_learning_rate}" "${warmup_steps}" "${initial_residual_scale}" "${gate_freeze_steps}" "${auxiliary_weight_start}" "${auxiliary_weight}" "${auxiliary_ramp_steps}" "${gradient_accumulation_steps}" "$((5 * gradient_accumulation_steps))" "${layout_loss_profile}" "$([[ ${use_validity_head} -eq 1 ]] && echo true || echo false)" "${initial_valid_probability}" "${validity_gating_mode}" "$([[ ${validity_use_transport_evidence} -eq 1 ]] && echo true || echo false)" "${launcher_log}"
+    printf '{"event":"glmocr_mthv2_ddp_armed","session":"%s","run_id":"%s","experiment_label":"%s","seed":%s,"smoke":%s,"gpu_ids":"%s","world_size":%s,"steps":%s,"lr_schedule_steps":%s,"learning_rate":%s,"decoder_adaptation":"%s","decoder_lora_rank":%s,"decoder_lora_alpha":%s,"decoder_learning_rate":%s,"warmup_steps":%s,"initial_residual_scale":%s,"gate_freeze_steps":%s,"auxiliary_weight_start":%s,"auxiliary_weight":%s,"auxiliary_ramp_steps":%s,"gradient_accumulation_steps":%s,"global_batch_size":%s,"effective_global_batch_size":%s,"layout_loss_profile":"%s","use_validity_head":%s,"initial_valid_probability":%s,"validity_gating_mode":"%s","validity_use_transport_evidence":%s,"defer_validation":%s,"selection_pending":%s,"test_used_for_selection":false,"log":"%s"}\n' \
+        "${session}" "${run_id}" "${experiment_label}" "${seed}" "$([[ ${smoke} -eq 1 ]] && echo true || echo false)" "${gpu_ids}" "${world_size}" "${max_steps}" "${lr_schedule_steps}" "${learning_rate}" "${decoder_adaptation}" "${decoder_lora_rank}" "${decoder_lora_alpha}" "${decoder_learning_rate}" "${warmup_steps}" "${initial_residual_scale}" "${gate_freeze_steps}" "${auxiliary_weight_start}" "${auxiliary_weight}" "${auxiliary_ramp_steps}" "${gradient_accumulation_steps}" "${world_size}" "$((world_size * gradient_accumulation_steps))" "${layout_loss_profile}" "$([[ ${use_validity_head} -eq 1 ]] && echo true || echo false)" "${initial_valid_probability}" "${validity_gating_mode}" "$([[ ${validity_use_transport_evidence} -eq 1 ]] && echo true || echo false)" "$([[ ${defer_validation} -eq 1 ]] && echo true || echo false)" "$([[ ${defer_validation} -eq 1 ]] && echo true || echo false)" "${launcher_log}"
 else
     run_inner
 fi

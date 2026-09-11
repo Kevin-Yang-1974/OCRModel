@@ -89,6 +89,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--natural-loop-min-cycle-length", type=int, default=8)
     parser.add_argument("--natural-loop-max-cycle-length", type=int, default=32)
     parser.add_argument("--natural-loop-cycle-repeats", type=int, default=3)
+    parser.add_argument("--natural-loop-max-new-tokens", type=int, default=768)
+    parser.add_argument("--natural-loop-continuation-horizon", type=int, default=16)
     parser.add_argument("--continuation-escape", action="store_true")
     parser.add_argument("--escape-budget", type=int, default=16)
     parser.add_argument("--escape-clear-steps", type=int, default=4)
@@ -244,6 +246,8 @@ def main() -> None:
             natural_loop_min_cycle_length=args.natural_loop_min_cycle_length,
             natural_loop_max_cycle_length=args.natural_loop_max_cycle_length,
             natural_loop_cycle_repeats=args.natural_loop_cycle_repeats,
+            natural_loop_max_new_tokens=args.natural_loop_max_new_tokens,
+            natural_loop_continuation_horizon=args.natural_loop_continuation_horizon,
             continuation_escape=args.continuation_escape,
             escape_budget=args.escape_budget,
             escape_clear_steps=args.escape_clear_steps,

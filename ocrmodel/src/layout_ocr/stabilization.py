@@ -1,9 +1,10 @@
 """Small, opt-in stabilization utilities for GLM-OCR generation.
 
-The text path is deliberately separate from layout generation.  The new
-natural-loop loss uses only detached argmax predictions from the normal
-teacher-forced forward; legacy target-cycle and inference-guard helpers remain
-available for reproducing older runs but are not part of the new experiment.
+The text path is deliberately separate from layout generation.  The natural
+loop training path first observes a real, no-grad autoregressive trajectory
+and then computes a differentiable loss from a detached loop prefix.  The
+older teacher-forced argmax helper remains available for reproducing previous
+runs, but it is not the natural-loop training path anymore.
 """
 
 from __future__ import annotations
@@ -184,6 +185,94 @@ def natural_predicted_loop_loss(
         "cycle_tokens": cycle_count.detach(),
         "active_pages": active_pages.detach(),
         "valid_tokens": valid_count.detach(),
+    }
+
+
+def natural_loop_rollout_loss(
+    logits: Tensor,
+    labels: Tensor,
+    candidate_mask: Tensor,
+    candidate_token_ids: Tensor,
+    continuation_targets: Tensor,
+    continuation_mask: Tensor | None = None,
+) -> dict[str, Tensor]:
+    """Score a detached free-run loop prefix with live decoder logits.
+
+    The masks and targets come from a no-grad autoregressive rollout and are
+    aligned to ``logits[..., :-1]``.  The unlikelihood mask marks tokens that
+    actually extended the observed loop; the continuation mask can include
+    the complete post-loop horizon and teaches that corrupted prefix to prefer
+    the real target token.  A negative candidate equal to the real target is
+    excluded so legal repeated symbols are not penalized.
+    """
+
+    if logits.ndim != 3 or labels.shape != logits.shape[:2]:
+        raise ValueError("logits must be [batch, sequence, vocab] and match labels")
+    shifted_shape = (logits.shape[0], logits.shape[1] - 1)
+    if continuation_mask is None:
+        continuation_mask = candidate_mask
+    if any(
+        tensor.shape != shifted_shape
+        for tensor in (
+            candidate_mask,
+            candidate_token_ids,
+            continuation_targets,
+            continuation_mask,
+        )
+    ):
+        raise ValueError("natural-loop rollout targets must align with logits[..., :-1]")
+
+    shift_logits = logits[..., :-1, :]
+    negative_valid = (
+        candidate_mask
+        & (candidate_token_ids >= 0)
+        & (continuation_targets >= 0)
+        & candidate_token_ids.ne(continuation_targets)
+    )
+    continuation_valid = continuation_mask & (continuation_targets >= 0)
+    active_tokens = negative_valid.sum().to(dtype=torch.float32)
+    active_pages = (negative_valid | continuation_valid).any(dim=1).sum().to(dtype=torch.float32)
+    candidate_tokens = candidate_mask.sum().to(dtype=torch.float32)
+    continuation_tokens = continuation_valid.sum().to(dtype=torch.float32)
+    if not bool(negative_valid.any() or continuation_valid.any()):
+        zero = logits.sum() * 0.0
+        return {
+            "loss": zero,
+            "unlikelihood": zero,
+            "continuation": zero,
+            "active_tokens": active_tokens.detach(),
+            "active_pages": active_pages.detach(),
+            "candidate_tokens": candidate_tokens.detach(),
+            "continuation_tokens": continuation_tokens.detach(),
+        }
+
+    zero = logits.sum() * 0.0
+    if bool(negative_valid.any()):
+        negative_logits = shift_logits[negative_valid].float()
+        candidate_ids = candidate_token_ids[negative_valid].long()
+        log_probability = F.log_softmax(negative_logits, dim=-1).gather(
+            -1, candidate_ids.unsqueeze(-1)
+        ).squeeze(-1)
+        probability = log_probability.exp().clamp(max=1.0 - 1e-6)
+        unlikelihood = (-torch.log1p(-probability)).mean()
+    else:
+        unlikelihood = zero
+    if bool(continuation_valid.any()):
+        continuation_logits = shift_logits[continuation_valid].float()
+        target_ids = continuation_targets[continuation_valid].long()
+        continuation = F.cross_entropy(continuation_logits, target_ids)
+    else:
+        continuation = zero
+    terms = [term for term, active in ((unlikelihood, negative_valid), (continuation, continuation_valid)) if bool(active.any())]
+    loss = sum(terms) / len(terms)
+    return {
+        "loss": loss,
+        "unlikelihood": unlikelihood,
+        "continuation": continuation,
+        "active_tokens": active_tokens.detach(),
+        "active_pages": active_pages.detach(),
+        "candidate_tokens": candidate_tokens.detach(),
+        "continuation_tokens": continuation_tokens.detach(),
     }
 
 
@@ -470,6 +559,57 @@ def _cycle_run(tokens: Sequence[int], min_cycle_length: int, max_cycle_length: i
         if repeats > best[1] or (repeats == best[1] and cycle_length > best[0]):
             best = (cycle_length, repeats)
     return best
+
+
+def generated_cycle_window(
+    tokens: Sequence[int],
+    *,
+    min_cycle_length: int = 8,
+    max_cycle_length: int = 32,
+    cycle_repeats: int = 3,
+    recent_window: int | None = 96,
+) -> dict[str, Any]:
+    """Locate the first repeated-cycle suffix in a generated token stream.
+
+    ``end`` is an exclusive generated-token index.  It identifies the prefix
+    that is fed back to the model before the loop's next continuation token is
+    predicted.  The function consumes only detached tokens and never enters
+    autograd.
+    """
+
+    if min_cycle_length <= 0 or max_cycle_length < min_cycle_length:
+        raise ValueError("invalid cycle length range")
+    if cycle_repeats < 2:
+        raise ValueError("cycle_repeats must be at least two")
+    if recent_window is not None and recent_window <= 0:
+        raise ValueError("recent_window must be positive when provided")
+
+    values = [int(token) for token in tokens]
+    window_size = recent_window or len(values)
+    start = max(min_cycle_length * cycle_repeats, len(values) - window_size)
+    for end in range(start, len(values) + 1):
+        window_start = max(0, end - window_size)
+        cycle_length, repeats = _cycle_run(
+            values[window_start:end], min_cycle_length, max_cycle_length
+        )
+        if cycle_length and repeats >= cycle_repeats:
+            cycle_start = end - cycle_length * repeats
+            return {
+                "detected": True,
+                "start": int(cycle_start),
+                "end": int(end),
+                "length": int(cycle_length),
+                "repeats": int(repeats),
+                "cycle": values[end - cycle_length : end],
+            }
+    return {
+        "detected": False,
+        "start": None,
+        "end": None,
+        "length": 0,
+        "repeats": 0,
+        "cycle": [],
+    }
 
 
 def repetition_diagnostics(

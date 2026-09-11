@@ -23,8 +23,11 @@ import torch
 from layout_ocr.data import load_records, validate_records
 from layout_ocr.train_screen import (
     configure_deterministic_execution,
+    decoder_lora_finite_report,
     evaluate,
+    inject_decoder_lora,
     load_adapter_checkpoint,
+    load_decoder_lora_checkpoint,
     load_model,
     write_json,
 )
@@ -150,6 +153,17 @@ def main() -> None:
     adapter_config = metadata.get("adapter_config") or {}
     if not isinstance(adapter_config, dict):
         raise ValueError("metadata.adapter_config must be an object")
+    decoder_adaptation = metadata.get(
+        "decoder_adaptation", summary.get("decoder_adaptation", "frozen")
+    )
+    if decoder_adaptation not in {"frozen", "lora"}:
+        raise ValueError(f"unsupported decoder adaptation in training metadata: {decoder_adaptation!r}")
+    summary_decoder_adaptation = summary.get("decoder_adaptation")
+    if summary_decoder_adaptation is not None and summary_decoder_adaptation != decoder_adaptation:
+        raise ValueError("training summary and metadata disagree on decoder adaptation")
+    decoder_lora_config = metadata.get("decoder_lora_config") or {}
+    if not isinstance(decoder_lora_config, dict):
+        raise ValueError("metadata.decoder_lora_config must be an object")
     model_args = argparse.Namespace(
         model_path=args.model_path,
         processor_mode=args.processor_mode,
@@ -176,6 +190,37 @@ def main() -> None:
         adapter_precision=args.adapter_precision,
     )
     model, processor, bridge = load_model(model_args, device)
+    decoder_lora_loaded = False
+    decoder_lora_report = {
+        "enabled": False,
+        "parameters_finite": True,
+        "non_finite_parameters": [],
+    }
+    if decoder_adaptation == "lora":
+        required_config = ("rank", "alpha", "dropout")
+        missing_config = [key for key in required_config if key not in decoder_lora_config]
+        if missing_config:
+            raise ValueError(
+                f"decoder LoRA metadata is missing configuration fields: {missing_config}"
+            )
+        injected_config = inject_decoder_lora(
+            model,
+            rank=int(decoder_lora_config["rank"]),
+            alpha=float(decoder_lora_config["alpha"]),
+            dropout=float(decoder_lora_config["dropout"]),
+        )
+        load_decoder_lora_checkpoint(checkpoint_dir, model)
+        decoder_lora_report = decoder_lora_finite_report(model)
+        if not decoder_lora_report["enabled"] or not decoder_lora_report["parameters_finite"]:
+            raise FloatingPointError("decoder LoRA checkpoint did not load as finite trainable state")
+        decoder_lora_config = {
+            **decoder_lora_config,
+            "rank": injected_config["rank"],
+            "alpha": injected_config["alpha"],
+            "dropout": injected_config["dropout"],
+            "target_count": injected_config["target_count"],
+        }
+        decoder_lora_loaded = True
     load_adapter_checkpoint(checkpoint_dir, bridge)
     output_dir.mkdir(parents=True)
     eval_args = argparse.Namespace(
@@ -217,6 +262,10 @@ def main() -> None:
         "test_shard_count": args.test_shard_count,
         "num_queries": args.num_queries,
         "max_eval_new_tokens": args.max_eval_new_tokens,
+        "decoder_adaptation": decoder_adaptation,
+        "decoder_lora_config": decoder_lora_config,
+        "decoder_lora_loaded": decoder_lora_loaded,
+        "decoder_lora_finite": decoder_lora_report,
         "metrics": metrics,
         "test_used_for_selection": False,
     }

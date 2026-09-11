@@ -67,7 +67,17 @@ test_manifest="${dataset_root}/test/manifest.jsonl"
 launcher_log="${remote_root}/runs/${run_id}.locked-test.seed${seed}.launcher.log"
 test_log="${group_root}/logs/seed${seed}.locked-test.log"
 torch_lib="${env_dir}/lib/python3.11/site-packages/torch/lib"
-cuda_library_path="/usr/local/cuda/targets/x86_64-linux/lib:${torch_lib}"
+machine_arch="$(uname -m)"
+case "${machine_arch}" in
+    x86_64) cuda_target_arch="x86_64" ;;
+    aarch64|arm64) cuda_target_arch="aarch64" ;;
+    *) cuda_target_arch="${machine_arch}" ;;
+esac
+cuda_library_path="${torch_lib}"
+system_cuda_library="/usr/local/cuda/targets/${cuda_target_arch}-linux/lib"
+if [[ -d "${system_cuda_library}" ]]; then
+    cuda_library_path="${system_cuda_library}:${cuda_library_path}"
+fi
 for component in cudnn nccl cuda_nvrtc cuda_cupti cufft curand cusparse cusolver nvtx nvjitlink; do
     component_lib="${nvidia_env}/lib/python3.11/site-packages/nvidia/${component}/lib"
     if [[ -d "${component_lib}" ]]; then

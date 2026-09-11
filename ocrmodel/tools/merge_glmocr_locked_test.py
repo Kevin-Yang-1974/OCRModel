@@ -354,6 +354,11 @@ def main() -> None:
         raise ValueError("training summary does not prove test exclusion")
     if selection.get("status") != "complete" or selection.get("test_used_for_selection") is not False:
         raise ValueError("selection file is not validation-only")
+    decoder_adaptation = metadata.get(
+        "decoder_adaptation", summary.get("decoder_adaptation", "frozen")
+    )
+    if decoder_adaptation not in {"frozen", "lora"}:
+        raise ValueError(f"unsupported decoder adaptation: {decoder_adaptation!r}")
     train_records = load_records(args.train_manifest)
     test_records = load_records(args.test_manifest)
     validate_records(train_records, split="train", num_queries=args.num_queries)
@@ -371,6 +376,14 @@ def main() -> None:
     )
     if not shard_dirs:
         raise FileNotFoundError(f"no test shards found in {shards_dir}")
+    expected_shard_count = len(
+        [value for value in args.gpu_ids.split(",") if value.strip()]
+    ) if args.gpu_ids else None
+    if expected_shard_count is not None and len(shard_dirs) != expected_shard_count:
+        raise ValueError(
+            f"test shard count mismatch: gpu_ids={expected_shard_count}, "
+            f"directories={len(shard_dirs)}"
+        )
     shard_summaries: list[dict[str, Any]] = []
     rows: list[dict[str, Any]] = []
     for shard_dir in shard_dirs:
@@ -379,6 +392,10 @@ def main() -> None:
             raise RuntimeError(f"incomplete test shard: {shard_dir}")
         if shard_summary.get("test_used_for_selection") is not False:
             raise ValueError(f"test shard is not selection-locked: {shard_dir}")
+        if decoder_adaptation == "lora" and shard_summary.get("decoder_lora_loaded") is not True:
+            raise ValueError(f"decoder LoRA was not loaded in test shard: {shard_dir}")
+        if decoder_adaptation == "frozen" and shard_summary.get("decoder_lora_loaded") is True:
+            raise ValueError(f"unexpected decoder LoRA state in frozen test shard: {shard_dir}")
         shard_rows = _read_jsonl(shard_dir / "test_predictions.jsonl")
         expected_shard_pages = int(shard_summary.get("test_pages", len(shard_rows)))
         if len(shard_rows) != expected_shard_pages:
@@ -406,6 +423,7 @@ def main() -> None:
     metrics.update(_merge_shard_diagnostics(shard_metrics, weights))
     metrics["test_used_for_selection"] = False
     metrics["pages"] = len(rows)
+    decoder_lora_loaded = decoder_adaptation == "lora"
     output_dir.mkdir(parents=True)
     with (output_dir / "test_predictions.jsonl").open("w", encoding="utf-8") as handle:
         for row in rows:
@@ -425,6 +443,8 @@ def main() -> None:
         "test_shard_gpu_ids": args.gpu_ids,
         "num_queries": args.num_queries,
         "max_eval_new_tokens": args.max_eval_new_tokens,
+        "decoder_adaptation": decoder_adaptation,
+        "decoder_lora_loaded": decoder_lora_loaded,
         "metrics": metrics,
         "test_used_for_selection": False,
     }

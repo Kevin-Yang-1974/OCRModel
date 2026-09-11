@@ -7,9 +7,11 @@ from layout_ocr.stabilization import (
     continuation_head_loss,
     cycle_escape_losses,
     eos_focus_loss,
+    generated_cycle_window,
     generate_with_loop_recovery,
     loop_continuation_diagnostics,
     natural_predicted_loop_loss,
+    natural_loop_rollout_loss,
     repeated_cycle_positions,
     repetition_diagnostics,
     unlikelihood_loss,
@@ -90,6 +92,49 @@ def test_natural_predicted_loop_loss_ignores_prompt_positions() -> None:
     )
     assert result["active_tokens"].item() == 0
     assert result["loss"].item() == 0.0
+
+
+def test_generated_cycle_window_uses_real_rollout_suffix() -> None:
+    result = generated_cycle_window(
+        [7, 8, 1, 2, 1, 2, 1, 2, 1, 2, 9],
+        min_cycle_length=2,
+        max_cycle_length=2,
+        cycle_repeats=3,
+        recent_window=32,
+    )
+    assert result["detected"] is True
+    assert result["end"] == 8
+    assert result["length"] == 2
+    assert result["cycle"] == [1, 2]
+    assert not generated_cycle_window([1, 2, 1, 2, 3], min_cycle_length=2, max_cycle_length=2)[
+        "detected"
+    ]
+
+
+def test_natural_loop_rollout_loss_combines_negative_and_continuation() -> None:
+    labels = torch.tensor([[-100, 9, 10, 11, 12, 13]])
+    logits = torch.zeros(1, labels.shape[1], 20, requires_grad=True)
+    negative_mask = torch.zeros(1, labels.shape[1] - 1, dtype=torch.bool)
+    continuation_mask = torch.zeros_like(negative_mask)
+    negative_ids = torch.full_like(negative_mask, -1, dtype=torch.long)
+    # Position 2 predicts the repeated token 3 while the target is 10.
+    negative_mask[0, 2] = True
+    continuation_mask[0, 2:4] = True
+    negative_ids[0, 2] = 3
+    result = natural_loop_rollout_loss(
+        logits,
+        labels,
+        negative_mask,
+        negative_ids,
+        labels[:, 1:],
+        continuation_mask,
+    )
+    assert result["active_tokens"].item() == 1
+    assert result["continuation_tokens"].item() == 2
+    assert torch.isfinite(result["loss"])
+    result["loss"].backward()
+    assert logits.grad is not None
+    assert torch.isfinite(logits.grad).all()
 
 
 def test_cycle_processor_penalizes_and_can_force_eos() -> None:
