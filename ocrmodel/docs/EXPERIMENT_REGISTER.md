@@ -33,7 +33,7 @@
 | `glmocr_mthv2_validity_assignment_256_v1` | `validity_assignment`；raw-mass gating；detached transport evidence；Hungarian region support；五卡；seed42；256 steps；全量 train＋32 页 validation 子集；无 selection | 全量 MTHv2 train manifest；validation 为确定性小子集 | GLM-OCR 固定 revision；从基础权重重新开始 | wrapper 在训练启动前因同步后的执行位问题退出，未产生训练指标；产物保留 | 无训练结果；已用新 run ID 重试 | 不读取 | 不作结果；修复 wrapper 后使用 v2 重试 |
 | `glmocr_mthv2_validity_assignment_256_v2` | `validity_assignment`；raw-mass gating；detached transport evidence；Hungarian region support；五卡；seed42；256 steps；全量 train＋32 页 validation 子集；无 selection | 全量 MTHv2 train manifest；validation 为确定性小子集 | GLM-OCR 固定 revision；从基础权重重新开始 | `a100-yky` smoke 通过；bounded 256-step 机制验证运行中 | 待验证：step128/256 query-level p gap、AUROC/AP、invalid context share、OCR/CER | 不读取 | 未通过 query-level 机制阈值前不扩展 seed43/44，不执行 selection-locked test |
 | `glmocr_natural_loop_A1_1024_260911_v1` | natural predicted-loop loss；`λ=0.05`；plain generation；无硬 EOS/循环 guard；LoRA；1024 steps；no-validation | 全量 MTHv2 train manifest；固定 800 页 test manifest 仅在训练完成后读取 | GLM-OCR 固定 revision；基础权重；seed42 | complete；step1024 checkpoint finite；fixed-final selection；训练不做 validation | 无 validation；固定 final step1024 | 已完成 direct test：CER `0.874635`；test 未参与选点 | 训练 mean official base loss `1.409982`、mean total `2.422198`；natural-loop active ratio `0`；test 结果见 `GLMOCR-B-260911-002.md` |
-| `glmocr_plain_baseline_1024_260911_v1` | plain baseline；natural loop disabled；plain generation；无硬 EOS/循环 guard；LoRA；1024 steps；no-validation | 全量 MTHv2 train manifest；固定 800 页 test manifest 待训练完成后读取 | GLM-OCR 固定 revision；基础权重；seed42 | complete；step1024 checkpoint finite；fixed-final selection；训练不做 validation | 无 validation；固定 final step1024 | 待启动五卡 direct test | 训练 mean official base loss `1.409982`、mean total `2.422198`；test 前不做任何选点或调参 |
+| `glmocr_plain_baseline_1024_260911_v1` | plain baseline；natural loop disabled；plain generation；无硬 EOS/循环 guard；LoRA；1024 steps；no-validation | 全量 MTHv2 train manifest；固定 800 页 test manifest | GLM-OCR 固定 revision；基础权重；seed42 | complete；step1024 checkpoint finite；fixed-final selection；训练不做 validation | 无 validation；固定 final step1024 | 五卡 direct test 已完成；CER `0.874635`；循环页率 `0.195000`；长度上限率 `0.207500` | 训练 mean official base loss `1.409982`、mean total `2.422198`；与 A1 的 checkpoint 和 test 指标完全一致 |
 | `glmocr_mthv2_attribution_128_retry_v1` | seed42 三组容量归因：A `no-op`；B 固定 gate `adapter-only`；C 固定 gate＋decoder-LoRA（rank 8、alpha 8、dropout 0）；五卡 DDP；128 steps；32 页 validation；无 selection | 同一 MTHv2 train manifest；同一确定性 validation32 manifest（32 页） | GLM-OCR 固定 revision；三组均从同一基础权重起点；B/C 训练预算一致 | bundle `complete`；A/B 复用已完成 run，C 使用新 run ID 重试完成；所有 checkpoint finite，residual relative norm A/B/C=`0/0.001505/0.001438` | validation CER A/B/C=`0.787648/0.786034/0.794012`；B−A=`−0.001613`，C−B=`+0.007978`；A/B/C teacher-forced OCR loss=`1.666193/1.664493/1.663769`。C 的 layout box MAE=`0.077862`、validity AUROC=`0.953366`，但 invalid gated context share=`0.798970`、p gap=`0.019232`，尚未达到 query 消除阈值；B validity AUROC=`0.494084`、invalid share=`0.924753` | 不读取；`test_manifest_read=false`、`test_used_for_selection=false` | A=`glmocr_mthv2_attribution_128_v1_A_noop`，B=`glmocr_mthv2_attribution_128_v1_B_adapter_only`，C=`glmocr_mthv2_attribution_128_retry_v1_C_decoder_lora`；原 C run 因 NCCL watchdog 超时保留，retry 将 DDP timeout 提高到 3600s；容量归因结论：LoRA 明显改善布局/validity，但在 128 steps 下未转化为 OCR CER，反而较 B 回退 |
 
 ## 2026-09-10/11 循环生成与 Teacher Forcing 审计
@@ -64,9 +64,9 @@
 | A1 / 128 | 0.686485 | 1.813698 | 6524 / 1543 / 5465 | 0.093750 | 0.125000 | 0.875000 |
 | A1 / 256 | 0.863078 | 1.776209 | 9727 / 1500 / 5786 | 0.156250 | 0.171875 | 0.828125 |
 
-## 2026-09-11：natural predicted-loop 1024-step direct-test 前记录
+## 2026-09-11：natural predicted-loop 1024-step direct-test 记录
 
-本条记录覆盖两个从同一基础权重、同一 seed `42`、同一全量 MTHv2 train manifest 重新开始的 1024-step run。两者均不做 validation，step `1024` 作为 fixed-final checkpoint；baseline 的 test 尚未启动，必须在本记录完成后再启动。该 no-validation 直测是用户明确授权的工程对照，不应与 validation-selected formal test 混称。
+本条记录覆盖两个从同一基础权重、同一 seed `42`、同一全量 MTHv2 train manifest 重新开始的 1024-step run。两者均不做 validation，step `1024` 作为 fixed-final checkpoint；文档先于 baseline test 更新，随后完成了五卡分片 direct test。该 no-validation 直测是用户明确授权的工程对照，不应与 validation-selected formal test 混称。
 
 | 项目 | A1 | plain baseline |
 | --- | --- | --- |
@@ -93,7 +93,22 @@
 | 长度上限率 | `0.207500` |
 | EOS 命中率 | `0.792500` |
 
-A1 test 使用 fixed-final step1024，`test_used_for_selection=false`；该 direct test 不是 validation 选点结果。baseline test 在本文档更新完成后使用五卡分片入口启动，暂不填入结果。
+A1 与 baseline 均使用 fixed-final step1024，`test_used_for_selection=false`；两次 direct test 都不是 validation 选点结果。baseline 使用 5 个互斥 shard（GPU `0,1,2,3,4`）并在合并后得到单一 summary。
+
+### A1 与 plain baseline direct test 对照
+
+| 指标 | A1 step1024 | plain baseline step1024 |
+| --- | ---: | ---: |
+| test pages | `800` | `800` |
+| CER | `0.8746345057` | `0.8746345057` |
+| 插入 / 删除 / 替换 | `149592 / 12942 / 67794` | `149592 / 12942 / 67794` |
+| 循环页率 | `0.195000` | `0.195000` |
+| repeated-cycle 页率 | `0.167500` | `0.167500` |
+| 长度上限率 | `0.207500` | `0.207500` |
+| EOS 命中率 | `0.792500` | `0.792500` |
+| 平均新生成 token 数 | `594.62125` | `594.62125` |
+
+两组 test 指标逐项完全一致。A1 与 baseline 的 `adapter.safetensors`、`decoder_lora.safetensors` 和 `adapter_config.json` SHA-256 也完全一致，说明 natural-loop loss 在该训练协议中没有产生任何参数更新差异。
 
 ### 配置、数据与证据指纹
 
@@ -104,11 +119,11 @@ A1 test 使用 fixed-final step1024，`test_used_for_selection=false`；该 dire
 - full protocol SHA-256：`e713c821afd97c6050b8f6d37553d3e783ed754c6b619379c532b88d957e0f93`。
 - 64 页 validation manifest 未读取；其 SHA-256 为 `8fb3478d621f46c1d6f9dc7f5c400626af46dc068c6fc6b4ce2a519a3ccbba38`，仅作为启动参数保留。
 - A1 训练证据：`/data3/yky/yangky_ocr_models/glm_ocr_layout_ot/training_runs/glmocr_natural_loop_A1_1024_260911_v1/seed42/summary.json`；A1 test：同目录 `locked-test/locked_test_summary.json`。
-- baseline 训练证据：`/data3/yky/yangky_ocr_models/glm_ocr_layout_ot/training_runs/glmocr_plain_baseline_1024_260911_v1/seed42/summary.json`；baseline test 尚无输出目录。
+- baseline 训练证据：`/data3/yky/yangky_ocr_models/glm_ocr_layout_ot/training_runs/glmocr_plain_baseline_1024_260911_v1/seed42/summary.json`；baseline test：同目录 `locked-test/locked_test_summary.json`。
 
 ### 当前解释边界
 
-A1 与 baseline 的 1024-step 训练汇总完全一致，且 A1 的 natural-loop active ratio 为 `0`，说明在正常 teacher-forced 分布中该惩罚没有触发；因此 A1 与 baseline 的差异不能预先解释为已经学会了自然脱环。A1 direct test 的高 CER 和长尾循环指标已记录，baseline 只有在同一 fixed-final step、同一 plain 推理和五卡 test 完成后，才能做公平比较。
+A1 与 baseline 的 1024-step 训练汇总完全一致，A1 的 natural-loop active ratio 为 `0`，两组最终 adapter/checkpoint 文件逐字节一致，且 800 页 plain direct test 指标逐项一致。因此本轮没有证据表明该惩罚改变了模型参数、降低了循环率或学会了自然脱环；下一步应先修正循环候选在 teacher-forced 分布中不触发的问题，而不是继续增大权重。
 
 ### 下降原因与边界判断
 
