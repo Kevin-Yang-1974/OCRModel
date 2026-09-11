@@ -2328,9 +2328,14 @@ def train(
         # is still finishing the current-step reductions.
         barrier(distributed)
         if (
-            step % args.validation_interval == 0
-            or step == args.max_steps
-            or step in args.diagnostic_steps
+            step == args.max_steps
+            or (
+                not getattr(args, "no_validation", False)
+                and (
+                    step % args.validation_interval == 0
+                    or step in args.diagnostic_steps
+                )
+            )
         ):
             if distributed.is_main:
                 checkpoint_dir = args.output_dir / f"checkpoint-{step}"
@@ -3292,6 +3297,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="evaluate all saved checkpoints without writing selection.json",
     )
+    parser.add_argument(
+        "--no-validation",
+        action="store_true",
+        help="skip validation evaluation and mark the fixed final checkpoint for direct test",
+    )
     parser.add_argument("--eval-only", action="store_true")
     return parser.parse_args()
 
@@ -3323,6 +3333,10 @@ def main() -> None:
             raise ValueError("checkpoint-free eval-only baseline requires --auxiliary-weight 0")
     if args.eval_only and args.scheduled_sampling:
         raise ValueError("scheduled sampling is a training-only option")
+    if args.no_validation and args.eval_only:
+        raise ValueError("--no-validation is only valid for training runs")
+    if args.no_validation and args.diagnostic_steps:
+        raise ValueError("--no-validation cannot be combined with diagnostic validation steps")
     if args.auxiliary_weight < 0.0 or args.auxiliary_weight_start < 0.0:
         raise ValueError("auxiliary weights must be non-negative")
     if args.auxiliary_ramp_steps < 0:
@@ -3480,6 +3494,7 @@ def main() -> None:
         "validation_interval": args.validation_interval,
         "diagnostic_steps": list(args.diagnostic_steps),
         "skip_selection": args.skip_selection,
+        "no_validation": args.no_validation,
         "text_repeat_suppression": args.text_repeat_suppression,
         "text_repeat_config": asdict(repeat_suppression_config(args)),
         "natural_loop_loss": natural_loop_config(args),
@@ -3737,6 +3752,70 @@ def main() -> None:
         if not distributed.is_main:
             return
         checkpoint_steps = training["checkpoint_steps"]
+        if args.no_validation:
+            if not checkpoint_steps:
+                raise RuntimeError("no-validation training did not save a final checkpoint")
+            final_step = max(checkpoint_steps)
+            final_checkpoint = args.output_dir / f"checkpoint-{final_step}"
+            if not (final_checkpoint / "adapter.safetensors").is_file():
+                raise FileNotFoundError(final_checkpoint / "adapter.safetensors")
+            fixed_selection = {
+                "status": "complete",
+                "selection_metric": "fixed_final_step_no_validation",
+                "selected_step": final_step,
+                "selection_performed": False,
+                "validation_evaluated": False,
+                "candidates": [],
+                "seeds": [args.seed],
+                "seed_runs": {
+                    str(args.seed): {
+                        "run_dir": str(args.output_dir),
+                        "selected_step": final_step,
+                    }
+                },
+                "test_manifest_read": metadata["test_manifest_read"],
+                "test_used_for_selection": False,
+            }
+            write_json(args.output_dir / "selection.json", fixed_selection)
+            summary = {
+                "status": "complete",
+                "mode": args.mode,
+                "experiment_label": args.experiment_label,
+                "seed": args.seed,
+                "auxiliary_weight": args.auxiliary_weight,
+                "adapter_precision": args.adapter_precision,
+                "layout_loss_profile": args.layout_loss_profile,
+                "query_assignment": args.query_assignment,
+                "decoder_adaptation": args.decoder_adaptation,
+                "decoder_lora_config": metadata["decoder_lora_config"],
+                "natural_loop_config": natural_loop_config(args),
+                "trainable_parameter_report": metadata["trainable_parameter_report"],
+                "lr_schedule_steps": training["lr_schedule_steps"],
+                "eval_only": False,
+                "skip_selection": False,
+                "no_validation": True,
+                "max_eval_new_tokens": args.max_eval_new_tokens,
+                "training": training,
+                "validation": None,
+                "validation_candidates": [],
+                "selection_candidates": [],
+                "selection": fixed_selection,
+                "test_manifest_read": metadata["test_manifest_read"],
+                "test_used_for_selection": False,
+            }
+            write_json(args.output_dir / "summary.json", summary)
+            (args.output_dir / "COMPLETED").touch()
+            metadata["status"] = "complete"
+            write_json(args.output_dir / "metadata.json", metadata)
+            print(json.dumps({
+                "status": "complete",
+                "run_dir": str(args.output_dir),
+                "final_step": final_step,
+                "validation_evaluated": False,
+                "selection_performed": False,
+                "test_used_for_selection": False,
+            }, ensure_ascii=False, separators=(",", ":")))
+            return
         candidates = []
         for step in checkpoint_steps:
             checkpoint_dir = args.output_dir / f"checkpoint-{step}"

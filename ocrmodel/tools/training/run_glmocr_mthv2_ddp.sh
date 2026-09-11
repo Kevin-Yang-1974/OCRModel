@@ -64,6 +64,7 @@ natural_loop_recent_window=96
 natural_loop_min_cycle_length=8
 natural_loop_max_cycle_length=32
 natural_loop_cycle_repeats=3
+no_validation=0
 continuation_escape=0
 escape_budget=16
 escape_clear_steps=4
@@ -147,6 +148,7 @@ while [[ $# -gt 0 ]]; do
         --natural-loop-min-cycle-length) natural_loop_min_cycle_length="$2"; shift 2 ;;
         --natural-loop-max-cycle-length) natural_loop_max_cycle_length="$2"; shift 2 ;;
         --natural-loop-cycle-repeats) natural_loop_cycle_repeats="$2"; shift 2 ;;
+        --no-validation) no_validation=1; shift ;;
         --continuation-escape) continuation_escape=1; shift ;;
         --escape-budget) escape_budget="$2"; shift 2 ;;
         --escape-clear-steps) escape_clear_steps="$2"; shift 2 ;;
@@ -227,8 +229,8 @@ case "${experiment_group}" in
         natural_loop_loss=1; natural_loop_weight=0.05
         decoder_adaptation="lora"
         generation_mode="plain"; repeat_cycle_penalty=0.0; repeat_force_eos_steps=0
-        warmup_steps=32; max_steps=256; lr_schedule_steps=256
-        validation_interval=128; diagnostic_steps="128,256" ;;
+        warmup_steps=102; max_steps=1024; lr_schedule_steps=1024
+        validation_interval=1024; diagnostic_steps=""; no_validation=1 ;;
     *)
         printf '{"event":"glmocr_mthv2_ddp_failed","error":"invalid_experiment_group","value":"%s"}\n' "${experiment_group}" >&2
         exit 64 ;;
@@ -522,8 +524,8 @@ write_status() {
         validation_stop_only_json=true
     fi
     mkdir -p "${group_root}/status"
-    printf '{"status":"%s","run_id":"%s","experiment_label":"%s","seed":%s,"smoke":%s,"world_size":5,"global_batch_size":5,"effective_global_batch_size":%s,"gradient_accumulation_steps":%s,"max_steps":%s,"lr_schedule_steps":%s,"learning_rate":%s,"decoder_adaptation":"%s","decoder_lora_rank":%s,"decoder_lora_alpha":%s,"decoder_lora_dropout":%s,"decoder_learning_rate":%s,"warmup_steps":%s,"min_lr_ratio":%s,"initial_residual_scale":%s,"gate_freeze_steps":%s,"auxiliary_weight_start":%s,"auxiliary_weight":%s,"auxiliary_ramp_steps":%s,"layout_loss_profile":"%s","use_validity_head":%s,"initial_valid_probability":%s,"validity_gating_mode":"%s","validity_use_transport_evidence":%s,"validation_interval":%s,"log_steps":%s,"max_eval_new_tokens":%s,"skip_selection":%s,"test_manifest_read":%s,"test_used_for_selection":false,"stop_reason":%s,"validation_stop_only":%s}\n' \
-        "${status}" "${run_id}" "${experiment_label}" "${seed}" "$([[ ${smoke} -eq 1 ]] && echo true || echo false)" "$((5 * gradient_accumulation_steps))" "${gradient_accumulation_steps}" "${status_max_steps}" "${status_lr_schedule_steps}" "${learning_rate}" "${decoder_adaptation}" "${decoder_lora_rank}" "${decoder_lora_alpha}" "${decoder_lora_dropout}" "${decoder_learning_rate}" "${warmup_steps}" "${min_lr_ratio}" "${initial_residual_scale}" "${gate_freeze_steps}" "${auxiliary_weight_start}" "${auxiliary_weight}" "${auxiliary_ramp_steps}" "${layout_loss_profile}" "${use_validity_head_json}" "${initial_valid_probability}" "${validity_gating_mode}" "${validity_use_transport_evidence_json}" "${validation_interval}" "${log_steps}" "${max_eval_new_tokens}" "${skip_selection_json}" "${test_manifest_read_json}" "${stop_reason_json}" "${validation_stop_only_json}" > "${group_root}/status/seed${seed}.json"
+    printf '{"status":"%s","run_id":"%s","experiment_label":"%s","seed":%s,"smoke":%s,"world_size":5,"global_batch_size":5,"effective_global_batch_size":%s,"gradient_accumulation_steps":%s,"max_steps":%s,"lr_schedule_steps":%s,"learning_rate":%s,"decoder_adaptation":"%s","decoder_lora_rank":%s,"decoder_lora_alpha":%s,"decoder_lora_dropout":%s,"decoder_learning_rate":%s,"warmup_steps":%s,"min_lr_ratio":%s,"initial_residual_scale":%s,"gate_freeze_steps":%s,"auxiliary_weight_start":%s,"auxiliary_weight":%s,"auxiliary_ramp_steps":%s,"layout_loss_profile":"%s","use_validity_head":%s,"initial_valid_probability":%s,"validity_gating_mode":"%s","validity_use_transport_evidence":%s,"validation_interval":%s,"no_validation":%s,"log_steps":%s,"max_eval_new_tokens":%s,"skip_selection":%s,"test_manifest_read":%s,"test_used_for_selection":false,"stop_reason":%s,"validation_stop_only":%s}\n' \
+        "${status}" "${run_id}" "${experiment_label}" "${seed}" "$([[ ${smoke} -eq 1 ]] && echo true || echo false)" "$((5 * gradient_accumulation_steps))" "${gradient_accumulation_steps}" "${status_max_steps}" "${status_lr_schedule_steps}" "${learning_rate}" "${decoder_adaptation}" "${decoder_lora_rank}" "${decoder_lora_alpha}" "${decoder_lora_dropout}" "${decoder_learning_rate}" "${warmup_steps}" "${min_lr_ratio}" "${initial_residual_scale}" "${gate_freeze_steps}" "${auxiliary_weight_start}" "${auxiliary_weight}" "${auxiliary_ramp_steps}" "${layout_loss_profile}" "${use_validity_head_json}" "${initial_valid_probability}" "${validity_gating_mode}" "${validity_use_transport_evidence_json}" "${validation_interval}" "$([[ ${no_validation} -eq 1 ]] && echo true || echo false)" "${log_steps}" "${max_eval_new_tokens}" "${skip_selection_json}" "${test_manifest_read_json}" "${stop_reason_json}" "${validation_stop_only_json}" > "${group_root}/status/seed${seed}.json"
 }
 
 run_inner() {
@@ -685,6 +687,7 @@ run_inner() {
     )
     (( text_repeat_suppression == 1 )) && method_args+=(--text-repeat-suppression)
     (( natural_loop_loss == 1 )) && method_args+=(--natural-loop-loss)
+    (( no_validation == 1 )) && method_args+=(--no-validation)
     (( continuation_escape == 1 )) && method_args+=(--continuation-escape)
     (( scheduled_sampling == 1 )) && method_args+=(--scheduled-sampling)
     (( loop_escape_training == 1 )) && method_args+=(--loop-escape-training)
@@ -771,11 +774,12 @@ skip_selection = bool(int(sys.argv[2]))
 selection = None
 if not skip_selection:
     selection = json.loads(open(sys.argv[1].replace("summary.json", "selection.json"), encoding="utf-8").read())
+validation = payload.get("validation") or {}
 print(json.dumps({
     "event": "glmocr_mthv2_ddp_complete",
     "status": payload.get("status"),
     "seed": payload.get("seed"),
-    "final_step": payload.get("validation", {}).get("step"),
+    "final_step": validation.get("step") or (selection.get("selected_step") if selection else None),
     "selected_step": selection.get("selected_step") if selection else None,
     "selection_performed": not skip_selection,
     "test_used_for_selection": payload.get("test_used_for_selection"),
@@ -857,6 +861,7 @@ if (( foreground == 0 )); then
     (( validity_use_transport_evidence == 1 )) && child_args+=(--validity-use-transport-evidence)
     (( text_repeat_suppression == 1 )) && child_args+=(--text-repeat-suppression)
     (( natural_loop_loss == 1 )) && child_args+=(--natural-loop-loss)
+    (( no_validation == 1 )) && child_args+=(--no-validation)
     (( continuation_escape == 1 )) && child_args+=(--continuation-escape)
     (( scheduled_sampling == 1 )) && child_args+=(--scheduled-sampling)
     (( loop_escape_training == 1 )) && child_args+=(--loop-escape-training)
