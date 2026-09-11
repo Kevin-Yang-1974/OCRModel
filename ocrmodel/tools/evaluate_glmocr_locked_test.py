@@ -126,6 +126,12 @@ def main() -> None:
         mode=args.mode,
         num_queries=args.num_queries,
         residual_scale_cap=args.residual_scale_cap,
+        initial_residual_scale=float(
+            (summary.get("training") or {}).get(
+                "initial_residual_scale",
+                metadata.get("initial_residual_scale", 0.0),
+            )
+        ),
         use_validity_head=bool(adapter_config.get("use_validity_head", False)),
         initial_valid_probability=float(
             adapter_config.get("initial_valid_probability", 0.05)
