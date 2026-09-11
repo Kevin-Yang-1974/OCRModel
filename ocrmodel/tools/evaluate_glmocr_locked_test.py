@@ -155,12 +155,16 @@ def main() -> None:
         max_eval_new_tokens=args.max_eval_new_tokens,
         output_dir=output_dir,
         diagnostic_steps=(),
+        generation_mode=metadata.get("generation_mode", "plain"),
+        audit_prompt_prefix=False,
+        eval_disable_repeat_guard=False,
     )
     metrics = evaluate(
         eval_args,
         model,
         processor,
         bridge,
+        None,
         test_records,
         train_records,
         device,
