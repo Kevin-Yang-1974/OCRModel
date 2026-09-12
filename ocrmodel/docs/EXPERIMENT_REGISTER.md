@@ -147,3 +147,34 @@ A1 与 baseline 的 1024-step 训练汇总完全一致，A1 的 natural-loop act
 MTHv2 原官方 split 是随机页级划分，没有书籍/版本元数据，不满足本项目的隔离要求。本轮不沿用该 split：将 `original_image` 中 `V...P...` 的卷号前缀作为版本/文档组代理，无卷号的数字页按 subset 合并为一组，再划分 train/validation/test。仅纳入 `1–32` 个文本行区域的整页，保证 32-query 无截断。选中页面还需通过 16×16 dHash、Hamming 距离不大于 4 的跨 split 近重复检查。这一卷号映射是可执行代理协议，不声称等价于完整书手或馆藏标注。
 
 上述 `1–32` 个区域限制只适用于历史 128 页机制筛选，不适用于当前全量 MTHv2 DDP。全量协议使用 512 queries，最大区域数为 407，保留全部 2159/240/800 页；validity/no-object 目标只由训练期 Hungarian 匹配生成，布局真值和 query mask 不进入推理输入。
+
+## 2026-09-11 BSCC 四卡 decoder-LoRA 20k 实验
+
+| 字段 | 口径 |
+| --- | --- |
+| run ID | `glmocr_mthv2_decoder_lora_lr1e5_20k_4gpu_rollout256_260912_v1` |
+| 分支 | `glm-ocr-layout-ot` |
+| 训练 | BSCC 四卡同步 DDP；global batch `4`；`20000` steps；seed `42` |
+| 数据 | full MTHv2：train/validation/test = `2159/240/800`；whole-page；512 queries |
+| 模型与目标 | geometry；Hungarian；full layout loss；FP32 adapter；fast processor；真实自由生成 rollout loop loss，max new tokens `256` |
+| decoder LoRA | rank `8`、alpha `8`、dropout `0`；本 run 学习率 `1e-5` |
+| checkpoint | `5000/10000/15000/20000` |
+| protocol 边界 | training 与 parallel validation 只使用 train/validation；selection 后才创建 test protocol |
+| 当前状态 | 原 v1 在 step112 因未启用训练期循环目标而停止；新的 rollout256 run 使用新 ID，待 smoke 通过后运行 |
+| 结果口径 | 用户授权的高 decoder-LoRA 学习率探索；不替代历史五卡协议，不与五卡结果作未校正的严格等预算比较 |
+
+原 `glmocr_mthv2_decoder_lora_lr1e5_20k_4gpu_260911_v1` 仅设置了 `generation_mode=loop_recovery`，未设置 `--natural-loop-loss` 或 `--loop-escape-training`，因此没有循环训练信号；该 run 已取消并保留日志，不进入 validation/test。上一轮 synthetic loop-escape smoke 也不作为本轮训练依据。新的 rollout256 run 显式启用 `--natural-loop-loss --natural-loop-max-new-tokens 256`：先进行 prompt-only no-grad 自由生成，再将 detached 生成前缀送入第二次带梯度 forward，以 live logits 计算循环损失；训练完成时要求 rollout tokens、active tokens 和加权循环损失均为有限正值。`evaluate_glmocr_locked_test.py` 已按 metadata 注入并加载 decoder LoRA，四个 test shard 和 merge 阶段均强制检查 `decoder_lora_loaded=true`。
+
+## 2026-09-12：natural predicted-loop A1 warm-start continuation（累计 1024 步）
+
+| 项目 | 配置/结果 |
+| --- | --- |
+| run ID | `glmocr_natural_rollout_A1_warmstart256_260912_v1`（256 步）→ `glmocr_natural_rollout_A1_warmstart256_cont768_260912_v1`（接续 768 步） |
+| 训练口径 | seed42；五卡 DDP；geometry/full/Hungarian；512 queries；LoRA；plain generation；无 validation、无推理期循环干预 |
+| 接续语义 | 从 finite `checkpoint-256` 加载 adapter 与 decoder LoRA；接续阶段重新建立 optimizer/scheduler；累计 optimizer updates=`1024`，summary 局部 selected step=`768` |
+| natural-loop 训练信号 | mean loss=`2.653688`；mean weighted loss=`0.132684`；active-page ratio=`0.946614`；说明 rollout-based 分支实际激活 |
+| checkpoint | `checkpoint-768` finite；训练 `test_manifest_read=false`、`test_used_for_selection=false` |
+| locked test | 五卡五 shard 完成；800 页；CER=`1.183537`；insert/delete/substitute=`224004/15646/72025`；循环页率=`0.228750`；长度上限率=`0.293750`；EOS=`0.706250` |
+| 对照 | plain baseline 800 页 CER=`0.874635`、循环页率=`0.195000`、长度上限率=`0.207500`；warm-start A1 CER 恶化 `+0.308902` |
+
+该 run 证明自然循环惩罚有非零训练梯度，但没有改善自由生成，反而增加插入和触顶。由于采用 `256+768` warm-start 且接续阶段重置 optimizer/scheduler，不能把它当成与从基础权重单次连续 1024 步的严格等价对照；详细证据见 `docs/实验日志/GLMOCR/训练退化诊断/GLMOCR-B-260912-001.md`。
