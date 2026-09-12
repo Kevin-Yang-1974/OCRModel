@@ -69,7 +69,7 @@ Validity 分支的实现位置为 `adapter.py` 的 `validity_head`、detached tr
 
 稳定性单独判定：三 run 无 CUDA/OOM/NaN/Inf/Traceback；共同选中点 residual norm `≤0.01`；generation limit rate `<0.10`；且不存在所有 seed 同时发生的后程灾难性 CER 退化。性能收益与稳定性分开报告。
 
-## BSCC 四卡 decoder-LoRA 变体
+## 历史：BSCC 四卡 decoder-LoRA 变体
 
 为验证 decoder LoRA 学习率 `1e-5`，新增 BSCC 四卡变体。该变体沿用本页的 whole-page、512-query、geometry、Hungarian、FP32 adapter 和 fast processor 配置，但使用四卡同步 DDP（global batch 4）、20,000 steps、完整 20,000-step LR horizon，并从基础 GLM-OCR revision 重新初始化，不续接旧 32-query checkpoint。本次 official-layout run 的训练目标固定为 `L_official + 0.2 L_layout`，关闭 `L_natural_loop`、scheduled sampling、loop escape 和 continuation head；`generation_mode=loop_recovery` 仅保留给验证/推理解码，不能代替训练信号。
 
@@ -77,4 +77,10 @@ Validity 分支的实现位置为 `adapter.py` 的 `validity_head`、detached tr
 
 训练入口 `tools/bscc/run_glmocr_mthv2_decoder_lora_4gpu.sbatch` 只审计 train/validation 并保存 step `5000/10000/15000/20000`，使用 `--defer-validation` 避免训练进程串行选点。`tools/bscc/run_glmocr_mthv2_parallel_validation_4gpu.sbatch` 将四个 checkpoint 分配到四张 GPU，按 validation CER 选择一个 step；`tools/bscc/run_glmocr_mthv2_locked_test_4gpu.sbatch` 在 selection 完成后才生成 test protocol 并执行四路分片 test。该变体的 test 仍为 selection-locked，且 `test_used_for_selection=false`。
 
-四卡变体是用户授权的高 decoder-LoRA 学习率探索，不替代既有五卡全量协议，也不与五卡结果作未校正的严格等预算比较。训练完成时必须确认 loss metadata 与上述目标一致、四个 checkpoint 健康、`test_manifest_read=false`；任何 CUDA/OOM/NaN/Inf、checkpoint 缺失、validation 不完整或 LoRA 未加载均终止后续阶段并保留日志。此前的训练期循环损失 run 已停止并排除，上一轮 synthetic loop-escape smoke 不进入本实验结果。
+四卡变体原计划用于高 decoder-LoRA 学习率探索，但在未分配节点、未产生训练产物前切换到 A100 五卡入口；对应 BSCC pending job 不作为结果。此前的训练期循环损失 run 已停止并排除，上一轮 synthetic loop-escape smoke 不进入当前实验结果。
+
+## 当前：A100 五卡 decoder-LoRA plain training
+
+当前正式 run 为 `glmocr_mthv2_decoder_lora_lr1e5_20k_5gpu_a100_official_layout_260912_v1`，使用 `tools/training/run_glmocr_a100_decoder_lora.sh`。该入口与 BSCC 版本共享相同的训练代码、whole-page/512-query/geometry/Hungarian/full layout loss、FP32 adapter、fast processor、decoder LoRA `rank/alpha/dropout=8/8/0`、decoder LoRA learning rate `1e-5` 及 plain objective `L_official + 0.2 L_layout`；差异是 A100 使用五卡同步 DDP（global batch 5），BSCC 计划使用四卡同步 DDP（global batch 4）。
+
+A100 launcher 先执行 bounded smoke，再执行 20,000-step deferred training，固定在 step `5000/10000/15000/20000` 保存 checkpoint 并进行 validation-only selection，最后才执行 selection-locked test。训练和 validation 均不读取 test；`generation_mode=loop_recovery` 仅是验证/测试解码配置，不会加入训练损失。当前 run 已完成启动前 GPU 准入并进入 smoke，后续阶段以 `pipeline_status.json`、metrics 和 checkpoint 健康状态为准。

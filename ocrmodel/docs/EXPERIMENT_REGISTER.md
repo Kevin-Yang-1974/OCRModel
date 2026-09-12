@@ -160,10 +160,26 @@ MTHv2 原官方 split 是随机页级划分，没有书籍/版本元数据，不
 | decoder LoRA | rank `8`、alpha `8`、dropout `0`；本 run 学习率 `1e-5` |
 | checkpoint | `5000/10000/15000/20000` |
 | protocol 边界 | training 与 parallel validation 只使用 train/validation；selection 后才创建 test protocol |
-| 当前状态 | 原 v1 与 rollout256 诊断 run 均不进入结果；新的 official-layout smoke `1494430` 已提交，正式训练 `1494433` 依赖 smoke 成功后运行 |
+| 当前状态 | 原 v1、rollout256 诊断 run 与 BSCC pending job 均不进入结果；BSCC job `1494430/1494433` 在分配节点前取消，当前转由 A100 五卡入口运行 |
 | 结果口径 | 用户授权的高 decoder-LoRA 学习率探索；不替代历史五卡协议，不与五卡结果作未校正的严格等预算比较 |
 
 原 `glmocr_mthv2_decoder_lora_lr1e5_20k_4gpu_260911_v1` 仅设置了 `generation_mode=loop_recovery`，未设置 `--natural-loop-loss` 或 `--loop-escape-training`，因此没有循环训练信号；该 run 已取消并保留日志，不进入 validation/test。上一轮 rollout256 诊断 run 也不作为本轮训练依据。新的 official-layout run 固定使用 `L_official + 0.2 L_layout`，训练阶段关闭 natural-loop、scheduled sampling、loop escape 和 continuation head；`evaluate_glmocr_locked_test.py` 已按 metadata 注入并加载 decoder LoRA，四个 test shard 和 merge 阶段均强制检查 `decoder_lora_loaded=true`。
+
+## 2026-09-12 A100 五卡 decoder-LoRA plain 20k 实验
+
+| 字段 | 口径 |
+| --- | --- |
+| run ID | `glmocr_mthv2_decoder_lora_lr1e5_20k_5gpu_a100_official_layout_260912_v1` |
+| 入口/会话 | `tools/training/run_glmocr_a100_decoder_lora.sh`；tmux `glmocr_a100_plain_260912` |
+| 训练 | A100 五卡同步 DDP；global batch `5`；`20000` steps；seed `42` |
+| 数据 | full MTHv2：train/validation/test = `2159/240/800`；whole-page；512 queries |
+| 模型与目标 | geometry；Hungarian；full layout loss；FP32 adapter；fast processor；`L_official + 0.2 L_layout`；natural-loop 等附加训练目标关闭 |
+| decoder LoRA | rank `8`、alpha `8`、dropout `0`；学习率 `1e-5` |
+| checkpoint/validation | `5000/10000/15000/20000`；validation-only selection |
+| protocol 边界 | smoke、training、validation 不读取 test；selection 后才执行 locked test |
+| 当前状态 | 已启动；当前阶段为 bounded smoke，正式训练等待 smoke 通过 |
+
+该 A100 run 与 BSCC 计划共享训练目标和公共 DDP launcher，仅 world size/global batch 不同。A100 smoke 通过的独立验证 run 已确认 checkpoint reload finite、decoder LoRA finite、natural-loop disabled、loss objective 正确且 test-free；当前正式 run 仍需完成自身 smoke 后才进入 20k 训练。
 
 ## 历史记录：2026-09-12 natural predicted-loop A1 warm-start continuation（累计 1024 步）
 

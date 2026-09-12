@@ -149,7 +149,7 @@ python tools/summarize_architecture_comparison.py \
 
 正式训练入口还必须自动执行 validation-only checkpoint selection 和 selection-locked test，且不允许 test 参与任何调参。
 
-## BSCC 四卡 decoder-LoRA 20k 流程
+## 历史：BSCC 四卡 decoder-LoRA 20k 流程
 
 本流程基于当前 A100 全量 DDP 参数迁移到 BSCC，新的正式 run 为 `glmocr_mthv2_decoder_lora_lr1e5_20k_4gpu_official_layout_260912_v1`。训练使用 whole-page、512 queries、全量 MTHv2（2159/240/800），四卡同步 DDP，global batch 为 4；adapter learning rate 为 `5e-5`，decoder LoRA 使用 rank/alpha/dropout `8/8/0`，学习率为本 run 专用的 `1e-5`。公共 A100 launcher 默认仍为 `1e-6`。
 
@@ -157,6 +157,12 @@ python tools/summarize_architecture_comparison.py \
 
 训练完成后提交 `tools/bscc/run_glmocr_mthv2_parallel_validation_4gpu.sbatch`。四张 GPU 分别对四个 checkpoint 执行 eval-only validation，汇总器按 validation CER、再按较小 step 平分选择，并同时写入 run 目录和 group 目录的 `selection.json`。只有 selection 完成后，`tools/bscc/run_glmocr_mthv2_locked_test_4gpu.sbatch` 才创建包含 test 的 protocol 并启动四卡分片 test；test 不参与训练或选点。
 
-三阶段应使用 Slurm `afterok` 依赖串联：training → parallel validation → locked test。任一阶段失败均保留产物和日志，不复用 run ID；高 decoder-LoRA 学习率及四卡 global batch 与历史五卡结果不同，本 run 只作为待验证实验记录。
+三阶段原计划使用 Slurm `afterok` 依赖串联：training → parallel validation → locked test。BSCC job 在分配节点前因切换到 A100 入口而取消，未产生训练产物，不进入结果；BSCC 单卡历史脚本仍保持不变。
 
-此前 run `glmocr_mthv2_decoder_lora_lr1e5_20k_4gpu_260911_v1` 已在 step112 停止：它只有 `generation_mode=loop_recovery`，没有训练期循环目标，因此不作结果、不进入 validation/test。上一轮 rollout256 run 也停止并保留为诊断记录，不作为本轮目标；新的 official-layout run 在训练完成后强制审计 loss objective、checkpoint 健康状态、LoRA 配置和 no-test 边界。
+此前 run `glmocr_mthv2_decoder_lora_lr1e5_20k_4gpu_260911_v1` 已在 step112 停止：它只有 `generation_mode=loop_recovery`，没有训练期循环目标，因此不作结果、不进入 validation/test。上一轮 rollout256 run 也停止并保留为诊断记录，不作为当前目标。
+
+## 当前 A100 五卡 decoder-LoRA plain 20k 流程
+
+当前入口为 `tools/training/run_glmocr_a100_decoder_lora.sh`，run ID 为 `glmocr_mthv2_decoder_lora_lr1e5_20k_5gpu_a100_official_layout_260912_v1`，tmux session 为 `glmocr_a100_plain_260912`。它与 BSCC 入口使用相同的 plain 训练配置：`L_official + 0.2 L_layout`、natural-loop 关闭、decoder LoRA learning rate `1e-5`、20,000 steps、checkpoint/validation 间隔 `5000`；仅 world size/global batch 改为 A100 五卡/5。
+
+A100 launcher 的阶段顺序为 bounded smoke → deferred training → 四个 checkpoint 的并行 validation/selection → selection-locked test。smoke 与训练/validation 阶段保持 no-test 边界，selection 完成前不读取 test；每阶段均保留结构化状态和完整日志。
