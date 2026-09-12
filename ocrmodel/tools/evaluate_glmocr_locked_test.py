@@ -101,6 +101,10 @@ def main() -> None:
         raise RuntimeError(f"training run is not complete: {run_dir}")
     summary = _read_json(summary_path)
     metadata = _read_json(metadata_path)
+    if (metadata.get("natural_loop_loss") or {}).get("mode") == "aligned_recovery_v1":
+        # This run's generation budget was fixed before validation selection.
+        # Do not silently fall back to the historical 1536-token test default.
+        args.max_eval_new_tokens = int(metadata["max_eval_new_tokens"])
     selection = _read_json(selection_path)
     if summary.get("status") != "complete" or metadata.get("status") != "complete":
         raise RuntimeError("locked test requires a complete training run")

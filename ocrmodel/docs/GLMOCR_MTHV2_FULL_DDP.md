@@ -68,3 +68,13 @@ Validity 分支的实现位置为 `adapter.py` 的 `validity_head`、detached tr
 6. 使用共同 step 分别运行三次 `run_glmocr_mthv2_locked_test.sh`。test 只在此阶段读取一次，不参与训练、早停、阈值或后处理调整。
 
 稳定性单独判定：三 run 无 CUDA/OOM/NaN/Inf/Traceback；共同选中点 residual norm `≤0.01`；generation limit rate `<0.10`；且不存在所有 seed 同时发生的后程灾难性 CER 退化。性能收益与稳定性分开报告。
+
+## BSCC 四卡 decoder-LoRA 变体
+
+为验证 decoder LoRA 学习率 `1e-5`，新增 BSCC 四卡变体。该变体沿用本页的 whole-page、512-query、geometry、Hungarian、FP32 adapter 和 fast processor 配置，但使用四卡同步 DDP（global batch 4）、20,000 steps、完整 20,000-step LR horizon，并从基础 GLM-OCR revision 重新初始化，不续接旧 32-query checkpoint。本次 official-layout run 的训练目标固定为 `L_official + 0.2 L_layout`，关闭 `L_natural_loop`、scheduled sampling、loop escape 和 continuation head；`generation_mode=loop_recovery` 仅保留给验证/推理解码，不能代替训练信号。
+
+公共训练代码仍保留 natural-loop 参数和旧诊断模式，以便复现历史证据，但当前 BSCC 入口不启用这些分支；本轮结果只按上述 plain training objective 解释。
+
+训练入口 `tools/bscc/run_glmocr_mthv2_decoder_lora_4gpu.sbatch` 只审计 train/validation 并保存 step `5000/10000/15000/20000`，使用 `--defer-validation` 避免训练进程串行选点。`tools/bscc/run_glmocr_mthv2_parallel_validation_4gpu.sbatch` 将四个 checkpoint 分配到四张 GPU，按 validation CER 选择一个 step；`tools/bscc/run_glmocr_mthv2_locked_test_4gpu.sbatch` 在 selection 完成后才生成 test protocol 并执行四路分片 test。该变体的 test 仍为 selection-locked，且 `test_used_for_selection=false`。
+
+四卡变体是用户授权的高 decoder-LoRA 学习率探索，不替代既有五卡全量协议，也不与五卡结果作未校正的严格等预算比较。训练完成时必须确认 loss metadata 与上述目标一致、四个 checkpoint 健康、`test_manifest_read=false`；任何 CUDA/OOM/NaN/Inf、checkpoint 缺失、validation 不完整或 LoRA 未加载均终止后续阶段并保留日志。此前的训练期循环损失 run 已停止并排除，上一轮 synthetic loop-escape smoke 不进入本实验结果。

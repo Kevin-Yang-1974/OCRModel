@@ -53,6 +53,7 @@ from .lora import (
     trainable_parameter_report,
 )
 from .losses import compute_layout_losses, match_layout_targets
+from .aligned_recovery import CONFIG as ALIGNED_CONFIG, collect_rollout as collect_aligned_rollout, recovery_losses
 from .metrics import aggregate_ocr_metrics
 from .autoregressive_region import box_iou, compute_region_losses
 from .stabilization import (
@@ -795,6 +796,9 @@ def text_repeat_activation_stats(
 def natural_loop_config(args: argparse.Namespace) -> dict[str, Any]:
     """Return the real-rollout natural prediction loop configuration."""
 
+    if getattr(args, "recovery_mode", "legacy") == "aligned_recovery_v1":
+        return {**ALIGNED_CONFIG, "enabled": True, "interval": args.aligned_rollout_interval}
+
     return {
         "enabled": bool(getattr(args, "natural_loop_loss", False)),
         "weight": float(getattr(args, "natural_loop_weight", 0.05)),
@@ -812,6 +816,33 @@ def natural_loop_config(args: argparse.Namespace) -> dict[str, Any]:
         "teacher_forced_detector": False,
         "synthetic_prefix": False,
         "inference_intervention": False,
+    }
+
+
+def loss_objective_config(args: argparse.Namespace) -> dict[str, Any]:
+    """Describe the loss terms that can contribute to a training update."""
+
+    extra_terms: list[str] = []
+    if bool(getattr(args, "text_repeat_suppression", False)):
+        extra_terms.append("L_text_repeat")
+    if bool(getattr(args, "scheduled_sampling", False)):
+        extra_terms.append("L_scheduled_prefix")
+    if bool(getattr(args, "loop_escape_training", False)):
+        extra_terms.append("L_loop_escape")
+    if bool(getattr(args, "continuation_head", False)):
+        extra_terms.append("L_continuation_head")
+    if natural_loop_config(args).get("enabled") is True:
+        extra_terms.append("L_natural_loop")
+    return {
+        "formula": (
+            "L_official + auxiliary_weight * L_layout"
+            if not extra_terms
+            else "L_official + auxiliary_weight * L_layout + extra_terms"
+        ),
+        "official_loss": "outputs.loss",
+        "official_weight": 1.0,
+        "layout_weight": float(args.auxiliary_weight),
+        "extra_terms": extra_terms,
     }
 
 
@@ -1989,20 +2020,30 @@ def train(
                 "candidate_tokens": torch.zeros((), device=device, dtype=torch.float32),
                 "continuation_tokens": torch.zeros((), device=device, dtype=torch.float32),
             }
-            if bool(getattr(args, "natural_loop_loss", False)):
+            aligned_mode = getattr(args, "recovery_mode", "legacy") == "aligned_recovery_v1"
+            aligned_rollout = None
+            if bool(getattr(args, "natural_loop_loss", False)) and (
+                not aligned_mode or step % args.aligned_rollout_interval == 0
+            ):
                 # The rollout must not see GT region targets.  Restore the
                 # training bridge state before the differentiable second
                 # forward below.
                 bridge.set_grid_thw(inputs["image_grid_thw"])
                 bridge.set_region_targets(None)
                 bridge.set_region_decode_controls()
-                natural_rollout = collect_natural_loop_rollout(
-                    model_module,
-                    args,
-                    inputs,
-                    inputs["labels"],
-                    eos_ids,
-                )
+                if aligned_mode:
+                    aligned_rollout = collect_aligned_rollout(model_module, inputs, eos_ids)
+                    natural_rollout.update(
+                        prefix_inputs=aligned_rollout["prefix_inputs"],
+                        detected_pages=float(aligned_rollout["detected"]),
+                        rollout_tokens=float(aligned_rollout["rollout_tokens"]),
+                        cycle_tokens=float((aligned_rollout["cycle"].get("length") or 0)
+                                           * (aligned_rollout["cycle"].get("repeats") or 0)),
+                    )
+                else:
+                    natural_rollout = collect_natural_loop_rollout(
+                        model_module, args, inputs, inputs["labels"], eos_ids,
+                    )
                 bridge.set_grid_thw(inputs["image_grid_thw"])
                 bridge.set_region_targets(
                     region_decoder_targets(record, device, args.num_queries)
@@ -2012,18 +2053,34 @@ def train(
                 bridge.set_region_decode_controls()
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                     natural_outputs = model(**natural_rollout["prefix_inputs"])
-                if natural_outputs.loss is None or natural_outputs.logits is None:
-                    raise RuntimeError("natural-loop second forward did not produce OCR logits/loss")
-                if not all_finite(
-                    bool(torch.isfinite(natural_outputs.loss).all()), distributed, device
-                ):
+                if natural_outputs.logits is None:
+                    raise RuntimeError("natural-loop second forward did not produce OCR logits")
+                if aligned_mode:
+                    supervised = bool(
+                        (aligned_rollout["prefix_inputs"]["labels"] != -100).any()
+                    )
+                    loss_finite = (
+                        (not supervised)
+                        or (
+                            natural_outputs.loss is not None
+                            and bool(torch.isfinite(natural_outputs.loss).all())
+                        )
+                    )
+                else:
+                    if natural_outputs.loss is None:
+                        raise RuntimeError(
+                            "natural-loop second forward did not produce OCR loss"
+                        )
+                    loss_finite = bool(torch.isfinite(natural_outputs.loss).all())
+                if not all_finite(loss_finite, distributed, device):
                     raise FloatingPointError(
                         f"non-finite natural-loop OCR loss at step {step}"
                     )
-                natural_loop = natural_loop_loss_for_rollout(
-                    natural_outputs,
-                    inputs["labels"],
-                    natural_rollout,
+                natural_loop = (
+                    recovery_losses(natural_outputs.logits, aligned_rollout, eos_ids)
+                    if aligned_mode else natural_loop_loss_for_rollout(
+                        natural_outputs, inputs["labels"], natural_rollout,
+                    )
                 )
             debug(f"step={step} micro={accumulation_index} losses_done")
             repeat_loss = (
@@ -2140,6 +2197,8 @@ def train(
                 if bool(getattr(args, "natural_loop_loss", False))
                 else 0.0
             )
+            if aligned_mode:
+                natural_loop_weight = min(step / ALIGNED_CONFIG["ramp_steps"], 1.0)
             natural_loop_term = natural_loop_weight * natural_loop["loss"]
             loss = (
                 ocr_objective_loss
@@ -2202,6 +2261,13 @@ def train(
             micro_sums["text_eos_activation_ratio"] += eos_activation_ratio
             micro_sums["official_base_loss"] += float(outputs.loss.detach())
             micro_sums["natural_loop_loss"] += float(natural_loop["loss"].detach())
+            if aligned_rollout is not None:
+                micro_sums["aligned_rollout_pages"] += 1
+                micro_sums["aligned_accepted_pages"] += int(aligned_rollout["accepted"])
+                micro_sums["aligned_end_tokens"] += float(natural_loop["end_tokens"])
+                micro_sums["aligned_end_loss"] += float(natural_loop["end"].detach())
+                if not aligned_rollout["accepted"]:
+                    micro_sums["aligned_skip_" + aligned_rollout["reason"]] += 1
             micro_sums["natural_loop_term"] += float(natural_loop_term.detach())
             micro_sums["natural_loop_unlikelihood"] += float(
                 natural_loop["unlikelihood"].detach()
@@ -2556,6 +2622,19 @@ def train(
             )
             if diagnostic:
                 diagnostic_train[str(step)] = dict(metrics)
+        if getattr(args, "recovery_mode", "legacy") == "aligned_recovery_v1":
+            for key in ("aligned_rollout_pages", "aligned_accepted_pages", "aligned_end_tokens",
+                        "aligned_end_loss", "aligned_skip_no_cycle", "aligned_skip_ambiguous_endpoint",
+                        "aligned_skip_alignment_error", "aligned_skip_weak_tail",
+                        "aligned_skip_legal_or_ambiguous_repeat", "aligned_skip_unsafe_end",
+                        "aligned_skip_context_capacity"):
+                metrics[key] = (mean_scalar(micro_sums[key], distributed, device)
+                                if key.endswith("loss") else sum_scalar(micro_sums[key], distributed, device))
+                running[key] += metrics[key]
+            metrics["aligned_detection_rate"] = metrics["natural_loop_detected_pages"] / max(1, metrics["aligned_rollout_pages"])
+            metrics["aligned_acceptance_rate"] = metrics["aligned_accepted_pages"] / max(1, metrics["aligned_rollout_pages"])
+            # Log every sampled step, not only every 16th optimizer update.
+            log_this_step = log_this_step or step % args.aligned_rollout_interval == 0
         for key in (
             "ocr_loss",
             "official_base_loss",
@@ -2664,6 +2743,7 @@ def train(
         "decoder_adaptation": getattr(args, "decoder_adaptation", "frozen"),
         "decoder_learning_rate": decoder_learning_rate,
         "official_base_loss": "outputs.loss",
+        "loss_objective": loss_objective_config(args),
         "natural_loop": natural_loop_config(args),
         "scheduled_sampling": {
             "enabled": bool(getattr(args, "scheduled_sampling", False)),
@@ -3350,6 +3430,8 @@ def evaluate(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
+    parser.add_argument("--recovery-mode", choices=["legacy", "aligned_recovery_v1"], default="legacy")
+    parser.add_argument("--aligned-rollout-interval", type=int, default=4)
     parser.add_argument("--mode", choices=["content_only", "attention", "geometry", "layout_ot"], required=True)
     parser.add_argument("--model-path", type=Path, required=True)
     parser.add_argument("--train-manifest", type=Path, required=True)
@@ -3595,6 +3677,13 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    if args.recovery_mode == "aligned_recovery_v1":
+        if args.aligned_rollout_interval < 1:
+            raise ValueError("aligned rollout interval must be positive")
+        if any((args.scheduled_sampling, args.loop_escape_training, args.continuation_head,
+                args.text_repeat_suppression)):
+            raise ValueError("aligned_recovery_v1 cannot mix legacy recovery objectives")
+        args.natural_loop_loss = True
     if args.layout_loss_profile == "validity_assignment":
         # This profile is intentionally self-contained: it cannot silently
         # fall back to the old normalized gate or a query-only validity head.
@@ -3802,6 +3891,7 @@ def main() -> None:
         "selection_performed": False,
         "text_repeat_suppression": args.text_repeat_suppression,
         "text_repeat_config": asdict(repeat_suppression_config(args)),
+        "loss_objective": loss_objective_config(args),
         "natural_loop_loss": natural_loop_config(args),
         "eval_disable_repeat_guard": args.eval_disable_repeat_guard,
         "audit_prompt_prefix": args.audit_prompt_prefix,
@@ -3873,6 +3963,7 @@ def main() -> None:
         "adapter_config": None,
         "model_path": str(args.model_path.resolve()),
         "code_sha256": sha256_file(Path(__file__).resolve()),
+        "recovery_code_sha256": sha256_file(Path(__file__).with_name("aligned_recovery.py")),
         "protocol": protocol_metadata,
         "test_manifest_read": bool(protocol_metadata.get("test_manifest_read", False)),
         "test_used_for_selection": False,
@@ -4027,6 +4118,7 @@ def main() -> None:
             # backward while rank 0 is still evaluating, which deadlocks NCCL.
             barrier(distributed)
             if distributed.is_main:
+                write_json(args.output_dir / "phase.json", {"phase": "initial_validation", "status": "running"})
                 validation0 = evaluate(
                     args,
                     model,
@@ -4053,6 +4145,8 @@ def main() -> None:
                 )
             barrier(distributed)
 
+        if distributed.is_main:
+            write_json(args.output_dir / "phase.json", {"phase": "training", "status": "running"})
         training = train(
             args,
             model,
@@ -4189,6 +4283,7 @@ def main() -> None:
             return
         candidates = []
         for step in checkpoint_steps:
+            write_json(args.output_dir / "phase.json", {"phase": "validation", "step": step, "status": "running"})
             checkpoint_dir = args.output_dir / f"checkpoint-{step}"
             load_adapter_checkpoint(checkpoint_dir, bridge)
             if args.decoder_adaptation == "lora":

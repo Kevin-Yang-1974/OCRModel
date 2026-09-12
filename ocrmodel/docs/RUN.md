@@ -148,3 +148,15 @@ python tools/summarize_architecture_comparison.py \
 本地 A100 后续运行入口必须从环境变量读取外部资产，且输出位于 `/data3/yky/yangky_ocr_models/glm_ocr_layout_ot`。`/data4/hyf` 始终只读。每次命令只可查询明确允许的物理 GPU；任一目标卡的瞬时利用率达到 50% 时，在启动子任务前整体退出。BSCC 由 Slurm 分配 GPU，不在登录节点查询或抢占物理卡。
 
 正式训练入口还必须自动执行 validation-only checkpoint selection 和 selection-locked test，且不允许 test 参与任何调参。
+
+## BSCC 四卡 decoder-LoRA 20k 流程
+
+本流程基于当前 A100 全量 DDP 参数迁移到 BSCC，新的正式 run 为 `glmocr_mthv2_decoder_lora_lr1e5_20k_4gpu_official_layout_260912_v1`。训练使用 whole-page、512 queries、全量 MTHv2（2159/240/800），四卡同步 DDP，global batch 为 4；adapter learning rate 为 `5e-5`，decoder LoRA 使用 rank/alpha/dropout `8/8/0`，学习率为本 run 专用的 `1e-5`。公共 A100 launcher 默认仍为 `1e-6`。
+
+训练阶段使用独立的 train/validation-only protocol，不打开 test，固定保存 `checkpoint-{5000,10000,15000,20000}`，训练目标为 `L_official + 0.2 L_layout`，不包含 `L_natural_loop` 或其他附加训练目标。对应入口为 `tools/bscc/run_glmocr_mthv2_decoder_lora_4gpu.sbatch`，它调用动态 world-size 的 `tools/training/run_glmocr_mthv2_ddp.sh --without-test --defer-validation`；旧 BSCC 单卡架构筛选入口保持不变。验证/测试仍可使用 `generation_mode=loop_recovery` 作为解码配置，但这不改变训练目标。
+
+训练完成后提交 `tools/bscc/run_glmocr_mthv2_parallel_validation_4gpu.sbatch`。四张 GPU 分别对四个 checkpoint 执行 eval-only validation，汇总器按 validation CER、再按较小 step 平分选择，并同时写入 run 目录和 group 目录的 `selection.json`。只有 selection 完成后，`tools/bscc/run_glmocr_mthv2_locked_test_4gpu.sbatch` 才创建包含 test 的 protocol 并启动四卡分片 test；test 不参与训练或选点。
+
+三阶段应使用 Slurm `afterok` 依赖串联：training → parallel validation → locked test。任一阶段失败均保留产物和日志，不复用 run ID；高 decoder-LoRA 学习率及四卡 global batch 与历史五卡结果不同，本 run 只作为待验证实验记录。
+
+此前 run `glmocr_mthv2_decoder_lora_lr1e5_20k_4gpu_260911_v1` 已在 step112 停止：它只有 `generation_mode=loop_recovery`，没有训练期循环目标，因此不作结果、不进入 validation/test。上一轮 rollout256 run 也停止并保留为诊断记录，不作为本轮目标；新的 official-layout run 在训练完成后强制审计 loss objective、checkpoint 健康状态、LoRA 配置和 no-test 边界。

@@ -61,6 +61,8 @@ repeat_cycle_repeats=3
 repeat_cycle_penalty=2.0
 repeat_force_eos_steps=16
 natural_loop_loss=0
+recovery_mode="legacy"
+aligned_rollout_interval=4
 natural_loop_weight=0.05
 natural_loop_recent_window=96
 natural_loop_min_cycle_length=8
@@ -101,6 +103,8 @@ region_spatial_iou_threshold=0.8
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --run-id) run_id="$2"; shift 2 ;;
+        --recovery-mode) recovery_mode="$2"; shift 2 ;;
+        --aligned-rollout-interval) aligned_rollout_interval="$2"; shift 2 ;;
         --experiment-group) experiment_group="$2"; shift 2 ;;
         --seed) seed="$2"; shift 2 ;;
         --experiment-label) experiment_label="$2"; shift 2 ;;
@@ -688,6 +692,8 @@ run_inner() {
     (( use_validity_head == 1 )) && validity_args+=(--use-validity-head)
     (( validity_use_transport_evidence == 1 )) && validity_args+=(--validity-use-transport-evidence)
     method_args=(
+        --recovery-mode "${recovery_mode}"
+        --aligned-rollout-interval "${aligned_rollout_interval}"
         --text-ul-weight "${text_ul_weight}"
         --generation-mode "${generation_mode}"
         --text-eos-loss-weight "${text_eos_loss_weight}"
@@ -858,6 +864,7 @@ if (( foreground == 0 )); then
     script_path="$(realpath -- "${BASH_SOURCE[0]}")"
     child_args=(
         bash "${script_path}" --foreground --run-id "${run_id}" --seed "${seed}"
+        --recovery-mode "${recovery_mode}" --aligned-rollout-interval "${aligned_rollout_interval}"
         --gpu-ids "${gpu_ids}" --gpu-utilization-limit "${gpu_utilization_limit}"
             --max-steps "${max_steps}" --lr-schedule-steps "${lr_schedule_steps}"
         --experiment-label "${experiment_label}"

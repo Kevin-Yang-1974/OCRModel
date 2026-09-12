@@ -36,9 +36,9 @@
 | `glmocr_plain_baseline_1024_260911_v1` | plain baseline；natural loop disabled；plain generation；无硬 EOS/循环 guard；LoRA；1024 steps；no-validation | 全量 MTHv2 train manifest；固定 800 页 test manifest | GLM-OCR 固定 revision；基础权重；seed42 | complete；step1024 checkpoint finite；fixed-final selection；训练不做 validation | 无 validation；固定 final step1024 | 五卡 direct test 已完成；CER `0.874635`；循环页率 `0.195000`；长度上限率 `0.207500` | 训练 mean official base loss `1.409982`、mean total `2.422198`；与 A1 的 checkpoint 和 test 指标完全一致 |
 | `glmocr_mthv2_attribution_128_retry_v1` | seed42 三组容量归因：A `no-op`；B 固定 gate `adapter-only`；C 固定 gate＋decoder-LoRA（rank 8、alpha 8、dropout 0）；五卡 DDP；128 steps；32 页 validation；无 selection | 同一 MTHv2 train manifest；同一确定性 validation32 manifest（32 页） | GLM-OCR 固定 revision；三组均从同一基础权重起点；B/C 训练预算一致 | bundle `complete`；A/B 复用已完成 run，C 使用新 run ID 重试完成；所有 checkpoint finite，residual relative norm A/B/C=`0/0.001505/0.001438` | validation CER A/B/C=`0.787648/0.786034/0.794012`；B−A=`−0.001613`，C−B=`+0.007978`；A/B/C teacher-forced OCR loss=`1.666193/1.664493/1.663769`。C 的 layout box MAE=`0.077862`、validity AUROC=`0.953366`，但 invalid gated context share=`0.798970`、p gap=`0.019232`，尚未达到 query 消除阈值；B validity AUROC=`0.494084`、invalid share=`0.924753` | 不读取；`test_manifest_read=false`、`test_used_for_selection=false` | A=`glmocr_mthv2_attribution_128_v1_A_noop`，B=`glmocr_mthv2_attribution_128_v1_B_adapter_only`，C=`glmocr_mthv2_attribution_128_retry_v1_C_decoder_lora`；原 C run 因 NCCL watchdog 超时保留，retry 将 DDP timeout 提高到 3600s；容量归因结论：LoRA 明显改善布局/validity，但在 128 steps 下未转化为 OCR CER，反而较 B 回退 |
 
-## 2026-09-10/11 循环生成与 Teacher Forcing 审计
+## 历史记录：2026-09-10/11 循环生成与 Teacher Forcing 审计
 
-本轮统一口径：seed `42`、同一分层 64 页 validation、最多 256 steps、五卡 DDP、整页输入、test 锁定。所有正式记录均为 `test_manifest_read=false`、`test_used_for_selection=false`。旧 A1 审计是已有 checkpoint 的 eval-only，不是本轮重新训练。
+本节仅封存已完成的 natural-loop/Teacher Forcing 审计，不属于当前 BSCC 方案。其历史记录统一使用 seed `42`、同一分层 64 页 validation、最多 256 steps、五卡 DDP、整页输入、test 锁定；所有正式记录均为 `test_manifest_read=false`、`test_used_for_selection=false`。旧 A1 审计是已有 checkpoint 的 eval-only，不是当前 BSCC 训练。
 
 | ID | 配置与状态 | validation / 工程结果 | test | 备注 |
 | --- | --- | --- | --- | --- |
@@ -123,7 +123,7 @@ A1 与 baseline 均使用 fixed-final step1024，`test_used_for_selection=false`
 
 ### 当前解释边界
 
-A1 与 baseline 的 1024-step 训练汇总完全一致，A1 的 natural-loop active ratio 为 `0`，两组最终 adapter/checkpoint 文件逐字节一致，且 800 页 plain direct test 指标逐项一致。因此本轮没有证据表明该惩罚改变了模型参数、降低了循环率或学会了自然脱环；下一步应先修正循环候选在 teacher-forced 分布中不触发的问题，而不是继续增大权重。
+A1 与 baseline 的 1024-step 训练汇总完全一致，A1 的 natural-loop active ratio 为 `0`，两组最终 adapter/checkpoint 文件逐字节一致，且 800 页 plain direct test 指标逐项一致。因此历史审计没有证据表明该惩罚改变了模型参数、降低了循环率或学会了自然脱环；该方向不再继续，当前 BSCC 返回 plain training objective。
 
 ### 下降原因与边界判断
 
@@ -134,7 +134,7 @@ A1 与 baseline 的 1024-step 训练汇总完全一致，A1 的 natural-loop act
 5. **当前“loop escape success”尚未证明模型真的学会续写。** A1 两个 checkpoint 的该指标均为 `0`；step128 的相对改善主要来自插入数下降和循环/触顶率暂时下降，不能解释为已经学会“停循环后输出后文”。
 6. **下降主要由密集页和自由生成长尾放大。** 新协议不再用硬 EOS 掩盖长尾，密集页面更容易累积区域/文本错误；A1 step256 的密集页 CER 已约 `1.3318`，而旧 guard ON 密集页约 `0.6269`。因此 64 页宏平均的恶化不是单一 batch loss 上升，而是 dense-page free-run 长尾失稳。
 
-结论：这次“相较上一个实验都下降”同时包含**协议不可比**（硬 EOS 截断被移除）和**真实训练退化**（新 checkpoint 的 TF loss 更高、A1 后程过拟合/梯度竞争）。当前不能据此得出“loop escape 目标本身无效”；能确认的是旧低 CER 不能作为公平基线，而新 A1 需要先固定在 step128 或减弱后程附加损失，再验证是否真正降低循环后的删除/插入错误。
+结论：这次“相较上一个实验都下降”同时包含**协议不可比**（硬 EOS 截断被移除）和**真实训练退化**（新 checkpoint 的 TF loss 更高、A1 后程过拟合/梯度竞争）。该结论仅用于封存历史 natural-loop 诊断；当前不再继续 natural-loop/loop-escape 路线，BSCC 正式 run 回到 `L_official + 0.2 L_layout` 的 plain training objective。旧低 CER 也不能作为当前 BSCC 协议下的性能承诺。
 
 ## 每个 run 必填
 
@@ -148,24 +148,26 @@ MTHv2 原官方 split 是随机页级划分，没有书籍/版本元数据，不
 
 上述 `1–32` 个区域限制只适用于历史 128 页机制筛选，不适用于当前全量 MTHv2 DDP。全量协议使用 512 queries，最大区域数为 407，保留全部 2159/240/800 页；validity/no-object 目标只由训练期 Hungarian 匹配生成，布局真值和 query mask 不进入推理输入。
 
-## 2026-09-11 BSCC 四卡 decoder-LoRA 20k 实验
+## 2026-09-12 BSCC 四卡 decoder-LoRA 20k 实验
 
 | 字段 | 口径 |
 | --- | --- |
-| run ID | `glmocr_mthv2_decoder_lora_lr1e5_20k_4gpu_rollout256_260912_v1` |
+| run ID | `glmocr_mthv2_decoder_lora_lr1e5_20k_4gpu_official_layout_260912_v1` |
 | 分支 | `glm-ocr-layout-ot` |
 | 训练 | BSCC 四卡同步 DDP；global batch `4`；`20000` steps；seed `42` |
 | 数据 | full MTHv2：train/validation/test = `2159/240/800`；whole-page；512 queries |
-| 模型与目标 | geometry；Hungarian；full layout loss；FP32 adapter；fast processor；真实自由生成 rollout loop loss，max new tokens `256` |
+| 模型与目标 | geometry；Hungarian；full layout loss；FP32 adapter；fast processor；`L_official + 0.2 L_layout`；关闭 natural-loop、scheduled sampling、loop escape 和 continuation head |
 | decoder LoRA | rank `8`、alpha `8`、dropout `0`；本 run 学习率 `1e-5` |
 | checkpoint | `5000/10000/15000/20000` |
 | protocol 边界 | training 与 parallel validation 只使用 train/validation；selection 后才创建 test protocol |
-| 当前状态 | 原 v1 在 step112 因未启用训练期循环目标而停止；新的 rollout256 run 使用新 ID，待 smoke 通过后运行 |
+| 当前状态 | 原 v1 与 rollout256 诊断 run 均不进入结果；新的 official-layout smoke `1494430` 已提交，正式训练 `1494433` 依赖 smoke 成功后运行 |
 | 结果口径 | 用户授权的高 decoder-LoRA 学习率探索；不替代历史五卡协议，不与五卡结果作未校正的严格等预算比较 |
 
-原 `glmocr_mthv2_decoder_lora_lr1e5_20k_4gpu_260911_v1` 仅设置了 `generation_mode=loop_recovery`，未设置 `--natural-loop-loss` 或 `--loop-escape-training`，因此没有循环训练信号；该 run 已取消并保留日志，不进入 validation/test。上一轮 synthetic loop-escape smoke 也不作为本轮训练依据。新的 rollout256 run 显式启用 `--natural-loop-loss --natural-loop-max-new-tokens 256`：先进行 prompt-only no-grad 自由生成，再将 detached 生成前缀送入第二次带梯度 forward，以 live logits 计算循环损失；训练完成时要求 rollout tokens、active tokens 和加权循环损失均为有限正值。`evaluate_glmocr_locked_test.py` 已按 metadata 注入并加载 decoder LoRA，四个 test shard 和 merge 阶段均强制检查 `decoder_lora_loaded=true`。
+原 `glmocr_mthv2_decoder_lora_lr1e5_20k_4gpu_260911_v1` 仅设置了 `generation_mode=loop_recovery`，未设置 `--natural-loop-loss` 或 `--loop-escape-training`，因此没有循环训练信号；该 run 已取消并保留日志，不进入 validation/test。上一轮 rollout256 诊断 run 也不作为本轮训练依据。新的 official-layout run 固定使用 `L_official + 0.2 L_layout`，训练阶段关闭 natural-loop、scheduled sampling、loop escape 和 continuation head；`evaluate_glmocr_locked_test.py` 已按 metadata 注入并加载 decoder LoRA，四个 test shard 和 merge 阶段均强制检查 `decoder_lora_loaded=true`。
 
-## 2026-09-12：natural predicted-loop A1 warm-start continuation（累计 1024 步）
+## 历史记录：2026-09-12 natural predicted-loop A1 warm-start continuation（累计 1024 步）
+
+以下记录只保留已完成的 natural-loop 诊断证据，不属于当前 BSCC 训练方案；当前方案不启用 natural-loop。
 
 | 项目 | 配置/结果 |
 | --- | --- |
