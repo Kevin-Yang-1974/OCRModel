@@ -40,7 +40,10 @@ def _finite(value: Any) -> bool:
 def _core_lora_config(value: Any) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise ValueError("decoder_lora_config must be an object")
-    required = ("rank", "alpha", "dropout", "learning_rate")
+    # ``inject_decoder_lora`` records the structural LoRA configuration here;
+    # optimizer learning rates are launcher/training arguments, not part of
+    # this object in either training or eval metadata.
+    required = ("rank", "alpha", "dropout")
     missing = [key for key in required if key not in value]
     if missing:
         raise ValueError(f"decoder_lora_config is missing fields: {missing}")
@@ -63,12 +66,26 @@ def _check_common_metadata(
         "decoder_adaptation",
         "generation_mode",
         "max_eval_new_tokens",
+        "free_generation_loss",
         "test_manifest_read",
         "test_used_for_selection",
         "model_path",
         "code_sha256",
     )
     for key in keys:
+        if key == "free_generation_loss":
+            training_free = training_metadata.get(key)
+            eval_free = eval_metadata.get(key)
+            # Metadata written before this objective was introduced has no
+            # field; treat it as the explicit disabled configuration.
+            if training_free is None and isinstance(eval_free, dict) and eval_free.get(
+                "enabled"
+            ) is False:
+                continue
+            if eval_free is None and isinstance(training_free, dict) and training_free.get(
+                "enabled"
+            ) is False:
+                continue
         if eval_metadata.get(key) != training_metadata.get(key):
             raise ValueError(
                 f"{context} metadata mismatch for {key}: "
@@ -104,6 +121,8 @@ def main() -> None:
     parser.add_argument("--group-root", type=Path)
     parser.add_argument("--steps", type=_parse_steps, default=DEFAULT_STEPS)
     parser.add_argument("--expected-world-size", type=int, default=4)
+    parser.add_argument("--expected-layout-weight", type=float, default=0.2)
+    parser.add_argument("--dataset-label", default="MTHv2")
     args = parser.parse_args()
 
     run_dir = args.run_dir.resolve()
@@ -144,10 +163,36 @@ def main() -> None:
         if (training.get(name) or {}).get("enabled") is not False:
             raise ValueError(f"training run enabled extra objective: {name}")
     objective = training.get("loss_objective") or {}
-    if objective.get("formula") != "L_official + auxiliary_weight * L_layout":
+    free_generation_objective = (
+        objective.get("formula")
+        == "L_free_generation_scaled + auxiliary_weight * L_layout"
+    )
+    if not free_generation_objective and objective.get("formula") != (
+        "L_official + auxiliary_weight * L_layout"
+    ):
         raise ValueError(f"unexpected training loss objective: {objective}")
-    if not math.isclose(float(objective.get("layout_weight", -1.0)), 0.2):
-        raise ValueError("training layout loss weight is not 0.2")
+    if free_generation_objective:
+        free_config = training.get("free_generation_loss") or objective.get(
+            "free_generation"
+        ) or {}
+        if free_config.get("enabled") is not True:
+            raise ValueError("free-generation objective is not enabled in training metadata")
+        if not (
+            free_config.get("free_prefix_forward") is True
+            or free_config.get("second_forward") is True
+        ):
+            raise ValueError("free-generation objective is missing its differentiable prefix forward")
+        if free_config.get("teacher_forced_forward") is not False:
+            raise ValueError("free-generation objective unexpectedly includes a teacher-forced forward")
+        if objective.get("official_loss") not in (
+            "free_generation_prefix_outputs.loss",
+            "free_generation_outputs.loss",
+        ):
+            raise ValueError("free-generation objective metadata has an unexpected loss source")
+    if not math.isclose(float(objective.get("layout_weight", -1.0)), args.expected_layout_weight):
+        raise ValueError(
+            f"training layout loss weight is not {args.expected_layout_weight}"
+        )
     if objective.get("extra_terms") != []:
         raise ValueError(f"unexpected extra loss terms: {objective.get('extra_terms')}")
 
@@ -214,7 +259,7 @@ def main() -> None:
     seed = int(metadata["seed"])
     selection = {
         "status": "complete",
-        "dataset": "MTHv2",
+        "dataset": args.dataset_label,
         "mode": metadata["mode"],
         "seed": seed,
         "seeds": [seed],

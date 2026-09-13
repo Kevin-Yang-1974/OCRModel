@@ -12,33 +12,40 @@ model_dir="${GLMOCR_A100_MODEL:-/data3/yky/yangky_ocr_models/models/sota/glm_ocr
 dataset_root="${GLMOCR_A100_MTHV2_ROOT:-/data3/yky/yangky_ocr_models/datasets/MTHv2/converted/mthv2_layout_page_v1}"
 protocol_file="${GLMOCR_A100_MTHV2_PROTOCOL:-${remote_root}/protocols/mthv2_full_2159_240_800_v1.json}"
 validation_manifest_override=""
+dataset_label="${GLMOCR_A100_DATASET_LABEL:-MTHv2}"
+protocol_label="${GLMOCR_A100_PROTOCOL_LABEL:-glm_ocr_mthv2_full_official_v1}"
+allow_count_mismatch=0
 init_checkpoint_dir=""
 run_id="glmocr_mthv2_full_ddp_v1"
 experiment_group="custom"
+mode="geometry"
 seed=42
 experiment_label=""
 gpu_ids="0,1,2,3,4"
 gpu_utilization_limit=50
 max_steps=3456
 lr_schedule_steps=3456
-learning_rate=5e-5
+# Parameter-optimized plain-training defaults. Historical launchers pass
+# their recorded values explicitly when they are being reproduced.
+learning_rate=2.5e-5
 decoder_adaptation="frozen"
 decoder_lora_rank=8
 decoder_lora_alpha=8
 decoder_lora_dropout=0
-decoder_learning_rate=1e-6
+decoder_learning_rate=5e-6
 warmup_steps=216
 min_lr_ratio=0.1
 gradient_accumulation_steps=1
 initial_residual_scale=0.0
 gate_freeze_steps=0
-auxiliary_weight=0.2
+auxiliary_weight=0.4
 auxiliary_weight_start=""
 auxiliary_ramp_steps=0
 diagnostic_steps=""
 layout_loss_profile="full"
 validation_interval=432
 max_eval_new_tokens=1536
+num_queries=512
 generation_mode="loop_recovery"
 log_steps=16
 use_validity_head=0
@@ -70,6 +77,9 @@ natural_loop_max_cycle_length=32
 natural_loop_cycle_repeats=3
 natural_loop_max_new_tokens=768
 natural_loop_continuation_horizon=16
+free_generation_loss=0
+free_generation_loss_weight=0.05
+free_generation_max_new_tokens=512
 no_validation=0
 continuation_escape=0
 escape_budget=16
@@ -106,6 +116,7 @@ while [[ $# -gt 0 ]]; do
         --recovery-mode) recovery_mode="$2"; shift 2 ;;
         --aligned-rollout-interval) aligned_rollout_interval="$2"; shift 2 ;;
         --experiment-group) experiment_group="$2"; shift 2 ;;
+        --mode) mode="$2"; shift 2 ;;
         --seed) seed="$2"; shift 2 ;;
         --experiment-label) experiment_label="$2"; shift 2 ;;
         --gpu-ids) gpu_ids="$2"; shift 2 ;;
@@ -130,6 +141,7 @@ while [[ $# -gt 0 ]]; do
         --layout-loss-profile) layout_loss_profile="$2"; shift 2 ;;
         --validation-interval) validation_interval="$2"; shift 2 ;;
         --max-eval-new-tokens) max_eval_new_tokens="$2"; shift 2 ;;
+        --num-queries) num_queries="$2"; shift 2 ;;
         --generation-mode) generation_mode="$2"; shift 2 ;;
         --log-steps) log_steps="$2"; shift 2 ;;
         --use-validity-head) use_validity_head=1; shift ;;
@@ -159,6 +171,9 @@ while [[ $# -gt 0 ]]; do
         --natural-loop-cycle-repeats) natural_loop_cycle_repeats="$2"; shift 2 ;;
         --natural-loop-max-new-tokens) natural_loop_max_new_tokens="$2"; shift 2 ;;
         --natural-loop-continuation-horizon) natural_loop_continuation_horizon="$2"; shift 2 ;;
+        --free-generation-loss) free_generation_loss=1; shift ;;
+        --free-generation-loss-weight) free_generation_loss_weight="$2"; shift 2 ;;
+        --free-generation-max-new-tokens) free_generation_max_new_tokens="$2"; shift 2 ;;
         --no-validation) no_validation=1; shift ;;
         --continuation-escape) continuation_escape=1; shift ;;
         --escape-budget) escape_budget="$2"; shift 2 ;;
@@ -196,6 +211,9 @@ while [[ $# -gt 0 ]]; do
         --dataset-root) dataset_root="$2"; shift 2 ;;
         --protocol-file) protocol_file="$2"; shift 2 ;;
         --validation-manifest) validation_manifest_override="$2"; shift 2 ;;
+        --dataset-label) dataset_label="$2"; shift 2 ;;
+        --protocol-label) protocol_label="$2"; shift 2 ;;
+        --allow-count-mismatch) allow_count_mismatch=1; shift ;;
         --init-checkpoint-dir) init_checkpoint_dir="$2"; shift 2 ;;
         *) printf '{"event":"glmocr_mthv2_ddp_failed","error":"unknown_argument","argument":"%s"}\n' "$1" >&2; exit 64 ;;
     esac
@@ -252,6 +270,18 @@ esac
     printf '{"event":"glmocr_mthv2_ddp_failed","error":"invalid_run_or_seed"}\n' >&2
     exit 64
 }
+case "${mode}" in
+    content_only|attention|geometry|layout_ot) ;;
+    *) printf '{"event":"glmocr_mthv2_ddp_failed","error":"invalid_mode","value":"%s"}\n' "${mode}" >&2; exit 64 ;;
+esac
+[[ "${num_queries}" =~ ^[1-9][0-9]*$ ]] || {
+    printf '{"event":"glmocr_mthv2_ddp_failed","error":"invalid_num_queries"}\n' >&2
+    exit 64
+}
+[[ "${allow_count_mismatch}" == "0" || "${allow_count_mismatch}" == "1" ]] || {
+    printf '{"event":"glmocr_mthv2_ddp_failed","error":"invalid_count_mismatch_policy"}\n' >&2
+    exit 64
+}
 [[ "${max_steps}" =~ ^[1-9][0-9]*$ && "${lr_schedule_steps}" =~ ^[1-9][0-9]*$ ]] || {
     printf '{"event":"glmocr_mthv2_ddp_failed","error":"invalid_step_configuration"}\n' >&2
     exit 64
@@ -292,6 +322,20 @@ esac
     printf '{"event":"glmocr_mthv2_ddp_failed","error":"invalid_natural_loop_rollout_configuration"}\n' >&2
     exit 64
 }
+[[ "${free_generation_loss}" == "0" || "${free_generation_loss}" == "1" ]] || {
+    printf '{"event":"glmocr_mthv2_ddp_failed","error":"invalid_free_generation_loss_flag"}\n' >&2
+    exit 64
+}
+[[ "${free_generation_loss_weight}" =~ ^[0-9]+(\.[0-9]+)?([eE]-?[0-9]+)?$ && "${free_generation_max_new_tokens}" =~ ^[1-9][0-9]*$ ]] || {
+    printf '{"event":"glmocr_mthv2_ddp_failed","error":"invalid_free_generation_configuration"}\n' >&2
+    exit 64
+}
+if (( free_generation_loss == 1 )); then
+    [[ "${generation_mode}" == "plain" && "${text_repeat_suppression}" == "0" && "${natural_loop_loss}" == "0" && "${scheduled_sampling}" == "0" && "${loop_escape_training}" == "0" && "${continuation_head}" == "0" && "${recovery_mode}" == "legacy" ]] || {
+        printf '{"event":"glmocr_mthv2_ddp_failed","error":"free_generation_objective_must_be_isolated"}\n' >&2
+        exit 64
+    }
+fi
 [[ "${escape_budget}" =~ ^[1-9][0-9]*$ && "${escape_clear_steps}" =~ ^[1-9][0-9]*$ && "${escape_eos_suppression}" =~ ^[0-9]+(\.[0-9]+)?$ && "${escape_eos_boost}" =~ ^[0-9]+(\.[0-9]+)?$ ]] || {
     printf '{"event":"glmocr_mthv2_ddp_failed","error":"invalid_continuation_escape_configuration"}\n' >&2
     exit 64
@@ -514,14 +558,16 @@ prepare_protocol() {
     audit_args=(
         --train-manifest "${train_manifest}"
         --validation-manifest "${validation_manifest}"
-        --num-queries 512
+        --num-queries "${num_queries}"
+        --dataset-label "${dataset_label}"
+        --protocol-label "${protocol_label}"
     )
     if (( without_test == 0 )); then
         audit_args+=(--test-manifest "${test_manifest}")
     else
         audit_args+=(--without-test)
     fi
-    if [[ -n "${validation_manifest_override}" ]]; then
+    if (( allow_count_mismatch == 1 )) || [[ -n "${validation_manifest_override}" ]]; then
         audit_args+=(--allow-count-mismatch)
     fi
     if [[ ! -f "${protocol_file}" ]]; then
@@ -610,13 +656,17 @@ run_inner() {
             --model-path "${model_dir}"
             --train-manifest "${train_manifest}"
             --output-dir "${output_dir}"
-            --num-queries 512 --seed "${seed}"
+            --mode "${mode}"
+            --num-queries "${num_queries}" --seed "${seed}"
+            --learning-rate "${learning_rate}"
             --decoder-adaptation "${decoder_adaptation}"
             --decoder-lora-rank "${decoder_lora_rank}"
             --decoder-lora-alpha "${decoder_lora_alpha}"
             --decoder-lora-dropout "${decoder_lora_dropout}"
             --decoder-learning-rate "${decoder_learning_rate}"
             --layout-loss-profile "${layout_loss_profile}"
+            --auxiliary-weight "${auxiliary_weight}"
+            --auxiliary-weight-start "${auxiliary_weight_start}"
             --residual-scale-cap 0.03
             --initial-residual-scale "${initial_residual_scale}"
             --initial-valid-probability "${initial_valid_probability}"
@@ -636,6 +686,8 @@ run_inner() {
             --natural-loop-cycle-repeats "${natural_loop_cycle_repeats}"
             --natural-loop-max-new-tokens "${natural_loop_max_new_tokens}"
             --natural-loop-continuation-horizon "${natural_loop_continuation_horizon}"
+            --free-generation-loss-weight "${free_generation_loss_weight}"
+            --free-generation-max-new-tokens "${free_generation_max_new_tokens}"
             --escape-budget "${escape_budget}"
             --escape-clear-steps "${escape_clear_steps}"
             --escape-eos-suppression "${escape_eos_suppression}"
@@ -656,10 +708,12 @@ run_inner() {
             --region-spatial-penalty "${region_spatial_penalty}"
             --region-spatial-iou-threshold "${region_spatial_iou_threshold}"
         )
+        [[ -n "${init_checkpoint_dir}" ]] && smoke_args+=(--init-checkpoint-dir "${init_checkpoint_dir}")
         (( use_validity_head == 1 )) && smoke_args+=(--use-validity-head)
         (( validity_use_transport_evidence == 1 )) && smoke_args+=(--validity-use-transport-evidence)
         (( text_repeat_suppression == 1 )) && smoke_args+=(--text-repeat-suppression)
         (( natural_loop_loss == 1 )) && smoke_args+=(--natural-loop-loss)
+        (( free_generation_loss == 1 )) && smoke_args+=(--free-generation-loss)
         (( continuation_escape == 1 )) && smoke_args+=(--continuation-escape)
         (( loop_escape_training == 1 )) && smoke_args+=(--loop-escape-training)
         (( continuation_head == 1 )) && smoke_args+=(--continuation-head)
@@ -710,6 +764,8 @@ run_inner() {
         --natural-loop-cycle-repeats "${natural_loop_cycle_repeats}"
         --natural-loop-max-new-tokens "${natural_loop_max_new_tokens}"
         --natural-loop-continuation-horizon "${natural_loop_continuation_horizon}"
+        --free-generation-loss-weight "${free_generation_loss_weight}"
+        --free-generation-max-new-tokens "${free_generation_max_new_tokens}"
         --natural-loop-weight "${natural_loop_weight}"
         --natural-loop-recent-window "${natural_loop_recent_window}"
         --natural-loop-min-cycle-length "${natural_loop_min_cycle_length}"
@@ -741,6 +797,7 @@ run_inner() {
     [[ -n "${init_checkpoint_dir}" ]] && method_args+=(--init-checkpoint-dir "${init_checkpoint_dir}")
     (( text_repeat_suppression == 1 )) && method_args+=(--text-repeat-suppression)
     (( natural_loop_loss == 1 )) && method_args+=(--natural-loop-loss)
+    (( free_generation_loss == 1 )) && method_args+=(--free-generation-loss)
     (( no_validation == 1 )) && method_args+=(--no-validation)
     (( continuation_escape == 1 )) && method_args+=(--continuation-escape)
     (( scheduled_sampling == 1 )) && method_args+=(--scheduled-sampling)
@@ -756,7 +813,7 @@ run_inner() {
     if "${torchrun}" --standalone --nnodes=1 --nproc_per_node="${world_size}" \
         -m layout_ocr.train_screen \
         --distributed-strategy ddp \
-        --mode geometry \
+        --mode "${mode}" \
         --model-path "${model_dir}" \
         --train-manifest "${train_manifest}" \
         --validation-manifest "${validation_manifest}" \
@@ -765,7 +822,7 @@ run_inner() {
         --per-device-batch-size 1 \
         --gradient-accumulation-steps "${gradient_accumulation_steps}" \
         --max-steps "${max_steps}" \
-        --num-queries 512 \
+        --num-queries "${num_queries}" \
         --seed "${seed}" \
         --experiment-label "${experiment_label}" \
         --learning-rate "${learning_rate}" \
@@ -865,6 +922,7 @@ if (( foreground == 0 )); then
     child_args=(
         bash "${script_path}" --foreground --run-id "${run_id}" --seed "${seed}"
         --recovery-mode "${recovery_mode}" --aligned-rollout-interval "${aligned_rollout_interval}"
+        --mode "${mode}" \
         --gpu-ids "${gpu_ids}" --gpu-utilization-limit "${gpu_utilization_limit}"
             --max-steps "${max_steps}" --lr-schedule-steps "${lr_schedule_steps}"
         --experiment-label "${experiment_label}"
@@ -883,6 +941,7 @@ if (( foreground == 0 )); then
         --layout-loss-profile "${layout_loss_profile}"
         --validation-interval "${validation_interval}"
         --max-eval-new-tokens "${max_eval_new_tokens}"
+        --num-queries "${num_queries}"
         --generation-mode "${generation_mode}"
         --log-steps "${log_steps}"
         --initial-valid-probability "${initial_valid_probability}"
@@ -896,6 +955,8 @@ if (( foreground == 0 )); then
         --repeat-force-eos-steps "${repeat_force_eos_steps}"
         --natural-loop-max-new-tokens "${natural_loop_max_new_tokens}"
         --natural-loop-continuation-horizon "${natural_loop_continuation_horizon}"
+        --free-generation-loss-weight "${free_generation_loss_weight}"
+        --free-generation-max-new-tokens "${free_generation_max_new_tokens}"
         --escape-budget "${escape_budget}"
         --escape-clear-steps "${escape_clear_steps}"
         --escape-eos-suppression "${escape_eos_suppression}"
@@ -921,6 +982,7 @@ if (( foreground == 0 )); then
         --remote-root "${remote_root}" --code-root "${code_root}"
         --env-dir "${env_dir}" --model-dir "${model_dir}"
         --dataset-root "${dataset_root}" --protocol-file "${protocol_file}"
+        --dataset-label "${dataset_label}" --protocol-label "${protocol_label}"
     )
     [[ -n "${init_checkpoint_dir}" ]] && child_args+=(--init-checkpoint-dir "${init_checkpoint_dir}")
     [[ -n "${validation_manifest_override}" ]] && child_args+=(--validation-manifest "${validation_manifest_override}")
@@ -928,6 +990,7 @@ if (( foreground == 0 )); then
     (( validity_use_transport_evidence == 1 )) && child_args+=(--validity-use-transport-evidence)
     (( text_repeat_suppression == 1 )) && child_args+=(--text-repeat-suppression)
     (( natural_loop_loss == 1 )) && child_args+=(--natural-loop-loss)
+    (( free_generation_loss == 1 )) && child_args+=(--free-generation-loss)
     (( no_validation == 1 )) && child_args+=(--no-validation)
     (( continuation_escape == 1 )) && child_args+=(--continuation-escape)
     (( scheduled_sampling == 1 )) && child_args+=(--scheduled-sampling)
@@ -939,6 +1002,7 @@ if (( foreground == 0 )); then
     (( without_test == 1 )) && child_args+=(--without-test)
     (( defer_validation == 1 )) && child_args+=(--defer-validation)
     (( smoke == 1 )) && child_args+=(--smoke)
+    (( allow_count_mismatch == 1 )) && child_args+=(--allow-count-mismatch)
     command_line="$(printf '%q ' "${child_args[@]}")"
     tmux new-session -d -s "${session}" "cd $(printf '%q' "${code_root}") && exec ${command_line} >$(printf '%q' "${launcher_log}") 2>&1"
     printf '{"event":"glmocr_mthv2_ddp_armed","session":"%s","run_id":"%s","experiment_label":"%s","seed":%s,"smoke":%s,"gpu_ids":"%s","world_size":%s,"steps":%s,"lr_schedule_steps":%s,"learning_rate":%s,"decoder_adaptation":"%s","decoder_lora_rank":%s,"decoder_lora_alpha":%s,"decoder_learning_rate":%s,"warmup_steps":%s,"initial_residual_scale":%s,"gate_freeze_steps":%s,"auxiliary_weight_start":%s,"auxiliary_weight":%s,"auxiliary_ramp_steps":%s,"gradient_accumulation_steps":%s,"global_batch_size":%s,"effective_global_batch_size":%s,"layout_loss_profile":"%s","use_validity_head":%s,"initial_valid_probability":%s,"validity_gating_mode":"%s","validity_use_transport_evidence":%s,"defer_validation":%s,"selection_pending":%s,"test_used_for_selection":false,"log":"%s"}\n' \

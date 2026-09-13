@@ -24,6 +24,7 @@ from layout_ocr.train_screen import (
     load_adapter_checkpoint,
     load_model,
     load_decoder_lora_checkpoint,
+    free_generation_loss_config,
     load_continuation_head_checkpoint,
     natural_loop_config,
     save_adapter_checkpoint,
@@ -39,14 +40,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model-path", type=Path, required=True)
     parser.add_argument("--train-manifest", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
-    parser.add_argument("--mode", choices=["geometry"], default="geometry")
+    parser.add_argument("--init-checkpoint-dir", type=Path, default=None)
+    parser.add_argument(
+        "--mode",
+        choices=["content_only", "attention", "geometry", "layout_ot"],
+        default="geometry",
+    )
     parser.add_argument("--num-queries", type=int, default=512)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--decoder-adaptation", choices=["frozen", "lora"], default="frozen")
     parser.add_argument("--decoder-lora-rank", type=int, default=8)
     parser.add_argument("--decoder-lora-alpha", type=float, default=8.0)
     parser.add_argument("--decoder-lora-dropout", type=float, default=0.0)
-    parser.add_argument("--decoder-learning-rate", type=float, default=1e-6)
+    parser.add_argument("--decoder-learning-rate", type=float, default=5e-6)
+    parser.add_argument("--learning-rate", type=float, default=2.5e-5)
+    parser.add_argument("--auxiliary-weight", type=float, default=0.4)
+    parser.add_argument("--auxiliary-weight-start", type=float, default=None)
     parser.add_argument("--steps", type=int, default=8)
     parser.add_argument("--adapter-precision", choices=["fp32"], default="fp32")
     parser.add_argument(
@@ -91,6 +100,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--natural-loop-cycle-repeats", type=int, default=3)
     parser.add_argument("--natural-loop-max-new-tokens", type=int, default=768)
     parser.add_argument("--natural-loop-continuation-horizon", type=int, default=16)
+    parser.add_argument("--free-generation-loss", action="store_true")
+    parser.add_argument("--free-generation-loss-weight", type=float, default=0.05)
+    parser.add_argument("--free-generation-max-new-tokens", type=int, default=512)
     parser.add_argument("--continuation-escape", action="store_true")
     parser.add_argument("--escape-budget", type=int, default=16)
     parser.add_argument("--escape-clear-steps", type=int, default=4)
@@ -136,10 +148,16 @@ def main() -> None:
         raise ValueError("decoder LoRA dropout must be in [0, 1)")
     if args.num_queries <= 0:
         raise ValueError("--num-queries must be positive")
+    if args.free_generation_loss and args.free_generation_loss_weight <= 0.0:
+        raise ValueError("free-generation loss weight must be positive when enabled")
+    if args.free_generation_max_new_tokens <= 0:
+        raise ValueError("free-generation rollout limit must be positive")
     if args.region_autoregressive and args.num_queries != 512:
         raise ValueError("--region-autoregressive requires --num-queries 512")
     if args.output_dir.exists():
         raise FileExistsError(args.output_dir)
+    if args.init_checkpoint_dir is not None and not args.init_checkpoint_dir.is_dir():
+        raise FileNotFoundError(args.init_checkpoint_dir)
 
     configure_deterministic_execution()
     distributed = initialize_distributed("ddp")
@@ -157,8 +175,8 @@ def main() -> None:
         all_records = load_records(args.train_manifest)
         validate_records(all_records, split="train", num_queries=args.num_queries)
         # Select the most demanding pages so the smoke test exercises the
-        # 512-query path and never hides high-region pages behind the legacy
-        # 32-query fixture.
+        # configured query path and never hides high-region pages behind a
+        # smaller legacy fixture.
         records = sorted(
             all_records,
             key=lambda row: (len(row["regions"]), len(row["page_text"]), row["page_id"]),
@@ -202,24 +220,44 @@ def main() -> None:
                 alpha=args.decoder_lora_alpha,
                 dropout=args.decoder_lora_dropout,
             )
-            model = wrap_model(model, distributed)
+            model = wrap_model(
+                model,
+                distributed,
+                find_unused_parameters=(
+                    args.mode == "content_only" or args.auxiliary_weight == 0.0
+                ),
+            )
         else:
             bridge.adapter = wrap_adapter(bridge.adapter, distributed)  # type: ignore[assignment]
         if continuation_head is not None:
             continuation_head = wrap_model(continuation_head, distributed)
+        init_checkpoint_loaded = False
+        if args.init_checkpoint_dir is not None:
+            load_adapter_checkpoint(args.init_checkpoint_dir, bridge)
+            if args.decoder_adaptation == "lora":
+                load_decoder_lora_checkpoint(args.init_checkpoint_dir, model)
+            if continuation_head is not None:
+                load_continuation_head_checkpoint(args.init_checkpoint_dir, continuation_head)
+            init_checkpoint_loaded = True
         train_args = argparse.Namespace(
             seed=args.seed,
             max_steps=args.steps,
             lr_schedule_steps=args.steps,
-            learning_rate=5e-5,
+            learning_rate=args.learning_rate,
+            # The bounded 8-step smoke cannot use the formal 216-step
+            # warmup; formal launchers pass warmup_steps=216 explicitly.
             warmup_steps=1,
             min_lr_ratio=0.1,
             initial_residual_scale=args.initial_residual_scale,
             gate_freeze_steps=0,
             layout_loss_profile=args.layout_loss_profile,
             query_assignment=args.query_assignment,
-            auxiliary_weight=0.2,
-            auxiliary_weight_start=0.2,
+            auxiliary_weight=args.auxiliary_weight,
+            auxiliary_weight_start=(
+                args.auxiliary_weight
+                if args.auxiliary_weight_start is None
+                else args.auxiliary_weight_start
+            ),
             auxiliary_ramp_steps=0,
             max_grad_norm=1.0,
             diagnostic_steps=(),
@@ -248,6 +286,9 @@ def main() -> None:
             natural_loop_cycle_repeats=args.natural_loop_cycle_repeats,
             natural_loop_max_new_tokens=args.natural_loop_max_new_tokens,
             natural_loop_continuation_horizon=args.natural_loop_continuation_horizon,
+            free_generation_loss=args.free_generation_loss,
+            free_generation_loss_weight=args.free_generation_loss_weight,
+            free_generation_max_new_tokens=args.free_generation_max_new_tokens,
             continuation_escape=args.continuation_escape,
             escape_budget=args.escape_budget,
             escape_clear_steps=args.escape_clear_steps,
@@ -297,15 +338,21 @@ def main() -> None:
                 "global_batch_size": distributed.world_size,
                 "per_device_batch_size": 1,
                 "num_queries": args.num_queries,
+                "mode": args.mode,
                 "steps": args.steps,
                 "record_count": len(records),
                 "max_regions_in_smoke": max(len(row["regions"]) for row in records),
                 "checkpoint_reload": True,
+                "init_checkpoint_dir": (
+                    str(args.init_checkpoint_dir) if args.init_checkpoint_dir is not None else None
+                ),
+                "init_checkpoint_loaded": init_checkpoint_loaded,
                 "parameters_finite": finite,
                 "test_used_for_selection": False,
                 "training": training,
                 "decoder_adaptation": args.decoder_adaptation,
                 "decoder_lora_config": decoder_lora_config,
+                "free_generation_loss": free_generation_loss_config(train_args),
                 "natural_loop_config": natural_loop_config(args),
                 }
             write_json(args.output_dir / "smoke_summary.json", summary)

@@ -833,16 +833,41 @@ def loss_objective_config(args: argparse.Namespace) -> dict[str, Any]:
         extra_terms.append("L_continuation_head")
     if natural_loop_config(args).get("enabled") is True:
         extra_terms.append("L_natural_loop")
+    free_generation_enabled = bool(getattr(args, "free_generation_loss", False))
+    primary_formula = (
+        "L_free_generation_scaled + auxiliary_weight * L_layout"
+        if free_generation_enabled
+        else "L_official + auxiliary_weight * L_layout"
+    )
+    if extra_terms:
+        primary_formula += " + extra_terms"
     return {
-        "formula": (
-            "L_official + auxiliary_weight * L_layout"
-            if not extra_terms
-            else "L_official + auxiliary_weight * L_layout + extra_terms"
+        "formula": primary_formula,
+        "official_loss": (
+            "free_generation_prefix_outputs.loss"
+            if free_generation_enabled
+            else "outputs.loss"
         ),
-        "official_loss": "outputs.loss",
         "official_weight": 1.0,
         "layout_weight": float(args.auxiliary_weight),
         "extra_terms": extra_terms,
+        "free_generation": free_generation_loss_config(args),
+    }
+
+
+def free_generation_loss_config(args: argparse.Namespace) -> dict[str, Any]:
+    """Describe the self-conditioned OCR objective used by the isolated experiment."""
+
+    return {
+        "enabled": bool(getattr(args, "free_generation_loss", False)),
+        "weight": float(getattr(args, "free_generation_loss_weight", 0.05)),
+        "max_new_tokens": int(getattr(args, "free_generation_max_new_tokens", 512)),
+        "rollout": "greedy_no_grad",
+        "free_prefix_forward": True,
+        "teacher_forced_forward": False,
+        "label_alignment": "generated_prefix_until_rollout_length",
+        "scale_mode": "fixed_constant",
+        "constant_weight": float(getattr(args, "free_generation_loss_weight", 0.05)),
     }
 
 
@@ -1088,6 +1113,148 @@ def token_weighted_loss_stats(outputs: Any, labels: torch.Tensor) -> tuple[torch
     selected_logits = shift_logits[valid].float()
     selected_labels = shift_labels[valid].long()
     return F.cross_entropy(selected_logits, selected_labels, reduction="sum"), count
+
+
+def collect_free_generation_rollout(
+    model: Any,
+    args: argparse.Namespace,
+    inputs: dict[str, Any],
+    labels: torch.Tensor,
+    eos_ids: set[int],
+) -> dict[str, Any]:
+    """Generate a detached greedy prefix for one differentiable free-prefix forward.
+
+    This helper is the no-grad rollout only.  It starts from the exact prompt,
+    never observes the ground-truth OCR target, and returns detached generated
+    tokens aligned with the target labels.  The caller then performs exactly
+    one normal forward on that prefix.  That single differentiable forward
+    supplies both the free-generation OCR loss and the geometry adapter's
+    layout side-channel; there is no preceding teacher-forced OCR forward.
+    """
+
+    if labels.ndim != 2 or labels.shape != inputs["input_ids"].shape:
+        raise ValueError("free-generation labels and input_ids must have the same rank-2 shape")
+    if inputs["input_ids"].shape[0] != 1:
+        raise ValueError("free-generation rollout currently requires a single page")
+    valid_positions = torch.nonzero(labels[0] != -100, as_tuple=False).flatten()
+    if not valid_positions.numel():
+        raise ValueError("free-generation rollout requires at least one target token")
+    prompt_length = int(valid_positions[0].item())
+    target_capacity = int(valid_positions[-1].item()) - prompt_length + 1
+    if target_capacity <= 0:
+        raise ValueError("free-generation target capacity must be positive")
+    max_new_tokens = min(
+        int(getattr(args, "free_generation_max_new_tokens", 512)),
+        target_capacity,
+    )
+
+    generation_inputs = {
+        key: value.detach() if isinstance(value, torch.Tensor) else value
+        for key, value in inputs.items()
+        if key != "labels"
+    }
+    # ``prepare_training_inputs`` contains the complete teacher-forced target.
+    # Slice every text-stream tensor back to the prompt so generation cannot
+    # observe any ground-truth OCR token.
+    for key in ("input_ids", "attention_mask", "mm_token_type_ids", "token_type_ids"):
+        value = generation_inputs.get(key)
+        if isinstance(value, torch.Tensor) and value.ndim >= 2:
+            generation_inputs[key] = value[:, :prompt_length]
+    generation_kwargs: dict[str, Any] = {
+        "max_new_tokens": max_new_tokens,
+        "do_sample": False,
+        "use_cache": True,
+    }
+    if eos_ids:
+        generation_kwargs["eos_token_id"] = sorted(eos_ids)
+    previous_use_cache = getattr(getattr(model, "config", None), "use_cache", None)
+    try:
+        if hasattr(model, "config") and previous_use_cache is not None:
+            model.config.use_cache = True
+        with torch.no_grad():
+            generated = model.generate(**generation_inputs, **generation_kwargs)
+    finally:
+        if hasattr(model, "config") and previous_use_cache is not None:
+            model.config.use_cache = previous_use_cache
+    if not isinstance(generated, torch.Tensor):
+        generated = getattr(generated, "sequences", None)
+    if not isinstance(generated, torch.Tensor) or generated.ndim != 2:
+        raise RuntimeError("free-generation rollout did not return generated token sequences")
+    if generated.shape[0] != inputs["input_ids"].shape[0]:
+        raise RuntimeError("free-generation rollout batch size does not match training inputs")
+    if generated.shape[1] < prompt_length:
+        raise RuntimeError("free-generation rollout returned fewer tokens than the prompt")
+
+    generated_tokens = generated[0, prompt_length:].detach()
+    generation_eos_hit = False
+    if eos_ids:
+        first_eos = next(
+            (
+                index
+                for index, token in enumerate(generated_tokens.tolist())
+                if int(token) in eos_ids
+            ),
+            None,
+        )
+        if first_eos is not None:
+            generated_tokens = generated_tokens[: first_eos + 1]
+            generation_eos_hit = True
+    generation_length = int(generated_tokens.numel())
+    generation_limit_hit = generation_length >= max_new_tokens and not generation_eos_hit
+
+    # A zero-token return is not expected from generate(), but keep the DDP
+    # graph well-defined with one EOS/pad placeholder if a backend returns it.
+    if generation_length == 0:
+        fallback = next(iter(eos_ids), None)
+        if fallback is None:
+            fallback = int(inputs["input_ids"][0, -1].item())
+        generated_tokens = torch.tensor(
+            [fallback], dtype=inputs["input_ids"].dtype, device=inputs["input_ids"].device
+        )
+        generation_length = 1
+
+    effective_length = min(generation_length, target_capacity)
+    generation_config = getattr(model, "generation_config", None)
+    pad_token_id = getattr(generation_config, "pad_token_id", None)
+    if pad_token_id is None:
+        pad_token_id = getattr(getattr(model, "config", None), "pad_token_id", None)
+    if pad_token_id is None:
+        pad_token_id = int(generated_tokens[-1].item())
+    free_input_ids = inputs["input_ids"].detach().clone()
+    free_input_ids[:, prompt_length : prompt_length + target_capacity] = int(pad_token_id)
+    free_input_ids[:, prompt_length : prompt_length + effective_length] = generated_tokens[
+        :effective_length
+    ].to(device=free_input_ids.device, dtype=free_input_ids.dtype)
+    free_labels = labels.detach().clone()
+    free_labels[:, :prompt_length] = -100
+    free_labels[:, prompt_length + effective_length :] = -100
+    return {
+        "prefix_inputs": {**inputs, "input_ids": free_input_ids, "labels": free_labels},
+        "generation_length": generation_length,
+        "target_capacity": target_capacity,
+        "active_tokens": int((free_labels[:, 1:] != -100).sum().detach().item()),
+        "generation_eos_hit": generation_eos_hit,
+        "generation_limit_hit": generation_limit_hit,
+    }
+
+
+def scaled_free_generation_loss(
+    free_outputs: Any,
+    args: argparse.Namespace,
+) -> dict[str, torch.Tensor | float]:
+    """Apply the fixed OCR coefficient selected by the calibration smoke."""
+
+    free_loss = getattr(free_outputs, "loss", None)
+    if free_loss is None:
+        raise RuntimeError("free-generation prefix forward did not produce OCR loss")
+    free_loss = free_loss.float()
+    weight = float(getattr(args, "free_generation_loss_weight", 0.05))
+    free_scale = free_loss.detach() * 0.0 + weight
+    return {
+        "raw_loss": free_loss,
+        "scale": free_scale,
+        "weighted_loss": free_loss * free_scale,
+    }
 
 
 def build_mixed_prefix_inputs(
@@ -1787,7 +1954,7 @@ def train(
         parameter_groups.append(
             {"params": [gate_parameter], "weight_decay": 0.0, "group_name": "content_gate"}
         )
-    decoder_learning_rate = getattr(args, "decoder_learning_rate", 1e-6)
+    decoder_learning_rate = getattr(args, "decoder_learning_rate", 5e-6)
     if lora_parameters:
         parameter_groups.append(
             {
@@ -1881,6 +2048,9 @@ def train(
     token_count_total = 0.0
     mixed_token_weighted_sum_total = 0.0
     mixed_token_count_total = 0.0
+    free_token_weighted_sum_total = 0.0
+    free_token_count_total = 0.0
+    free_generation_enabled = bool(getattr(args, "free_generation_loss", False))
     started = time.time()
     checkpoint_steps: list[int] = []
     checkpoint_health: list[dict[str, Any]] = []
@@ -1943,12 +2113,44 @@ def train(
             bridge.set_grid_thw(inputs["image_grid_thw"])
             bridge.set_region_targets(
                 region_decoder_targets(record, device, args.num_queries)
-                if region_enabled
+                if region_enabled and not free_generation_enabled
                 else None
             )
             bridge.set_region_decode_controls()
+            free_rollout = {
+                "generation_length": 0,
+                "target_capacity": 0,
+                "active_tokens": 0,
+                "generation_eos_hit": False,
+                "generation_limit_hit": False,
+            }
+            forward_inputs = inputs
+            ocr_labels = inputs["labels"]
+            if free_generation_enabled:
+                # The rollout is prompt-only and no-grad.  Restore the
+                # training-only region targets before the one differentiable
+                # forward so the same forward supplies both free OCR logits
+                # and the supervised geometry side-channel.
+                bridge.set_region_targets(None)
+                bridge.set_region_decode_controls()
+                free_rollout = collect_free_generation_rollout(
+                    model_module,
+                    args,
+                    inputs,
+                    inputs["labels"],
+                    eos_ids,
+                )
+                bridge.set_grid_thw(inputs["image_grid_thw"])
+                bridge.set_region_targets(
+                    region_decoder_targets(record, device, args.num_queries)
+                    if region_enabled
+                    else None
+                )
+                bridge.set_region_decode_controls()
+                forward_inputs = free_rollout["prefix_inputs"]
+                ocr_labels = forward_inputs["labels"]
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                outputs = model(**inputs)
+                outputs = model(**forward_inputs)
             debug(f"step={step} micro={accumulation_index} forward_done")
             if outputs.loss is None or bridge.last_output is None or bridge.last_patch_positions is None:
                 raise RuntimeError("GLM-OCR forward did not produce OCR loss and layout state")
@@ -1957,7 +2159,7 @@ def train(
             ):
                 raise FloatingPointError(f"non-finite OCR loss at step {step}")
             tf_token_loss_sum, tf_token_count = token_weighted_loss_stats(
-                outputs, inputs["labels"]
+                outputs, ocr_labels
             )
             layout_output = bridge.last_output
             targets = layout_targets(record, bridge.last_patch_positions, args.num_queries)
@@ -2005,6 +2207,28 @@ def train(
                 bool(torch.isfinite(auxiliary_loss).all()), distributed, device
             ):
                 raise FloatingPointError(f"non-finite auxiliary loss at step {step}")
+            free_generation_raw_loss = outputs.loss.float() * 0.0
+            free_generation_scale = outputs.loss.float() * 0.0
+            free_generation_weighted_loss = outputs.loss.float() * 0.0
+            free_token_loss_sum = outputs.loss.float() * 0.0
+            free_token_count = 0
+            if free_generation_enabled:
+                # ``outputs`` is the single differentiable free-prefix
+                # forward after the no-grad rollout above.  The coefficient
+                # is a fixed experiment constant, not a per-page scale.
+                scaled_free = scaled_free_generation_loss(outputs, args)
+                free_generation_raw_loss = scaled_free["raw_loss"]
+                free_generation_scale = scaled_free["scale"]
+                free_generation_weighted_loss = scaled_free["weighted_loss"]
+                free_token_loss_sum, free_token_count = tf_token_loss_sum, tf_token_count
+                if not all_finite(
+                    bool(torch.isfinite(free_generation_weighted_loss).all()),
+                    distributed,
+                    device,
+                ):
+                    raise FloatingPointError(
+                        f"non-finite scaled free-generation loss at step {step}"
+                    )
             repeat_losses = text_repeat_losses(args, outputs, inputs["labels"], eos_ids)
             repeat_activation_ratio, eos_activation_ratio = text_repeat_activation_stats(
                 args, inputs["labels"], eos_ids
@@ -2179,10 +2403,16 @@ def train(
                             negative_token_ids=loop_negative_ids,
                         )
                     )
-            ocr_objective_loss = (
-                outputs.loss.float()
-                + scheduled_probability * (mixed_prefix_loss - outputs.loss.float())
-            )
+            if free_generation_enabled:
+                # No teacher-forced OCR CE is computed in this mode.  The
+                # single differentiable forward above is the optimization
+                # source, multiplied by the fixed experiment coefficient.
+                ocr_objective_loss = free_generation_weighted_loss
+            else:
+                ocr_objective_loss = (
+                    outputs.loss.float()
+                    + scheduled_probability * (mixed_prefix_loss - outputs.loss.float())
+                )
             escape_ramp = min(
                 1.0,
                 step / max(1, args.loop_escape_ramp_steps),
@@ -2213,6 +2443,9 @@ def train(
             if diagnostic:
                 component_losses = {
                     "ocr": outputs.loss.float(),
+                    "free_generation": free_generation_raw_loss,
+                    "free_generation_scale": free_generation_scale,
+                    "free_generation_weighted": free_generation_weighted_loss,
                     "mixed_prefix": mixed_prefix_loss,
                     "ocr_objective": ocr_objective_loss,
                     "loop_escape": escape_losses["escape"],
@@ -2240,6 +2473,31 @@ def train(
             (loss / accumulation_steps).backward()
             debug(f"step={step} micro={accumulation_index} backward_done")
             micro_sums["ocr_loss"] += float(outputs.loss.detach())
+            micro_sums["free_generation_loss"] += float(
+                free_generation_raw_loss.detach()
+            )
+            micro_sums["free_generation_scale"] += float(
+                free_generation_scale.detach()
+            )
+            micro_sums["free_generation_weighted_loss"] += float(
+                free_generation_weighted_loss.detach()
+            )
+            micro_sums["free_generation_token_numerator"] += float(
+                free_token_loss_sum.detach()
+            )
+            micro_sums["free_generation_token_count"] += float(free_token_count)
+            micro_sums["free_generation_rollout_tokens"] += float(
+                free_rollout["generation_length"]
+            )
+            micro_sums["free_generation_active_tokens"] += float(
+                free_rollout["active_tokens"]
+            )
+            micro_sums["free_generation_eos_pages"] += float(
+                bool(free_rollout["generation_eos_hit"])
+            )
+            micro_sums["free_generation_limit_pages"] += float(
+                bool(free_rollout["generation_limit_hit"])
+            )
             micro_sums["mixed_prefix_loss"] += float(mixed_prefix_loss.detach())
             micro_sums["ocr_objective_loss"] += float(ocr_objective_loss.detach())
             micro_sums["token_weighted_ocr_numerator"] += float(tf_token_loss_sum.detach())
@@ -2368,6 +2626,27 @@ def train(
         mixed_prefix_token_weighted_loss = global_mixed_token_loss_sum / max(
             1.0, global_mixed_token_count
         )
+        global_free_token_loss_sum = sum_scalar(
+            micro_sums["free_generation_token_numerator"], distributed, device
+        )
+        global_free_token_count = sum_scalar(
+            micro_sums["free_generation_token_count"], distributed, device
+        )
+        free_generation_token_weighted_loss = global_free_token_loss_sum / max(
+            1.0, global_free_token_count
+        )
+        global_free_rollout_tokens = sum_scalar(
+            micro_sums["free_generation_rollout_tokens"], distributed, device
+        )
+        global_free_active_tokens = sum_scalar(
+            micro_sums["free_generation_active_tokens"], distributed, device
+        )
+        global_free_eos_pages = sum_scalar(
+            micro_sums["free_generation_eos_pages"], distributed, device
+        )
+        global_free_limit_pages = sum_scalar(
+            micro_sums["free_generation_limit_pages"], distributed, device
+        )
         global_natural_active_tokens = sum_scalar(
             micro_sums["natural_loop_active_tokens"], distributed, device
         )
@@ -2402,13 +2681,15 @@ def train(
         token_count_total += global_token_count
         mixed_token_weighted_sum_total += global_mixed_token_loss_sum
         mixed_token_count_total += global_mixed_token_count
-        teacher_forced_step_loss = mean_scalar(
+        free_token_weighted_sum_total += global_free_token_loss_sum
+        free_token_count_total += global_free_token_count
+        current_ocr_step_loss = mean_scalar(
             micro_sums["ocr_loss"] / accumulation_steps, distributed, device
         )
         if ocr_ema_16 is None:
-            ocr_ema_16 = teacher_forced_step_loss
+            ocr_ema_16 = current_ocr_step_loss
         else:
-            ocr_ema_16 = (15.0 / 16.0) * ocr_ema_16 + (1.0 / 16.0) * teacher_forced_step_loss
+            ocr_ema_16 = (15.0 / 16.0) * ocr_ema_16 + (1.0 / 16.0) * current_ocr_step_loss
         global_layout_components = (
             {
                 key: mean_scalar(
@@ -2424,11 +2705,11 @@ def train(
             else None
         )
         metrics = {
-            # ``ocr_loss`` remains the teacher-forced loss for compatibility;
-            # the explicit names below prevent a current-batch endpoint from
-            # being mistaken for a run-level trend.
-            "ocr_loss": teacher_forced_step_loss,
-            "last_batch_ocr_loss": teacher_forced_step_loss,
+            # ``ocr_loss`` is the loss from the active differentiable OCR
+            # forward.  In free-generation mode that is the detached-prefix
+            # forward; otherwise it is the ordinary teacher-forced forward.
+            "ocr_loss": current_ocr_step_loss,
+            "last_batch_ocr_loss": current_ocr_step_loss,
             "official_base_loss": mean_scalar(
                 micro_sums["official_base_loss"] / accumulation_steps,
                 distributed,
@@ -2439,6 +2720,30 @@ def train(
             else {},
             "ema_ocr_loss_16": ocr_ema_16,
             "token_weighted_ocr_loss": token_weighted_ocr_loss,
+            "free_generation_loss": mean_scalar(
+                micro_sums["free_generation_loss"] / accumulation_steps,
+                distributed,
+                device,
+            ),
+            "free_generation_scale": mean_scalar(
+                micro_sums["free_generation_scale"] / accumulation_steps,
+                distributed,
+                device,
+            ),
+            "free_generation_weighted_loss": mean_scalar(
+                micro_sums["free_generation_weighted_loss"] / accumulation_steps,
+                distributed,
+                device,
+            ),
+            "free_generation_token_weighted_loss": free_generation_token_weighted_loss,
+            "free_generation_rollout_tokens": global_free_rollout_tokens,
+            "free_generation_active_tokens": global_free_active_tokens,
+            "free_generation_eos_pages": global_free_eos_pages,
+            "free_generation_limit_pages": global_free_limit_pages,
+            "free_generation_eos_rate": global_free_eos_pages
+            / max(1.0, float(distributed.world_size * accumulation_steps)),
+            "free_generation_limit_rate": global_free_limit_pages
+            / max(1.0, float(distributed.world_size * accumulation_steps)),
             "mixed_prefix_token_weighted_loss": mixed_prefix_token_weighted_loss,
             "mixed_prefix_loss": mean_scalar(
                 micro_sums["mixed_prefix_loss"] / accumulation_steps,
@@ -2560,6 +2865,9 @@ def train(
                     "loss_components": {
                         "ocr": metrics["ocr_loss"],
                         "official_base": metrics["official_base_loss"],
+                        "free_generation": metrics["free_generation_weighted_loss"],
+                        "free_generation_raw": metrics["free_generation_loss"],
+                        "free_generation_scale": metrics["free_generation_scale"],
                         "mixed_prefix": metrics["mixed_prefix_loss"],
                         "ocr_objective": metrics["ocr_objective_loss"],
                         **(global_layout_components or {}),
@@ -2583,11 +2891,36 @@ def train(
                         "total": metrics["total_loss"],
                     },
                     "loss_component_scope": "global_accumulated_micro_batches",
-                    "ocr_loss_scope": "teacher_forced_current_optimizer_batch",
-                    "official_base_loss_scope": "teacher_forced_current_optimizer_batch",
-                    "token_weighted_ocr_loss_scope": "all_valid_ocr_tokens_in_current_optimizer_batch",
+                    "ocr_loss_scope": (
+                        "free_generation_prefix_forward_current_optimizer_batch"
+                        if free_generation_enabled
+                        else "teacher_forced_current_optimizer_batch"
+                    ),
+                    "official_base_loss_scope": (
+                        "free_generation_prefix_forward_current_optimizer_batch"
+                        if free_generation_enabled
+                        else "teacher_forced_current_optimizer_batch"
+                    ),
+                    "free_generation_loss_scope": (
+                        "free_generation_prefix_forward_current_optimizer_batch"
+                        if free_generation_enabled
+                        else "disabled"
+                    ),
+                    "free_generation_token_loss_scope": (
+                        "generated_prefix_aligned_valid_ocr_tokens_current_optimizer_batch"
+                    ),
+                    "token_weighted_ocr_loss_scope": (
+                        "generated_prefix_aligned_valid_ocr_tokens_current_optimizer_batch"
+                        if free_generation_enabled
+                        else "all_valid_ocr_tokens_in_current_optimizer_batch"
+                    ),
                     "loss_dtypes": {
                         "ocr": _dtype_name(last_outputs.loss.dtype),
+                        "free_generation": _dtype_name(free_generation_raw_loss.dtype),
+                        "free_generation_weighted": _dtype_name(
+                            free_generation_weighted_loss.dtype
+                        ),
+                        "free_generation_scale": _dtype_name(free_generation_scale.dtype),
                         "mixed_prefix": _dtype_name(
                             (mixed_outputs.loss if mixed_outputs is not None else last_outputs.loss).dtype
                         ),
@@ -2642,6 +2975,16 @@ def train(
             "mixed_prefix_token_weighted_loss",
             "mixed_prefix_loss",
             "ocr_objective_loss",
+            "free_generation_loss",
+            "free_generation_scale",
+            "free_generation_weighted_loss",
+            "free_generation_token_weighted_loss",
+            "free_generation_rollout_tokens",
+            "free_generation_active_tokens",
+            "free_generation_eos_pages",
+            "free_generation_limit_pages",
+            "free_generation_eos_rate",
+            "free_generation_limit_rate",
             "ema_ocr_loss_16",
             "loop_escape_loss",
             "loop_margin_loss",
@@ -2744,6 +3087,7 @@ def train(
         "decoder_learning_rate": decoder_learning_rate,
         "official_base_loss": "outputs.loss",
         "loss_objective": loss_objective_config(args),
+        "free_generation_loss": free_generation_loss_config(args),
         "natural_loop": natural_loop_config(args),
         "scheduled_sampling": {
             "enabled": bool(getattr(args, "scheduled_sampling", False)),
@@ -2772,6 +3116,8 @@ def train(
         "token_weighted_ocr_loss": token_weighted_sum_total / max(1.0, token_count_total),
         "mixed_prefix_token_weighted_loss": mixed_token_weighted_sum_total
         / max(1.0, mixed_token_count_total),
+        "free_generation_token_weighted_loss": free_token_weighted_sum_total
+        / max(1.0, free_token_count_total),
         "final_decoder_learning_rate": decoder_step_learning_rate,
         "trainable_parameter_report": parameter_report,
         "decoder_lora": decoder_lora_finite_report(model_module),
@@ -3454,7 +3800,7 @@ def parse_args() -> argparse.Namespace:
         default="",
         help="human-readable attribution group label stored in run metadata",
     )
-    parser.add_argument("--learning-rate", type=float, default=5e-5)
+    parser.add_argument("--learning-rate", type=float, default=2.5e-5)
     parser.add_argument(
         "--decoder-adaptation",
         choices=["frozen", "lora"],
@@ -3464,8 +3810,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--decoder-lora-rank", type=int, default=8)
     parser.add_argument("--decoder-lora-alpha", type=float, default=8.0)
     parser.add_argument("--decoder-lora-dropout", type=float, default=0.0)
-    parser.add_argument("--decoder-learning-rate", type=float, default=1e-6)
-    parser.add_argument("--warmup-steps", type=int, default=64)
+    parser.add_argument("--decoder-learning-rate", type=float, default=5e-6)
+    parser.add_argument("--warmup-steps", type=int, default=216)
     parser.add_argument(
         "--lr-schedule-steps",
         type=optional_positive_int,
@@ -3475,7 +3821,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-lr-ratio", type=float, default=0.1)
     parser.add_argument("--residual-scale-cap", type=optional_positive_float, default=0.03)
     parser.add_argument("--initial-residual-scale", type=float, default=0.0)
-    parser.add_argument("--auxiliary-weight", type=float, default=0.2)
+    parser.add_argument("--auxiliary-weight", type=float, default=0.4)
     parser.add_argument(
         "--auxiliary-weight-start",
         type=float,
@@ -3573,6 +3919,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--natural-loop-cycle-repeats", type=int, default=3)
     parser.add_argument("--natural-loop-max-new-tokens", type=int, default=768)
     parser.add_argument("--natural-loop-continuation-horizon", type=int, default=16)
+    parser.add_argument(
+        "--free-generation-loss",
+        action="store_true",
+        help="replace teacher-forced OCR CE with CE under a detached greedy generated prefix",
+    )
+    parser.add_argument(
+        "--free-generation-loss-weight",
+        type=float,
+        default=0.05,
+        help="fixed coefficient for the free-generation OCR loss",
+    )
+    parser.add_argument("--free-generation-max-new-tokens", type=int, default=512)
     parser.add_argument(
         "--continuation-escape",
         action="store_true",
@@ -3713,6 +4071,26 @@ def main() -> None:
             raise ValueError("checkpoint-free eval-only baseline requires --auxiliary-weight 0")
     if args.eval_only and args.scheduled_sampling:
         raise ValueError("scheduled sampling is a training-only option")
+    if args.free_generation_loss and args.free_generation_loss_weight <= 0.0:
+        raise ValueError("free-generation loss weight must be positive when enabled")
+    if args.free_generation_max_new_tokens <= 0:
+        raise ValueError("free-generation rollout limit must be positive")
+    if args.free_generation_loss and not args.eval_only:
+        if args.generation_mode != "plain":
+            raise ValueError("free-generation training requires --generation-mode plain")
+        if any(
+            (
+                args.text_repeat_suppression,
+                args.scheduled_sampling,
+                args.loop_escape_training,
+                args.continuation_head,
+                args.natural_loop_loss,
+                args.recovery_mode != "legacy",
+            )
+        ):
+            raise ValueError(
+                "free-generation training is isolated and cannot mix recovery or extra OCR objectives"
+            )
     if args.no_validation and args.eval_only:
         raise ValueError("--no-validation is only valid for training runs")
     if args.no_validation and args.diagnostic_steps:
@@ -3892,6 +4270,7 @@ def main() -> None:
         "text_repeat_suppression": args.text_repeat_suppression,
         "text_repeat_config": asdict(repeat_suppression_config(args)),
         "loss_objective": loss_objective_config(args),
+        "free_generation_loss": free_generation_loss_config(args),
         "natural_loop_loss": natural_loop_config(args),
         "eval_disable_repeat_guard": args.eval_disable_repeat_guard,
         "audit_prompt_prefix": args.audit_prompt_prefix,
@@ -4009,7 +4388,13 @@ def main() -> None:
             }
         if distributed.enabled:
             if args.decoder_adaptation == "lora":
-                model = wrap_model(model, distributed)
+                model = wrap_model(
+                    model,
+                    distributed,
+                    find_unused_parameters=(
+                        args.mode == "content_only" or args.auxiliary_weight == 0.0
+                    ),
+                )
             else:
                 bridge.adapter = wrap_adapter(bridge.adapter, distributed)  # type: ignore[assignment]
             if continuation_head is not None:
@@ -4098,6 +4483,7 @@ def main() -> None:
                 "repeat_guard_enabled": bool(
                     repeat_suppression_config(args).enabled and not args.eval_disable_repeat_guard
                 ),
+                "free_generation_loss": free_generation_loss_config(args),
                 "natural_loop_config": natural_loop_config(args),
                 "max_eval_new_tokens": args.max_eval_new_tokens,
                 "validation": validation,
@@ -4181,6 +4567,7 @@ def main() -> None:
                 "query_assignment": args.query_assignment,
                 "decoder_adaptation": args.decoder_adaptation,
                 "decoder_lora_config": metadata["decoder_lora_config"],
+                "free_generation_loss": free_generation_loss_config(args),
                 "natural_loop_config": natural_loop_config(args),
                 "trainable_parameter_report": metadata["trainable_parameter_report"],
                 "lr_schedule_steps": training["lr_schedule_steps"],
@@ -4253,6 +4640,7 @@ def main() -> None:
                 "query_assignment": args.query_assignment,
                 "decoder_adaptation": args.decoder_adaptation,
                 "decoder_lora_config": metadata["decoder_lora_config"],
+                "free_generation_loss": free_generation_loss_config(args),
                 "natural_loop_config": natural_loop_config(args),
                 "trainable_parameter_report": metadata["trainable_parameter_report"],
                 "lr_schedule_steps": training["lr_schedule_steps"],
@@ -4330,6 +4718,14 @@ def main() -> None:
                 "mixed_prefix_token_weighted_loss",
                 "mixed_prefix_loss",
                 "ocr_objective_loss",
+                "free_generation_loss",
+                "free_generation_scale",
+                "free_generation_weighted_loss",
+                "free_generation_token_weighted_loss",
+                "free_generation_rollout_tokens",
+                "free_generation_active_tokens",
+                "free_generation_eos_rate",
+                "free_generation_limit_rate",
                 "official_base_loss",
                 "text_unlikelihood_activation_ratio",
                 "text_eos_activation_ratio",
@@ -4507,6 +4903,27 @@ def main() -> None:
                         {
                             "step": row["step"],
                             "value": training_value(row, "ocr_objective_loss"),
+                        }
+                        for row in diagnostic_points
+                    ],
+                    "training_free_generation_loss": [
+                        {
+                            "step": row["step"],
+                            "value": training_value(row, "free_generation_loss"),
+                        }
+                        for row in diagnostic_points
+                    ],
+                    "training_free_generation_weighted_loss": [
+                        {
+                            "step": row["step"],
+                            "value": training_value(row, "free_generation_weighted_loss"),
+                        }
+                        for row in diagnostic_points
+                    ],
+                    "training_free_generation_scale": [
+                        {
+                            "step": row["step"],
+                            "value": training_value(row, "free_generation_scale"),
                         }
                         for row in diagnostic_points
                     ],
@@ -4730,6 +5147,7 @@ def main() -> None:
                 "query_assignment": args.query_assignment,
                 "decoder_adaptation": args.decoder_adaptation,
                 "decoder_lora_config": metadata["decoder_lora_config"],
+                "free_generation_loss": free_generation_loss_config(args),
                 "natural_loop_config": natural_loop_config(args),
                 "trainable_parameter_report": metadata["trainable_parameter_report"],
                 "lr_schedule_steps": training["lr_schedule_steps"],
@@ -4825,6 +5243,7 @@ def main() -> None:
             "query_assignment": args.query_assignment,
             "decoder_adaptation": args.decoder_adaptation,
             "decoder_lora_config": metadata["decoder_lora_config"],
+            "free_generation_loss": free_generation_loss_config(args),
             "natural_loop_config": natural_loop_config(args),
             "trainable_parameter_report": metadata["trainable_parameter_report"],
             "lr_schedule_steps": training["lr_schedule_steps"],
