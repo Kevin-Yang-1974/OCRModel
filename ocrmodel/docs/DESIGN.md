@@ -1,256 +1,235 @@
-# 设计说明
+# GLMOCR Geometry 设计（代码对齐、易读版）
 
-## 1. 核心瓶颈与设计边界
+> 本文只解释当前正式 mode=geometry 路径。核心代码是 PreMergeLayoutAdapter 和 LayoutAwarePatchMerger；图中的每条主路径都对应实际调用，训练标注只走虚线监督分支。
 
-整页符号识别既需要保留局部形态，又需要建模区域、阅读顺序和书写方向。小样本适配时，若仅依赖文本生成损失，稀疏布局信号容易被高频内容信号覆盖；若把标注布局作为推理输入，则破坏整页端到端协议。
+## 先给结论
 
-## 2. 总体架构
+你对 geometry 的理解基本正确：它是在第二次 query–token 相关性计算得到的分数上，减去“预测区域中心到 patch 中心的距离惩罚”，然后再做 softmax。
 
-GLM-OCR 的视觉编码器先生成整页 visual tokens。`PreMergeLayoutAdapter` 使用可学习 seed queries 对这些 tokens 做交叉 attention，得到布局 queries；随后预测区域、顺序和方向，并在视觉内容进入原合并器前回写布局上下文。布局真值不出现在 `forward` 接口中。
+需要补充一个严格的术语区别：代码中只有第一次交互是 nn.MultiheadAttention。第二次不是另一个标准的 nn.MultiheadAttention block，而是手工完成的两步：
 
-当前代码还实现了一个可选的 validity/no-object 分支：Hungarian 对齐后，将匹配到标注区域的 query 标为 valid，未匹配 query 标为 no-object；`validity_head` 从页面相关 query 预测 `p_valid`，再对 query→视觉 transport 和 token 侧融合做门控。该分支目前是待验证架构候选，不是已经确认的默认结构。全量 MTHv2 的 256-step 诊断中，`p_valid` 从约 0.05 整体升至约 0.60，但 valid/no-object 的分离不足，gated invalid fusion mass 仍约 0.95，因此不能把 validity gating 表述为已验证收益。
+1. 用 layout queries 和视觉 tokens 计算相关性矩阵；
+2. 将矩阵转置并重新归一化，用 layout queries 加权生成每个视觉 token 的布局上下文。
 
-## 3. 模块与对照
+所以文档中把第二步称为“geometry-aware query-to-token fusion”更准确；如果简称为“第二次 cross-attention”，必须同时注明它不是标准 MHA，并写清楚分数阶段与聚合阶段的 Q/K/V。
 
-当前确认实验优先比较 `attention` 与 `geometry`，并保留 `layout_ot` 作为运输约束对照。`geometry` 在内容相似度中加入预测区域中心—patch 中心距离；`layout_ot` 使用同一几何 score，但进一步调用半松弛传输。该实现仍是项目候选设计，不是已验证结论。
+## 1. 一张图看懂主前向
 
-四种模式共用 query 生成器、bbox/order/direction 预测头、残差写回和原始 merger：`content_only` 不回写布局，`attention` 只使用内容 score，`geometry` 使用中心距离偏置后的 softmax，`layout_ot` 使用相同 score 的半松弛运输。这样可分离 query 参数、几何偏置和运输约束的贡献。
-
-## 4. Geometry 融合：论文级定义
-
-本节给出当前代码的逐步定义。几何融合不是独立的页面检测器，也不是把标注框作为额外输入；它是发生在 GLM-OCR 原始视觉 merger 之前、对同一组视觉 token 的可微残差条件化。
-
-### 4.1 接入位置和符号
-
-设 batch 大小为 B，视觉 token 数为 N，隐藏维度为 D，布局 query 数为 Q。当前机制筛选使用单页输入，bridge 实际约束 B=1，但适配器张量保留 batch 维度。视觉编码器下采样并进入原始 merger 前的 token 记为 V ∈ R^(B×N×D)；可学习 query seed 记为 S ∈ R^(Q×D)。
-
-LayoutAwarePatchMerger 的调用顺序是：整页图像 → GLM-OCR visual encoder 和空间下采样 → hidden_state [N,D] → PreMergeLayoutAdapter → adapted hidden_state [N,D] → 原始 GLM-OCR merger。bridge 将 hidden_state 增加 batch 维并转为 float 后送入适配器；adapter_precision=fp32 时显式关闭 autocast，写回前再转回原 hidden_state dtype。融合不改变 N、D 或 token 顺序。
-
-下图中的实线表示推理与训练共用的 forward 路径，虚线表示只在训练或诊断阶段使用的标注、匹配和辅助损失路径。布局标注不会沿实线进入 geometry score。
+实线是训练和推理共用的前向路径。V 是同一个 merger 前视觉 token 张量：它既作为第一次交叉注意力的 K/Value，也作为第二次相关性计算的视觉侧输入，最后还直接走残差主干。
 
 ```mermaid
 flowchart LR
-    A[整页图像<br/>+ OCR prompt] --> B[GLM-OCR视觉编码器]
-    B --> C[整页视觉 tokens]
-    C --> D[布局适配器<br/>Layout queries]
-    D --> E[几何融合<br/>可选 validity/no-object 门控]
-    C --> E
-    E --> F[原始视觉 merger]
-    F --> G[GLM-OCR语言解码器]
-    G --> H[OCR结果]
+    IMG[整页图像] --> PROC[Processor]
+    PROC --> PIX[图像张量]
+    PROC --> GRID[image_grid_thw]
+    PIX --> ENC[冻结 GLM-OCR 视觉编码器]
+    ENC --> V[merger 前视觉 tokens V]
 
-    I[训练期布局标注] -.仅训练.-> J[Hungarian 对齐<br/>bbox / 顺序 / 方向 / valid mask]
-    J -.辅助损失.-> D
-    J -.validity loss.-> E
-    I -.不进入推理.-> D
+    GRID --> POS[patch_grid_positions]
+    SIZE[视觉配置 spatial_merge_size] --> POS
+    POS --> P[确定性的 patch centers p]
+
+    SEED[可学习 seed queries S] --> CA1[Cross Attention 1<br/>Q = S<br/>K = V<br/>Value = V]
+    V --> CA1
+    CA1 --> Z[页面相关 layout queries Z]
+
+    Z --> HEAD[box / order / direction heads]
+    HEAD --> C[预测 bbox 中心 c]
+
+    Z --> AFF[交互 2：手工相关性计算<br/>Q = Z，K = V<br/>E = ZV^T / sqrt(D)]
+    V --> AFF
+    AFF --> GEO[geometry<br/>A = E - dist(c,p) / tau_g，tau_g = 0.2]
+    C --> GEO
+    P --> GEO
+
+    GEO --> WT[权重归一化<br/>T = softmax over tokens / Q<br/>W = transpose(T)，再按 query 归一化]
+    Z --> WT
+    WT --> H[Value = Z<br/>H = WZ]
+
+    V --> ADD[V_tilde = V + alpha H]
+    H --> ADD
+    ADD --> MERGER[原始 GLM-OCR visual merger]
+    MERGER --> DEC[GLM-OCR language decoder<br/>冻结基座 + 可训练 LoRA]
+    PROMPT[Text Recognition: prompt] --> DEC
+    DEC --> OUT[OCR 文本]
 ```
 
-### 4.2 视觉 patch 的归一化位置
+图中有三个容易画错的地方：
 
-patch_positions 由 image_grid_thw 和 spatial_merge_size 在模型内部重建，不读取 bbox 标注。设视觉网格高度和宽度为 H、W，空间下采样倍率为 s，代码使用 H′ = H // s、W′ = W // s，并要求 N = H′W′。第 r 行、第 c 列 token 的归一化中心为：
+- patch centers p 不是视觉编码器预测出来的 bbox，也不是 GT。它由 image_grid_thw 和 spatial_merge_size 确定性重建。
+- geometry 只把预测 bbox 的中心 c 放进距离项；bbox 的宽高、IoU 和边界没有直接进入 geometry score。
+- V_tilde 先经过原始 visual merger，再进入语言解码器；不是把 layout decoder 的输出直接加到 LLM 输入上。
 
-$$p_(rW′+c) = ((c + 0.5) / W′, (r + 0.5) / H′), 0 ≤ r < H′, 0 ≤ c < W′.$$
+## 2. 两次交互的 Q、K、V 到底是什么
 
-位置按照 torch.meshgrid(indexing="ij") 后的行优先顺序展平，与视觉 token 序列保持一致。p_i 只表示视觉网格中的相对坐标，不是原始像素坐标，也不是布局 ground truth。当前 whole-page bridge 还要求 temporal = 1，不接受视频或多帧输入。
+这里把代码拆成三个动作，避免把第二个动作误读为一个普通的 MHA：
 
-### 4.3 页面相关 query
+| 动作 | 代码对应 | Q | K | Value（值向量） | 输出 |
+|---|---|---|---|---|---|
+| 第一次：生成页面相关 query | query_attention(seed, visual_tokens, visual_tokens) | seed S | 视觉 tokens V | 视觉 tokens V | Z，每个 query 一个页面相关表示 |
+| 第二次 A：计算 query–token 分数 | queries @ visual_tokens.transpose(-1, -2) | layout queries Z | 视觉 tokens V | 此处还没有单独的 Value 输入 | E 或加入 geometry 后的 A，形状为 [B,Q,N] |
+| 第二次 B：把 query 信息写回 token | torch.matmul(token_weights, queries) | 输出按视觉 token i 索引 | — | layout queries Z | H，每个视觉 token 一个布局上下文 |
 
-seed S 在 batch 维复制后，以视觉 token 为 key 和 value 做一次多头交叉注意力：
+第一次是标准交叉注意力，可以直接写成：
 
-$$Z = LN_q(S + MHA(S, V, V)), Z ∈ R^(B×Q×D).$$
+$$Z=\operatorname{LN}_q\left(S+\operatorname{MHA}(Q=S,K=V,\operatorname{Value}=V)\right).$$
 
-Z 是当前页面相关的布局 query。S 跨页面共享，Z 随页面视觉内容变化；forward 不接收 GT bbox、reading order 或 writing direction。
+第二次要分开写：
 
-### 4.4 由 query 预测 bbox 中心
+- **分数阶段**：Z 是 Q-like，V 是 K-like，先得到 E = ZV^T / sqrt(D)；
+- **聚合阶段**：权重转成 token-first 后，Z 充当 Value，得到 H = WZ。
 
-每个 query 经过 bbox、order 和 direction 三个预测头。geometry score 只使用 bbox head；order 和 direction 只通过共享 query 和辅助损失间接影响融合：
+若只看输出方向，第二次“类似于”视觉 token 作 Q、layout query 作 K/V；但这不是代码实际调用的 API，也不是完全等价的标准 MHA，因为代码先对每个 query 在 token 维做 softmax，再除以 Q，随后又在每个 token 的 query 维重新归一化。因此图中应保留“分数：Q=Z、K=V；聚合：Value=Z”这两个标注，而不要给整个第二步强行指定一个单独的 Q/K/V 三元组。
 
-$$u_q = W_b z_q + b_b, r_q = sigmoid(u_q).$$
+## 3. Geometry 的实际计算
 
-sigmoid 使四个坐标落在 [0,1]。代码随后显式重排两个角点：
+设 batch 大小为 B（当前整页路径通常 B=1），merger 前视觉 token 数为 N，隐藏维度为 D，query 数为 Q=512：
 
-$$b_q = (min(r_q0,r_q2), min(r_q1,r_q3), max(r_q0,r_q2), max(r_q1,r_q3)).$$
+$$V\in\mathbb{R}^{B\times N\times D},\qquad S\in\mathbb{R}^{B\times Q\times D},\qquad Z\in\mathbb{R}^{B\times Q\times D}.$$
 
-框中心为：
+### 3.1 patch 中心从哪里来
 
-$$c_q = ((b_q0 + b_q2) / 2, (b_q1 + b_q3) / 2).$$
+Processor 提供 image_grid_thw；bridge 再结合视觉配置中的 spatial_merge_size=s 调用 patch_grid_positions()。若视觉网格为 (1,H,W)，则 merger 前网格为：
 
-当前实现因此是中心距离几何，而不是完整 bbox 几何：框的宽高、面积、边界距离和 IoU 不直接进入 score，只由 bbox 辅助损失监督。数据记录中的 regions[*].bbox 必须已经是归一化 xyxy；layout_targets() 不会把像素坐标再次归一化。
+$$H'=\lfloor H/s\rfloor,\qquad W'=\lfloor W/s\rfloor,\qquad N=H'W'.$$
 
-### 4.5 内容 logit 加入几何偏置
+第 r 行、第 c 列 token 的归一化中心为：
 
-先计算与 attention 对照完全相同的内容相似度：
+$$p_{rW'+c}=\left(\frac{c+0.5}{W'},\frac{r+0.5}{H'}\right).$$
 
-$$e_qi = z_q^T v_i / sqrt(D).$$
+代码使用 meshgrid(indexing="ij") 后按行优先展平，所以 p_i 与 v_i 一一对应。p_i 只是视觉网格相对坐标，不是像素坐标，不是预测量，也不是 GT bbox 中心。
 
-然后计算预测中心与 patch 中心的二维欧氏距离：
+### 3.2 先从视觉 token 生成 layout queries
 
-$$d_qi = ||c_q - p_i||_2.$$
+第一次交叉注意力由 PreMergeLayoutAdapter._queries() 完成：
 
-geometry 的最终融合 logit 为：
+$$Z=\operatorname{LN}_q\left(S+\operatorname{MHA}(S,V,V)\right).$$
 
-$$s_qi = e_qi - d_qi / τ_g.$$
+这里第二、第三个参数都是 visual_tokens，因此它们分别是 K 和 Value。随后三个 head 从同一个 Z 预测：
 
-τ_g 是 geometry_temperature，当前默认值为 0.2。距离越近，惩罚越小；距离越远的 patch 仍然可以被读取，但必须有足够高的内容相似度抵消几何惩罚。因此，这是 soft spatial prior，不是硬区域 mask。τ_g 越小，空间先验越尖锐；τ_g 越大，geometry 越接近普通 attention。
+$$r_q=\sigma(W_bz_q+b_b)\in[0,1]^4,$$
 
-实现用 torch.cdist 计算中心到 patch 的距离，并先在 float32 中计算距离，再转换回 score dtype。因为 c_q 来自当前 forward 的预测框，OCR loss 和 assignment loss 可以通过 s_qi → d_qi → c_q → b_q → z_q 回传到 bbox head 和 query 生成器；几何项不是静态位置编码或训练后后处理。
+$$b_q=(\min(r_{q0},r_{q2}),\min(r_{q1},r_{q3}),\max(r_{q0},r_{q2}),\max(r_{q1},r_{q3})).$$
 
-### 4.6 从 score 得到 query–token 权重
+预测中心为：
 
-geometry 不调用 SemiRelaxedTransport。它沿 token 维做普通 softmax，再固定每个 query 的总质量：
+$$c_q=\left(\frac{b_{q0}+b_{q2}}{2},\frac{b_{q1}+b_{q3}}{2}\right).$$
 
-$$A_qi = softmax_i(s_qi), T_qi = A_qi / Q.$$
+order_head 和 direction_head 也读取 Z，但它们不直接进入 geometry score。
 
-因此每个 query 满足 sum_i T_qi = 1 / Q。这个除法只控制不同 query 数下的整体写回幅度，不构成最优传输的双边缘约束；geometry 中的 transport 变量应称为归一化 attention 权重，而不是 OT plan。
+### 3.3 geometry 加在第二次相关性分数上
 
-随后把 T 转成 token-first，并在每个 token 的 query 维重新归一化：
+先计算内容相关性：
 
-$$W_iq = T_qi / (sum_k T_ki + 1e-12).$$
+$$E_{qi}=\frac{z_q^{\mathsf T}v_i}{\sqrt{D}}.$$
 
-于是每个视觉 token 得到多个 query 的凸组合：
+再计算预测中心与 patch 中心的欧氏距离：
 
-$$h_i = LN_c(sum_q W_iq z_q).$$
+$$G_{qi}=\lVert c_q-p_i\rVert_2.$$
 
-其中 LN_c 对应 content_norm。当前实现没有额外 MLP、concat、第二个 cross-attention block 或 token 数量变化。基础 `attention`/`geometry`/`layout_ot` 路径中，由于 softmax 权重严格为正，所有 query 默认都能参与融合；`query_mask` 只用于辅助损失和诊断，不会自动屏蔽未匹配 query。
+mode=geometry 的核心分数是：
 
-启用 validity/no-object head 时，先由 query 预测：
+$$\boxed{A_{qi}=E_{qi}-\frac{G_{qi}}{\tau_g}},\qquad \tau_g=0.2.$$
 
-$$p_q = sigmoid(l_q^{valid}), \quad T^{gate}_{qi} = T_{qi} p_q.$$
+也就是说，你说的“在算第二个相关性矩阵时减去几何惩罚”是对的；更精确地说，是在 scores.softmax(dim=-1) 之前，把中心距离惩罚加到内容 logits 上。这个距离项由 torch.cdist 计算，使用预测中心 c_q，不读取 GT。
 
-旧 checkpoint 默认保持 `legacy_normalized` 语义：按视觉 token 重新归一化 gated transport，并计算有效覆盖率：
+距离越小，patch 的 logit 被扣得越少；距离越大，logit 被扣得越多，但不是硬裁剪。高内容相似度仍可能抵消部分距离惩罚，所以这是可微的 soft spatial prior。
 
-$$W^{gate}_{iq} = T^{gate}_{qi} / (sum_k T^{gate}_{ki} + 1e-12), \quad c_i = sum_q T^{gate}_{qi} / (sum_q T_{qi} + 1e-12).$$
+### 3.4 从分数得到 token 级布局上下文
 
-融合上下文为 `c_i × LN_c(sum_q W^{gate}_{iq} z_q)`。raw transport、gated transport 和 valid coverage 均保留用于诊断。
+代码先对每个 query 沿视觉 token 维做 softmax，再除以 query 数：
 
-新 `validity_assignment` profile 使用 `raw_mass` 语义，不对 gated transport 再做 query 维归一化：
+$$T_{qi}=\frac{1}{Q}\operatorname{softmax}_{i}(A_{qi}).$$
 
-$$W^{raw}_{iq} = T_{qi} / (sum_k T_{ki} + 1e-12), \quad c_i = sum_q W^{raw}_{iq}p_q,$$
+随后转置为 token-first，并在每个 token 的 query 维重新归一化：
 
-$$h_i = c_i × LN_c(sum_q W^{raw}_{iq}p_q z_q), \quad ṽ_i = v_i + αh_i.$$
+$$W_{iq}=\frac{T_{qi}}{\sum_{k=1}^{Q}T_{ki}+\varepsilon},\qquad \varepsilon=10^{-12}.$$
 
-因此 `p_q=0` 时 query q 对视觉上下文的贡献严格为零，损失掉的质量进入 implicit null sink，而不是被 token 侧重新分配给其它 query。为使 validity 不再只读取 query 的 common-mode 表征，该 profile 还计算 detached raw-transport 视觉证据：
+最后用 layout queries 作为 Value 聚合：
 
-$$r_q = sum_i (Q T_{qi})v_i, \quad u_q = LN(q_q + stopgrad(LN(r_q))), \quad p_q = sigmoid(head(u_q)).$$
+$$h_i=\operatorname{LN}_c\left(\sum_{q=1}^{Q}W_{iq}z_q\right),\qquad H=[h_1,\ldots,h_N].$$
 
-这里没有新增大规模可学习投影；validity head 仍为单个线性层，输出接口和 whole-page 推理接口不变。
+当前 geometry 路径中的 transport 变量实际保存的是上述 softmax 权重 T；这里没有调用 SemiRelaxedTransport。只有 layout_ot 模式才会把 score 送入 OT 模块，本文不把那个对照模式画进主图。
 
-### 4.7 受控残差写回
+### 3.5 通过受控残差写回原视觉 token
 
-布局上下文以一个全局可学习标量写回原视觉 token：
+布局上下文最后写回同一份视觉 token：
 
-$$ṽ_i = v_i + α h_i, α = clip(tanh(g), -α_max, α_max).$$
+$$\widetilde V=V+\alpha H,$$
 
-content_gate g 初始化为 0。旧 checkpoint 未设置上限时使用 α = tanh(g)；稳定性确认配置设置 α_max = 0.03，把有效残差限制在 [-0.03, 0.03]。门控是一个标量，不为不同 query、token 或通道分别学习写回强度。
+$$\alpha=\operatorname{clip}(\tanh(g),-0.03,0.03),\qquad g_0=0.$$
 
-零初始化产生两个工程性质：第一，初始 forward 满足 ṽ_i = v_i，是严格 identity path；第二，在 α = 0 的瞬间，OCR 主损失对 h_i 内容参数的直接梯度被门控，但对 g 仍有梯度，布局辅助损失可以同时训练 query 和 bbox 预测。之后门控逐渐打开，geometry context 才会改变视觉表示。
+因此初始化时 alpha=0，有 V_tilde=V；适配器初始不会改变基础模型的视觉前向。LayoutAwarePatchMerger 随后把 V_tilde 交给原始 visual.merger，而不是直接交给语言解码器。
 
-最后，bridge 将 ṽ 转回原 hidden_state dtype，并调用原始 base_merger。因此 geometry 是“原 merger 前的残差条件化”，不是先裁剪页面再调用另一个 OCR 模型。
+## 4. 训练监督放在哪里
 
-### 4.8 训练目标与标签隔离
+训练图单独画出来，避免把 GT 误画成推理输入：
 
-训练总目标写为：
+```mermaid
+flowchart LR
+    F[一次 teacher-forcing forward] --> PRED[得到 Z、boxes、order、direction、transport T]
+    GT[训练期 regions 标注<br/>bbox + reading order + direction] --> TARGET[layout_targets]
+    PC[同一页的 patch centers p] --> TARGET
+    PRED -.detach boxes / order / T 支持.-> MATCH[Hungarian query-target matching]
+    TARGET --> MATCH
+    MATCH --> ALIGNED[对齐后的 query targets]
+    PRED --> LL[layout losses]
+    ALIGNED --> LL
+    F --> OCR[outputs.loss = L_OCR]
+    LL --> LA[L_layout]
+    OCR --> TOTAL[L_total = L_OCR + 0.4 L_layout]
+    LA --> TOTAL
+```
 
-$$L = L_OCR + λ_aux(λ_b L_box + λ_o L_order + λ_d L_direction + λ_a L_assignment + λ_e L_entropy + λ_v L_obj + λ_c L_count + λ_r L_rank).$$
+具体含义如下：
 
-当前 `full` 配置的权重为 (1, 0.5, 0.5, 1, 0, 0, 0, 0)；旧 `no_assignment_validity` 配置保留 assignment=0 与旧 validity 权重的接口兼容性，但实现中的 validity BCE 已改为全 query reduction。新 `validity_assignment` 首轮固定为：
+1. 模型先完成不含 GT 的正常 forward，得到 Z、预测框、顺序分数、方向 logits 和 T。
+2. forward 之后，layout_targets() 根据标注区域和 p 构造训练 target；token_owners 表示哪些视觉 token 落在某个标注区域内。
+3. match_layout_targets() 用 detached 的预测框、预测顺序以及可用的 token 支持计算 Hungarian 匹配。匹配只负责把某个 GT 区域分配给某个 query，不把 GT 框写回 geometry score。
+4. 匹配完成后再计算布局辅助损失。当前 full profile 为：
 
-$$L_{aux} = L_{box} + 0.5L_{order} + 0.5L_{direction} + 0.25L_{assignment} + 1.0L_{obj} + 0.5L_{count} + 0.1L_{rank}.$$
+$$L_{\mathrm{layout}}=L_{\mathrm{box}}+0.5L_{\mathrm{order}}+0.5L_{\mathrm{direction}}+L_{\mathrm{assignment}}.$$
 
-其中 validity 初始概率按全量 MTHv2 训练集 valid 先验设置为约 `0.066`；稳定性确认使用的其它 profile 不因本修复改变。
+5. 当前正式 plain 训练目标为：
 
-- L_box：对归一化 xyxy bbox 使用 Smooth L1，并按有效 query mask 平均。
-- L_order：对 order_scores 使用 Smooth L1，reading order 归一化到 [0,1]。
-- L_direction：对 vertical_rtl、horizontal_ltr、unknown 使用交叉熵。
-- L_assignment：把 `log T + log p_valid` 在 query 维做 softmax，再对有 owner 的 patch 使用 NLL；owner = -1 的 patch 忽略。没有 validity head 时退化为 raw `T` 的 token-first NLL。
-- L_entropy：记录 transport 熵，默认权重为 0；geometry 中它作用于 softmax 权重，layout_ot 中才与半松弛 OT 一起解释。
-- L_obj：对 Hungarian 后的 `query_mask` 使用全 query 的 `BCEWithLogitsLoss`，使常数预测的最优点服从页面 valid 先验，而不是固定为 0.5。
-- L_count：约束 `mean(sigmoid(l_valid))` 接近页面 `K/Q`。
-- L_rank：对 matched/no-object query 使用 `softplus(1 - l_pos + l_neg)`，直接建立正负 margin。
+$$\boxed{L_{\mathrm{total}}=L_{\mathrm{OCR}}+0.4L_{\mathrm{layout}}}.$$
 
-数据层按 reading_order 排序 regions，并根据 patch center 是否落在 bbox 内生成 token_owners。重叠框当前取排序后的第一个 region，框外 patch 标记为 -1。所有这些 target 都是在 adapter forward 完成后生成，不改变 patch_positions 和 geometry score。
+其中 L_OCR 是整页真值文本的 teacher-forcing 交叉熵。当前正式入口没有把 natural-loop、scheduled sampling 或恢复损失加入默认训练目标；generation_mode=loop_recovery 只影响验证/测试解码协议。
 
-若使用 hungarian query assignment，代码只用 detached 的预测框、sigmoid 后的 order score 和 detached raw transport 对 query slot 进行匹配，代价为：
+## 5. 当前配置与边界
 
-$$C_mq = 0.6 C_{box} + 0.2 C_{order} + 0.2 C_{support}.$$
+当前 A100/BSCC geometry 启动器（tools/training/run_glmocr_a100_decoder_lora.sh 和 tools/bscc/run_glmocr_mthv2_decoder_lora_4gpu.sbatch）使用的关键配置是：
 
-其中 `C_support` 是目标区域内 raw transport 的平均 query 质量；目标区域没有覆盖 patch 时回退到原来的 `0.7 C_box + 0.3 C_order`。validity 不参与匹配，避免错误 validity 预测与 target slot 自强化。
+| 项目 | 当前值 |
+|---|---|
+| 输入 | 整页图像 + Text Recognition: prompt |
+| query 数 | 512 |
+| 第一次 attention head 数 | 8 |
+| geometry temperature | 0.2 |
+| adapter precision | fp32 |
+| residual scale | 初始 0，有效范围 [-0.03, 0.03] |
+| query-target assignment | Hungarian |
+| layout loss profile | full |
+| layout loss weight | 0.4 |
+| decoder | 冻结基础权重，当前 decoder-LoRA 入口训练 LoRA 参数 |
 
-匹配结果只重排辅助监督目标，不把 GT 框、GT 顺序或匹配索引回填到 forward。因此 hungarian 不构成 label leakage，推理仍然是整页、无布局标注的路径。
+adapter.py 还保留了 use_validity_head、region_autoregressive 等可选实验代码，配置层也保留 layout_ot 等对照模式；当前正式 geometry 启动器没有打开这些分支，因此它们不放进上面的主图。以后若启动这些选项，需要为对应实验单独补图和单独写清训练/推理边界。
 
-### 4.9 与其它融合模式的精确差异
+## 6. 代码对应关系
 
-四种模式共用 query 生成器、预测头、残差写回和原始 merger，差异只在 score 或权重：
-
-| 模式 | score | 权重/融合 |
-|---|---|---|
-| content_only | 不计算布局 score | 直接返回 V |
-| attention | e_qi | T = softmax_i(e_qi) / Q |
-| geometry | e_qi − d_qi / τ_g | T = softmax_i(s_qi) / Q |
-| layout_ot | e_qi − d_qi / τ_g | SemiRelaxedTransport(s) |
-| geometry + validity (legacy) | e_qi − d_qi / τ_g | 对 T 施加 p_valid 门控，token 侧重归一化并以 valid coverage 保留幅度信息 |
-| geometry + validity (raw_mass) | e_qi − d_qi / τ_g | 使用 `W_raw × p_valid`，不重新归一化 gated query 质量；无效质量进入 implicit null sink |
-
-所以 geometry 相对于 attention 的新增量是预测中心距离偏置及其反向梯度；相对于 layout_ot，geometry 不含固定 query 边缘和松弛 token 边缘的迭代更新。比较时必须固定 query 数、训练预算、数据划分、残差约束、精度和 loss profile。
-
-### 4.10 计算开销、可归因性和限制
-
-相对于 attention，geometry 主要增加 B×Q×N 的距离矩阵，计算和显存量级约为 O(BQN)。它不增加 geometry 专用的可学习参数；bbox head 在布局模式中共同存在，以保持参数量对等。额外的几何计算通常低于 backbone 和 query–token 相似度计算，但在 N 或 Q 较大时仍需记录实际峰值显存。
-
-论文中应明确以下限制：当前几何项只使用预测 bbox 中心；T 是两次局部归一化后的 softmax 权重而非严格 OT；legacy validity 分支不能让未匹配 query 在 forward 中真正消失。新 `validity_assignment` 的 raw-mass gate、视觉证据和 no-object 目标已实现，但尚未由 bounded A100 run 验证达到 query-level 阈值；训练早期错误 bbox 或 validity 概率仍可能造成错误空间排斥；τ_g、残差上限、validity 权重和辅助损失权重必须由 validation-only 协议确定。geometry 是否稳定优于 attention，以及 validity gating 是否能降低重复生成，仍需统一多 seed、小样本划分和跨来源验证，不能由单个短程 run 推断。
-
-### 4.10.1 Validity 分支的当前证据边界
-
-全量 MTHv2 `glmocr_mthv2_validity_no_assignment_256_v1` 使用 512 queries、五卡同步 DDP、有效 global batch 20、峰值学习率 `2.5e-5`、gate 全程冻结和 `no_assignment_validity` profile。训练指标已记录到 step 256：前 64 步与后 64 步的 OCR loss 中位数约为 `1.3856` 与 `1.4068`，没有形成下降趋势；valid/no-object 的 `p_valid` 差值后程均值约 `0.0101`，step 256 约 `0.0177`，gated invalid fusion mass 仍约 `0.946`。因此该分支目前只能证明实现可运行并且数值有限，不能证明它改善了 OCR 或 query 选择。
-
-针对上述退化已新增 `validity_assignment` profile：Hungarian 保留并加入 detached raw-transport region support，validity 改为全 query object BCE＋cardinality＋ranking，assignment 纳入 `log p_valid`，前向切换到 `raw_mass`，并支持 64 steps 零残差 gate freeze。该 profile 的本地测试与 `a100-yky` 五卡 smoke 已通过；seed42/256-step 机制验证当前使用全量 train 加 32 页 validation 子集运行中。在 `Δp≥0.10`、AUROC≥0.80、invalid context share<0.50 等 validation-only 指标通过前，不扩展 seed43/44，也不执行 selection-locked test。
-
-### 4.11 与代码的对应关系
-
-- glm_bridge.py::patch_grid_positions：从 image_grid_thw 和 spatial_merge_size 生成归一化 patch 中心，并保持视觉 token 的行优先顺序。
-- glm_bridge.py::LayoutAwarePatchMerger.forward：在原始 merger 前建立 batch 维、调用适配器、记录诊断量，并把融合结果转回 backbone dtype。
-- adapter.py::PreMergeLayoutAdapter._queries：执行 seed query 到视觉 token 的多头交叉注意力。
-- adapter.py::PreMergeLayoutAdapter._scores：计算 e_qi；在 geometry/layout_ot 模式下计算 cdist 并减去 d_qi / τ_g。
-- adapter.py::PreMergeLayoutAdapter.forward：预测 bbox/order/direction，执行 geometry softmax 或 layout_ot transport；validity profile 读取 detached transport evidence，并在 `raw_mass` 模式完成不再归一化的 query gate、content_norm 和残差写回。
-- data.py::layout_targets：根据标注 bbox、reading_order 和 patch center 生成辅助监督 target；该函数在 forward 之后调用。
-- losses.py::match_layout_targets 与 compute_layout_losses：执行 detached raw-transport support 的 Hungarian target-slot 对齐、object/cardinality/ranking/assignment 辅助损失，不改变 geometry forward 的标签隔离边界。
-
-## 5. 目标函数
-
-目标函数的逐项定义、默认权重和 target-query 对齐边界见第 4.8 节。本模块新增 bbox Smooth L1、顺序回归、方向分类和 token-region assignment NLL；无标注 query 通过 mask 忽略，传输熵默认权重为零。
-
-## 6. 训练策略
-
-确定性 A100 架构对照已经支持 geometry 在 `step 768` 取得当前 validation 最优组合，但这只证明固定小样本协议下的候选可运行性。进入全量 MTHv2 后，`glmocr_mthv2_full_ddp_v1` 因学习率调度过早降至 `5e-6` 停止，gate warm-start 诊断也没有形成可用于正式训练的证据；随后 `no_assignment` 与 validity/no-object 诊断显示，辅助项可以下降，但 OCR loss 仍在约 1.4 附近振荡。因此当前训练策略的重点已从“继续放大训练规模”转为先确认 query target、validity 梯度和 gated fusion 路径。
-
-稳定性确认保持主干、原 patch merger、输入协议和 `auxiliary_weight=0.2` 不变，只训练 pre-merger adapter。学习率先用 64 steps 线性 warmup 至 `5e-5`，再 cosine 衰减，并在 step 1024 到达 `5e-6`。原始 `content_gate` 仍作为 checkpoint 参数保存，实际回写系数采用 `clamp(tanh(content_gate), -0.03, 0.03)`；未配置上限的旧 checkpoint 继续使用原始 `tanh` 语义。受控小残差尺度的设计依据来自 ReZero 的零初始化残差思想和 CaiT LayerScale 的小尺度残差注入，但 `0.03` 是依据本项目首轮最佳 checkpoint 的观察值设定，属于项目修改而非两篇论文的原始超参数[4-5]。
-
-全量 MTHv2 的正式协议仍为 train 2159 页、validation 240 页、test 800 页；正式 selection 和 test 尚未因上述诊断而启动。当前 validity 诊断只使用 seed42，训练阶段不读取 test、不生成 selection；后续是否扩展到 seed43/44，必须先由 validation-only 结果和 query-level 机制证据决定。
-
-## 7. 轻量化边界
-
-首轮仅训练 adapter、query seeds 和辅助头，以减少小样本过拟合与存储开销。这是训练范围控制，不单独作为结构创新。后续是否解冻视觉高层或合并器，由统一消融结果决定。
-
-## 8. 接入与风险
-
-接入点是 GLM-OCR 视觉 tokens 进入视觉—语言合并器之前；当前代码按锁定的 GLM-OCR checkpoint 建立并验证了这一 pre-merger tensor seam，正式实验仍需固定同一 checkpoint、processor 和整页输入协议。主要失败风险是 query collapse、Hungarian target 与 query 表征不一致、validity head 学成全局偏置、gated fusion 被 token 侧归一化抵消、OT 数值敏感、辅助监督压制识别目标，以及不同对照计算量不对等。
-
-## 9. 方法来源边界
-
-直接采用部分：GLM-OCR 官方 checkpoint `ca5d8b3e287e52589e37c28385d9655ee4372f9d`、CogViT 视觉编码器、空间下采样、`GlmOcrVisionPatchMerger` 和 GLM-0.5B decoder。官方 Transformers 实现明确在视觉 block 后先下采到 1536 维 token，再调用 patch merger[1-3]。
-
-结合项目修改部分：`LayoutAwarePatchMerger` 保留官方 merger，但在其前对下采样 token 执行布局融合。数据使用整页 `Text Recognition:` prompt，不使用官方 SDK 的 PP-DocLayout-V3 裁剪两阶段推理。
-
-项目新增部分：整页布局 queries、预测 bbox 中心的 geometry score、布局条件化半松弛 OT、四种模式对照、布局辅助目标，以及可选的 validity/no-object query 门控。这些是项目候选设计；其中 validity 分支已完成代码与五卡诊断，但尚未获得改善 OCR 或降低无效 fusion 的实验支持，不归因为 GLM-OCR 原论文方法。
+- src/layout_ocr/glm_bridge.py::patch_grid_positions：从 image_grid_thw 和 spatial_merge_size 重建 p。
+- src/layout_ocr/glm_bridge.py::LayoutAwarePatchMerger.forward：接收原始 merger 的输入 hidden_state，执行适配后再调用 base_merger。
+- src/layout_ocr/adapter.py::PreMergeLayoutAdapter._queries：第一次交叉注意力，Q=S、K=V、Value=V。
+- src/layout_ocr/adapter.py::PreMergeLayoutAdapter._scores：计算 E=ZV^T/sqrt(D)，并在 geometry 模式减去 cdist(c,p)/tau_g。
+- src/layout_ocr/adapter.py::PreMergeLayoutAdapter.forward：生成 T、token-side W、布局上下文 H 和 V_tilde=V+alpha H。
+- src/layout_ocr/data.py::layout_targets：构造训练期 bbox、order、direction 和 token owner target。
+- src/layout_ocr/losses.py::match_layout_targets：执行 detached Hungarian 匹配。
+- src/layout_ocr/losses.py::compute_layout_losses：计算 full profile 的布局损失。
 
 ## 参考文献
 
 [1] Duan, S., Xue, Y., Wang, W., et al. GLM-OCR Technical Report. arXiv:2603.10910, 2026. https://arxiv.org/abs/2603.10910
 
-[2] zai-org. GLM-OCR model card, revision `ca5d8b3e287e52589e37c28385d9655ee4372f9d`. https://huggingface.co/zai-org/GLM-OCR
+[2] zai-org. GLM-OCR model card, revision ca5d8b3e287e52589e37c28385d9655ee4372f9d. https://huggingface.co/zai-org/GLM-OCR
 
-[3] Hugging Face. `modeling_glm_ocr.py`, Transformers 5.3 series. https://github.com/huggingface/transformers/blob/v5.3.0/src/transformers/models/glm_ocr/modeling_glm_ocr.py
-
-[4] Bachlechner, T., Majumder, B. P., Mao, H., et al. ReZero is All You Need: Fast Convergence at Large Depth. arXiv:2003.04887, 2020. https://arxiv.org/abs/2003.04887
-
-[5] Touvron, H., Cord, M., Sablayrolles, A., et al. Going Deeper With Image Transformers. ICCV, 2021. https://openaccess.thecvf.com/content/ICCV2021/html/Touvron_Going_Deeper_With_Image_Transformers_ICCV_2021_paper.html
+[3] Hugging Face. modeling_glm_ocr.py, Transformers 5.3 series. https://github.com/huggingface/transformers/blob/v5.3.0/src/transformers/models/glm_ocr/modeling_glm_ocr.py
