@@ -50,6 +50,9 @@ layout_loss_profile="full"
 validation_interval=432
 max_eval_new_tokens=1536
 num_queries=512
+box_head_mlp=0
+box_head_hidden=0
+query_refine_layers=0
 generation_mode="loop_recovery"
 log_steps=16
 use_validity_head=0
@@ -148,6 +151,9 @@ while [[ $# -gt 0 ]]; do
         --validation-interval) validation_interval="$2"; shift 2 ;;
         --max-eval-new-tokens) max_eval_new_tokens="$2"; shift 2 ;;
         --num-queries) num_queries="$2"; shift 2 ;;
+        --box-head-mlp) box_head_mlp=1; shift ;;
+        --box-head-hidden) box_head_hidden="$2"; shift 2 ;;
+        --query-refine-layers) query_refine_layers="$2"; shift 2 ;;
         --generation-mode) generation_mode="$2"; shift 2 ;;
         --log-steps) log_steps="$2"; shift 2 ;;
         --use-validity-head) use_validity_head=1; shift ;;
@@ -286,6 +292,14 @@ esac
     printf '{"event":"glmocr_mthv2_ddp_failed","error":"invalid_num_queries"}\n' >&2
     exit 64
 }
+[[ "${box_head_mlp}" == "0" || "${box_head_mlp}" == "1" ]] || {
+    printf '{"event":"glmocr_mthv2_ddp_failed","error":"invalid_box_head_mlp_flag"}\n' >&2
+    exit 64
+}
+[[ "${box_head_hidden}" =~ ^[0-9]+$ && "${query_refine_layers}" =~ ^[0-9]+$ ]] || {
+    printf '{"event":"glmocr_mthv2_ddp_failed","error":"invalid_layout_head_configuration"}\n' >&2
+    exit 64
+}
 [[ "${allow_count_mismatch}" == "0" || "${allow_count_mismatch}" == "1" ]] || {
     printf '{"event":"glmocr_mthv2_ddp_failed","error":"invalid_count_mismatch_policy"}\n' >&2
     exit 64
@@ -403,7 +417,7 @@ esac
     exit 64
 }
 case "${layout_loss_profile}" in
-    full|ocr_only|no_assignment|no_assignment_validity|validity_assignment|no_geometry|history_box_equalized_v1|history_box_equalized_v2) ;;
+    full|ocr_only|no_assignment|no_assignment_validity|validity_assignment|no_geometry|history_box_equalized_v1|history_box_equalized_v2|iou_consistent) ;;
     *) printf '{"event":"glmocr_mthv2_ddp_failed","error":"invalid_layout_loss_profile"}\n' >&2; exit 64 ;;
 esac
 case "${validity_gating_mode}" in
@@ -705,6 +719,8 @@ run_inner() {
             --decoder-lora-dropout "${decoder_lora_dropout}"
             --decoder-learning-rate "${decoder_learning_rate}"
             --layout-loss-profile "${layout_loss_profile}"
+            --box-head-hidden "${box_head_hidden}"
+            --query-refine-layers "${query_refine_layers}"
             --auxiliary-weight "${auxiliary_weight}"
             --auxiliary-weight-start "${auxiliary_weight_start}"
             --residual-scale-cap 0.03
@@ -748,6 +764,7 @@ run_inner() {
             --region-spatial-penalty "${region_spatial_penalty}"
             --region-spatial-iou-threshold "${region_spatial_iou_threshold}"
         )
+        (( box_head_mlp == 1 )) && smoke_args+=(--box-head-mlp)
         [[ -n "${init_checkpoint_dir}" ]] && smoke_args+=(--init-checkpoint-dir "${init_checkpoint_dir}")
         [[ -n "${init_checkpoint_override_residual_scale}" ]] && smoke_args+=(--init-checkpoint-override-residual-scale "${init_checkpoint_override_residual_scale}")
         (( init_checkpoint_allow_mode_mismatch == 1 )) && smoke_args+=(--init-checkpoint-allow-mode-mismatch)
@@ -837,6 +854,11 @@ run_inner() {
         --region-spatial-penalty "${region_spatial_penalty}"
         --region-spatial-iou-threshold "${region_spatial_iou_threshold}"
     )
+    geometry_args=(
+        --box-head-hidden "${box_head_hidden}"
+        --query-refine-layers "${query_refine_layers}"
+    )
+    (( box_head_mlp == 1 )) && geometry_args+=(--box-head-mlp)
     [[ -n "${init_checkpoint_dir}" ]] && method_args+=(--init-checkpoint-dir "${init_checkpoint_dir}")
     [[ -n "${init_checkpoint_override_residual_scale}" ]] && method_args+=(--init-checkpoint-override-residual-scale "${init_checkpoint_override_residual_scale}")
     (( init_checkpoint_allow_mode_mismatch == 1 )) && method_args+=(--init-checkpoint-allow-mode-mismatch)
@@ -870,6 +892,7 @@ run_inner() {
         --max-steps "${max_steps}" \
         --global-step-offset "${global_step_offset}" \
         --num-queries "${num_queries}" \
+        "${geometry_args[@]}" \
         --seed "${seed}" \
         --experiment-label "${experiment_label}" \
         --learning-rate "${learning_rate}" \
@@ -1017,6 +1040,8 @@ if (( foreground == 0 )); then
         --validation-interval "${validation_interval}"
         --max-eval-new-tokens "${max_eval_new_tokens}"
         --num-queries "${num_queries}"
+        --box-head-hidden "${box_head_hidden}"
+        --query-refine-layers "${query_refine_layers}"
         --generation-mode "${generation_mode}"
         --log-steps "${log_steps}"
         --initial-valid-probability "${initial_valid_probability}"
@@ -1059,6 +1084,7 @@ if (( foreground == 0 )); then
         --dataset-root "${dataset_root}" --protocol-file "${protocol_file}"
         --dataset-label "${dataset_label}" --protocol-label "${protocol_label}"
     )
+    (( box_head_mlp == 1 )) && child_args+=(--box-head-mlp)
     [[ -n "${init_checkpoint_dir}" ]] && child_args+=(--init-checkpoint-dir "${init_checkpoint_dir}")
     [[ -n "${init_checkpoint_override_residual_scale}" ]] && child_args+=(--init-checkpoint-override-residual-scale "${init_checkpoint_override_residual_scale}")
     (( init_checkpoint_allow_mode_mismatch == 1 )) && child_args+=(--init-checkpoint-allow-mode-mismatch)

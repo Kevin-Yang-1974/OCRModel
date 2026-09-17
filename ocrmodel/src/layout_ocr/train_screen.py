@@ -74,6 +74,7 @@ from .stabilization import (
 
 LAYOUT_LOSS_KEYS = (
     "layout_box",
+    "layout_giou",
     "layout_order",
     "layout_direction",
     "layout_assignment",
@@ -1755,8 +1756,23 @@ def load_adapter_checkpoint(
         # the historical token-wise re-normalization behavior.
         recorded.setdefault("validity_gating_mode", "legacy_normalized")
         recorded.setdefault("validity_use_transport_evidence", False)
+        # These fields were added for the geometry-head upgrade.  A legacy
+        # checkpoint can be upgraded to the new zero-initialized modules.
+        recorded.setdefault("box_head_mlp", False)
+        recorded.setdefault("box_head_hidden", 0)
+        recorded.setdefault("query_refine_layers", 0)
         comparable_recorded = dict(recorded)
         comparable_expected = dict(expected)
+        # Permit the one-way legacy -> upgraded architecture transition while
+        # keeping checkpoints that already contain new modules strict.
+        for key, legacy_value in {
+            "box_head_mlp": False,
+            "box_head_hidden": 0,
+            "query_refine_layers": 0,
+        }.items():
+            if comparable_recorded[key] == legacy_value:
+                comparable_recorded.pop(key, None)
+                comparable_expected.pop(key, None)
         if override_initial_residual_scale is not None:
             comparable_recorded.pop("initial_residual_scale", None)
             comparable_expected.pop("initial_residual_scale", None)
@@ -1779,7 +1795,19 @@ def load_adapter_checkpoint(
     non_finite = [name for name, value in state.items() if not bool(torch.isfinite(value).all())]
     if non_finite:
         raise FloatingPointError(f"non-finite checkpoint tensors in {path}: {non_finite}")
-    adapter.load_state_dict(state)
+    incompatible = adapter.load_state_dict(state, strict=False)
+    print(
+        json.dumps(
+            {
+                "event": "adapter_checkpoint_loaded",
+                "path": str(path),
+                "missing_keys": incompatible.missing_keys,
+                "unexpected_keys": incompatible.unexpected_keys,
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+    )
     if override_initial_residual_scale is not None:
         if not -1.0 < override_initial_residual_scale < 1.0:
             raise ValueError("override_initial_residual_scale must be strictly between -1 and 1")
@@ -1946,6 +1974,9 @@ def load_model(args: argparse.Namespace, device: torch.device) -> tuple[Any, Any
         region_pointer_mask=getattr(args, "region_pointer_mask", True),
         region_spatial_penalty=getattr(args, "region_spatial_penalty", 4.0),
         region_spatial_iou_threshold=getattr(args, "region_spatial_iou_threshold", 0.8),
+        box_head_mlp=getattr(args, "box_head_mlp", False),
+        box_head_hidden=getattr(args, "box_head_hidden", 0),
+        query_refine_layers=getattr(args, "query_refine_layers", 0),
     )
     model.config.use_cache = False
     return model, processor, bridge
@@ -3854,6 +3885,13 @@ def parse_args() -> argparse.Namespace:
         help="cumulative optimizer steps already completed by an initialization checkpoint",
     )
     parser.add_argument("--num-queries", type=int, default=32)
+    parser.add_argument(
+        "--box-head-mlp",
+        action="store_true",
+        help="use the zero-initialized residual MLP before layout geometry heads",
+    )
+    parser.add_argument("--box-head-hidden", type=int, default=0)
+    parser.add_argument("--query-refine-layers", type=int, default=0)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
         "--experiment-label",
@@ -3933,6 +3971,7 @@ def parse_args() -> argparse.Namespace:
             "no_geometry",
             "history_box_equalized_v1",
             "history_box_equalized_v2",
+            "iou_consistent",
         ],
         default="full",
     )

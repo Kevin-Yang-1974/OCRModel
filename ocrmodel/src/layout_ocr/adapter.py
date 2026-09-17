@@ -51,6 +51,29 @@ class PreMergeLayoutAdapter(nn.Module):
         self.query_norm = nn.LayerNorm(d)
         self.content_norm = nn.LayerNorm(d)
         self.box_head = nn.Linear(d, 4)
+        self.geom_adapter: nn.Sequential | None = None
+        if config.box_head_mlp:
+            hidden = config.box_head_hidden or d
+            self.geom_adapter = nn.Sequential(
+                nn.Linear(d, hidden),
+                nn.GELU(),
+                nn.Linear(hidden, d),
+            )
+            nn.init.zeros_(self.geom_adapter[-1].weight)
+            nn.init.zeros_(self.geom_adapter[-1].bias)
+        self.query_refine: nn.ModuleList | None = None
+        if config.query_refine_layers > 0:
+            self.query_refine = nn.ModuleList(
+                nn.TransformerEncoderLayer(
+                    d_model=d,
+                    nhead=config.num_heads,
+                    dim_feedforward=4 * d,
+                    dropout=config.dropout,
+                    batch_first=True,
+                    norm_first=True,
+                )
+                for _ in range(config.query_refine_layers)
+            )
         self.order_head = nn.Linear(d, 1)
         self.direction_head = nn.Linear(d, config.num_directions)
         self.validity_head: nn.Linear | None = None
@@ -105,7 +128,11 @@ class PreMergeLayoutAdapter(nn.Module):
     def _queries(self, visual_tokens: Tensor) -> Tensor:
         seed = self.query_seed.unsqueeze(0).expand(visual_tokens.shape[0], -1, -1)
         update, _ = self.query_attention(seed, visual_tokens, visual_tokens, need_weights=False)
-        return self.query_norm(seed + update)
+        queries = self.query_norm(seed + update)
+        if self.query_refine is not None:
+            for layer in self.query_refine:
+                queries = layer(queries)
+        return queries
 
     def _scores(
         self, queries: Tensor, visual_tokens: Tensor, boxes: Tensor, patch_positions: Tensor | None
@@ -169,12 +196,15 @@ class PreMergeLayoutAdapter(nn.Module):
         if visual_tokens.ndim != 3:
             raise ValueError("visual_tokens must have shape [batch, tokens, hidden]")
         queries = self._queries(visual_tokens)
-        raw_boxes = self.box_head(queries).sigmoid()
+        geom = queries
+        if self.geom_adapter is not None:
+            geom = queries + self.geom_adapter(queries)
+        raw_boxes = self.box_head(geom).sigmoid()
         xy_min = torch.minimum(raw_boxes[..., :2], raw_boxes[..., 2:])
         xy_max = torch.maximum(raw_boxes[..., :2], raw_boxes[..., 2:])
         boxes = torch.cat((xy_min, xy_max), dim=-1)
-        order_scores = self.order_head(queries).squeeze(-1)
-        direction_logits = self.direction_head(queries)
+        order_scores = self.order_head(geom).squeeze(-1)
+        direction_logits = self.direction_head(geom)
         region_output = None
         if self.region_decoder is not None:
             region_output = self.region_decoder(

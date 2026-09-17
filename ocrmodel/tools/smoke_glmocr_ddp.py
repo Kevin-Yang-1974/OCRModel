@@ -47,6 +47,9 @@ def parse_args() -> argparse.Namespace:
         default="geometry",
     )
     parser.add_argument("--num-queries", type=int, default=512)
+    parser.add_argument("--box-head-mlp", action="store_true")
+    parser.add_argument("--box-head-hidden", type=int, default=0)
+    parser.add_argument("--query-refine-layers", type=int, default=0)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--decoder-adaptation", choices=["frozen", "lora"], default="frozen")
     parser.add_argument("--layout-only", action="store_true")
@@ -72,6 +75,7 @@ def parse_args() -> argparse.Namespace:
             "no_geometry",
             "history_box_equalized_v1",
             "history_box_equalized_v2",
+            "iou_consistent",
         ],
         default="full",
     )
@@ -196,6 +200,9 @@ def main() -> None:
             max_pixels=args.max_pixels,
             mode=args.mode,
             num_queries=args.num_queries,
+            box_head_mlp=args.box_head_mlp,
+            box_head_hidden=args.box_head_hidden,
+            query_refine_layers=args.query_refine_layers,
             residual_scale_cap=args.residual_scale_cap,
             initial_residual_scale=args.initial_residual_scale,
             use_validity_head=args.use_validity_head,

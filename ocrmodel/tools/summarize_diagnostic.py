@@ -11,6 +11,7 @@ from typing import Any
 
 LAYOUT_LOSS_KEYS = (
     "layout_box",
+    "layout_giou",
     "layout_order",
     "layout_direction",
     "layout_assignment",

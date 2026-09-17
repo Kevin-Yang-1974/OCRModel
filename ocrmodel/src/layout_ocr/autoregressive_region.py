@@ -16,6 +16,8 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
+from .geometry import box_iou
+
 
 @dataclass(frozen=True)
 class RegionDecoderConfig:
@@ -57,23 +59,6 @@ class RegionDecoderOutput:
     candidate_boxes: Tensor
     count_logits: Tensor
     target_indices: Tensor | None = None
-
-
-def box_iou(boxes_a: Tensor, boxes_b: Tensor) -> Tensor:
-    """Pairwise IoU for normalized ``xyxy`` boxes."""
-
-    top_left = torch.maximum(boxes_a[:, :, None, :2], boxes_b[:, None, :, :2])
-    bottom_right = torch.minimum(boxes_a[:, :, None, 2:], boxes_b[:, None, :, 2:])
-    intersection = (bottom_right - top_left).clamp_min(0)
-    intersection_area = intersection[..., 0] * intersection[..., 1]
-    area_a = (boxes_a[..., 2] - boxes_a[..., 0]).clamp_min(0) * (
-        boxes_a[..., 3] - boxes_a[..., 1]
-    ).clamp_min(0)
-    area_b = (boxes_b[..., 2] - boxes_b[..., 0]).clamp_min(0) * (
-        boxes_b[..., 3] - boxes_b[..., 1]
-    ).clamp_min(0)
-    union = area_a[..., None] + area_b[..., None, :] - intersection_area
-    return intersection_area / union.clamp_min(1e-8)
 
 
 def _sort_boxes(boxes: Tensor) -> Tensor:

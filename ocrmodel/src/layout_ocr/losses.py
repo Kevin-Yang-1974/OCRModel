@@ -8,6 +8,7 @@ from torch import Tensor
 
 from .adapter import LayoutAdapterOutput
 from .config import LayoutLossConfig, QueryAssignment
+from .geometry import box_giou_loss, generalized_box_iou
 
 
 def _masked_mean(values: Tensor, mask: Tensor) -> Tensor:
@@ -187,7 +188,11 @@ def match_layout_targets(
             continue
         target_boxes = targets["target_boxes"][batch_index, target_indices].detach().float()
         predicted_boxes = output.boxes[batch_index].detach().float()
-        box_cost = (target_boxes[:, None, :] - predicted_boxes[None, :, :]).abs().mean(dim=-1)
+        l1_cost = (target_boxes[:, None, :] - predicted_boxes[None, :, :]).abs().mean(dim=-1)
+        giou_cost = 1.0 - generalized_box_iou(
+            target_boxes[None], predicted_boxes[None]
+        )[0]
+        box_cost = 0.5 * l1_cost + 0.5 * giou_cost
         target_orders = targets["target_orders"][batch_index, target_indices].detach().float()
         predicted_orders = output.order_scores[batch_index].detach().float().sigmoid()
         order_cost = (target_orders[:, None] - predicted_orders[None, :]).abs()
@@ -297,6 +302,7 @@ def compute_layout_losses(
     """
 
     box = _masked_mean(F.smooth_l1_loss(output.boxes, target_boxes, reduction="none"), query_mask)
+    giou = _masked_mean(box_giou_loss(output.boxes, target_boxes), query_mask)
     order = _masked_mean(
         F.smooth_l1_loss(output.order_scores, target_orders, reduction="none"), query_mask
     )
@@ -325,6 +331,7 @@ def compute_layout_losses(
 
     total = (
         weights.box * box
+        + weights.giou * giou
         + weights.order * order
         + weights.direction * direction
         + weights.assignment * assignment
@@ -336,6 +343,7 @@ def compute_layout_losses(
     return {
         "loss": total,
         "layout_box": box,
+        "layout_giou": giou,
         "layout_order": order,
         "layout_direction": direction,
         "layout_assignment": assignment,

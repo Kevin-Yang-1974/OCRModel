@@ -32,6 +32,7 @@ def test_auxiliary_losses_are_finite() -> None:
     assert set(losses) == {
         "loss",
         "layout_box",
+        "layout_giou",
         "layout_order",
         "layout_direction",
         "layout_assignment",
@@ -112,6 +113,10 @@ def test_layout_loss_profiles_are_explicit() -> None:
     assert fixed.validity_cardinality == 0.5
     assert fixed.validity_ranking == 0.1
     assert layout_loss_config("no_geometry").box == 0.0
+    iou_consistent = layout_loss_config("iou_consistent")
+    assert iou_consistent.box == 1.0
+    assert iou_consistent.giou == 2.0
+    assert iou_consistent.assignment == 1.0
 
 
 def test_validity_loss_uses_hungarian_query_mask() -> None:

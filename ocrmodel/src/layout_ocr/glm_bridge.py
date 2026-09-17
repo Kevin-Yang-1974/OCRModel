@@ -175,6 +175,9 @@ def install_layout_adapter(
     region_pointer_mask: bool = True,
     region_spatial_penalty: float = 4.0,
     region_spatial_iou_threshold: float = 0.8,
+    box_head_mlp: bool = False,
+    box_head_hidden: int = 0,
+    query_refine_layers: int = 0,
 ) -> LayoutAwarePatchMerger:
     """Install the adapter at the verified Transformers GLM-OCR pre-merger seam."""
 
@@ -200,6 +203,9 @@ def install_layout_adapter(
         region_pointer_mask=region_pointer_mask,
         region_spatial_penalty=region_spatial_penalty,
         region_spatial_iou_threshold=region_spatial_iou_threshold,
+        box_head_mlp=box_head_mlp,
+        box_head_hidden=box_head_hidden,
+        query_refine_layers=query_refine_layers,
     )
     adapter = PreMergeLayoutAdapter(config).to(next(model.parameters()).device)
     bridge = LayoutAwarePatchMerger(

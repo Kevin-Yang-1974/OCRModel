@@ -15,6 +15,7 @@ LayoutLossProfile = Literal[
     "no_geometry",
     "history_box_equalized_v1",
     "history_box_equalized_v2",
+    "iou_consistent",
 ]
 QueryAssignment = Literal["fixed_order", "hungarian"]
 
@@ -44,6 +45,9 @@ class LayoutAdapterConfig:
     region_pointer_mask: bool = True
     region_spatial_penalty: float = 4.0
     region_spatial_iou_threshold: float = 0.8
+    box_head_mlp: bool = False
+    box_head_hidden: int = 0
+    query_refine_layers: int = 0
 
     def __post_init__(self) -> None:
         if self.hidden_size <= 0 or self.num_queries <= 0:
@@ -70,6 +74,10 @@ class LayoutAdapterConfig:
             raise ValueError("region decoder hidden size must be divisible by its head count")
         if self.region_spatial_penalty < 0 or not 0.0 < self.region_spatial_iou_threshold <= 1.0:
             raise ValueError("invalid region spatial duplicate penalty")
+        if self.box_head_hidden < 0:
+            raise ValueError("box_head_hidden must be non-negative")
+        if self.query_refine_layers < 0:
+            raise ValueError("query_refine_layers must be non-negative")
         if (
             self.max_residual_scale is not None
             and abs(self.initial_residual_scale) > self.max_residual_scale
@@ -87,6 +95,7 @@ class LayoutLossConfig:
     validity: float = 0.0
     validity_cardinality: float = 0.0
     validity_ranking: float = 0.0
+    giou: float = 0.0
 
 
 def layout_loss_config(profile: str) -> LayoutLossConfig:
@@ -122,4 +131,12 @@ def layout_loss_config(profile: str) -> LayoutLossConfig:
         # mean assignment=2.33602 and mean raw box=0.00284428.  Use the
         # rounded ratio 821.3 -> 820.0 for the next continuation.
         return LayoutLossConfig(box=820.0)
+    if profile == "iou_consistent":
+        return LayoutLossConfig(
+            box=1.0,
+            giou=2.0,
+            assignment=1.0,
+            order=0.5,
+            direction=0.5,
+        )
     raise ValueError(f"unsupported layout loss profile: {profile}")
