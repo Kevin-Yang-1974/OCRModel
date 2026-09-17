@@ -833,23 +833,33 @@ def loss_objective_config(args: argparse.Namespace) -> dict[str, Any]:
         extra_terms.append("L_continuation_head")
     if natural_loop_config(args).get("enabled") is True:
         extra_terms.append("L_natural_loop")
+    layout_only = bool(getattr(args, "layout_only", False))
     free_generation_enabled = bool(getattr(args, "free_generation_loss", False))
-    primary_formula = (
-        "L_free_generation_scaled + auxiliary_weight * L_layout"
-        if free_generation_enabled
-        else "L_official + auxiliary_weight * L_layout"
-    )
+    if layout_only:
+        primary_formula = "auxiliary_weight * L_layout"
+    else:
+        primary_formula = (
+            "L_free_generation_scaled + auxiliary_weight * L_layout"
+            if free_generation_enabled
+            else "L_official + auxiliary_weight * L_layout"
+        )
     if extra_terms:
         primary_formula += " + extra_terms"
     return {
         "formula": primary_formula,
         "official_loss": (
-            "free_generation_prefix_outputs.loss"
-            if free_generation_enabled
-            else "outputs.loss"
+            None
+            if layout_only
+            else (
+                "free_generation_prefix_outputs.loss"
+                if free_generation_enabled
+                else "outputs.loss"
+            )
         ),
-        "official_weight": 1.0,
+        "official_weight": 0.0 if layout_only else 1.0,
         "layout_weight": float(args.auxiliary_weight),
+        "layout_only": layout_only,
+        "text_recognition_branch": "disabled" if layout_only else "enabled",
         "extra_terms": extra_terms,
         "free_generation": free_generation_loss_config(args),
     }
@@ -1722,7 +1732,13 @@ def load_continuation_head_checkpoint(
     return state
 
 
-def load_adapter_checkpoint(path: Path, bridge: LayoutAwarePatchMerger) -> dict[str, Any]:
+def load_adapter_checkpoint(
+    path: Path,
+    bridge: LayoutAwarePatchMerger,
+    *,
+    override_initial_residual_scale: float | None = None,
+    allow_mode_mismatch: bool = False,
+) -> dict[str, Any]:
     adapter = unwrap_module(bridge.adapter)
     config_path = path / "adapter_config.json"
     expected = asdict(adapter.config)
@@ -1739,7 +1755,18 @@ def load_adapter_checkpoint(path: Path, bridge: LayoutAwarePatchMerger) -> dict[
         # the historical token-wise re-normalization behavior.
         recorded.setdefault("validity_gating_mode", "legacy_normalized")
         recorded.setdefault("validity_use_transport_evidence", False)
-        if recorded != expected:
+        comparable_recorded = dict(recorded)
+        comparable_expected = dict(expected)
+        if override_initial_residual_scale is not None:
+            comparable_recorded.pop("initial_residual_scale", None)
+            comparable_expected.pop("initial_residual_scale", None)
+        if allow_mode_mismatch:
+            # A paired attention-vs-geometry comparison may intentionally
+            # reuse the same learned adapter tensors while changing only the
+            # fusion rule.  Keep every other adapter field strict.
+            comparable_recorded.pop("mode", None)
+            comparable_expected.pop("mode", None)
+        if comparable_recorded != comparable_expected:
             raise ValueError(
                 f"adapter config mismatch for {path}: recorded={recorded}, expected={expected}"
             )
@@ -1753,6 +1780,11 @@ def load_adapter_checkpoint(path: Path, bridge: LayoutAwarePatchMerger) -> dict[
     if non_finite:
         raise FloatingPointError(f"non-finite checkpoint tensors in {path}: {non_finite}")
     adapter.load_state_dict(state)
+    if override_initial_residual_scale is not None:
+        if not -1.0 < override_initial_residual_scale < 1.0:
+            raise ValueError("override_initial_residual_scale must be strictly between -1 and 1")
+        with torch.no_grad():
+            adapter.content_gate.fill_(math.atanh(override_initial_residual_scale))
     return state
 
 
@@ -2051,20 +2083,24 @@ def train(
     free_token_weighted_sum_total = 0.0
     free_token_count_total = 0.0
     free_generation_enabled = bool(getattr(args, "free_generation_loss", False))
+    layout_only = bool(getattr(args, "layout_only", False))
     started = time.time()
     checkpoint_steps: list[int] = []
     checkpoint_health: list[dict[str, Any]] = []
     diagnostic_train: dict[str, dict[str, Any]] = {}
+    step_offset = int(getattr(args, "global_step_offset", 0))
+    final_global_step = step_offset + args.max_steps
     for step in range(1, args.max_steps + 1):
+        global_step = step_offset + step
         learning_rate = learning_rate_at_step(
-            min(step, lr_schedule_steps),
+            min(global_step, lr_schedule_steps),
             peak_learning_rate=args.learning_rate,
             warmup_steps=args.warmup_steps,
             max_steps=lr_schedule_steps,
             min_lr_ratio=args.min_lr_ratio,
         )
         decoder_step_learning_rate = learning_rate_at_step(
-            min(step, lr_schedule_steps),
+            min(global_step, lr_schedule_steps),
             peak_learning_rate=decoder_learning_rate,
             warmup_steps=args.warmup_steps,
             max_steps=lr_schedule_steps,
@@ -2075,7 +2111,7 @@ def train(
                 parameter_group["lr"] = decoder_step_learning_rate
             elif parameter_group.get("group_name") == "continuation_head":
                 parameter_group["lr"] = learning_rate_at_step(
-                    min(step, lr_schedule_steps),
+                    min(global_step, lr_schedule_steps),
                     peak_learning_rate=args.continuation_head_learning_rate,
                     warmup_steps=args.warmup_steps,
                     max_steps=lr_schedule_steps,
@@ -2084,14 +2120,14 @@ def train(
             elif parameter_group.get("group_name") != "content_gate":
                 parameter_group["lr"] = learning_rate
         auxiliary_weight = auxiliary_weight_at_step(
-            step,
+            global_step,
             start_weight=auxiliary_weight_start,
             end_weight=args.auxiliary_weight,
             ramp_steps=args.auxiliary_ramp_steps,
         )
-        gate_frozen = gate_parameter is not None and step <= args.gate_freeze_steps
+        gate_frozen = gate_parameter is not None and global_step <= args.gate_freeze_steps
         optimizer.zero_grad(set_to_none=True)
-        diagnostic = step in args.diagnostic_steps
+        diagnostic = global_step in args.diagnostic_steps
         micro_records: list[dict[str, Any]] = []
         micro_sums: Counter[str] = Counter()
         diagnostic_gradient_sums: Counter[str] = Counter()
@@ -2105,7 +2141,7 @@ def train(
         last_auxiliary_losses = None
         last_loss = None
         for accumulation_index in range(accumulation_steps):
-            micro_index = (step - 1) * accumulation_steps + accumulation_index
+            micro_index = (global_step - 1) * accumulation_steps + accumulation_index
             record = record_for_micro(micro_index)
             micro_records.append(record)
             debug(f"step={step} micro={accumulation_index} record={record['page_id']} prepare")
@@ -2403,7 +2439,12 @@ def train(
                             negative_token_ids=loop_negative_ids,
                         )
                     )
-            if free_generation_enabled:
+            if layout_only:
+                # The recognition forward is still executed because the GLM
+                # bridge consumes its visual activations, but its text loss is
+                # deliberately excluded from the optimization graph.
+                ocr_objective_loss = outputs.loss.float() * 0.0
+            elif free_generation_enabled:
                 # No teacher-forced OCR CE is computed in this mode.  The
                 # single differentiable forward above is the optimization
                 # source, multiplied by the fixed experiment coefficient.
@@ -2607,7 +2648,7 @@ def train(
         log_this_step = (
             step == 1
             or step % args.log_steps == 0
-            or step == args.max_steps
+            or global_step == final_global_step
             or diagnostic
         )
         global_token_loss_sum = sum_scalar(
@@ -2858,7 +2899,8 @@ def train(
             transport = average_scalar_diagnostics(micro_transports)
             metrics.update(
                 {
-                    "step": step,
+                    "step": global_step,
+                    "relative_step": step,
                     "page_id": record["page_id"],
                     "page_ids": [item["page_id"] for item in micro_records],
                     "optimizer_update": True,
@@ -2954,7 +2996,7 @@ def train(
                 }
             )
             if diagnostic:
-                diagnostic_train[str(step)] = dict(metrics)
+                diagnostic_train[str(global_step)] = dict(metrics)
         if getattr(args, "recovery_mode", "legacy") == "aligned_recovery_v1":
             for key in ("aligned_rollout_pages", "aligned_accepted_pages", "aligned_end_tokens",
                         "aligned_end_loss", "aligned_skip_no_cycle", "aligned_skip_ambiguous_endpoint",
@@ -3016,7 +3058,7 @@ def train(
         if distributed.is_main and log_this_step:
             append_jsonl(
                 args.output_dir / "train_metrics.jsonl",
-                {"step": step, "page_id": record["page_id"], **metrics},
+                {"step": global_step, "relative_step": step, "page_id": record["page_id"], **metrics},
             )
         # Rank 0 performs the compact JSON/diagnostic write above.  Keep the
         # next page forward from overtaking it; otherwise whole-page token
@@ -3024,25 +3066,25 @@ def train(
         # is still finishing the current-step reductions.
         barrier(distributed)
         if (
-            step == args.max_steps
+            global_step == final_global_step
             or (
                 not getattr(args, "no_validation", False)
                 and (
-                    step % args.validation_interval == 0
-                    or step in args.diagnostic_steps
+                    global_step % args.validation_interval == 0
+                    or global_step in args.diagnostic_steps
                 )
             )
         ):
             if distributed.is_main:
-                checkpoint_dir = args.output_dir / f"checkpoint-{step}"
+                checkpoint_dir = args.output_dir / f"checkpoint-{global_step}"
                 checkpoint_dir.mkdir(exist_ok=False)
-                health = save_adapter_checkpoint(checkpoint_dir, bridge, step)
+                health = save_adapter_checkpoint(checkpoint_dir, bridge, global_step)
                 health["decoder_lora"] = save_decoder_lora_checkpoint(
-                    checkpoint_dir, model_module, step
+                    checkpoint_dir, model_module, global_step
                 )
                 if continuation_head is not None:
                     health["continuation_head"] = save_continuation_head_checkpoint(
-                        checkpoint_dir, continuation_head, step
+                        checkpoint_dir, continuation_head, global_step
                     )
                 health.update(
                     {
@@ -3067,15 +3109,21 @@ def train(
         if lora_state:
             save_file(lora_state, args.output_dir / "decoder_lora.safetensors")
         if continuation_head is not None:
-            save_continuation_head_checkpoint(args.output_dir, continuation_head, args.max_steps)
+            save_continuation_head_checkpoint(
+                args.output_dir, continuation_head, final_global_step
+            )
     barrier(distributed)
     return {
         "steps": args.max_steps,
+        "global_step_offset": step_offset,
+        "global_step_start": step_offset + 1,
+        "global_step_end": final_global_step,
         "seconds": elapsed,
         "steps_per_second": args.max_steps / max(elapsed, 1e-9),
         "checkpoint_steps": checkpoint_steps,
         "checkpoint_health": checkpoint_health,
         "diagnostic_train": diagnostic_train,
+        "layout_only": layout_only,
         "lr_schedule_steps": lr_schedule_steps,
         "auxiliary_weight_start": auxiliary_weight_start,
         "auxiliary_weight_end": args.auxiliary_weight,
@@ -3170,6 +3218,7 @@ def evaluate(
     predictions_path.parent.mkdir(parents=True, exist_ok=True)
     pairs: list[tuple[str, str]] = []
     box_errors: list[float] = []
+    box_ious: list[float] = []
     direction_correct = 0
     direction_total = 0
     generation_limit_hits = 0
@@ -3458,11 +3507,14 @@ def evaluate(
         count = int(targets["query_mask"].sum())
         if count:
             query_mask = targets["query_mask"][0]
-            error = (
-                bridge.last_output.boxes[0, query_mask]
-                - targets["target_boxes"][0, query_mask]
-            ).abs()
+            predicted_boxes = bridge.last_output.boxes[0, query_mask]
+            target_boxes = targets["target_boxes"][0, query_mask]
+            error = (predicted_boxes - target_boxes).abs()
             box_errors.append(float(error.mean()))
+            pairwise_iou = box_iou(
+                predicted_boxes.unsqueeze(0), target_boxes.unsqueeze(0)
+            )[0]
+            box_ious.append(float(torch.diagonal(pairwise_iou).mean().detach()))
             predicted_direction = bridge.last_output.direction_logits[0, query_mask].argmax(dim=-1)
             direction_correct += int(
                 (predicted_direction == targets["target_directions"][0, query_mask]).sum()
@@ -3528,6 +3580,8 @@ def evaluate(
     metrics.update(
         {
             "layout_box_mae": sum(box_errors) / max(1, len(box_errors)),
+            "layout_box_iou": sum(box_ious) / max(1, len(box_ious)),
+            "layout_box_iou_regions": len(box_ious),
             "layout_direction_accuracy": direction_correct / max(1, direction_total),
             "layout_direction_regions": direction_total,
             "mean_annotated_queries": sum(annotated_query_counts)
@@ -3793,6 +3847,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--per-device-batch-size", type=int, default=1)
     parser.add_argument("--gradient-accumulation-steps", type=int, default=1)
     parser.add_argument("--max-steps", type=int, default=256)
+    parser.add_argument(
+        "--global-step-offset",
+        type=int,
+        default=0,
+        help="cumulative optimizer steps already completed by an initialization checkpoint",
+    )
     parser.add_argument("--num-queries", type=int, default=32)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
@@ -3806,6 +3866,22 @@ def parse_args() -> argparse.Namespace:
         choices=["frozen", "lora"],
         default="frozen",
         help="keep the GLM decoder frozen or train selected decoder projections with LoRA",
+    )
+    parser.add_argument(
+        "--layout-only",
+        action="store_true",
+        help="optimize layout losses only; exclude the text-recognition loss",
+    )
+    parser.add_argument(
+        "--init-checkpoint-override-residual-scale",
+        type=float,
+        default=None,
+        help="override only the loaded checkpoint content-gate scale",
+    )
+    parser.add_argument(
+        "--init-checkpoint-allow-mode-mismatch",
+        action="store_true",
+        help="reuse adapter tensors when only the recorded fusion mode differs",
     )
     parser.add_argument("--decoder-lora-rank", type=int, default=8)
     parser.add_argument("--decoder-lora-alpha", type=float, default=8.0)
@@ -3855,6 +3931,8 @@ def parse_args() -> argparse.Namespace:
             "no_assignment_validity",
             "validity_assignment",
             "no_geometry",
+            "history_box_equalized_v1",
+            "history_box_equalized_v2",
         ],
         default="full",
     )
@@ -4054,12 +4132,41 @@ def main() -> None:
         )
     if args.auxiliary_weight_start is None:
         args.auxiliary_weight_start = args.auxiliary_weight
+    if args.init_checkpoint_override_residual_scale is not None:
+        if not -1.0 < args.init_checkpoint_override_residual_scale < 1.0:
+            raise ValueError(
+                "--init-checkpoint-override-residual-scale must be strictly between -1 and 1"
+            )
+        if args.init_checkpoint_dir is None:
+            raise ValueError(
+                "--init-checkpoint-override-residual-scale requires --init-checkpoint-dir"
+            )
+    if args.init_checkpoint_allow_mode_mismatch and args.init_checkpoint_dir is None:
+        raise ValueError(
+            "--init-checkpoint-allow-mode-mismatch requires --init-checkpoint-dir"
+        )
+    if args.layout_only:
+        if args.auxiliary_weight <= 0.0 or args.auxiliary_weight_start <= 0.0:
+            raise ValueError("--layout-only requires positive layout loss weights")
+        if any(
+            (
+                args.text_repeat_suppression,
+                args.scheduled_sampling,
+                args.loop_escape_training,
+                args.continuation_head,
+                args.natural_loop_loss,
+                args.free_generation_loss,
+            )
+        ):
+            raise ValueError("--layout-only cannot enable text or rollout objectives")
     if args.eval_checkpoint_dir is not None and not args.eval_only:
         raise ValueError("--eval-checkpoint-dir is only valid with --eval-only")
     if args.init_checkpoint_dir is not None and args.eval_only:
         raise ValueError("--init-checkpoint-dir is only valid for training runs")
     if args.init_checkpoint_dir is not None and args.eval_checkpoint_dir is not None:
         raise ValueError("--init-checkpoint-dir and --eval-checkpoint-dir are mutually exclusive")
+    if args.global_step_offset < 0:
+        raise ValueError("--global-step-offset must be non-negative")
     if args.eval_only and args.eval_checkpoint_dir is None:
         if args.mode != "content_only":
             raise ValueError(
@@ -4125,8 +4232,15 @@ def main() -> None:
         and abs(args.initial_residual_scale) > args.residual_scale_cap
     ):
         raise ValueError("--initial-residual-scale must not exceed --residual-scale-cap")
-    if any(step > args.max_steps for step in args.diagnostic_steps):
-        raise ValueError("diagnostic steps must not exceed --max-steps")
+    final_global_step = args.global_step_offset + args.max_steps
+    if any(
+        step != 0
+        and not (args.global_step_offset < step <= final_global_step)
+        for step in args.diagnostic_steps
+    ):
+        raise ValueError(
+            "diagnostic steps must lie within the cumulative training step range"
+        )
     if args.auxiliary_ramp_steps > args.max_steps:
         raise ValueError("--auxiliary-ramp-steps must not exceed --max-steps")
     if args.gate_freeze_steps > args.max_steps:
@@ -4235,8 +4349,12 @@ def main() -> None:
         "experiment_label": args.experiment_label,
         "seed": args.seed,
         "max_steps": args.max_steps,
+        "global_step_offset": args.global_step_offset,
+        "global_step_start": args.global_step_offset + 1,
+        "global_step_end": args.global_step_offset + args.max_steps,
         "lr_schedule_steps": lr_schedule_steps,
         "num_queries": args.num_queries,
+        "layout_only": args.layout_only,
         "auxiliary_weight": args.auxiliary_weight,
         "auxiliary_weight_start": args.auxiliary_weight_start,
         "auxiliary_ramp_steps": args.auxiliary_ramp_steps,
@@ -4276,6 +4394,8 @@ def main() -> None:
         "audit_prompt_prefix": args.audit_prompt_prefix,
         "eval_checkpoint_dir": str(args.eval_checkpoint_dir) if args.eval_checkpoint_dir else None,
         "init_checkpoint_dir": str(args.init_checkpoint_dir) if args.init_checkpoint_dir else None,
+        "init_checkpoint_override_residual_scale": args.init_checkpoint_override_residual_scale,
+        "init_checkpoint_allow_mode_mismatch": args.init_checkpoint_allow_mode_mismatch,
         "loop_escape_training": args.loop_escape_training,
         "loop_escape_config": {
             "cycle_length": args.loop_escape_cycle_length,
@@ -4332,7 +4452,7 @@ def main() -> None:
             "schedule_steps": lr_schedule_steps,
             "min_lr_ratio": args.min_lr_ratio,
             "terminal_learning_rate": learning_rate_at_step(
-                min(args.max_steps, lr_schedule_steps),
+                min(args.global_step_offset + args.max_steps, lr_schedule_steps),
                 peak_learning_rate=args.learning_rate,
                 warmup_steps=args.warmup_steps,
                 max_steps=lr_schedule_steps,
@@ -4392,7 +4512,9 @@ def main() -> None:
                     model,
                     distributed,
                     find_unused_parameters=(
-                        args.mode == "content_only" or args.auxiliary_weight == 0.0
+                        args.mode == "content_only"
+                        or args.auxiliary_weight == 0.0
+                        or args.layout_only
                     ),
                 )
             else:
@@ -4410,7 +4532,12 @@ def main() -> None:
                 raise FileNotFoundError(
                     f"training initialization checkpoint directory is missing: {args.init_checkpoint_dir}"
                 )
-            load_adapter_checkpoint(args.init_checkpoint_dir, bridge)
+            load_adapter_checkpoint(
+                args.init_checkpoint_dir,
+                bridge,
+                override_initial_residual_scale=args.init_checkpoint_override_residual_scale,
+                allow_mode_mismatch=args.init_checkpoint_allow_mode_mismatch,
+            )
             if args.decoder_adaptation == "lora":
                 load_decoder_lora_checkpoint(args.init_checkpoint_dir, model)
             if continuation_head is not None:

@@ -15,6 +15,10 @@ run_id="glmocr_mthv2_full_ddp_v1"
 seed=42
 gpu_id=0
 gpu_ids=""
+mode="geometry"
+num_queries=512
+max_eval_new_tokens=1536
+gpu_utilization_limit="${GLMOCR_LOCKED_TEST_GPU_UTILIZATION_LIMIT:-50}"
 session=""
 foreground=0
 
@@ -24,6 +28,10 @@ while [[ $# -gt 0 ]]; do
         --seed) seed="$2"; shift 2 ;;
         --gpu-id) gpu_id="$2"; shift 2 ;;
         --gpu-ids) gpu_ids="$2"; shift 2 ;;
+        --mode) mode="$2"; shift 2 ;;
+        --num-queries) num_queries="$2"; shift 2 ;;
+        --max-eval-new-tokens) max_eval_new_tokens="$2"; shift 2 ;;
+        --gpu-utilization-limit) gpu_utilization_limit="$2"; shift 2 ;;
         --session) session="$2"; shift 2 ;;
         --foreground) foreground=1; shift ;;
         --remote-root) remote_root="$2"; shift 2 ;;
@@ -39,6 +47,18 @@ done
 [[ -z "${gpu_ids}" ]] && gpu_ids="${gpu_id}"
 [[ "${run_id}" =~ ^[A-Za-z0-9_.-]+$ && "${seed}" =~ ^[0-9]+$ && "${gpu_ids}" =~ ^[0-9]+(,[0-9]+)*$ ]] || {
     printf '{"event":"glmocr_locked_test_failed","error":"invalid_run_seed_or_gpu_ids"}\n' >&2
+    exit 64
+}
+case "${mode}" in
+    content_only|attention|geometry|layout_ot) ;;
+    *) printf '{"event":"glmocr_locked_test_failed","error":"invalid_mode","value":"%s"}\n' "${mode}" >&2; exit 64 ;;
+esac
+[[ "${num_queries}" =~ ^[1-9][0-9]*$ && "${max_eval_new_tokens}" =~ ^[1-9][0-9]*$ ]] || {
+    printf '{"event":"glmocr_locked_test_failed","error":"invalid_evaluation_configuration"}\n' >&2
+    exit 64
+}
+[[ "${gpu_utilization_limit}" =~ ^[1-9][0-9]*$ ]] || {
+    printf '{"event":"glmocr_locked_test_failed","error":"invalid_gpu_utilization_limit"}\n' >&2
     exit 64
 }
 IFS=',' read -r -a gpu_array <<< "${gpu_ids}"
@@ -135,8 +155,8 @@ query_gpus() {
             printf '{"event":"glmocr_locked_test_failed","error":"cannot_parse_gpu_utilization","gpu":%s}\n' "${gpu}" >&2
             exit 69
         }
-        (( utilization < 50 )) || {
-            printf '{"event":"glmocr_locked_test_failed","error":"gpu_admission_failed","gpu":%s,"utilization":%s}\n' "${gpu}" "${utilization}" >&2
+        (( utilization < gpu_utilization_limit )) || {
+            printf '{"event":"glmocr_locked_test_failed","error":"gpu_admission_failed","gpu":%s,"utilization":%s,"limit":%s}\n' "${gpu}" "${utilization}" "${gpu_utilization_limit}" >&2
             exit 75
         }
         utilization_json+="${gpu}:${utilization},"
@@ -169,7 +189,10 @@ run_inner() {
             --protocol-file "${protocol_file}" \
             --run-dir "${run_dir}" \
             --selection-file "${selection_file}" \
+            --mode "${mode}" \
             --seed "${seed}" \
+            --num-queries "${num_queries}" \
+            --max-eval-new-tokens "${max_eval_new_tokens}" \
             > "${test_log}" 2>&1
     else
         shard_root="${run_dir}/locked-test-shards"
@@ -201,7 +224,10 @@ run_inner() {
                     --run-dir "${run_dir}" \
                     --output-dir "${shard_dir}" \
                     --selection-file "${selection_file}" \
+                    --mode "${mode}" \
                     --seed "${seed}" \
+                    --num-queries "${num_queries}" \
+                    --max-eval-new-tokens "${max_eval_new_tokens}" \
                     --test-shard-index "${shard_index}" \
                     --test-shard-count "${gpu_count}"
             ) > "${shard_log}" 2>&1 &
@@ -235,6 +261,8 @@ run_inner() {
             --protocol-file "${protocol_file}" \
             --selection-file "${selection_file}" \
             --seed "${seed}" \
+            --num-queries "${num_queries}" \
+            --max-eval-new-tokens "${max_eval_new_tokens}" \
             --gpu-ids "${gpu_ids}" \
             > "${test_log}" 2>&1
     fi
@@ -254,7 +282,7 @@ if (( foreground == 0 )); then
     }
     mkdir -p "${remote_root}/runs"
     script_path="$(realpath -- "${BASH_SOURCE[0]}")"
-    command_line="$(printf '%q ' bash "${script_path}" --foreground --run-id "${run_id}" --seed "${seed}" --gpu-ids "${gpu_ids}" --remote-root "${remote_root}" --code-root "${code_root}" --env-dir "${env_dir}" --model-dir "${model_dir}" --dataset-root "${dataset_root}" --protocol-file "${protocol_file}")"
+    command_line="$(printf '%q ' bash "${script_path}" --foreground --run-id "${run_id}" --seed "${seed}" --gpu-ids "${gpu_ids}" --mode "${mode}" --num-queries "${num_queries}" --max-eval-new-tokens "${max_eval_new_tokens}" --gpu-utilization-limit "${gpu_utilization_limit}" --remote-root "${remote_root}" --code-root "${code_root}" --env-dir "${env_dir}" --model-dir "${model_dir}" --dataset-root "${dataset_root}" --protocol-file "${protocol_file}")"
     tmux new-session -d -s "${session}" "cd $(printf '%q' "${code_root}") && exec ${command_line} >$(printf '%q' "${launcher_log}") 2>&1"
     printf '{"event":"glmocr_locked_test_armed","session":"%s","run_id":"%s","seed":%s,"gpu_ids":"%s","test_used_for_selection":false,"log":"%s"}\n' \
         "${session}" "${run_id}" "${seed}" "${gpu_ids}" "${launcher_log}"

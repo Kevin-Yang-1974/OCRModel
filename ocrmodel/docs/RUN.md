@@ -149,6 +149,22 @@ python tools/summarize_architecture_comparison.py \
 
 正式训练入口还必须自动执行 validation-only checkpoint selection 和 selection-locked test，且不允许 test 参与任何调参。
 
+## 参数优选后的统一默认超参数
+
+图片所示参数优选结果作为后续 A100-yky 与 BSCC 新 run 的统一默认值：
+
+| 参数 | 后续默认值 |
+| --- | ---: |
+| 主 adapter learning rate | `2.5e-5` |
+| decoder LoRA learning rate | `5e-6` |
+| `auxiliary_weight` | `0.4` |
+| `warmup_steps` | `216` |
+| `max_grad_norm` | `1.0` |
+
+对应 plain 训练目标为 `L_official + 0.4 L_layout`；`natural_loop`、scheduled sampling、loop escape 和 continuation head 均保持关闭。旧 run 的实际配置和结果仍按原值保留在历史记录中，不回写为新参数。
+
+后续入口默认使用新的、独立的 run ID：A100-yky 为 `glmocr_mthv2_decoder_lora_hpopt_20k_5gpu_a100_official_layout_260912_v1`，BSCC 为 `glmocr_mthv2_decoder_lora_hpopt_20k_4gpu_official_layout_260912_v1`。
+
 ## 历史：BSCC 四卡 decoder-LoRA 20k 流程
 
 本流程基于当前 A100 全量 DDP 参数迁移到 BSCC，新的正式 run 为 `glmocr_mthv2_decoder_lora_lr1e5_20k_4gpu_official_layout_260912_v1`。训练使用 whole-page、512 queries、全量 MTHv2（2159/240/800），四卡同步 DDP，global batch 为 4；adapter learning rate 为 `5e-5`，decoder LoRA 使用 rank/alpha/dropout `8/8/0`，学习率为本 run 专用的 `1e-5`。公共 A100 launcher 默认仍为 `1e-6`。
@@ -161,8 +177,12 @@ python tools/summarize_architecture_comparison.py \
 
 此前 run `glmocr_mthv2_decoder_lora_lr1e5_20k_4gpu_260911_v1` 已在 step112 停止：它只有 `generation_mode=loop_recovery`，没有训练期循环目标，因此不作结果、不进入 validation/test。上一轮 rollout256 run 也停止并保留为诊断记录，不作为当前目标。
 
-## 当前 A100 五卡 decoder-LoRA plain 20k 流程
+## 已完成：A100 五卡 decoder-LoRA plain 20k 流程（旧参数）
 
-当前入口为 `tools/training/run_glmocr_a100_decoder_lora.sh`，run ID 为 `glmocr_mthv2_decoder_lora_lr1e5_20k_5gpu_a100_official_layout_260912_v1`，tmux session 为 `glmocr_a100_plain_260912`。它与 BSCC 入口使用相同的 plain 训练配置：`L_official + 0.2 L_layout`、natural-loop 关闭、decoder LoRA learning rate `1e-5`、20,000 steps、checkpoint/validation 间隔 `5000`；仅 world size/global batch 改为 A100 五卡/5。
+已完成入口 `tools/training/run_glmocr_a100_decoder_lora.sh` 的历史 run ID 为 `glmocr_mthv2_decoder_lora_lr1e5_20k_5gpu_a100_official_layout_260912_v1`，tmux session 为 `glmocr_a100_plain_260912`。该 run 使用旧的 `adapter LR=5e-5`、`decoder LoRA LR=1e-5`、`auxiliary_weight=0.2`；其结果不代表参数优选后的新默认配置。
 
 A100 launcher 的阶段顺序为 bounded smoke → deferred training → 四个 checkpoint 的并行 validation/selection → selection-locked test。smoke 与训练/validation 阶段保持 no-test 边界，selection 完成前不读取 test；每阶段均保留结构化状态和完整日志。
+
+## A100 q32 teacher-forcing 三模式诊断
+
+当前一次性诊断入口是 `tools/training/run_dunhuang_local_q32_tf_ablation_a100.sh`。它在同一组五张 A100 上串行执行 `content_only`、`attention`、`geometry` 三个 mode 的 8-step smoke 与 256-step teacher-forcing 训练，初始 residual scale 为 `0.005`，不读取 validation/test 进行选点；随后把每组 `checkpoint-256` 固定为 direct-test checkpoint，在 59 页 test 上各执行一次。完整配置、run ID 和结果位置见 `docs/GLMOCR_TF_ABLATION_256_GATE005_20260915.md`。

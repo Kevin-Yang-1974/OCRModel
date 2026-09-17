@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Audit the official full MTHv2 page manifests and emit a run protocol."""
+"""Audit page manifests and emit a run protocol.
+
+The historical filename is retained for launcher compatibility; dataset and
+protocol labels are explicit so non-MTHv2 fixtures are not mislabeled.
+"""
 
 from __future__ import annotations
 
@@ -101,8 +105,8 @@ def build_protocol(args: argparse.Namespace) -> dict[str, Any]:
         stats[split] = split_stats
     return {
         "status": "ok",
-        "dataset": "MTHv2",
-        "protocol": "glm_ocr_mthv2_full_official_v1",
+        "dataset": getattr(args, "dataset_label", "MTHv2"),
+        "protocol": getattr(args, "protocol_label", "glm_ocr_mthv2_full_official_v1"),
         "split_pages": {split: stats[split]["pages"] for split in manifests},
         "max_regions": max(value["max_regions"] for value in stats.values()),
         "max_text_chars": max(value["max_text_chars"] for value in stats.values()),
@@ -125,6 +129,8 @@ def main() -> None:
         help="audit only train/validation and do not open the test manifest",
     )
     parser.add_argument("--num-queries", type=int, default=512)
+    parser.add_argument("--dataset-label", default="MTHv2")
+    parser.add_argument("--protocol-label", default="glm_ocr_mthv2_full_official_v1")
     parser.add_argument("--output", type=Path)
     parser.add_argument(
         "--allow-count-mismatch",

@@ -16,6 +16,8 @@ dataset_label="${GLMOCR_A100_DATASET_LABEL:-MTHv2}"
 protocol_label="${GLMOCR_A100_PROTOCOL_LABEL:-glm_ocr_mthv2_full_official_v1}"
 allow_count_mismatch=0
 init_checkpoint_dir=""
+init_checkpoint_override_residual_scale=""
+init_checkpoint_allow_mode_mismatch=0
 run_id="glmocr_mthv2_full_ddp_v1"
 experiment_group="custom"
 mode="geometry"
@@ -25,6 +27,8 @@ gpu_ids="0,1,2,3,4"
 gpu_utilization_limit=50
 max_steps=3456
 lr_schedule_steps=3456
+global_step_offset=0
+layout_only=0
 # Parameter-optimized plain-training defaults. Historical launchers pass
 # their recorded values explicitly when they are being reproduced.
 learning_rate=2.5e-5
@@ -123,6 +127,8 @@ while [[ $# -gt 0 ]]; do
         --gpu-utilization-limit) gpu_utilization_limit="$2"; shift 2 ;;
         --max-steps) max_steps="$2"; shift 2 ;;
         --lr-schedule-steps) lr_schedule_steps="$2"; shift 2 ;;
+        --global-step-offset) global_step_offset="$2"; shift 2 ;;
+        --layout-only) layout_only=1; shift ;;
         --learning-rate) learning_rate="$2"; shift 2 ;;
         --decoder-adaptation) decoder_adaptation="$2"; shift 2 ;;
         --decoder-lora-rank) decoder_lora_rank="$2"; shift 2 ;;
@@ -215,6 +221,8 @@ while [[ $# -gt 0 ]]; do
         --protocol-label) protocol_label="$2"; shift 2 ;;
         --allow-count-mismatch) allow_count_mismatch=1; shift ;;
         --init-checkpoint-dir) init_checkpoint_dir="$2"; shift 2 ;;
+        --init-checkpoint-override-residual-scale) init_checkpoint_override_residual_scale="$2"; shift 2 ;;
+        --init-checkpoint-allow-mode-mismatch) init_checkpoint_allow_mode_mismatch=1; shift ;;
         *) printf '{"event":"glmocr_mthv2_ddp_failed","error":"unknown_argument","argument":"%s"}\n' "$1" >&2; exit 64 ;;
     esac
 done
@@ -286,6 +294,28 @@ esac
     printf '{"event":"glmocr_mthv2_ddp_failed","error":"invalid_step_configuration"}\n' >&2
     exit 64
 }
+[[ "${global_step_offset}" =~ ^[0-9]+$ ]] || {
+    printf '{"event":"glmocr_mthv2_ddp_failed","error":"invalid_global_step_offset"}\n' >&2
+    exit 64
+}
+[[ "${layout_only}" == "0" || "${layout_only}" == "1" ]] || {
+    printf '{"event":"glmocr_mthv2_ddp_failed","error":"invalid_layout_only_flag"}\n' >&2
+    exit 64
+}
+if [[ -n "${init_checkpoint_override_residual_scale}" ]]; then
+    [[ -n "${init_checkpoint_dir}" && "${init_checkpoint_override_residual_scale}" =~ ^-?(0|0\.[0-9]+|1\.0)$ ]] || {
+        printf '{"event":"glmocr_mthv2_ddp_failed","error":"invalid_checkpoint_gate_override"}\n' >&2
+        exit 64
+    }
+fi
+[[ "${init_checkpoint_allow_mode_mismatch}" == "0" || "${init_checkpoint_allow_mode_mismatch}" == "1" ]] || {
+    printf '{"event":"glmocr_mthv2_ddp_failed","error":"invalid_checkpoint_mode_mismatch_flag"}\n' >&2
+    exit 64
+}
+if (( init_checkpoint_allow_mode_mismatch == 1 )) && [[ -z "${init_checkpoint_dir}" ]]; then
+    printf '{"event":"glmocr_mthv2_ddp_failed","error":"mode_mismatch_requires_init_checkpoint"}\n' >&2
+    exit 64
+fi
 [[ "${warmup_steps}" =~ ^[0-9]+$ && "${gradient_accumulation_steps}" =~ ^[1-9][0-9]*$ ]] || {
     printf '{"event":"glmocr_mthv2_ddp_failed","error":"invalid_optimization_configuration"}\n' >&2
     exit 64
@@ -373,7 +403,7 @@ esac
     exit 64
 }
 case "${layout_loss_profile}" in
-    full|ocr_only|no_assignment|no_assignment_validity|validity_assignment|no_geometry) ;;
+    full|ocr_only|no_assignment|no_assignment_validity|validity_assignment|no_geometry|history_box_equalized_v1|history_box_equalized_v2) ;;
     *) printf '{"event":"glmocr_mthv2_ddp_failed","error":"invalid_layout_loss_profile"}\n' >&2; exit 64 ;;
 esac
 case "${validity_gating_mode}" in
@@ -406,6 +436,16 @@ fi
 }
 if [[ -z "${auxiliary_weight_start}" ]]; then
     auxiliary_weight_start="${auxiliary_weight}"
+fi
+if (( layout_only == 1 )); then
+    [[ "${auxiliary_weight}" =~ ^[0-9]+(\.[0-9]+)?$ && "${auxiliary_weight_start}" =~ ^[0-9]+(\.[0-9]+)?$ ]] || {
+        printf '{"event":"glmocr_mthv2_ddp_failed","error":"invalid_layout_only_weight"}\n' >&2
+        exit 64
+    }
+    awk "BEGIN { exit !(${auxiliary_weight} > 0 && ${auxiliary_weight_start} > 0) }" || {
+        printf '{"event":"glmocr_mthv2_ddp_failed","error":"layout_only_requires_positive_weight"}\n' >&2
+        exit 64
+    }
 fi
 [[ "${initial_residual_scale}" =~ ^-?(0|0\.[0-9]+|1\.0)$ ]] || {
     printf '{"event":"glmocr_mthv2_ddp_failed","error":"invalid_initial_residual_scale"}\n' >&2
@@ -709,6 +749,9 @@ run_inner() {
             --region-spatial-iou-threshold "${region_spatial_iou_threshold}"
         )
         [[ -n "${init_checkpoint_dir}" ]] && smoke_args+=(--init-checkpoint-dir "${init_checkpoint_dir}")
+        [[ -n "${init_checkpoint_override_residual_scale}" ]] && smoke_args+=(--init-checkpoint-override-residual-scale "${init_checkpoint_override_residual_scale}")
+        (( init_checkpoint_allow_mode_mismatch == 1 )) && smoke_args+=(--init-checkpoint-allow-mode-mismatch)
+        (( layout_only == 1 )) && smoke_args+=(--layout-only)
         (( use_validity_head == 1 )) && smoke_args+=(--use-validity-head)
         (( validity_use_transport_evidence == 1 )) && smoke_args+=(--validity-use-transport-evidence)
         (( text_repeat_suppression == 1 )) && smoke_args+=(--text-repeat-suppression)
@@ -795,6 +838,9 @@ run_inner() {
         --region-spatial-iou-threshold "${region_spatial_iou_threshold}"
     )
     [[ -n "${init_checkpoint_dir}" ]] && method_args+=(--init-checkpoint-dir "${init_checkpoint_dir}")
+    [[ -n "${init_checkpoint_override_residual_scale}" ]] && method_args+=(--init-checkpoint-override-residual-scale "${init_checkpoint_override_residual_scale}")
+    (( init_checkpoint_allow_mode_mismatch == 1 )) && method_args+=(--init-checkpoint-allow-mode-mismatch)
+    (( layout_only == 1 )) && method_args+=(--layout-only)
     (( text_repeat_suppression == 1 )) && method_args+=(--text-repeat-suppression)
     (( natural_loop_loss == 1 )) && method_args+=(--natural-loop-loss)
     (( free_generation_loss == 1 )) && method_args+=(--free-generation-loss)
@@ -822,6 +868,7 @@ run_inner() {
         --per-device-batch-size 1 \
         --gradient-accumulation-steps "${gradient_accumulation_steps}" \
         --max-steps "${max_steps}" \
+        --global-step-offset "${global_step_offset}" \
         --num-queries "${num_queries}" \
         --seed "${seed}" \
         --experiment-label "${experiment_label}" \
@@ -881,6 +928,33 @@ run_inner() {
         printf '{"event":"glmocr_mthv2_ddp_failed","error":"run_completed_without_summary","run_dir":"%s"}\n' "${run_dir}" >&2
         exit 1
     fi
+    if (( skip_selection == 0 && defer_validation == 0 )); then
+        # The locked-test launcher consumes a group-level selection file. A
+        # single-seed DDP run writes the authoritative selection under seedN,
+        # so materialize the aggregate before marking the run complete.
+        "${python}" - "${run_dir}/selection.json" "${group_root}/selection.json" "${run_dir}" "${seed}" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+source = Path(sys.argv[1])
+target = Path(sys.argv[2])
+run_dir = Path(sys.argv[3])
+seed = int(sys.argv[4])
+selection = json.loads(source.read_text(encoding="utf-8"))
+selection["seeds"] = [seed]
+selection["seed_runs"] = {
+    str(seed): {
+        "run_dir": str(run_dir),
+        "selected_step": selection.get("selected_step"),
+    }
+}
+target.write_text(
+    json.dumps(selection, ensure_ascii=False, indent=2) + "\n",
+    encoding="utf-8",
+)
+PY
+    fi
     write_status complete
     trap - ERR
     "${python}" - "${run_dir}/summary.json" "${skip_selection}" "${defer_validation}" <<'PY'
@@ -925,6 +999,7 @@ if (( foreground == 0 )); then
         --mode "${mode}" \
         --gpu-ids "${gpu_ids}" --gpu-utilization-limit "${gpu_utilization_limit}"
             --max-steps "${max_steps}" --lr-schedule-steps "${lr_schedule_steps}"
+        --global-step-offset "${global_step_offset}"
         --experiment-label "${experiment_label}"
         --learning-rate "${learning_rate}" --decoder-adaptation "${decoder_adaptation}"
         --decoder-lora-rank "${decoder_lora_rank}" --decoder-lora-alpha "${decoder_lora_alpha}"
@@ -985,6 +1060,8 @@ if (( foreground == 0 )); then
         --dataset-label "${dataset_label}" --protocol-label "${protocol_label}"
     )
     [[ -n "${init_checkpoint_dir}" ]] && child_args+=(--init-checkpoint-dir "${init_checkpoint_dir}")
+    [[ -n "${init_checkpoint_override_residual_scale}" ]] && child_args+=(--init-checkpoint-override-residual-scale "${init_checkpoint_override_residual_scale}")
+    (( init_checkpoint_allow_mode_mismatch == 1 )) && child_args+=(--init-checkpoint-allow-mode-mismatch)
     [[ -n "${validation_manifest_override}" ]] && child_args+=(--validation-manifest "${validation_manifest_override}")
     (( use_validity_head == 1 )) && child_args+=(--use-validity-head)
     (( validity_use_transport_evidence == 1 )) && child_args+=(--validity-use-transport-evidence)

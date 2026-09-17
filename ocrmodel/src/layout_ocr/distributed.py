@@ -86,7 +86,12 @@ def wrap_adapter(adapter: nn.Module, info: DistributedInfo) -> nn.Module:
     )
 
 
-def wrap_model(model: nn.Module, info: DistributedInfo) -> nn.Module:
+def wrap_model(
+    model: nn.Module,
+    info: DistributedInfo,
+    *,
+    find_unused_parameters: bool = False,
+) -> nn.Module:
     """Wrap the complete GLM-OCR model when decoder LoRA is trainable."""
 
     if not info.enabled:
@@ -96,7 +101,7 @@ def wrap_model(model: nn.Module, info: DistributedInfo) -> nn.Module:
         device_ids=[info.local_rank],
         output_device=info.local_rank,
         broadcast_buffers=False,
-        find_unused_parameters=False,
+        find_unused_parameters=find_unused_parameters,
     )
 
 

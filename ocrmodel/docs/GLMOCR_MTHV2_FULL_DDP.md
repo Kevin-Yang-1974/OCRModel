@@ -69,6 +69,22 @@ Validity 分支的实现位置为 `adapter.py` 的 `validity_head`、detached tr
 
 稳定性单独判定：三 run 无 CUDA/OOM/NaN/Inf/Traceback；共同选中点 residual norm `≤0.01`；generation limit rate `<0.10`；且不存在所有 seed 同时发生的后程灾难性 CER 退化。性能收益与稳定性分开报告。
 
+## 参数优选后的统一默认值（后续 official-layout / decoder-LoRA run）
+
+参数优选后，A100-yky 与 BSCC 的新训练入口统一采用以下配置；本节不改写前面已完成历史 run 的配置记录：
+
+| 参数 | 后续默认值 |
+| --- | ---: |
+| 主 adapter learning rate | `2.5e-5` |
+| decoder LoRA learning rate | `5e-6` |
+| `auxiliary_weight` | `0.4` |
+| `warmup_steps` | `216` |
+| `max_grad_norm` | `1.0` |
+| 训练目标 | `L_official + 0.4 L_layout` |
+| 训练附加目标 | natural-loop、scheduled sampling、loop escape、continuation head 均关闭 |
+
+新 run 从固定 GLM-OCR base revision 初始化，仍遵守 train/validation-only 与 selection-locked test 边界。历史 run 的 checkpoint、validation 和 test 结果按实际使用的旧参数解释。
+
 ## 历史：BSCC 四卡 decoder-LoRA 变体
 
 为验证 decoder LoRA 学习率 `1e-5`，新增 BSCC 四卡变体。该变体沿用本页的 whole-page、512-query、geometry、Hungarian、FP32 adapter 和 fast processor 配置，但使用四卡同步 DDP（global batch 4）、20,000 steps、完整 20,000-step LR horizon，并从基础 GLM-OCR revision 重新初始化，不续接旧 32-query checkpoint。本次 official-layout run 的训练目标固定为 `L_official + 0.2 L_layout`，关闭 `L_natural_loop`、scheduled sampling、loop escape 和 continuation head；`generation_mode=loop_recovery` 仅保留给验证/推理解码，不能代替训练信号。
@@ -79,8 +95,8 @@ Validity 分支的实现位置为 `adapter.py` 的 `validity_head`、detached tr
 
 四卡变体原计划用于高 decoder-LoRA 学习率探索，但在未分配节点、未产生训练产物前切换到 A100 五卡入口；对应 BSCC pending job 不作为结果。此前的训练期循环损失 run 已停止并排除，上一轮 synthetic loop-escape smoke 不进入当前实验结果。
 
-## 当前：A100 五卡 decoder-LoRA plain training
+## 已完成：A100 五卡 decoder-LoRA plain training（旧参数）
 
-当前正式 run 为 `glmocr_mthv2_decoder_lora_lr1e5_20k_5gpu_a100_official_layout_260912_v1`，使用 `tools/training/run_glmocr_a100_decoder_lora.sh`。该入口与 BSCC 版本共享相同的训练代码、whole-page/512-query/geometry/Hungarian/full layout loss、FP32 adapter、fast processor、decoder LoRA `rank/alpha/dropout=8/8/0`、decoder LoRA learning rate `1e-5` 及 plain objective `L_official + 0.2 L_layout`；差异是 A100 使用五卡同步 DDP（global batch 5），BSCC 计划使用四卡同步 DDP（global batch 4）。
+历史正式 run 为 `glmocr_mthv2_decoder_lora_lr1e5_20k_5gpu_a100_official_layout_260912_v1`，使用 `tools/training/run_glmocr_a100_decoder_lora.sh`。它使用旧的 `adapter LR=5e-5`、`decoder LoRA LR=1e-5`、`auxiliary_weight=0.2` 和 plain objective `L_official + 0.2 L_layout`；后续新入口改用本页“参数优选后的统一默认值”。
 
-A100 launcher 先执行 bounded smoke，再执行 20,000-step deferred training，固定在 step `5000/10000/15000/20000` 保存 checkpoint 并进行 validation-only selection，最后才执行 selection-locked test。训练和 validation 均不读取 test；`generation_mode=loop_recovery` 仅是验证/测试解码配置，不会加入训练损失。当前 run 已完成启动前 GPU 准入并进入 smoke，后续阶段以 `pipeline_status.json`、metrics 和 checkpoint 健康状态为准。
+A100 launcher 先执行 bounded smoke，再执行 20,000-step deferred training，固定在 step `5000/10000/15000/20000` 保存 checkpoint 并进行 validation-only selection，最后才执行 selection-locked test。训练和 validation 均不读取 test；`generation_mode=loop_recovery` 仅是验证/测试解码配置，不会加入训练损失。该历史 run 已按用户要求在 checkpoint-5000 后停止，跳过 validation 并完成固定 checkpoint 的 direct test；后续新 run 使用本页“参数优选后的统一默认值”。

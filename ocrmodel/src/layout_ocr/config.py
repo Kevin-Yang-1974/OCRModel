@@ -13,6 +13,8 @@ LayoutLossProfile = Literal[
     "no_assignment_validity",
     "validity_assignment",
     "no_geometry",
+    "history_box_equalized_v1",
+    "history_box_equalized_v2",
 ]
 QueryAssignment = Literal["fixed_order", "hungarian"]
 
@@ -110,4 +112,14 @@ def layout_loss_config(profile: str) -> LayoutLossConfig:
         )
     if profile == "no_geometry":
         return LayoutLossConfig(box=0.0, order=0.0, direction=0.0)
+    if profile == "history_box_equalized_v1":
+        # Valid from-scratch Q32 phase-1 history: mean assignment=2.51680,
+        # mean box=0.0432866, giving an equalizing ratio of 58.14.  Round to
+        # 58.0 for the controlled rerun and keep the other weights unchanged.
+        return LayoutLossConfig(box=58.0)
+    if profile == "history_box_equalized_v2":
+        # The late tail of the valid box=58 run (steps 2512-3000) had
+        # mean assignment=2.33602 and mean raw box=0.00284428.  Use the
+        # rounded ratio 821.3 -> 820.0 for the next continuation.
+        return LayoutLossConfig(box=820.0)
     raise ValueError(f"unsupported layout loss profile: {profile}")

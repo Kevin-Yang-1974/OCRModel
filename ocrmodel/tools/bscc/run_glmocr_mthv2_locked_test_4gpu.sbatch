@@ -16,7 +16,7 @@ env_dir="${experiment_root}/envs/glm-ocr-py311-cu128"
 model_dir="${workspace}/models/GLM-OCR-ca5d8b3"
 dataset_root="${BSCC_MTHV2_PAGE_ROOT:-${workspace}/datasets/MTHv2/converted/mthv2_layout_page_v1_real}"
 pytorch_package="/home/bingxing2/apps/package/pytorch/2.8.0-cu128_cp311"
-run_id="${GLMOCR_BSCC_RUN_ID:-glmocr_mthv2_decoder_lora_lr1e5_20k_4gpu_official_layout_260912_v1}"
+run_id="${GLMOCR_BSCC_RUN_ID:-glmocr_mthv2_decoder_lora_hpopt_20k_4gpu_official_layout_260912_v1}"
 seed=42
 group_root="${experiment_root}/training_runs/${run_id}"
 run_dir="${group_root}/seed${seed}"
@@ -94,13 +94,13 @@ if summary.get("selection_pending") is True or selection.get("status") != "compl
     raise SystemExit("validation selection is not complete")
 if metadata.get("world_size") != 4 or metadata.get("decoder_adaptation") != "lora":
     raise SystemExit("training configuration is not four-card decoder-LoRA")
-if not math.isclose(float((metadata.get("decoder_lora_config") or {}).get("learning_rate")), 1e-5):
-    raise SystemExit("training decoder LoRA learning rate is not 1e-5")
+if not math.isclose(float((metadata.get("decoder_lora_config") or {}).get("learning_rate")), 5e-6):
+    raise SystemExit("training decoder LoRA learning rate is not 5e-6")
 objective = (metadata.get("loss_objective") or {})
 if objective.get("formula") != "L_official + auxiliary_weight * L_layout":
     raise SystemExit(f"unexpected training loss objective: {objective}")
-if not math.isclose(float(objective.get("layout_weight", -1.0)), 0.2):
-    raise SystemExit("training layout loss weight is not 0.2")
+if not math.isclose(float(objective.get("layout_weight", -1.0)), 0.4):
+    raise SystemExit("training layout loss weight is not 0.4")
 if objective.get("extra_terms") != []:
     raise SystemExit(f"unexpected extra loss terms: {objective.get('extra_terms')}")
 selected_step = selection.get("selected_step")

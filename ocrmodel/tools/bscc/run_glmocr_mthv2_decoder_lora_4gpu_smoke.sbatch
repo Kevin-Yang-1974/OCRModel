@@ -16,7 +16,7 @@ env_dir="${experiment_root}/envs/glm-ocr-py311-cu128"
 model_dir="${workspace}/models/GLM-OCR-ca5d8b3"
 dataset_root="${BSCC_MTHV2_PAGE_ROOT:-${workspace}/datasets/MTHv2/converted/mthv2_layout_page_v1_real}"
 pytorch_package="/home/bingxing2/apps/package/pytorch/2.8.0-cu128_cp311"
-run_id="${GLMOCR_BSCC_RUN_ID:-glmocr_mthv2_decoder_lora_lr1e5_4gpu_official_layout_smoke_260912_v1}"
+run_id="${GLMOCR_BSCC_RUN_ID:-glmocr_mthv2_decoder_lora_hpopt_4gpu_official_layout_smoke_260912_v1}"
 seed=42
 gpu_ids="${GLMOCR_BSCC_GPU_IDS:-${CUDA_VISIBLE_DEVICES:-${SLURM_JOB_GPUS:-0,1,2,3}}}"
 group_root="${experiment_root}/training_runs/${run_id}"
@@ -72,7 +72,7 @@ bash "${code_root}/tools/training/run_glmocr_mthv2_ddp.sh" \
     --model-dir "${model_dir}" \
     --dataset-root "${dataset_root}" \
     --protocol-file "${protocol_file}" \
-    --experiment-label "bscc_decoder_lora_lr1e5_4gpu_smoke" \
+    --experiment-label "bscc_decoder_lora_hpopt_4gpu_smoke" \
     --max-steps 8 \
     --lr-schedule-steps 8 \
     --warmup-steps 0 \
@@ -81,7 +81,10 @@ bash "${code_root}/tools/training/run_glmocr_mthv2_ddp.sh" \
     --decoder-lora-rank 8 \
     --decoder-lora-alpha 8 \
     --decoder-lora-dropout 0 \
-    --decoder-learning-rate 1e-5 \
+    --learning-rate 2.5e-5 \
+    --decoder-learning-rate 5e-6 \
+    --auxiliary-weight 0.4 \
+    --auxiliary-weight-start 0.4 \
     --layout-loss-profile full \
     --max-eval-new-tokens 1536 \
     --without-test \
@@ -114,8 +117,8 @@ for name in ("scheduled_sampling", "loop_escape", "continuation_head"):
 objective = training.get("loss_objective") or {}
 if objective.get("formula") != "L_official + auxiliary_weight * L_layout":
     raise SystemExit(f"unexpected smoke training objective: {objective}")
-if not math.isclose(float(objective.get("layout_weight", -1.0)), 0.2):
-    raise SystemExit("smoke layout loss weight is not 0.2")
+if not math.isclose(float(objective.get("layout_weight", -1.0)), 0.4):
+    raise SystemExit("smoke layout loss weight is not 0.4")
 if objective.get("extra_terms") != []:
     raise SystemExit(f"unexpected smoke extra loss terms: {objective.get('extra_terms')}")
 print(json.dumps({
@@ -123,5 +126,5 @@ print(json.dumps({
     "loss_objective": objective,
 }, separators=(",", ":")))
 PY
-printf '{"event":"glmocr_bscc_smoke_complete","run_id":"%s","world_size":4,"steps":8,"decoder_learning_rate":1e-5,"natural_loop_loss":false,"loss_objective":"L_official + 0.2 * L_layout","test_manifest_read":false,"log":"%s"}\n' \
+printf '{"event":"glmocr_bscc_smoke_complete","run_id":"%s","world_size":4,"steps":8,"learning_rate":2.5e-5,"decoder_learning_rate":5e-6,"auxiliary_weight":0.4,"max_grad_norm":1.0,"natural_loop_loss":false,"loss_objective":"L_official + 0.4 * L_layout","test_manifest_read":false,"log":"%s"}\n' \
     "${run_id}" "${launcher_log}"

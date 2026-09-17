@@ -49,6 +49,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-queries", type=int, default=512)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--decoder-adaptation", choices=["frozen", "lora"], default="frozen")
+    parser.add_argument("--layout-only", action="store_true")
+    parser.add_argument("--init-checkpoint-override-residual-scale", type=float, default=None)
+    parser.add_argument("--init-checkpoint-allow-mode-mismatch", action="store_true")
     parser.add_argument("--decoder-lora-rank", type=int, default=8)
     parser.add_argument("--decoder-lora-alpha", type=float, default=8.0)
     parser.add_argument("--decoder-lora-dropout", type=float, default=0.0)
@@ -67,6 +70,8 @@ def parse_args() -> argparse.Namespace:
             "no_assignment_validity",
             "validity_assignment",
             "no_geometry",
+            "history_box_equalized_v1",
+            "history_box_equalized_v2",
         ],
         default="full",
     )
@@ -224,7 +229,9 @@ def main() -> None:
                 model,
                 distributed,
                 find_unused_parameters=(
-                    args.mode == "content_only" or args.auxiliary_weight == 0.0
+                    args.mode == "content_only"
+                    or args.auxiliary_weight == 0.0
+                    or args.layout_only
                 ),
             )
         else:
@@ -233,7 +240,12 @@ def main() -> None:
             continuation_head = wrap_model(continuation_head, distributed)
         init_checkpoint_loaded = False
         if args.init_checkpoint_dir is not None:
-            load_adapter_checkpoint(args.init_checkpoint_dir, bridge)
+            load_adapter_checkpoint(
+                args.init_checkpoint_dir,
+                bridge,
+                override_initial_residual_scale=args.init_checkpoint_override_residual_scale,
+                allow_mode_mismatch=args.init_checkpoint_allow_mode_mismatch,
+            )
             if args.decoder_adaptation == "lora":
                 load_decoder_lora_checkpoint(args.init_checkpoint_dir, model)
             if continuation_head is not None:
@@ -268,6 +280,7 @@ def main() -> None:
             per_device_batch_size=1,
             gradient_accumulation_steps=1,
             decoder_adaptation=args.decoder_adaptation,
+            layout_only=args.layout_only,
             decoder_learning_rate=args.decoder_learning_rate,
             text_repeat_suppression=args.text_repeat_suppression,
             text_ul_weight=args.text_ul_weight,
@@ -347,10 +360,12 @@ def main() -> None:
                     str(args.init_checkpoint_dir) if args.init_checkpoint_dir is not None else None
                 ),
                 "init_checkpoint_loaded": init_checkpoint_loaded,
+                "init_checkpoint_allow_mode_mismatch": args.init_checkpoint_allow_mode_mismatch,
                 "parameters_finite": finite,
                 "test_used_for_selection": False,
                 "training": training,
                 "decoder_adaptation": args.decoder_adaptation,
+                "layout_only": args.layout_only,
                 "decoder_lora_config": decoder_lora_config,
                 "free_generation_loss": free_generation_loss_config(train_args),
                 "natural_loop_config": natural_loop_config(args),

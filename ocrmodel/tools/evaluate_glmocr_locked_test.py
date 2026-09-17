@@ -57,7 +57,11 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         help="validation-only selection file; defaults to run-dir/selection.json",
     )
-    parser.add_argument("--mode", choices=["geometry"], default="geometry")
+    parser.add_argument(
+        "--mode",
+        choices=["content_only", "attention", "geometry", "layout_ot"],
+        default="geometry",
+    )
     parser.add_argument("--seed", type=int, required=True)
     parser.add_argument("--num-queries", type=int, default=512)
     parser.add_argument("--adapter-precision", choices=["fp32"], default="fp32")

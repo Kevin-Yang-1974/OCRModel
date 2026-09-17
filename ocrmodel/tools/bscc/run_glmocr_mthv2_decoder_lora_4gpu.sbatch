@@ -16,7 +16,7 @@ env_dir="${experiment_root}/envs/glm-ocr-py311-cu128"
 model_dir="${workspace}/models/GLM-OCR-ca5d8b3"
 dataset_root="${BSCC_MTHV2_PAGE_ROOT:-${workspace}/datasets/MTHv2/converted/mthv2_layout_page_v1_real}"
 pytorch_package="/home/bingxing2/apps/package/pytorch/2.8.0-cu128_cp311"
-run_id="${GLMOCR_BSCC_RUN_ID:-glmocr_mthv2_decoder_lora_lr1e5_20k_4gpu_official_layout_260912_v1}"
+run_id="${GLMOCR_BSCC_RUN_ID:-glmocr_mthv2_decoder_lora_hpopt_20k_4gpu_official_layout_260912_v1}"
 seed=42
 gpu_utilization_limit=50
 group_root="${experiment_root}/training_runs/${run_id}"
@@ -95,22 +95,22 @@ bash "${code_root}/tools/training/run_glmocr_mthv2_ddp.sh" \
     --model-dir "${model_dir}" \
     --dataset-root "${dataset_root}" \
     --protocol-file "${protocol_file}" \
-    --experiment-label "bscc_decoder_lora_lr1e5_20k_4gpu_official_layout" \
+    --experiment-label "bscc_decoder_lora_hpopt_20k_4gpu_official_layout" \
     --max-steps 20000 \
     --lr-schedule-steps 20000 \
-    --learning-rate 5e-5 \
+    --learning-rate 2.5e-5 \
     --decoder-adaptation lora \
     --decoder-lora-rank 8 \
     --decoder-lora-alpha 8 \
     --decoder-lora-dropout 0 \
-    --decoder-learning-rate 1e-5 \
+    --decoder-learning-rate 5e-6 \
     --warmup-steps 216 \
     --min-lr-ratio 0.1 \
     --gradient-accumulation-steps 1 \
     --initial-residual-scale 0 \
     --gate-freeze-steps 0 \
-    --auxiliary-weight 0.2 \
-    --auxiliary-weight-start 0.2 \
+    --auxiliary-weight 0.4 \
+    --auxiliary-weight-start 0.4 \
     --auxiliary-ramp-steps 0 \
     --layout-loss-profile full \
     --validation-interval 5000 \
@@ -147,8 +147,8 @@ for name in ("scheduled_sampling", "loop_escape", "continuation_head"):
 objective = training.get("loss_objective") or {}
 if objective.get("formula") != "L_official + auxiliary_weight * L_layout":
     raise SystemExit(f"unexpected training loss objective: {objective}")
-if not math.isclose(float(objective.get("layout_weight", -1.0)), 0.2):
-    raise SystemExit("layout loss weight is not 0.2")
+if not math.isclose(float(objective.get("layout_weight", -1.0)), 0.4):
+    raise SystemExit("layout loss weight is not 0.4")
 if objective.get("extra_terms") != []:
     raise SystemExit(f"unexpected extra loss terms: {objective.get('extra_terms')}")
 print(json.dumps({
@@ -156,5 +156,5 @@ print(json.dumps({
     "loss_objective": objective,
 }, separators=(",", ":")))
 PY
-printf '{"event":"glmocr_bscc_train_complete","run_id":"%s","world_size":4,"max_steps":20000,"checkpoint_steps":[5000,10000,15000,20000],"decoder_learning_rate":1e-5,"natural_loop_loss":false,"loss_objective":"L_official + 0.2 * L_layout","test_manifest_read":false,"selection_pending":true,"log":"%s"}\n' \
+printf '{"event":"glmocr_bscc_train_complete","run_id":"%s","world_size":4,"max_steps":20000,"learning_rate":2.5e-5,"decoder_learning_rate":5e-6,"auxiliary_weight":0.4,"warmup_steps":216,"max_grad_norm":1.0,"checkpoint_steps":[5000,10000,15000,20000],"natural_loop_loss":false,"loss_objective":"L_official + 0.4 * L_layout","test_manifest_read":false,"selection_pending":true,"log":"%s"}\n' \
     "${run_id}" "${launcher_log}"

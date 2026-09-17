@@ -17,10 +17,17 @@
 | 全量 MTHv2 协议 | train 2159 / validation 240 / test 800 页；whole-page；512 queries；五卡同步 DDP |
 | 当前 validity 候选 | `validity_assignment`：Hungarian＋detached raw-transport region support；object BCE＋cardinality＋ranking；`log T + log p_valid` assignment；raw-mass gate |
 
+## 后续统一默认超参数
+
+参数优选后的正式 run 统一使用：主 adapter LR `2.5e-5`、decoder LoRA LR `5e-6`、`auxiliary_weight=0.4`、warmup `216`、max grad norm `1.0`，训练目标为 `L_official + 0.4 L_layout`。natural-loop、scheduled sampling、loop escape 和 continuation head 均关闭。A100-yky 与 BSCC 分别使用独立的新 run ID；本轮 gate=`0.005` 跨域微调是按用户指定的较小 LR `1e-5`／`2e-6` 执行的例外；下面已完成 run 的旧参数和结果不作回写。
+
 ## 运行记录
 
 | ID | 配置 | 数据指纹 | checkpoint 起点 | 状态 | validation | test | 备注 |
 | --- | --- | --- | --- | --- | --- | --- | --- |
+| `glmocr_mthv2_sparse24_q32_layout_boxeq820_3000_from_boxeq58_a100_260916_v1` | Q32 layout-only；`history_box_equalized_v2`（box `820`、assignment `1`、order/direction `0.5`）；seed42；五卡；3000-step continuation | MTHv2 sparse24 train/validation/test manifest | `glmocr_mthv2_sparse24_q32_layout_boxeq58_3000_a100_260916_v1/seed42/checkpoint-3000` | complete；checkpoint finite | step `3000`；IoU `0.456072`；MAE `0.029717` | step `3000`；IoU `0.446998`；MAE `0.030560`；CER `0.393093` | box 权重按训练历史调至与 assignment 同量级；作为后续敦煌／地方志 Q32 微调的共同起点；`test_used_for_selection=false` |
+| `glmocr_dunhuang_local_q32_gate005_attn_geom_260916_v1` | `attention`／`geometry`；Q32；`history_box_equalized_v2`；残差 gate `0.005`；256 steps；五卡；seed42 | `dunhuang_local_gazetteer_q32_v1_portable` | 上一行 run 的 `seed42/checkpoint-3000`；同时加载 `adapter.safetensors` 与 `decoder_lora.safetensors` | complete；两臂均完成 smoke、训练、validation-only selection 和 locked test | 两臂均只评估 step `256`；validation 选点未读取 test | attention：IoU `0.271496`、CER `0.173582`；geometry：IoU `0.286134`、CER `0.173371` | 主／decoder LR `1e-5`／`2e-6`；attention 复用 geometry adapter（仅放宽 mode 字段）；两臂 EOS `1.0`、触顶／循环均为 `0`；`test_used_for_selection=false` |
+| `glmocr_dunhuang_local_q32_boxeq820_gate005_lr1e5_content_only_256_frommthv2_260916_v1` | `content_only`；Q32；同一 `history_box_equalized_v2`；残差 gate `0.005`；256 steps；五卡；seed42 | `dunhuang_local_gazetteer_q32_v1_portable` | 同一 source `seed42/checkpoint-3000`；同时加载 `adapter.safetensors` 与 `decoder_lora.safetensors` | complete；smoke、训练、validation-only selection 和 locked test 均完成 | step `256`；CER `0.209867`；layout IoU `0.309260`；MAE `0.061531` | 59 页；IoU `0.263915`；MAE `0.068268`；CER `0.173582` | 主／decoder LR `1e-5`／`2e-6`；`auxiliary_weight=0`，融合保持 identity；EOS `1.0`、触顶／循环均为 `0`；`test_used_for_selection=false` |
 | `mechanism_screen_128_seed42_20260907_v1` | `configs/mechanism_screen_128.toml` | BSCC setup 时生成并锁定 | GLM-OCR `ca5d8b3` | setup `1480858`、screen `1480859_[0-3]` 均完成；`selection.json` 已生成 | geometry；validation CER `0.155984` | 不运行 | 256 steps 机制筛选：content_only `0.171386`、attention `0.156192`、geometry `0.155984`、layout_ot `0.162466`；R2 与布局指标见各 run `summary.json`；首次 setup `1480589` 因计算节点无外网失败，失败记录保留 |
 | `mechanism_confirm_128_3seed_v1` | 同一锁定协议；attention/geometry × auxiliary off/on | 同上 | 同上 | 12 个 run 已完成 | 两种 `aux0.2` 模式的三种子均在 step 256 最优；attention 平均 CER `0.2251`，geometry `0.2045` | 未读取 | step 1024 平均 CER 分别退化至 `1.3745`、`1.2408`；gate 绝对值增至约 `0.085–0.089`，生成触顶率增至约 `35%–47%`。训练 loss 下降且未出现 NaN，当前判断为残差扰动累积与解码漂移 |
 | `mechanism_stable_128_3seed_v1` | `configs/mechanism_stable_128.toml`；attention/geometry × `auxiliary_weight=0.2` × 三种子，另含 content-only eval-only 基线 | 复用同一锁定协议 | 同上 | Slurm array `1481332` 的 7 个 task 均完成，退出码 `0:0`；`selection.json` 已生成 | validation-only 选择 geometry、step `256`；平均 CER `0.206043`，标准差 `0.000024`；content-only 基线 CER `0.208411` | 未读取；稳定性验收失败，不进入正式 test | 64-step warmup、峰值 `5e-5`、cosine 至 `0.1×`；有效 residual scale 限制 `±0.03`。step 1024 两种模式 CER 均回退约 `0.185`，生成触顶率 `0.109375` 超过 `0.10`；attention/seed44/step768 CER `0.520120` 超过 `0.5`；`test_used_for_selection=false`，`eligible_for_formal_test=false` |
@@ -35,6 +42,21 @@
 | `glmocr_natural_loop_A1_1024_260911_v1` | natural predicted-loop loss；`λ=0.05`；plain generation；无硬 EOS/循环 guard；LoRA；1024 steps；no-validation | 全量 MTHv2 train manifest；固定 800 页 test manifest 仅在训练完成后读取 | GLM-OCR 固定 revision；基础权重；seed42 | complete；step1024 checkpoint finite；fixed-final selection；训练不做 validation | 无 validation；固定 final step1024 | 已完成 direct test：CER `0.874635`；test 未参与选点 | 训练 mean official base loss `1.409982`、mean total `2.422198`；natural-loop active ratio `0`；test 结果见 `GLMOCR-B-260911-002.md` |
 | `glmocr_plain_baseline_1024_260911_v1` | plain baseline；natural loop disabled；plain generation；无硬 EOS/循环 guard；LoRA；1024 steps；no-validation | 全量 MTHv2 train manifest；固定 800 页 test manifest | GLM-OCR 固定 revision；基础权重；seed42 | complete；step1024 checkpoint finite；fixed-final selection；训练不做 validation | 无 validation；固定 final step1024 | 五卡 direct test 已完成；CER `0.874635`；循环页率 `0.195000`；长度上限率 `0.207500` | 训练 mean official base loss `1.409982`、mean total `2.422198`；与 A1 的 checkpoint 和 test 指标完全一致 |
 | `glmocr_mthv2_attribution_128_retry_v1` | seed42 三组容量归因：A `no-op`；B 固定 gate `adapter-only`；C 固定 gate＋decoder-LoRA（rank 8、alpha 8、dropout 0）；五卡 DDP；128 steps；32 页 validation；无 selection | 同一 MTHv2 train manifest；同一确定性 validation32 manifest（32 页） | GLM-OCR 固定 revision；三组均从同一基础权重起点；B/C 训练预算一致 | bundle `complete`；A/B 复用已完成 run，C 使用新 run ID 重试完成；所有 checkpoint finite，residual relative norm A/B/C=`0/0.001505/0.001438` | validation CER A/B/C=`0.787648/0.786034/0.794012`；B−A=`−0.001613`，C−B=`+0.007978`；A/B/C teacher-forced OCR loss=`1.666193/1.664493/1.663769`。C 的 layout box MAE=`0.077862`、validity AUROC=`0.953366`，但 invalid gated context share=`0.798970`、p gap=`0.019232`，尚未达到 query 消除阈值；B validity AUROC=`0.494084`、invalid share=`0.924753` | 不读取；`test_manifest_read=false`、`test_used_for_selection=false` | A=`glmocr_mthv2_attribution_128_v1_A_noop`，B=`glmocr_mthv2_attribution_128_v1_B_adapter_only`，C=`glmocr_mthv2_attribution_128_retry_v1_C_decoder_lora`；原 C run 因 NCCL watchdog 超时保留，retry 将 DDP timeout 提高到 3600s；容量归因结论：LoRA 明显改善布局/validity，但在 128 steps 下未转化为 OCR CER，反而较 B 回退 |
+
+## 2026-09-15/16：box 权重等化续训与 gate=0.005 跨域微调
+
+本轮先在 MTHv2 sparse24 上从既有 `boxeq58` checkpoint 接续 3000 步，把 layout loss 中 box 项提高到 `820.0`，再将该 run 的 seed42 Q32 `adapter.safetensors` 和 `decoder_lora.safetensors` 一起迁移到敦煌／地方志合并数据。后续微调严格只跑 `attention` 与 `geometry` 两臂、各 256 步；训练结束后先用唯一 checkpoint 做 validation-only selection，再做 selection-locked test。
+
+| 阶段 | run ID | validation | locked test | 关键状态 |
+| --- | --- | --- | --- | --- |
+| MTHv2 Q32 source | `glmocr_mthv2_sparse24_q32_layout_boxeq820_3000_from_boxeq58_a100_260916_v1` | IoU `0.456072`；MAE `0.029717` | IoU `0.446998`；MAE `0.030560`；CER `0.393093` | step `3000` complete；训练、选点和 test 均 finite；test 未参与选点 |
+| 敦煌／地方志 attention | `glmocr_dunhuang_local_q32_boxeq820_gate005_lr1e5_attention_256_frommthv2_260916_v1` | step `256` selected | IoU `0.271496`；MAE `0.053813`；CER `0.173582`；I/D/S `482/487/1495` | gate `0.005`；EOS `1.0`；触顶、repeated-cycle、loop 均 `0` |
+| 敦煌／地方志 geometry | `glmocr_dunhuang_local_q32_boxeq820_gate005_lr1e5_geometry_256_frommthv2_260916_v1` | step `256` selected | IoU `0.286134`；MAE `0.053027`；CER `0.173371`；I/D/S `483/486/1492` | gate `0.005`；EOS `1.0`；触顶、repeated-cycle、loop 均 `0` |
+| 敦煌／地方志 content-only | `glmocr_dunhuang_local_q32_boxeq820_gate005_lr1e5_content_only_256_frommthv2_260916_v1` | step `256` selected | IoU `0.263915`；MAE `0.068268`；CER `0.173582`；I/D/S `482/486/1496` | `auxiliary_weight=0`；融合 identity；EOS `1.0`；触顶、repeated-cycle、loop 均 `0` |
+
+相同起点和预算下，content-only 的 CER `0.173582` 与 attention 完全一致，但 layout test IoU/MAE 为 `0.263915/0.068268`，弱于 attention 的 `0.271496/0.053813`；geometry 仍以 `0.286134/0.053027` 的 IoU/MAE 和 `0.173371` CER 最优。该 content-only 结果支持布局融合对布局指标的增益方向，但当前只有一个 seed、一个 256-step checkpoint，仍属于诊断性证据，不替代多 seed 或长程正式比较。
+
+远端证据根目录为 `/data3/yky/yangky_ocr_models/glm_ocr_layout_ot/training_runs/`；编排汇总为 `/data3/yky/yangky_ocr_models/glm_ocr_layout_ot/runs/glmocr_dunhuang_local_q32_gate005_attn_geom_260916_v1.summary.json`。两个微调 run 均记录 `test_manifest_read=false`、`test_used_for_selection=false`，且各自保存 `checkpoint-256`、`selection.json` 和 `locked-test/locked_test_summary.json`。
 
 ## 历史记录：2026-09-10/11 循环生成与 Teacher Forcing 审计
 
@@ -134,7 +156,7 @@ A1 与 baseline 的 1024-step 训练汇总完全一致，A1 的 natural-loop act
 5. **当前“loop escape success”尚未证明模型真的学会续写。** A1 两个 checkpoint 的该指标均为 `0`；step128 的相对改善主要来自插入数下降和循环/触顶率暂时下降，不能解释为已经学会“停循环后输出后文”。
 6. **下降主要由密集页和自由生成长尾放大。** 新协议不再用硬 EOS 掩盖长尾，密集页面更容易累积区域/文本错误；A1 step256 的密集页 CER 已约 `1.3318`，而旧 guard ON 密集页约 `0.6269`。因此 64 页宏平均的恶化不是单一 batch loss 上升，而是 dense-page free-run 长尾失稳。
 
-结论：这次“相较上一个实验都下降”同时包含**协议不可比**（硬 EOS 截断被移除）和**真实训练退化**（新 checkpoint 的 TF loss 更高、A1 后程过拟合/梯度竞争）。该结论仅用于封存历史 natural-loop 诊断；当前不再继续 natural-loop/loop-escape 路线，BSCC 正式 run 回到 `L_official + 0.2 L_layout` 的 plain training objective。旧低 CER 也不能作为当前 BSCC 协议下的性能承诺。
+结论：这次“相较上一个实验都下降”同时包含**协议不可比**（硬 EOS 截断被移除）和**真实训练退化**（新 checkpoint 的 TF loss 更高、A1 后程过拟合/梯度竞争）。该结论仅用于封存历史 natural-loop 诊断；当前不再继续 natural-loop/loop-escape 路线，后续 A100-yky 与 BSCC 新 run 统一使用参数优选后的 `L_official + 0.4 L_layout` plain objective。旧低 CER 也不能作为当前协议下的性能承诺。
 
 ## 每个 run 必填
 
@@ -163,9 +185,9 @@ MTHv2 原官方 split 是随机页级划分，没有书籍/版本元数据，不
 | 当前状态 | 原 v1、rollout256 诊断 run 与 BSCC pending job 均不进入结果；BSCC job `1494430/1494433` 在分配节点前取消，当前转由 A100 五卡入口运行 |
 | 结果口径 | 用户授权的高 decoder-LoRA 学习率探索；不替代历史五卡协议，不与五卡结果作未校正的严格等预算比较 |
 
-原 `glmocr_mthv2_decoder_lora_lr1e5_20k_4gpu_260911_v1` 仅设置了 `generation_mode=loop_recovery`，未设置 `--natural-loop-loss` 或 `--loop-escape-training`，因此没有循环训练信号；该 run 已取消并保留日志，不进入 validation/test。上一轮 rollout256 诊断 run 也不作为本轮训练依据。新的 official-layout run 固定使用 `L_official + 0.2 L_layout`，训练阶段关闭 natural-loop、scheduled sampling、loop escape 和 continuation head；`evaluate_glmocr_locked_test.py` 已按 metadata 注入并加载 decoder LoRA，四个 test shard 和 merge 阶段均强制检查 `decoder_lora_loaded=true`。
+原 `glmocr_mthv2_decoder_lora_lr1e5_20k_4gpu_260911_v1` 仅设置了 `generation_mode=loop_recovery`，未设置 `--natural-loop-loss` 或 `--loop-escape-training`，因此没有循环训练信号；该 run 已取消并保留日志，不进入 validation/test。上一轮 rollout256 诊断 run 也不作为本轮训练依据。上述历史 official-layout run 使用 `L_official + 0.2 L_layout`，训练阶段关闭 natural-loop、scheduled sampling、loop escape 和 continuation head；后续新 run 改用 `L_official + 0.4 L_layout`。`evaluate_glmocr_locked_test.py` 已按 metadata 注入并加载 decoder LoRA，test shard 和 merge 阶段均强制检查 `decoder_lora_loaded=true`。
 
-## 2026-09-12 A100 五卡 decoder-LoRA plain 20k 实验
+## 2026-09-12 A100 五卡 decoder-LoRA plain 20k 实验（旧参数，已完成）
 
 | 字段 | 口径 |
 | --- | --- |
@@ -177,9 +199,9 @@ MTHv2 原官方 split 是随机页级划分，没有书籍/版本元数据，不
 | decoder LoRA | rank `8`、alpha `8`、dropout `0`；学习率 `1e-5` |
 | checkpoint/validation | `5000/10000/15000/20000`；validation-only selection |
 | protocol 边界 | smoke、training、validation 不读取 test；selection 后才执行 locked test |
-| 当前状态 | 已启动；当前阶段为 bounded smoke，正式训练等待 smoke 通过 |
+| 当前状态 | 已完成 step 5000 固定 checkpoint 的 direct test；未做 validation selection |
 
-该 A100 run 与 BSCC 计划共享训练目标和公共 DDP launcher，仅 world size/global batch 不同。A100 smoke 通过的独立验证 run 已确认 checkpoint reload finite、decoder LoRA finite、natural-loop disabled、loss objective 正确且 test-free；当前正式 run 仍需完成自身 smoke 后才进入 20k 训练。
+该 A100 run 与 BSCC 旧计划共享训练代码和公共 DDP launcher，仅 world size/global batch 不同。A100 smoke 已确认 checkpoint reload finite、decoder LoRA finite、natural-loop disabled、loss objective 正确且 test-free；正式训练按用户要求在 checkpoint-5000 后停止，跳过 validation，随后完成 800 页 direct test。后续新 run 使用本登记表顶部的参数优选配置和新 run ID。
 
 ## 历史记录：2026-09-12 natural predicted-loop A1 warm-start continuation（累计 1024 步）
 
