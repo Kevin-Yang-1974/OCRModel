@@ -214,6 +214,7 @@ A1 与 baseline 的 1024-step 训练汇总完全一致，A1 的 natural-loop act
 | `glmocr_dunhuang_local_sem_adapter_gate001_lr1e5_dec1e6_256_from_giou20x10000_20260918_v1` | 敦煌地方志 `glmocr_compat`；主 LR `1e-5`、decoder LR `1e-6`、gate 热启动 `0.01`（上限 `0.03`）；256 步；`--no-validation` | 无（固定末步） | 59 页；CER `0.170694`；IoU `0.365151`；MAE `0.090792`；I/D/S `476/475/1472`；触顶 `0`；trigram `0.0406` | gate `0.010253 → 0.012923` 单调上升；插入占比 `0.196`。同 test 历史区间 `0.1677–0.1736`，本次居中：未超过最优 `0.167735`，但也未出现 MTHv2 那次的崩坏 |
 | `glmocr_dunhuang_local_sem_adapter_continue256_val64_gate0013_lr1e5_dec1e6_20260918_v1` | 敦煌地方志；从上一行 `checkpoint-256` 续训 256 步（gate 热启动 `0.012923` 精确接续）；主 LR `1e-5`、decoder LR `1e-6`；每 64 步存档；`--defer-validation` + 5 路并行 eval-only | 并行验证选 step `256`；CER `0.207219`（80 页）；四个候选点 `0.207219–0.208077`，**step-0 恒等对照 `0.207331`** | 59 页；CER `0.169778`；IoU `0.365151`；MAE `0.090792`；I/D/S `475/470/1465`；触顶 `0`；trigram `0.0410` | gate `0.012923 → 0.015485` 仍单调（距上限仍有 1.9×），但 `ema_ocr_loss_16` 均值 `1.1451` 高于父 run 末值 `1.0801`；**四个候选点与 step-0 恒等对照完全持平**，选点 CER 仅比起点好 `0.0001`；test 微降 `0.0009`（父 run `0.170694`）。判定该配置已无训练空间 |
 | `glmocr_dunhuang_local_q32_zeroshot_baseline_20260918_v1` | **zero-shot 对照（非训练）**：官方 GLM-OCR 权重 `ca5d8b3e287e52589e37c28385d9655ee4372f9d`，`content_only` + `initial_residual_scale=0`（适配器对视觉特征严格恒等）、decoder 冻结；`tools/evaluate_glmocr_zeroshot_test.py` | 80 页 validation；CER `0.210687` | 59 页；CER `0.173864`；I/D/S `482/486/1500`；触顶 `0`；trigram `0.0400` | `adapter_gate_after_load=0.0`、`raw_content_gate=0.0`、`residual_relative_norm=0.0`、`decoder_lora_loaded=false`、`training_updates=0`；prompt 与 layout_ot 完全相同（固定 `_messages()`），故为**端到端流水线净收益**的对照，不可拆分为 `sem_adapter` 单独贡献 |
+| `glmocr_dunhuang_stage2_ablation_resolution_20260918_v1` | **判定性消融（非训练）**：同 checkpoint / 同 mode / 只改单一变量的 5 臂 eval-only。A/B 改写父 run checkpoint 的 `content_gate` 标量（0 与上限 0.03），C 为微调模型 4M，D/E 为基座 4M/2M | 80 页 validation：A(gate=0,1M) `0.210501`；B(gate=cap,1M) `0.205914`；C(微调,4M) `0.111608`；D(基座,4M) `0.112988`；E(基座,2M) `0.135474` | 不读取 | **分辨率 −0.0977 是主导因素（零训练）**；gate=0 与基座无差异（LoRA 在 1M 下惰性）、gate=0.0129 显著改善（残差通道有效）；gate 单调到上限仍未触顶 |
 
 阶段二结论：同一套 stage-2 配置在 MTHv2 上把 CER 从 `0.393093` 推到 `0.443434`（插入占比 `0.622`），换到敦煌目标域后 CER `0.170694`、插入占比 `0.196`、触顶 `0`——支持「stage-2 应在目标域执行」的设计判断。
 
@@ -222,6 +223,14 @@ A1 与 baseline 的 1024-step 训练汇总完全一致，A1 的 natural-loop act
 **zero-shot 对照（09-18 补）**：官方 GLM-OCR 基座在同一 59 页 test 上 CER `0.173864`、80 页 validation `0.210687`。整条 stage-1 布局精修 + stage-2 语义适配器链路的净收益因此只有 `0.004–0.006` CER（test）/ `0.0035`（validation），且所有微调 run 都挤在 `0.1677–0.1736` 这 `0.006` 宽的带内——**基座在该 test 上已接近饱和，既有指标区分度低于 59 页样本噪声**。此外 zero-shot 的插入占比 `0.195`、触顶 `0`、trigram `0.040` 与微调 run 一致，说明敦煌 2k 步那两次的过生成崩坏（插入占比 `0.66`/`0.79`）是训练过久引入的，不是基座固有行为。
 
 **仍未解决**：`sem_adapter` 相对 `content_only`／`geometry` 的必要性——上面两条对照都不构成 `gate=0` 冻结 vs `gate` 可训的同 mode 消融。要论证增益，需在同一起点、同一 split 上补这一格。
+
+**判定性消融与分辨率扫描（09-19 补）**：同 checkpoint、同 mode、只改单一变量的 5 臂 eval-only（`glmocr_dunhuang_stage2_ablation_resolution_20260918_v1`，80 页 validation，逐页配对 bootstrap）。三条结论：
+
+1. **输入分辨率是主导因素。** `max_pixels=1003520` 把每一页（原生 310–367 万像素）下采样到约三分之一，官方 processor 默认 `longest_edge` 是 `9633792`。仅把它放到原生，**零训练**即让基座 CER 从 `0.210687` 降到 `0.112988`（−0.0977，−46%；CI [−0.1100, −0.0850]），约为此前全部适配器工作（1M 下 0.0048）的 20 倍。增益全部来自替换错误（4580→2056），插入/删除/生成长度基本不变。
+2. **有效通道是语义残差，不是 decoder LoRA。** 同 checkpoint 下 `gate=0` 时 `0.210501`，与基座 `0.210687` 无差异（CI 含 0）→ LoRA 在 1M 下惰性；`gate=0.012923` 时 `0.207331`，显著改善（CI [+0.0018, +0.0047]）。**此前「收益全部来自 decoder LoRA」的归因基于跨谱系比较（`content_only` run 的起点本身已是微调模型），不是受控消融，已更正。**
+3. **门控被上限卡住。** `0 → 0.0129 → 0.03` 对应 `0.2105 → 0.2073 → 0.2059` 单调，而训练全程 gate 只到 `0.015485`，从未触顶。
+
+原生分辨率下微调仍显著但幅度缩小（微调 4M `0.111608` vs 基座 4M `0.112988`，CI [−0.0022, −0.0006]），同一对适配器在 1M 下贡献 `0.0034`——说明 1M 下的一部分增益是在补偿退化的输入。原生分辨率下替换 2030 处分布在 1279 个不同对上，其中约 7.5% 是异体字/标注噪声（`眾/衆`40、`髙/高`18、`於/扵`17、`逺/遠`14 等，且 `眾`40/`衆`8、`逺`21/`遠`18 参考自身两形并存）。
 
 本段训练运行均记录 `test_manifest_read=false`／`test_used_for_selection=false`；test 协议在各 run 训练结束后单独生成，且只读取一次。唯一的例外是 `..._zeroshot_baseline_20260918_v1`：它是纯 test 对照、不做任何选点，复用续训 run 的 test 协议（59 页 + image sha256 锁定），记录 `test_manifest_read=true`、`test_used_for_selection=false`、`training_updates=0`。
 
