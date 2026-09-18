@@ -158,6 +158,73 @@ A1 与 baseline 的 1024-step 训练汇总完全一致，A1 的 natural-loop act
 
 结论：这次“相较上一个实验都下降”同时包含**协议不可比**（硬 EOS 截断被移除）和**真实训练退化**（新 checkpoint 的 TF loss 更高、A1 后程过拟合/梯度竞争）。该结论仅用于封存历史 natural-loop 诊断；当前不再继续 natural-loop/loop-escape 路线，后续 A100-yky 与 BSCC 新 run 统一使用参数优选后的 `L_official + 0.4 L_layout` plain objective。旧低 CER 也不能作为当前协议下的性能承诺。
 
+## 2026-09-13/18：iou_consistent 布局精修、tf 三臂与 sem_adapter 阶段二
+
+补登 2026-09-13 至 09-18 共 25 个 run。除注明外均为 A100 五卡同步 DDP、global batch 5、seed 42、`test_manifest_read=false`。
+
+### A. 2026-09-13/14：敦煌地方志长程微调与跨域 warm-start
+
+| run ID | 配置 | validation | locked test | 关键状态 |
+| --- | --- | --- | --- | --- |
+| `glmocr_dunhuang_local_gazetteer_q32_geometry_2k_a100_260913_v4` | geometry；full layout loss；`auxiliary_weight=0.4`；decoder LoRA；2000 步 | 选 step `500`；CER `0.457322` | 59 页；CER `0.454315`；MAE `0.200780`；I/D/S `4283/453/1713`；触顶 `4`；repeated-trigram `0.1072` | 过生成主导，插入占编辑距离 `0.664`；gate 升至 `0.015452`。该结果确立敦煌长程微调的崩坏模式 |
+| `glmocr_dunhuang_local_gazetteer_q32_official_content_only_2k_a100_260913_v4` | content_only；full；2000 步 | 选 step `500`；CER `0.695865` | 59 页；CER `0.816485`；MAE `0.211802`；I/D/S `9137/459/1994`；触顶 `7` | 插入占比 `0.788`，最严重的过生成；gate 全程 `0`，说明崩坏不依赖残差通路 |
+| `glmocr_q32_free_warmstart_ref600_content_only_600_from200_lr125e-6_dec25e-7_r512_a100_260914_v1` | content_only；full；decoder LR `2.5e-7`；600 步 | 选 step `800`；CER `0.204236` | 59 页；CER `0.170764`；MAE `0.211803`；I/D/S `478/477/1469`；触顶 `0`；trigram `0.0408` | 起点为 `training_initializations/glmocr_dunhuang_local_gazetteer_q32_content_only_ref600_bscc_260913_v2_step200`；低 LR 下过生成未出现 |
+| `glmocr_q32_free_warmstart_ref600_geometry_600_lr625e-6_dec125e-6_r512_a100_260914_v1` | geometry；full；`auxiliary_weight=0.2`；decoder LR `1.25e-6`；600 步 | 选 step `600` | 59 页；CER `0.169074`；MAE `0.192503`；I/D/S `478/459/1463`；触顶 `0` | 起点 `..._geometry_ref600_bscc_260913_v2_step200`；终值 gate `0.009494` |
+| `glmocr_q32_free_warmstart_ref600_geometry_2000_from600_repair_lr125e-6_dec25e-7_r512_a100_260914_v1` | geometry；full；`auxiliary_weight=0.2`；decoder LR `2.5e-7`；1400 步 | 选 step `1400`；CER `0.197226` | 59 页；CER `0.168862`；MAE `0.195746`；I/D/S `475/485/1437`；触顶 `0` | 从上一行 `checkpoint-600` 接续的修复臂 |
+| `glmocr_q32_free_warmstart_ref600_geometry_2000_from600_lr625e-6_dec125e-6_r512_a100_260914_v1` | geometry；full；2000 步 | 无 | 不读取 | `stopped_by_user`；仅 `metadata.json`／`train_metrics.jsonl`，无 checkpoint，不作结果 |
+
+### B. 2026-09-15：MTHv2 layout-only 与 tf_gate005 三臂
+
+| run ID | 配置 | validation | locked test | 关键状态 |
+| --- | --- | --- | --- | --- |
+| `glmocr_mthv2_sparse24_q32_layout_only_3000_a100_260915_v3` | geometry；full；`layout_only=true`；`auxiliary_weight=1.0`；3000 步 | 选 `validation_layout_box_iou` step `3000`；IoU `0.072805` | 509 页；CER `0.393093`；IoU `0.072533`；MAE `0.226048`；I/D/S `29308/6435/18566`；触顶 `26`；trigram `0.3185` | gate 全程 `0`，语义通路未激活；作为后续 Q32 布局续训的共同起点 |
+| `glmocr_q32_tf_attention_gate005_256_a100_260915_v2` | attention；full；`auxiliary_weight=0.4`；256 步；`--no-validation` | 无 | 59 页；**CER `0.167735`**；MAE `0.085796`；I/D/S `476/456/1449`；触顶 `0`；trigram `0.0414` | 59 页历史最优；gate `0.012892` |
+| `glmocr_q32_tf_content_only_gate005_256_a100_260915_v1` | content_only；full；256 步；`--no-validation` | 无 | 59 页；CER `0.168017`；MAE `0.211803`；I/D/S `461/459/1465`；触顶 `0` | gate `0.005000`（未动） |
+| `glmocr_q32_tf_geometry_gate005_256_a100_260915_v2` | geometry；full；`auxiliary_weight=0.4`；256 步；`--no-validation` | 无 | 59 页；CER `0.169074`；MAE `0.195998`；I/D/S `476/469/1455`；触顶 `0` | gate `0.012006` |
+| `glmocr_q32_free_geometry_from600_2500_lr4x_min0p2_r512_a100_260915_v2` | geometry；full；`auxiliary_weight=0.2`；2500 步 | 无 | 不读取 | 从 `ref600_geometry_600/checkpoint-600` 接续；complete 但未做 selection 与 test；终值 gate `0.020056` |
+| `glmocr_dunhuang_local_q32_alpha001_from_sparse_layout_256_a100_260915_v5` | geometry；full；`auxiliary_weight=0.4`；256 步 | `fixed_final_step_diagnostic`；`validation_evaluated=true` | 不读取 | 起点 `layout_only_3000_v3/checkpoint-3000`，`init_checkpoint_override_residual_scale=0`；gate `0.017337`；诊断 run，无 locked test |
+
+### C. 2026-09-16/17/18：iou_consistent / giou 布局精修线
+
+布局损失从 box 权重等化转向 `iou_consistent` 系列。该线 `decoder_adaptation=frozen`、`auxiliary_weight=1.0`，只训布局分支；逐 checkpoint 在 MTHv2 sparse24 validation 149 页上评测。
+
+| run ID | 起点 / 步数 | 逐 step 布局验证（IoU / MAE） | 关键状态 |
+| --- | --- | --- | --- |
+| `glmocr_mthv2_sparse24_q32_layout_continuation_2000_from3000_a100_260916_v1` | `layout_only_3000_v3/checkpoint-3000`（full loss）；2000 步 | 未评测 | complete；gate `0`；无 selection 与 test |
+| `glmocr_dunhuang_local_q32_alpha001_from_boxeq58_256_a100_260916_v1` | `boxeq58_3000/checkpoint-3000`（`history_box_equalized_v1`）；256 步 | 未评测 | complete；gate `0.016514`；无 selection 与 test |
+| `glmocr_mthv2_sparse24_q32_layout_iou_consistent_giou10x_mlp_refine_3000_from_boxeq820_20260917_v1` | `boxeq820_3000/checkpoint-3000`；3000 步；`iou_consistent_giou10x` | `1000`：`0.422549`／`0.048471`；`2000`：`0.475591`／`0.039474`；`3000`：`0.549673`／`0.037354` | complete；gate 触顶 `0.0300`，`mean_gradient_norm=376.5` 异常大；无 selection 与 test |
+| `glmocr_mthv2_sparse24_q32_layout_iou_consistent_mlp_refine_3000_from_boxeq820_20260917_retry2` | 同上；3000 步；`iou_consistent` | 未评测 | 仅到 `checkpoint-1000`，未完成；不作结果 |
+| `glmocr_mthv2_sparse24_q32_layout_iou_consistent_giou10x_mlp_refine_10000_continue_from_giou10x3000_20260917_v1` | 上一行 giou10x run 的 `checkpoint-3000`；10000 步 | 无 | 仅 `metadata.json`，无 checkpoint；不作结果 |
+| `glmocr_mthv2_sparse24_q32_layout_iou_consistent_giou10x_mlp_refine_10000_continue_from_giou10x3000_20260917_v2` | 同上；10000 步 | `2000`：`0.470294`／`0.045306`；`4000`：`0.514404`／`0.043766`；`6000`：`0.594829`／`0.035771`；`8000`：`0.639213`／`0.028548`；`10000`：`0.647969`／`0.028292` | 训练与布局验证均已完成，`status` 未翻为 complete；未做 selection 与 test |
+| `glmocr_mthv2_sparse24_q32_layout_iou_consistent_giou20x_mlp_refine_10000_continue_from_giou10x10000_20260918_v1` | 同上；10000 步 | 无 | 空目录（无 seed 产物）；不作结果 |
+| `glmocr_mthv2_sparse24_q32_layout_iou_consistent_giou20x_mlp_refine_10000_continue_from_giou10x10000_20260918_v2` | `giou10x_10000_v2/checkpoint-10000`；10000 步；`iou_consistent_giou20x` | `2000`：`0.535813`／`0.039420`；`4000`：`0.604446`／`0.030769`；`6000`：`0.636638`／`0.028477`；`8000`：`0.671110`／`0.027422`；`10000`：**`0.672084`／`0.027824`** | 本线最优布局结果；作为 09-18 sem_adapter 的起点；未做 selection 与 test |
+
+布局精修线小结：`giou10x` 把 3000 步的 IoU `0.549673` 推高到 10000 步的 `0.647969`；`giou20x` 在同样 10000 步上进一步到 `0.672084`，MAE 同步从 `0.037354` 降到 `0.027824`。同期 OCR 指标（validation CER 约 `0.49–0.58`）未见同向改善，符合「布局分支只优化几何」的两阶段设计预期。
+
+### D. 2026-09-18：sem_adapter 阶段二
+
+阶段二按 `plans/LAYOUT_OCR_DECOUPLING_PLAN.md` 冻结布局分支，只训 `sem_adapter` + `content_gate`（外加 decoder LoRA），损失为 OCR-only。
+
+| run ID | 数据 / 配置 | validation | locked test | 关键状态 |
+| --- | --- | --- | --- | --- |
+| `glmocr_mthv2_sem_adapter_stage2_from_giou20x10000_20260918_v1` | MTHv2；`layout_ot`；`ocr_only`；LoRA LR `5e-6`；1024 步 | 并行验证选 step `256`；CER `0.949633`（149 页） | 不读取 | 冷启动未修正（gate 起点 `0`）且主 LR 过高；终值 gate 触顶 `0.0300`；判定配置失败 |
+| `glmocr_mthv2_sem_adapter_stage2_from_giou20x10000_lrhalf_warmup432_gate001_20260918_v1` | 同上，主 LR 减半、warmup `432`、gate 热启动 `0.01` | 无 | 不读取 | smoke 阶段 `failed`；不作结果 |
+| `glmocr_mthv2_sem_adapter_stage2_from_giou20x10000_lrhalf_warmup432_gate001_20260918_v2` | 同行修正后重试；decoder LR `2.5e-6`；1024 步 | 并行验证选 step `256`；CER `0.519398`（149 页） | 不读取 | 冷启动修复生效（终值 gate `0.023306`），validation CER 由 `0.9496` 改善到 `0.5194`，但仍远差于布局起点 |
+| `glmocr_mthv2_sem_adapter_stage2_gate001_lr1e5_256_from_giou20x10000_20260918_v1` | MTHv2；主 LR `1e-5`、decoder LR `5e-6`、gate 热启动 `0.01`；256 步；`--no-validation` | 无（固定末步） | 509 页；CER `0.443434`；IoU `0.665427`；MAE `0.031535`；I/D/S `38098/4762/18404`；触顶 `35`；trigram `0.3334` | gate `0.012655`；差于起点 `0.393093`，插入占编辑距离 `0.622`，过生成主导，判定该轮 stage-2 失败 |
+| `glmocr_dunhuang_local_sem_adapter_gate001_lr1e5_dec1e6_256_from_giou20x10000_20260918_v1` | 敦煌地方志 `glmocr_compat`；主 LR `1e-5`、decoder LR `1e-6`、gate 热启动 `0.01`（上限 `0.03`）；256 步；`--no-validation` | 无（固定末步） | 59 页；CER `0.170694`；IoU `0.365151`；MAE `0.090792`；I/D/S `476/475/1472`；触顶 `0`；trigram `0.0406` | gate `0.010253 → 0.012923` 单调上升；插入占比 `0.196`。同 test 历史区间 `0.1677–0.1736`，本次居中：未超过最优 `0.167735`，但也未出现 MTHv2 那次的崩坏 |
+| `glmocr_dunhuang_local_sem_adapter_continue256_val64_gate0013_lr1e5_dec1e6_20260918_v1` | 敦煌地方志；从上一行 `checkpoint-256` 续训 256 步（gate 热启动 `0.012923` 精确接续）；主 LR `1e-5`、decoder LR `1e-6`；每 64 步存档；`--defer-validation` + 5 路并行 eval-only | 并行验证选 step `256`；CER `0.207219`（80 页）；四个候选点 `0.207219–0.208077`，**step-0 恒等对照 `0.207331`** | 59 页；CER `0.169778`；IoU `0.365151`；MAE `0.090792`；I/D/S `475/470/1465`；触顶 `0`；trigram `0.0410` | gate `0.012923 → 0.015485` 仍单调（距上限仍有 1.9×），但 `ema_ocr_loss_16` 均值 `1.1451` 高于父 run 末值 `1.0801`；**四个候选点与 step-0 恒等对照完全持平**，选点 CER 仅比起点好 `0.0001`；test 微降 `0.0009`（父 run `0.170694`）。判定该配置已无训练空间 |
+| `glmocr_dunhuang_local_q32_zeroshot_baseline_20260918_v1` | **zero-shot 对照（非训练）**：官方 GLM-OCR 权重 `ca5d8b3e287e52589e37c28385d9655ee4372f9d`，`content_only` + `initial_residual_scale=0`（适配器对视觉特征严格恒等）、decoder 冻结；`tools/evaluate_glmocr_zeroshot_test.py` | 80 页 validation；CER `0.210687` | 59 页；CER `0.173864`；I/D/S `482/486/1500`；触顶 `0`；trigram `0.0400` | `adapter_gate_after_load=0.0`、`raw_content_gate=0.0`、`residual_relative_norm=0.0`、`decoder_lora_loaded=false`、`training_updates=0`；prompt 与 layout_ot 完全相同（固定 `_messages()`），故为**端到端流水线净收益**的对照，不可拆分为 `sem_adapter` 单独贡献 |
+
+阶段二结论：同一套 stage-2 配置在 MTHv2 上把 CER 从 `0.393093` 推到 `0.443434`（插入占比 `0.622`），换到敦煌目标域后 CER `0.170694`、插入占比 `0.196`、触顶 `0`——支持「stage-2 应在目标域执行」的设计判断。
+
+**续训验证（09-18 补）**：在父 run 之上续训 256 步并每 64 步存档验证，四个候选点 `0.207219–0.208077`、step-0 恒等对照 `0.207331`，全部持平（0.0001 量级）；锁定 test `0.169778` 对父 run `0.170694` 仅降 `0.0009`，而同一间隔的 validation CER 完全不动。结论：**该配置（主 LR `1e-5`、decoder LR `1e-6`、gate 上限 `0.03`、256 步）已无训练空间**，日志里 gate 仍在单调上升不构成「还有空间」的证据。
+
+**zero-shot 对照（09-18 补）**：官方 GLM-OCR 基座在同一 59 页 test 上 CER `0.173864`、80 页 validation `0.210687`。整条 stage-1 布局精修 + stage-2 语义适配器链路的净收益因此只有 `0.004–0.006` CER（test）/ `0.0035`（validation），且所有微调 run 都挤在 `0.1677–0.1736` 这 `0.006` 宽的带内——**基座在该 test 上已接近饱和，既有指标区分度低于 59 页样本噪声**。此外 zero-shot 的插入占比 `0.195`、触顶 `0`、trigram `0.040` 与微调 run 一致，说明敦煌 2k 步那两次的过生成崩坏（插入占比 `0.66`/`0.79`）是训练过久引入的，不是基座固有行为。
+
+**仍未解决**：`sem_adapter` 相对 `content_only`／`geometry` 的必要性——上面两条对照都不构成 `gate=0` 冻结 vs `gate` 可训的同 mode 消融。要论证增益，需在同一起点、同一 split 上补这一格。
+
+本段训练运行均记录 `test_manifest_read=false`／`test_used_for_selection=false`；test 协议在各 run 训练结束后单独生成，且只读取一次。唯一的例外是 `..._zeroshot_baseline_20260918_v1`：它是纯 test 对照、不做任何选点，复用续训 run 的 test 协议（59 页 + image sha256 锁定），记录 `test_manifest_read=true`、`test_used_for_selection=false`、`training_updates=0`。
+
 ## 每个 run 必填
 
 记录 Git commit、上游 GLM-OCR 版本与权重标识、manifest 哈希、R1/R2 配置、GPU 集合、训练预算、辅助损失权重、validation 选点规则和唯一 run ID。失败 run 保留原 ID，重试使用新 ID。
