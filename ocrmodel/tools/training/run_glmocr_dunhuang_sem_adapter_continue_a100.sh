@@ -40,7 +40,12 @@ max_eval_new_tokens="${GLMOCR_DH_CONTINUE_MAX_EVAL_NEW_TOKENS:-1536}"
 # any evaluation whose metadata diverges from the training run on these, so the
 # eval-only invocations below have to repeat them verbatim.
 eval_generation_mode="loop_recovery"
-eval_max_pixels=1003520
+# Visual-token budget.  The ablation in
+# results/glmocr_dunhuang_stage2_ablation_resolution_20260918_v1/ showed the
+# 1003520 default downscales every Dunhuang page to about a third of its
+# native pixels and costs ~0.098 CER, so training and both evaluation
+# stages take this one value.
+eval_max_pixels="${GLMOCR_DH_CONTINUE_MAX_PIXELS:-1003520}"
 # Resumed gate: the parent run's final raw_content_gate.  Passing it explicitly
 # overrides the sem_adapter wrapper's 0.01 warm start so the continuation keeps
 # the gate the parent already learned instead of resetting it downward.
@@ -185,7 +190,8 @@ common_wrapper_args() {
         --decoder-learning-rate "${decoder_learning_rate}" \
         --warmup-steps "${warmup_steps}" --min-lr-ratio "${min_lr_ratio}" \
         --init-checkpoint-override-residual-scale "${resume_gate}" \
-        --max-eval-new-tokens "${max_eval_new_tokens}" --log-steps 16
+        --max-eval-new-tokens "${max_eval_new_tokens}" \
+        --max-pixels "${eval_max_pixels}" --log-steps 16
 }
 
 run_smoke() {
@@ -435,6 +441,7 @@ run_test() {
     bash "${locked_test_launcher}" --foreground --run-id "${run_id}" --seed "${seed}" \
         --gpu-ids "${gpu_ids}" --gpu-utilization-limit "${gpu_utilization_limit}" \
         --mode layout_ot --num-queries "${num_queries}" --max-eval-new-tokens "${max_eval_new_tokens}" \
+        --max-pixels "${eval_max_pixels}" \
         --remote-root "${remote_root}" --code-root "${code_root}" --env-dir "${env_dir}" \
         --model-dir "${model_dir}" --dataset-root "${dunhuang_root}" \
         --protocol-file "${test_protocol}" \
@@ -531,11 +538,24 @@ if (( foreground == 0 )); then
     script_path="$(realpath -- "${BASH_SOURCE[0]}")"
     mkdir -p "${workspace_runs}"
     command_line="$(printf '%q ' bash "${script_path}" --foreground)"
+    # tmux attaches new sessions to an existing server, whose environment is
+    # the one from when that server started.  Anything configured through
+    # GLMOCR_DH_CONTINUE_* therefore has to be restated on the inner command
+    # line; otherwise the inner run silently falls back to the defaults,
+    # collides with an existing run directory and exits 74 with an empty log.
+    env_prefix=""
+    env_prefix+="export GLMOCR_DH_CONTINUE_RUN_ID=$(printf '%q' "${run_id}"); "
+    env_prefix+="export GLMOCR_DH_CONTINUE_SESSION=$(printf '%q' "${session}"); "
+    env_prefix+="export GLMOCR_DH_CONTINUE_MAX_PIXELS=$(printf '%q' "${eval_max_pixels}"); "
+    env_prefix+="export GLMOCR_DH_CONTINUE_RESUME_GATE=$(printf '%q' "${resume_gate}"); "
+    env_prefix+="export GLMOCR_DH_CONTINUE_PARENT_RUN_ID=$(printf '%q' "${parent_run_id}"); "
+    env_prefix+="export GLMOCR_DH_CONTINUE_PARENT_CHECKPOINT=$(printf '%q' "${parent_checkpoint_dir}"); "
+    env_prefix+="export GLMOCR_DH_CONTINUE_GPU_IDS=$(printf '%q' "${gpu_ids}"); "
     # The inner invocation re-runs preflight, so it has to know whether it
     # is resuming; without this it takes the fresh-run branch and exits 74.
     (( resume_validation == 0 )) || command_line+="--resume-validation "
     tmux new-session -d -s "${session}" \
-        "cd $(printf '%q' "${code_root}") && exec ${command_line} >$(printf '%q' "${workspace_runs}/${session}.log") 2>&1"
+        "cd $(printf '%q' "${code_root}") && ${env_prefix}exec ${command_line} >$(printf '%q' "${workspace_runs}/${session}.log") 2>&1"
     printf '{"event":"glmocr_dh_continue_pipeline_armed","session":"%s","run_id":"%s","parent_run_id":"%s","gpu_ids":"%s","log":"%s"}\n' \
         "${session}" "${run_id}" "${parent_run_id}" "${gpu_ids}" "${workspace_runs}/${session}.log"
 else

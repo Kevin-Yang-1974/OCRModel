@@ -17,6 +17,7 @@ gpu_id=0
 gpu_ids=""
 mode="geometry"
 num_queries=512
+max_pixels=1003520
 max_eval_new_tokens=1536
 gpu_utilization_limit="${GLMOCR_LOCKED_TEST_GPU_UTILIZATION_LIMIT:-50}"
 session=""
@@ -31,6 +32,7 @@ while [[ $# -gt 0 ]]; do
         --mode) mode="$2"; shift 2 ;;
         --num-queries) num_queries="$2"; shift 2 ;;
         --max-eval-new-tokens) max_eval_new_tokens="$2"; shift 2 ;;
+        --max-pixels) max_pixels="$2"; shift 2 ;;
         --gpu-utilization-limit) gpu_utilization_limit="$2"; shift 2 ;;
         --session) session="$2"; shift 2 ;;
         --foreground) foreground=1; shift ;;
@@ -192,6 +194,7 @@ run_inner() {
             --mode "${mode}" \
             --seed "${seed}" \
             --num-queries "${num_queries}" \
+            --max-pixels "${max_pixels}" \
             --max-eval-new-tokens "${max_eval_new_tokens}" \
             > "${test_log}" 2>&1
     else
@@ -227,6 +230,7 @@ run_inner() {
                     --mode "${mode}" \
                     --seed "${seed}" \
                     --num-queries "${num_queries}" \
+                    --max-pixels "${max_pixels}" \
                     --max-eval-new-tokens "${max_eval_new_tokens}" \
                     --test-shard-index "${shard_index}" \
                     --test-shard-count "${gpu_count}"

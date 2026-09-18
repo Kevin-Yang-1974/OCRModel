@@ -48,10 +48,17 @@ auxiliary_ramp_steps=0
 diagnostic_steps=""
 layout_loss_profile="full"
 validation_interval=432
+# Visual-token budget per page.  The upstream processor defaults to
+# longest_edge=9633792; 1003520 was a deliberate 1280-token budget that
+# downscales every Dunhuang page to about a third of its native pixels.
+max_pixels=1003520
 max_eval_new_tokens=1536
 num_queries=512
 box_head_mlp=0
 box_head_hidden=0
+sem_adapter_mlp=0
+sem_adapter_hidden=0
+freeze_layout_branch=0
 query_refine_layers=0
 generation_mode="loop_recovery"
 log_steps=16
@@ -150,9 +157,13 @@ while [[ $# -gt 0 ]]; do
         --layout-loss-profile) layout_loss_profile="$2"; shift 2 ;;
         --validation-interval) validation_interval="$2"; shift 2 ;;
         --max-eval-new-tokens) max_eval_new_tokens="$2"; shift 2 ;;
+        --max-pixels) max_pixels="$2"; shift 2 ;;
         --num-queries) num_queries="$2"; shift 2 ;;
         --box-head-mlp) box_head_mlp=1; shift ;;
         --box-head-hidden) box_head_hidden="$2"; shift 2 ;;
+        --sem-adapter-mlp) sem_adapter_mlp=1; shift ;;
+        --sem-adapter-hidden) sem_adapter_hidden="$2"; shift 2 ;;
+        --freeze-layout-branch) freeze_layout_branch=1; shift ;;
         --query-refine-layers) query_refine_layers="$2"; shift 2 ;;
         --generation-mode) generation_mode="$2"; shift 2 ;;
         --log-steps) log_steps="$2"; shift 2 ;;
@@ -228,6 +239,7 @@ while [[ $# -gt 0 ]]; do
         --allow-count-mismatch) allow_count_mismatch=1; shift ;;
         --init-checkpoint-dir) init_checkpoint_dir="$2"; shift 2 ;;
         --init-checkpoint-override-residual-scale) init_checkpoint_override_residual_scale="$2"; shift 2 ;;
+        --warm-start-content-gate) init_checkpoint_override_residual_scale="$2"; shift 2 ;;
         --init-checkpoint-allow-mode-mismatch) init_checkpoint_allow_mode_mismatch=1; shift ;;
         *) printf '{"event":"glmocr_mthv2_ddp_failed","error":"unknown_argument","argument":"%s"}\n' "$1" >&2; exit 64 ;;
     esac
@@ -296,10 +308,28 @@ esac
     printf '{"event":"glmocr_mthv2_ddp_failed","error":"invalid_box_head_mlp_flag"}\n' >&2
     exit 64
 }
-[[ "${box_head_hidden}" =~ ^[0-9]+$ && "${query_refine_layers}" =~ ^[0-9]+$ ]] || {
+[[ "${sem_adapter_mlp}" == "0" || "${sem_adapter_mlp}" == "1" ]] || {
+    printf '{"event":"glmocr_mthv2_ddp_failed","error":"invalid_sem_adapter_mlp_flag"}\n' >&2
+    exit 64
+}
+[[ "${freeze_layout_branch}" == "0" || "${freeze_layout_branch}" == "1" ]] || {
+    printf '{"event":"glmocr_mthv2_ddp_failed","error":"invalid_freeze_layout_branch_flag"}\n' >&2
+    exit 64
+}
+[[ "${box_head_hidden}" =~ ^[0-9]+$ && "${sem_adapter_hidden}" =~ ^[0-9]+$ && "${query_refine_layers}" =~ ^[0-9]+$ ]] || {
     printf '{"event":"glmocr_mthv2_ddp_failed","error":"invalid_layout_head_configuration"}\n' >&2
     exit 64
 }
+if (( freeze_layout_branch == 1 )); then
+    (( sem_adapter_mlp == 1 )) || {
+        printf '{"event":"glmocr_mthv2_ddp_failed","error":"freeze_layout_branch_requires_sem_adapter"}\n' >&2
+        exit 64
+    }
+    (( layout_only == 0 )) || {
+        printf '{"event":"glmocr_mthv2_ddp_failed","error":"freeze_layout_branch_conflicts_with_layout_only"}\n' >&2
+        exit 64
+    }
+fi
 [[ "${allow_count_mismatch}" == "0" || "${allow_count_mismatch}" == "1" ]] || {
     printf '{"event":"glmocr_mthv2_ddp_failed","error":"invalid_count_mismatch_policy"}\n' >&2
     exit 64
@@ -417,7 +447,7 @@ esac
     exit 64
 }
 case "${layout_loss_profile}" in
-    full|ocr_only|no_assignment|no_assignment_validity|validity_assignment|no_geometry|history_box_equalized_v1|history_box_equalized_v2|iou_consistent) ;;
+    full|ocr_only|no_assignment|no_assignment_validity|validity_assignment|no_geometry|history_box_equalized_v1|history_box_equalized_v2|iou_consistent|iou_consistent_giou10x|iou_consistent_giou20x) ;;
     *) printf '{"event":"glmocr_mthv2_ddp_failed","error":"invalid_layout_loss_profile"}\n' >&2; exit 64 ;;
 esac
 case "${validity_gating_mode}" in
@@ -648,6 +678,8 @@ write_status() {
     local test_manifest_read_json=true
     local use_validity_head_json=false
     local validity_use_transport_evidence_json=false
+    local sem_adapter_mlp_json=false
+    local freeze_layout_branch_json=false
     local defer_validation_json=false
     local selection_pending_json=false
     local stop_reason_json=null
@@ -662,14 +694,16 @@ write_status() {
     (( without_test == 1 )) && test_manifest_read_json=false
     (( use_validity_head == 1 )) && use_validity_head_json=true
     (( validity_use_transport_evidence == 1 )) && validity_use_transport_evidence_json=true
+    (( sem_adapter_mlp == 1 )) && sem_adapter_mlp_json=true
+    (( freeze_layout_branch == 1 )) && freeze_layout_branch_json=true
     (( defer_validation == 1 )) && { defer_validation_json=true; selection_pending_json=true; }
     if [[ "${status}" == "stopped_by_user" ]]; then
         stop_reason_json='"user_requested_validation_stop"'
         validation_stop_only_json=true
     fi
     mkdir -p "${group_root}/status"
-    printf '{"status":"%s","run_id":"%s","experiment_label":"%s","seed":%s,"smoke":%s,"world_size":%s,"global_batch_size":%s,"effective_global_batch_size":%s,"gradient_accumulation_steps":%s,"max_steps":%s,"lr_schedule_steps":%s,"learning_rate":%s,"decoder_adaptation":"%s","decoder_lora_rank":%s,"decoder_lora_alpha":%s,"decoder_lora_dropout":%s,"decoder_learning_rate":%s,"warmup_steps":%s,"min_lr_ratio":%s,"initial_residual_scale":%s,"gate_freeze_steps":%s,"auxiliary_weight_start":%s,"auxiliary_weight":%s,"auxiliary_ramp_steps":%s,"layout_loss_profile":"%s","use_validity_head":%s,"initial_valid_probability":%s,"validity_gating_mode":"%s","validity_use_transport_evidence":%s,"validation_interval":%s,"no_validation":%s,"defer_validation":%s,"selection_pending":%s,"log_steps":%s,"max_eval_new_tokens":%s,"skip_selection":%s,"test_manifest_read":%s,"test_used_for_selection":false,"stop_reason":%s,"validation_stop_only":%s}\n' \
-        "${status}" "${run_id}" "${experiment_label}" "${seed}" "$([[ ${smoke} -eq 1 ]] && echo true || echo false)" "${world_size}" "$((world_size))" "$((world_size * gradient_accumulation_steps))" "${gradient_accumulation_steps}" "${status_max_steps}" "${status_lr_schedule_steps}" "${learning_rate}" "${decoder_adaptation}" "${decoder_lora_rank}" "${decoder_lora_alpha}" "${decoder_lora_dropout}" "${decoder_learning_rate}" "${warmup_steps}" "${min_lr_ratio}" "${initial_residual_scale}" "${gate_freeze_steps}" "${auxiliary_weight_start}" "${auxiliary_weight}" "${auxiliary_ramp_steps}" "${layout_loss_profile}" "${use_validity_head_json}" "${initial_valid_probability}" "${validity_gating_mode}" "${validity_use_transport_evidence_json}" "${validation_interval}" "$([[ ${no_validation} -eq 1 ]] && echo true || echo false)" "${defer_validation_json}" "${selection_pending_json}" "${log_steps}" "${max_eval_new_tokens}" "${skip_selection_json}" "${test_manifest_read_json}" "${stop_reason_json}" "${validation_stop_only_json}" > "${group_root}/status/seed${seed}.json"
+    printf '{"status":"%s","run_id":"%s","experiment_label":"%s","seed":%s,"smoke":%s,"world_size":%s,"global_batch_size":%s,"effective_global_batch_size":%s,"gradient_accumulation_steps":%s,"max_steps":%s,"lr_schedule_steps":%s,"learning_rate":%s,"decoder_adaptation":"%s","decoder_lora_rank":%s,"decoder_lora_alpha":%s,"decoder_lora_dropout":%s,"decoder_learning_rate":%s,"warmup_steps":%s,"min_lr_ratio":%s,"initial_residual_scale":%s,"gate_freeze_steps":%s,"auxiliary_weight_start":%s,"auxiliary_weight":%s,"auxiliary_ramp_steps":%s,"layout_loss_profile":"%s","sem_adapter_mlp":%s,"sem_adapter_hidden":%s,"freeze_layout_branch":%s,"use_validity_head":%s,"initial_valid_probability":%s,"validity_gating_mode":"%s","validity_use_transport_evidence":%s,"validation_interval":%s,"no_validation":%s,"defer_validation":%s,"selection_pending":%s,"log_steps":%s,"max_eval_new_tokens":%s,"skip_selection":%s,"test_manifest_read":%s,"test_used_for_selection":false,"stop_reason":%s,"validation_stop_only":%s}\n' \
+        "${status}" "${run_id}" "${experiment_label}" "${seed}" "$([[ ${smoke} -eq 1 ]] && echo true || echo false)" "${world_size}" "$((world_size))" "$((world_size * gradient_accumulation_steps))" "${gradient_accumulation_steps}" "${status_max_steps}" "${status_lr_schedule_steps}" "${learning_rate}" "${decoder_adaptation}" "${decoder_lora_rank}" "${decoder_lora_alpha}" "${decoder_lora_dropout}" "${decoder_learning_rate}" "${warmup_steps}" "${min_lr_ratio}" "${initial_residual_scale}" "${gate_freeze_steps}" "${auxiliary_weight_start}" "${auxiliary_weight}" "${auxiliary_ramp_steps}" "${layout_loss_profile}" "${sem_adapter_mlp_json}" "${sem_adapter_hidden}" "${freeze_layout_branch_json}" "${use_validity_head_json}" "${initial_valid_probability}" "${validity_gating_mode}" "${validity_use_transport_evidence_json}" "${validation_interval}" "$([[ ${no_validation} -eq 1 ]] && echo true || echo false)" "${defer_validation_json}" "${selection_pending_json}" "${log_steps}" "${max_eval_new_tokens}" "${skip_selection_json}" "${test_manifest_read_json}" "${stop_reason_json}" "${validation_stop_only_json}" > "${group_root}/status/seed${seed}.json"
 }
 
 run_inner() {
@@ -720,6 +754,7 @@ run_inner() {
             --decoder-learning-rate "${decoder_learning_rate}"
             --layout-loss-profile "${layout_loss_profile}"
             --box-head-hidden "${box_head_hidden}"
+            --sem-adapter-hidden "${sem_adapter_hidden}"
             --query-refine-layers "${query_refine_layers}"
             --auxiliary-weight "${auxiliary_weight}"
             --auxiliary-weight-start "${auxiliary_weight_start}"
@@ -765,6 +800,8 @@ run_inner() {
             --region-spatial-iou-threshold "${region_spatial_iou_threshold}"
         )
         (( box_head_mlp == 1 )) && smoke_args+=(--box-head-mlp)
+        (( sem_adapter_mlp == 1 )) && smoke_args+=(--sem-adapter-mlp)
+        (( freeze_layout_branch == 1 )) && smoke_args+=(--freeze-layout-branch)
         [[ -n "${init_checkpoint_dir}" ]] && smoke_args+=(--init-checkpoint-dir "${init_checkpoint_dir}")
         [[ -n "${init_checkpoint_override_residual_scale}" ]] && smoke_args+=(--init-checkpoint-override-residual-scale "${init_checkpoint_override_residual_scale}")
         (( init_checkpoint_allow_mode_mismatch == 1 )) && smoke_args+=(--init-checkpoint-allow-mode-mismatch)
@@ -856,13 +893,16 @@ run_inner() {
     )
     geometry_args=(
         --box-head-hidden "${box_head_hidden}"
+        --sem-adapter-hidden "${sem_adapter_hidden}"
         --query-refine-layers "${query_refine_layers}"
     )
     (( box_head_mlp == 1 )) && geometry_args+=(--box-head-mlp)
+    (( sem_adapter_mlp == 1 )) && geometry_args+=(--sem-adapter-mlp)
     [[ -n "${init_checkpoint_dir}" ]] && method_args+=(--init-checkpoint-dir "${init_checkpoint_dir}")
     [[ -n "${init_checkpoint_override_residual_scale}" ]] && method_args+=(--init-checkpoint-override-residual-scale "${init_checkpoint_override_residual_scale}")
     (( init_checkpoint_allow_mode_mismatch == 1 )) && method_args+=(--init-checkpoint-allow-mode-mismatch)
     (( layout_only == 1 )) && method_args+=(--layout-only)
+    (( freeze_layout_branch == 1 )) && method_args+=(--freeze-layout-branch)
     (( text_repeat_suppression == 1 )) && method_args+=(--text-repeat-suppression)
     (( natural_loop_loss == 1 )) && method_args+=(--natural-loop-loss)
     (( free_generation_loss == 1 )) && method_args+=(--free-generation-loss)
@@ -911,7 +951,7 @@ run_inner() {
         --auxiliary-weight-start "${auxiliary_weight_start}" \
         --auxiliary-ramp-steps "${auxiliary_ramp_steps}" \
         --max-grad-norm 1.0 \
-        --max-pixels 1003520 \
+        --max-pixels "${max_pixels}" \
         --max-eval-new-tokens "${max_eval_new_tokens}" \
         --validation-interval "${validation_interval}" \
         --log-steps "${log_steps}" \
@@ -1041,6 +1081,7 @@ if (( foreground == 0 )); then
         --max-eval-new-tokens "${max_eval_new_tokens}"
         --num-queries "${num_queries}"
         --box-head-hidden "${box_head_hidden}"
+        --sem-adapter-hidden "${sem_adapter_hidden}"
         --query-refine-layers "${query_refine_layers}"
         --generation-mode "${generation_mode}"
         --log-steps "${log_steps}"
@@ -1085,6 +1126,9 @@ if (( foreground == 0 )); then
         --dataset-label "${dataset_label}" --protocol-label "${protocol_label}"
     )
     (( box_head_mlp == 1 )) && child_args+=(--box-head-mlp)
+    (( sem_adapter_mlp == 1 )) && child_args+=(--sem-adapter-mlp)
+    (( freeze_layout_branch == 1 )) && child_args+=(--freeze-layout-branch)
+    (( layout_only == 1 )) && child_args+=(--layout-only)
     [[ -n "${init_checkpoint_dir}" ]] && child_args+=(--init-checkpoint-dir "${init_checkpoint_dir}")
     [[ -n "${init_checkpoint_override_residual_scale}" ]] && child_args+=(--init-checkpoint-override-residual-scale "${init_checkpoint_override_residual_scale}")
     (( init_checkpoint_allow_mode_mismatch == 1 )) && child_args+=(--init-checkpoint-allow-mode-mismatch)
@@ -1108,8 +1152,8 @@ if (( foreground == 0 )); then
     (( allow_count_mismatch == 1 )) && child_args+=(--allow-count-mismatch)
     command_line="$(printf '%q ' "${child_args[@]}")"
     tmux new-session -d -s "${session}" "cd $(printf '%q' "${code_root}") && exec ${command_line} >$(printf '%q' "${launcher_log}") 2>&1"
-    printf '{"event":"glmocr_mthv2_ddp_armed","session":"%s","run_id":"%s","experiment_label":"%s","seed":%s,"smoke":%s,"gpu_ids":"%s","world_size":%s,"steps":%s,"lr_schedule_steps":%s,"learning_rate":%s,"decoder_adaptation":"%s","decoder_lora_rank":%s,"decoder_lora_alpha":%s,"decoder_learning_rate":%s,"warmup_steps":%s,"initial_residual_scale":%s,"gate_freeze_steps":%s,"auxiliary_weight_start":%s,"auxiliary_weight":%s,"auxiliary_ramp_steps":%s,"gradient_accumulation_steps":%s,"global_batch_size":%s,"effective_global_batch_size":%s,"layout_loss_profile":"%s","use_validity_head":%s,"initial_valid_probability":%s,"validity_gating_mode":"%s","validity_use_transport_evidence":%s,"defer_validation":%s,"selection_pending":%s,"test_used_for_selection":false,"log":"%s"}\n' \
-        "${session}" "${run_id}" "${experiment_label}" "${seed}" "$([[ ${smoke} -eq 1 ]] && echo true || echo false)" "${gpu_ids}" "${world_size}" "${max_steps}" "${lr_schedule_steps}" "${learning_rate}" "${decoder_adaptation}" "${decoder_lora_rank}" "${decoder_lora_alpha}" "${decoder_learning_rate}" "${warmup_steps}" "${initial_residual_scale}" "${gate_freeze_steps}" "${auxiliary_weight_start}" "${auxiliary_weight}" "${auxiliary_ramp_steps}" "${gradient_accumulation_steps}" "${world_size}" "$((world_size * gradient_accumulation_steps))" "${layout_loss_profile}" "$([[ ${use_validity_head} -eq 1 ]] && echo true || echo false)" "${initial_valid_probability}" "${validity_gating_mode}" "$([[ ${validity_use_transport_evidence} -eq 1 ]] && echo true || echo false)" "$([[ ${defer_validation} -eq 1 ]] && echo true || echo false)" "$([[ ${defer_validation} -eq 1 ]] && echo true || echo false)" "${launcher_log}"
+    printf '{"event":"glmocr_mthv2_ddp_armed","session":"%s","run_id":"%s","experiment_label":"%s","seed":%s,"smoke":%s,"gpu_ids":"%s","world_size":%s,"steps":%s,"lr_schedule_steps":%s,"learning_rate":%s,"decoder_adaptation":"%s","decoder_lora_rank":%s,"decoder_lora_alpha":%s,"decoder_learning_rate":%s,"warmup_steps":%s,"initial_residual_scale":%s,"gate_freeze_steps":%s,"auxiliary_weight_start":%s,"auxiliary_weight":%s,"auxiliary_ramp_steps":%s,"gradient_accumulation_steps":%s,"global_batch_size":%s,"effective_global_batch_size":%s,"layout_loss_profile":"%s","sem_adapter_mlp":%s,"sem_adapter_hidden":%s,"freeze_layout_branch":%s,"use_validity_head":%s,"initial_valid_probability":%s,"validity_gating_mode":"%s","validity_use_transport_evidence":%s,"defer_validation":%s,"selection_pending":%s,"test_used_for_selection":false,"log":"%s"}\n' \
+        "${session}" "${run_id}" "${experiment_label}" "${seed}" "$([[ ${smoke} -eq 1 ]] && echo true || echo false)" "${gpu_ids}" "${world_size}" "${max_steps}" "${lr_schedule_steps}" "${learning_rate}" "${decoder_adaptation}" "${decoder_lora_rank}" "${decoder_lora_alpha}" "${decoder_learning_rate}" "${warmup_steps}" "${initial_residual_scale}" "${gate_freeze_steps}" "${auxiliary_weight_start}" "${auxiliary_weight}" "${auxiliary_ramp_steps}" "${gradient_accumulation_steps}" "${world_size}" "$((world_size * gradient_accumulation_steps))" "${layout_loss_profile}" "$([[ ${sem_adapter_mlp} -eq 1 ]] && echo true || echo false)" "${sem_adapter_hidden}" "$([[ ${freeze_layout_branch} -eq 1 ]] && echo true || echo false)" "$([[ ${use_validity_head} -eq 1 ]] && echo true || echo false)" "${initial_valid_probability}" "${validity_gating_mode}" "$([[ ${validity_use_transport_evidence} -eq 1 ]] && echo true || echo false)" "$([[ ${defer_validation} -eq 1 ]] && echo true || echo false)" "$([[ ${defer_validation} -eq 1 ]] && echo true || echo false)" "${launcher_log}"
 else
     run_inner
 fi
