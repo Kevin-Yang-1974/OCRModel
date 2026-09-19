@@ -77,6 +77,7 @@ skip_selection=0
 prefix_tokens=0
 prefix_payload="queries"
 prefix_position="front"
+prefix_learning_rate=""
 without_test=0
 defer_validation=0
 session=""
@@ -185,6 +186,7 @@ while [[ $# -gt 0 ]]; do
         --prefix-tokens) prefix_tokens="$2"; shift 2 ;;
         --prefix-payload) prefix_payload="$2"; shift 2 ;;
         --prefix-position) prefix_position="$2"; shift 2 ;;
+        --prefix-learning-rate) prefix_learning_rate="$2"; shift 2 ;;
         --skip-selection) skip_selection=1; shift ;;
         --without-test) without_test=1; shift ;;
         --defer-validation) defer_validation=1; shift ;;
@@ -932,6 +934,7 @@ run_inner() {
         geometry_args+=(--prefix-tokens "${prefix_tokens}")
         geometry_args+=(--prefix-payload "${prefix_payload}")
         geometry_args+=(--prefix-position "${prefix_position}")
+        [[ -z "${prefix_learning_rate}" ]] || geometry_args+=(--prefix-learning-rate "${prefix_learning_rate}")
     fi
     [[ -n "${init_checkpoint_dir}" ]] && method_args+=(--init-checkpoint-dir "${init_checkpoint_dir}")
     [[ -n "${init_checkpoint_override_residual_scale}" ]] && method_args+=(--init-checkpoint-override-residual-scale "${init_checkpoint_override_residual_scale}")

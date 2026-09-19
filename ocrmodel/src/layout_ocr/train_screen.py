@@ -2267,7 +2267,10 @@ def train(
             {
                 "params": list(prefix_parameters),
                 "weight_decay": 0.01,
-                "lr": getattr(args, "decoder_learning_rate", 5e-6),
+                "lr": (
+                    getattr(args, "prefix_learning_rate", None)
+                    or getattr(args, "decoder_learning_rate", 5e-6)
+                ),
                 "group_name": "layout_prefix",
             }
         )
@@ -4262,6 +4265,16 @@ def parse_args() -> argparse.Namespace:
         help=(
             "what the prefix tokens carry: 'queries' is one token per layout query "
             "(per-region), 'global' is the page-level mean broadcast to every slot"
+        ),
+    )
+    parser.add_argument(
+        "--prefix-learning-rate",
+        type=optional_positive_float,
+        default=None,
+        help=(
+            "learning rate for the prefix projection, slot base and oracle encoder. "
+            "They are typically the only modules carrying new signal, so the "
+            "decoder rate leaves a freshly initialised encoder far too small a step"
         ),
     )
     parser.add_argument(
