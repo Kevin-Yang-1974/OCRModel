@@ -746,6 +746,41 @@ def test_enable_reserves_resizes_freezes_and_installs_in_order() -> None:
     assert bridge.prefix_splice is runtime.splice
 
 
+def test_enable_preserves_pre_existing_trainable_parameters() -> None:
+    """The stage-two semantic path must survive the resize.
+
+    ``freeze_layout_branch`` deliberately leaves ``content_gate`` and
+    ``sem_adapter.*`` trainable.  A blanket ``requires_grad_(False)`` after the
+    resize removed them from the optimizer without reporting anything, so the
+    prefix arm trained 0 adapter parameters against a baseline's 4.7M -- a
+    comparison of two different recipes presented as one feature apart.
+    """
+
+    from layout_ocr.prefix_injection import enable_prefix_injection
+
+    hidden = 8
+    model = _FakeModel(vocab=64, hidden=hidden)
+    bridge = _FakeBridge(hidden=hidden)
+    tokenizer = _FakeTokenizer(base=64)
+    for parameter in model.parameters():
+        parameter.requires_grad_(False)
+    # Stand in for the semantic path the caller deliberately left trainable.
+    keep = nn.Parameter(torch.randn(4, 4))
+    model.sem_path = nn.Module()
+    model.sem_path.weight = nn.Parameter(keep.detach().clone())
+    model.sem_path.weight.requires_grad_(True)
+
+    runtime = enable_prefix_injection(
+        model, bridge, tokenizer, token_count=3, payload_mode_="queries"
+    )
+
+    assert model.sem_path.weight.requires_grad, "the semantic path was silently frozen"
+    # The fresh embedding rows are still frozen.
+    assert not model.embed.weight.requires_grad
+    # And the injector trains.
+    assert runtime.injector.projection.weight.requires_grad
+
+
 def test_enable_rejects_a_zero_count() -> None:
     from layout_ocr.prefix_injection import enable_prefix_injection
 

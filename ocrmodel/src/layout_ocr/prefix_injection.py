@@ -609,20 +609,33 @@ def enable_prefix_injection(
 
     Order matters.  ``resize_token_embeddings`` builds a *new* embedding module, so
     the splice must be installed after it or it would hook a discarded module; and
-    it leaves the fresh rows with ``requires_grad=True`` on a model whose
-    parameters were all frozen before the adapter was installed, so the freeze is
-    reapplied before the injector is added.  Without that second step the whole
-    embedding matrix would silently become trainable.
+    the fresh rows arrive trainable, so they are frozen before the injector is
+    added.
+
+    Only the *new* tensors are frozen.  Re-freezing the whole model is the obvious
+    way to write that and it is wrong: the caller has already made deliberate
+    choices about which of the pre-existing parameters train, and freezing them all
+    discards those choices without reporting anything.
     """
 
     if token_count <= 0:
         raise ValueError("enable_prefix_injection requires token_count > 0")
     reserved_ids = reserve_prefix_tokens(tokenizer, token_count)
+    # Which parameters existed, and which of them the caller had left trainable.
+    # ``freeze_layout_branch`` keeps ``content_gate`` and ``sem_adapter.*``
+    # trainable on purpose -- that is the stage-two semantic path, 4.7M parameters
+    # in the current recipe -- so a blanket re-freeze here silently removes them
+    # from the optimizer and confounds the prefix against a baseline that still
+    # trains them.  That happened once: the prefix arm reported
+    # adapter_trainable_parameter_count 0 against the baseline's 4721665.
+    pre_existing = {id(parameter) for parameter in model.parameters()}
     model.resize_token_embeddings(len(tokenizer), mean_resizing=False)
-    # The resize un-freezes the embedding it just built; restore the contract that
-    # only the adapter, LoRA and the injector train.
+    # The resize builds a new embedding whose rows default to trainable.  Only
+    # those new tensors are frozen; everything that existed before keeps exactly
+    # the state the caller set up.
     for parameter in model.parameters():
-        parameter.requires_grad_(False)
+        if id(parameter) not in pre_existing:
+            parameter.requires_grad_(False)
     injector, splice, handle = install_prefix_injection(
         model,
         bridge,
