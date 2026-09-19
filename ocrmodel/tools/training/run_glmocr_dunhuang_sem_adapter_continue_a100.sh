@@ -48,6 +48,13 @@ prefix_position="${GLMOCR_DH_CONTINUE_PREFIX_POSITION:-front}"
 # 为真时生效，否则 generation_mode=loop_recovery 是个空转的名字。改动训练目标，
 # 所以对照臂必须同批重跑。
 natural_loop="${GLMOCR_DH_CONTINUE_NATURAL_LOOP:-0}"
+# The guard and the regulariser are the same flag but not the same thing.  The
+# guard is inference-time and is what makes two arms comparable when scored; the
+# training term additionally runs a ~1500-token free rollout *every step*, which
+# measured 64 steps in 37 minutes against 256 steps in 3.5 -- about 10x the cost,
+# for a term that fired on zero tokens in that run.  So eval is armed by
+# ``natural_loop`` and training only by this second switch.
+natural_loop_train="${GLMOCR_DH_CONTINUE_NATURAL_LOOP_TRAIN:-0}"
 prefix_lr="${GLMOCR_DH_CONTINUE_PREFIX_LR:-}"
 # Fixed by the shared DDP runner.  The parallel-validation summarizer rejects
 # any evaluation whose metadata diverges from the training run on these, so the
