@@ -197,7 +197,7 @@ def test_extend_prefix_side_inputs_rejects_a_batch() -> None:
         extend_prefix_side_inputs(inputs, [40])
 
 
-def test_tail_position_appends_and_keeps_side_inputs_aligned() -> None:
+def test_tail_position_keeps_every_side_input_aligned() -> None:
     """The control that leaves the image tokens' positions untouched."""
 
     inputs = {
@@ -206,11 +206,54 @@ def test_tail_position_appends_and_keeps_side_inputs_aligned() -> None:
         "labels": torch.tensor([[-100, -100, 7]]),
         "mm_token_type_ids": torch.tensor([[1, 1, 0]]),
     }
+    # Two leading -100 labels, so the prompt ends after the second token.
     out = extend_prefix_side_inputs(inputs, [40, 41], position="tail")
-    assert out["input_ids"].tolist() == [[1, 1, 0, 40, 41]]
-    assert out["attention_mask"].shape == (1, 5)
-    assert out["labels"].tolist() == [[-100, -100, 7, -100, -100]]
+    assert out["input_ids"].tolist() == [[1, 1, 40, 41, 0]]
+    assert out["attention_mask"].tolist() == [[1, 1, 1, 1, 1]]
+    assert out["labels"].tolist() == [[-100, -100, -100, -100, 7]]
     assert out["mm_token_type_ids"].tolist() == [[1, 1, 0, 0, 0]]
+
+
+def test_tail_position_inserts_at_the_prompt_boundary_not_the_sequence_end() -> None:
+    """Teacher-forced inputs carry the answer after the prompt.
+
+    Appending would put the reserved rows past the target: they would contribute
+    nothing to the loss and the answer would no longer be the last thing the model
+    sees, which is the property that made ``tail`` untrainable before.
+    """
+
+    inputs = {
+        "input_ids": torch.tensor([[1, 1, 0, 7, 8, 9]]),
+        "attention_mask": torch.ones(1, 6, dtype=torch.long),
+        "labels": torch.tensor([[-100, -100, -100, 7, 8, 9]]),
+        "mm_token_type_ids": torch.tensor([[1, 1, 0, 0, 0, 0]]),
+    }
+    out = extend_prefix_side_inputs(inputs, [40, 41], position="tail")
+    # Inserted after the third token, i.e. at the prompt/target boundary.
+    assert out["input_ids"].tolist() == [[1, 1, 0, 40, 41, 7, 8, 9]]
+    assert out["labels"].tolist() == [[-100, -100, -100, -100, -100, 7, 8, 9]]
+    assert out["mm_token_type_ids"].tolist() == [[1, 1, 0, 0, 0, 0, 0, 0]]
+    # The answer is still the last thing the model sees.
+    assert out["labels"][0, -1].item() == 9
+
+
+def test_tail_position_on_an_all_prompt_sequence_appends() -> None:
+    inputs = {
+        "input_ids": torch.tensor([[1, 2, 3]]),
+        "labels": torch.tensor([[-100, -100, -100]]),
+    }
+    out = extend_prefix_side_inputs(inputs, [40], position="tail")
+    assert out["input_ids"].tolist() == [[1, 2, 3, 40]]
+    assert out["labels"].tolist() == [[-100, -100, -100, -100]]
+
+
+def test_tail_position_on_a_sequence_that_starts_with_a_target() -> None:
+    inputs = {
+        "input_ids": torch.tensor([[7, 8]]),
+        "labels": torch.tensor([[7, 8]]),
+    }
+    out = extend_prefix_side_inputs(inputs, [40], position="tail")
+    assert out["input_ids"].tolist() == [[40, 7, 8]]
 
 
 def test_position_must_be_front_or_tail() -> None:

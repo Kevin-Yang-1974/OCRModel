@@ -177,13 +177,18 @@ def extend_prefix_side_inputs(
     the prompt already receives, so the loss never asks the model to predict a
     reserved id.
 
-    ``position`` places the span at the front of the sequence or at its end, which
-    is a diagnostic rather than a design choice.  Leading text shifts the mrope
-    position of every following token, image tokens included; trailing the prompt
-    leaves the image positions untouched and shifts only the text tail.  The two
-    therefore separate "the vision positions moved" from "there is more attention
-    mass in the sequence", and a 2026-09-19 eval measured the two placements
-    differently, so the distinction is load-bearing rather than cosmetic.
+    ``position`` places the span at the start of the sequence or at the end of the
+    *prompt*.  Leading text shifts the mrope position of every following token,
+    image tokens included; sitting after the prompt leaves the image positions
+    untouched.  A 2026-09-19 eval measured the two differently, so the distinction
+    is load-bearing rather than cosmetic.
+
+    "End of the prompt" rather than "end of the sequence" because the two coincide
+    only for inference inputs.  A teacher-forced sequence carries the answer after
+    the prompt, and appending there would put the reserved rows past the target --
+    they would take no part in the loss and the target would no longer be the last
+    thing the model sees.  The prompt boundary is the leading run of ``-100`` labels,
+    which is exactly what ``prepare_training_inputs`` writes for the prompt.
 
     ``splice_disabled`` inserts the span without letting the hook overwrite it,
     which isolates the cost of *having* K extra positions from the cost of the
@@ -197,50 +202,62 @@ def extend_prefix_side_inputs(
     input_ids = inputs["input_ids"]
     if position == "front":
         extended, prefix = build_prefix_input_ids(input_ids, reserved_ids)
+        if prefix is None:
+            return inputs
+        at = 0
     else:
         prefix = torch.tensor(
             [reserved_ids], dtype=input_ids.dtype, device=input_ids.device
         )
-        extended = torch.cat((input_ids, prefix), dim=1)
-    if prefix is None:
-        return inputs
+        at = _prompt_boundary(inputs)
+        extended = torch.cat((input_ids[:, :at], prefix, input_ids[:, at:]), dim=1)
     width = prefix.shape[1]
     inputs["input_ids"] = extended
     attention_mask = inputs.get("attention_mask")
     if isinstance(attention_mask, Tensor):
-        pad = torch.ones(
+        block = torch.ones(
             (1, width), dtype=attention_mask.dtype, device=attention_mask.device
         )
-        inputs["attention_mask"] = (
-            torch.cat((pad, attention_mask), dim=1)
-            if position == "front"
-            else torch.cat((attention_mask, pad), dim=1)
-        )
+        inputs["attention_mask"] = _insert(attention_mask, at, block)
     labels = inputs.get("labels")
     if isinstance(labels, Tensor):
-        ignore = torch.full(
-            (1, width), -100, dtype=labels.dtype, device=labels.device
-        )
-        inputs["labels"] = (
-            torch.cat((ignore, labels), dim=1)
-            if position == "front"
-            else torch.cat((labels, ignore), dim=1)
-        )
+        # Prompt, so the loss must never ask for it.
+        block = torch.full((1, width), -100, dtype=labels.dtype, device=labels.device)
+        inputs["labels"] = _insert(labels, at, block)
     mm_token_type_ids = inputs.get("mm_token_type_ids")
     if isinstance(mm_token_type_ids, Tensor):
         # ``get_rope_index`` groups this stream to place vision tokens, with the
         # documented convention text=0, image=1, video=2.  The prefix is text, so
-        # it is filled with text rather than copied from the first real token --
-        # copying would be wrong the moment a template leads with an image.
-        text_type = torch.zeros(
+        # it is filled with text rather than copied from a neighbouring token --
+        # copying would be wrong the moment the insertion point sits inside an
+        # image span.
+        block = torch.zeros(
             (1, width), dtype=mm_token_type_ids.dtype, device=mm_token_type_ids.device
         )
-        inputs["mm_token_type_ids"] = (
-            torch.cat((text_type, mm_token_type_ids), dim=1)
-            if position == "front"
-            else torch.cat((mm_token_type_ids, text_type), dim=1)
-        )
+        inputs["mm_token_type_ids"] = _insert(mm_token_type_ids, at, block)
     return inputs
+
+
+def _prompt_boundary(inputs: dict[str, Any]) -> int:
+    """Index where the prompt ends and the answer begins.
+
+    ``prepare_training_inputs`` masks the prompt with ``-100``, so the boundary is
+    the length of the leading run of ``-100``.  Without labels -- inference inputs,
+    which are prompt-only -- the whole sequence is prompt.
+    """
+
+    labels = inputs.get("labels")
+    if not isinstance(labels, Tensor):
+        return int(inputs["input_ids"].shape[1])
+    # Count the leading run of -100: cumprod stays 1 exactly while every position
+    # so far is masked, so its sum is the boundary and it is 0 when the first
+    # position is already a target.
+    is_prompt = (labels == -100).to(torch.int32)
+    return int(is_prompt.cumprod(dim=1).sum().item())
+
+
+def _insert(x: Tensor, at: int, block: Tensor) -> Tensor:
+    return torch.cat((x[:, :at], block, x[:, at:]), dim=1)
 
 
 class PrefixLogitsMask:

@@ -2202,15 +2202,6 @@ def train(
     # bridge rather than passed in so the data path cannot be wired to one prefix
     # runtime while the model carries another.
     prefix_runtime = getattr(bridge, "prefix_runtime", None)
-    if prefix_runtime is not None and getattr(args, "prefix_position", "front") == "tail":
-        # A trailing span sits after the assistant target in a teacher-forced
-        # sequence, so its ``-100`` labels land past the end of the loss window and
-        # the target would no longer be the last thing the model sees.  The tail
-        # placement exists to measure the cost of the span in eval; training with
-        # it would be measuring something else.
-        raise RuntimeError(
-            "prefix position 'tail' is an eval-only control; train with 'front'"
-        )
     if prefix_runtime is not None and getattr(args, "free_generation_loss", False):
         # Free generation runs its own greedy rollout forward before the
         # differentiable one, and the rollout builds its inputs from a prompt-only
