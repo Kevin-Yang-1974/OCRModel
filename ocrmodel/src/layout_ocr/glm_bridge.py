@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from typing import Any
 
 import torch
@@ -25,6 +26,54 @@ def patch_grid_positions(grid_thw: Tensor, spatial_merge_size: int) -> Tensor:
     cols = cols / merged_width
     yy, xx = torch.meshgrid(rows, cols, indexing="ij")
     return torch.stack((xx.reshape(-1), yy.reshape(-1)), dim=-1).unsqueeze(0)
+
+
+def _probe_merger_attenuation(
+    path: str,
+    hidden_state: Tensor,
+    merged_tokens: Tensor,
+    base_merger: nn.Module,
+) -> None:
+    """Measure how much of the write-back survives the visual merger.
+
+    The adapter writes into the *pre-merger* hidden state, so whatever the layout
+    branch contributes still has to pass GLM-OCR's patch merger (neighbour
+    concatenation plus a learned projection) before the language model can see
+    it.  A perturbation of relative size ``in_rel`` can leave the merger as one of
+    relative size ``out_rel``; ``attenuation = out_rel / in_rel`` is the transfer
+    factor of the fusion seam.
+
+    If the merger attenuates the write-back by orders of magnitude then the
+    injection point, not the layout content, is what bounds the decoder's access
+    to layout information -- and no re-parameterisation of the context at the same
+    seam can fix it.  This is a forward-only, eval-only measurement; it runs an
+    extra no-grad merger call, so it stays behind its own env var.
+    """
+
+    import json
+
+    with torch.no_grad():
+        plain = base_merger(hidden_state)
+        perturbed = base_merger(merged_tokens)
+        plain = plain.float()
+        perturbed = perturbed.float()
+        in_rel = float(
+            (merged_tokens.float() - hidden_state.float()).norm(dim=-1).mean()
+            / hidden_state.float().norm(dim=-1).mean().clamp_min(1e-12)
+        )
+        out_rel = float(
+            (perturbed - plain).norm(dim=-1).mean()
+            / plain.norm(dim=-1).mean().clamp_min(1e-12)
+        )
+        record = {
+            "in_rel": in_rel,
+            "out_rel": out_rel,
+            "attenuation": None if in_rel <= 0 else out_rel / in_rel,
+            "pre_tokens": int(hidden_state.shape[0]),
+            "post_tokens": int(plain.shape[0]),
+        }
+    with open(path, "a", encoding="utf-8") as handle:
+        handle.write(json.dumps(record) + chr(10))
 
 
 class LayoutAwarePatchMerger(nn.Module):
@@ -57,6 +106,10 @@ class LayoutAwarePatchMerger(nn.Module):
         self._region_targets: dict[str, Tensor] | None = None
         self._region_pointer_mask: bool | None = None
         self._region_spatial_penalty: bool | None = None
+        # Set by ``install_prefix_injection``.  When present the branch output is
+        # also published as decoder prefix tokens; the write-back is left alone,
+        # so the two routes can be run together or one at a time.
+        self.prefix_splice: Any | None = None
 
     def set_grid_thw(self, grid_thw: Tensor) -> None:
         self._grid_thw = grid_thw
@@ -103,7 +156,19 @@ class LayoutAwarePatchMerger(nn.Module):
             )
         self.last_output = output
         self.last_patch_positions = positions
-        adapted = output.merged_tokens.squeeze(0).to(hidden_state.dtype)
+        if self.prefix_splice is not None:
+            from .prefix_injection import publish_prefix_payload
+
+            # Published here rather than read by the text-model hook because this
+            # is the only place the branch output exists, and ``GlmOcrModel``
+            # reaches the text model in the same forward -- see the module
+            # docstring of ``prefix_injection`` for why that ordering is what
+            # makes a single vision pass sufficient.
+            publish_prefix_payload(self.prefix_splice, output)
+        # Keep the un-anchored write-back for the attenuation probe: the graph
+        # anchor added below is a DDP bookkeeping term with no forward meaning.
+        raw_merged = output.merged_tokens.squeeze(0).to(hidden_state.dtype)
+        adapted = raw_merged
         self.last_visual_tokens = hidden_state.detach()
         self.last_residual = (output.merged_tokens.squeeze(0).float() - hidden_state.float()).detach()
         self.last_writeback_residual = (adapted.float() - hidden_state.float()).detach()
@@ -154,6 +219,11 @@ class LayoutAwarePatchMerger(nn.Module):
             graph_anchor = term if graph_anchor is None else graph_anchor + term
         if graph_anchor is not None:
             adapted = adapted + graph_anchor.to(dtype=adapted.dtype)
+        probe_path = os.environ.get("GLMOCR_MERGER_ATTENUATION")
+        if probe_path:
+            _probe_merger_attenuation(
+                probe_path, hidden_state, raw_merged, self.base_merger
+            )
         return self.base_merger(adapted)
 
 
@@ -177,6 +247,8 @@ def install_layout_adapter(
     region_spatial_iou_threshold: float = 0.8,
     box_head_mlp: bool = False,
     box_head_hidden: int = 0,
+    sem_adapter_mlp: bool = False,
+    sem_adapter_hidden: int = 0,
     query_refine_layers: int = 0,
 ) -> LayoutAwarePatchMerger:
     """Install the adapter at the verified Transformers GLM-OCR pre-merger seam."""
@@ -205,6 +277,8 @@ def install_layout_adapter(
         region_spatial_iou_threshold=region_spatial_iou_threshold,
         box_head_mlp=box_head_mlp,
         box_head_hidden=box_head_hidden,
+        sem_adapter_mlp=sem_adapter_mlp,
+        sem_adapter_hidden=sem_adapter_hidden,
         query_refine_layers=query_refine_layers,
     )
     adapter = PreMergeLayoutAdapter(config).to(next(model.parameters()).device)

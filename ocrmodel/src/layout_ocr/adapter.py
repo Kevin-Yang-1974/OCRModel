@@ -32,8 +32,9 @@ class LayoutAdapterOutput:
     region_output: RegionDecoderOutput | None = None
 
 
-def _probe_layout_writeback(path: str, token_weights: Tensor, layout_context: Tensor,
-                            visual_tokens: Tensor) -> None:
+def _probe_layout_writeback(path: str, token_weights: Tensor | None, layout_context: Tensor,
+                            visual_tokens: Tensor, residual_scale: Tensor | None = None,
+                            intervention: str = "full") -> None:
     """Diagnostic hook: how much spatial information the write-back actually carries.
 
     The residual reaches the decoder only as ``layout_context[p]``, a per-patch
@@ -42,24 +43,41 @@ def _probe_layout_writeback(path: str, token_weights: Tensor, layout_context: Te
     put spatial or reading-order information into it.  ``lc_flat`` <= ~0.1 is that
     degenerate regime; ``vt_flat`` is the same statistic for the visual tokens, so a
     comparison is against a representation that is known to be patch-specific.
+
+    ``lc_norm_over_vt`` is the norm of the *context*, not of the injected residual.
+    The write-back is ``alpha * layout_context`` with ``alpha`` clipped to
+    ``max_residual_scale`` (0.03 in every current entry point), so the perturbation
+    that actually reaches the merger is ``inj_over_vt = alpha * lc_norm_over_vt`` --
+    roughly 30x smaller than ``lc_norm_over_vt`` at the cap.  Reporting both keeps
+    "the amplitude is sufficient" from being read off the wrong number.
     """
+
     import json, os
+
+    from .writeback_intervention import flatness as _flatness
 
     with torch.no_grad():
         def flatness(x: Tensor) -> float:
-            x = x.float()
-            centred = x - x.mean(dim=1, keepdim=True)
-            return float((centred.norm(dim=-1).mean() / x.norm(dim=-1).mean().clamp_min(1e-12)))
+            return float(_flatness(x))
 
+        visual_norm = visual_tokens.float().norm(dim=-1).mean().clamp_min(1e-12)
+        context_norm = layout_context.float().norm(dim=-1).mean()
+        mean = layout_context.float().mean(dim=1, keepdim=True)
+        scale = None if residual_scale is None else float(residual_scale.detach())
         record = {
             "patches": int(visual_tokens.shape[1]),
             "lc_flat": flatness(layout_context),
             "vt_flat": flatness(visual_tokens),
             "tw_flat": float(token_weights.float().std(dim=1).mean()) if token_weights is not None else None,
-            "lc_norm_over_vt": float(
-                layout_context.float().norm(dim=-1).mean()
-                / visual_tokens.float().norm(dim=-1).mean().clamp_min(1e-12)
+            "lc_norm_over_vt": float(context_norm / visual_norm),
+            "lc_global_share": float(mean.norm(dim=-1).mean() / context_norm.clamp_min(1e-12)),
+            "lc_spatial_share": float(
+                (layout_context.float() - mean).norm(dim=-1).mean() / context_norm.clamp_min(1e-12)
             ),
+            "residual_scale": scale,
+            # The number the "amplitude is sufficient" claim depends on.
+            "inj_over_vt": None if scale is None else float(scale * context_norm / visual_norm),
+            "intervention": intervention,
         }
     with open(path, "a", encoding="utf-8") as handle:
         handle.write(json.dumps(record) + chr(10))
@@ -94,6 +112,16 @@ class PreMergeLayoutAdapter(nn.Module):
             )
             nn.init.zeros_(self.geom_adapter[-1].weight)
             nn.init.zeros_(self.geom_adapter[-1].bias)
+        self.sem_adapter: nn.Sequential | None = None
+        if config.sem_adapter_mlp:
+            hidden = config.sem_adapter_hidden or d
+            self.sem_adapter = nn.Sequential(
+                nn.Linear(d, hidden),
+                nn.GELU(),
+                nn.Linear(hidden, d),
+            )
+            nn.init.zeros_(self.sem_adapter[-1].weight)
+            nn.init.zeros_(self.sem_adapter[-1].bias)
         self.query_refine: nn.ModuleList | None = None
         if config.query_refine_layers > 0:
             self.query_refine = nn.ModuleList(
@@ -183,7 +211,7 @@ class PreMergeLayoutAdapter(nn.Module):
     def _raw_mass_context(
         self,
         transport: Tensor,
-        queries: Tensor,
+        sem: Tensor,
         validity_probs: Tensor,
     ) -> tuple[Tensor, Tensor]:
         """Fuse queries while retaining raw token mass for validity gating."""
@@ -194,7 +222,7 @@ class PreMergeLayoutAdapter(nn.Module):
         )
         weighted_queries = raw_token_weights * validity_probs.unsqueeze(1)
         valid_coverage = weighted_queries.sum(dim=-1)
-        layout_context = self.content_norm(torch.matmul(weighted_queries, queries))
+        layout_context = self.content_norm(torch.matmul(weighted_queries, sem))
         return layout_context * valid_coverage.unsqueeze(-1), valid_coverage
 
     def _region_context(
@@ -229,6 +257,9 @@ class PreMergeLayoutAdapter(nn.Module):
         if visual_tokens.ndim != 3:
             raise ValueError("visual_tokens must have shape [batch, tokens, hidden]")
         queries = self._queries(visual_tokens)
+        sem = queries
+        if self.sem_adapter is not None:
+            sem = queries + self.sem_adapter(queries)
         geom = queries
         if self.geom_adapter is not None:
             geom = queries + self.geom_adapter(queries)
@@ -249,6 +280,10 @@ class PreMergeLayoutAdapter(nn.Module):
             )
         validity_logits = None
         validity_probs = None
+        # ``raw_mass`` gating fuses inside ``_raw_mass_context`` and never builds
+        # ``token_weights``.  Bind it here so the write-back probe below cannot
+        # raise NameError in that mode.
+        token_weights: Tensor | None = None
 
         if self.config.mode == "content_only":
             transport = None
@@ -301,7 +336,7 @@ class PreMergeLayoutAdapter(nn.Module):
                     # re-normalizer: p_q == 0 removes query q exactly.
                     layout_context, valid_coverage = self._raw_mass_context(
                         transport,
-                        queries,
+                        sem,
                         validity_probs,
                     )
                 else:
@@ -310,14 +345,14 @@ class PreMergeLayoutAdapter(nn.Module):
                     token_weights = token_weights / token_weights.sum(
                         dim=-1, keepdim=True
                     ).clamp_min(1e-12)
-                    layout_context = self.content_norm(torch.matmul(token_weights, queries))
+                    layout_context = self.content_norm(torch.matmul(token_weights, sem))
                     layout_context = layout_context * valid_coverage.unsqueeze(-1)
             else:
                 token_weights = transport.transpose(1, 2)
                 token_weights = token_weights / token_weights.sum(
                     dim=-1, keepdim=True
                 ).clamp_min(1e-12)
-                layout_context = self.content_norm(torch.matmul(token_weights, queries))
+                layout_context = self.content_norm(torch.matmul(token_weights, sem))
             # Keep the zero-initialized gate an exact identity path.  This makes
             # the attention/geometry comparison attributable to the learned
             # layout context instead of an unconditional extra LayerNorm.
@@ -326,13 +361,24 @@ class PreMergeLayoutAdapter(nn.Module):
                     region_output, patch_positions, visual_tokens.shape[1]
                 )
             import os as _os
+            from .writeback_intervention import apply_intervention, intervention_mode
+
+            # Attribution arms replace the context before it is scaled, so every
+            # arm shares one code path and one residual magnitude.  Eval-only:
+            # applying an arm during training would train against a corrupted
+            # signal, and the mode is recorded in the probe so an artifact
+            # cannot be mistaken for a ``full`` run after the fact.
+            _intervention = intervention_mode()
+            if _intervention != "full":
+                layout_context = apply_intervention(layout_context, _intervention)
+            _scale = self.effective_residual_scale()
             _probe_path = _os.environ.get("GLMOCR_ADAPTER_PROBE")
             if _probe_path:
                 _probe_layout_writeback(
                     _probe_path, token_weights,
-                    layout_context, visual_tokens
+                    layout_context, visual_tokens, _scale, _intervention,
                 )
-            merged = visual_tokens + self.effective_residual_scale() * layout_context
+            merged = visual_tokens + _scale * layout_context
 
         return LayoutAdapterOutput(
             merged_tokens=merged,

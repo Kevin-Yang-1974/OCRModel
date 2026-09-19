@@ -117,6 +117,10 @@ def test_layout_loss_profiles_are_explicit() -> None:
     assert iou_consistent.box == 1.0
     assert iou_consistent.giou == 2.0
     assert iou_consistent.assignment == 1.0
+    iou_consistent_giou10x = layout_loss_config("iou_consistent_giou10x")
+    assert iou_consistent_giou10x.box == 1.0
+    assert iou_consistent_giou10x.giou == 20.0
+    assert iou_consistent_giou10x.assignment == 1.0
 
 
 def test_validity_loss_uses_hungarian_query_mask() -> None:

@@ -15,6 +15,7 @@ from layout_ocr.train_screen import (
     configure_deterministic_execution,
     diagnostic_triage,
     auxiliary_weight_at_step,
+    assert_frozen_parameters_excluded,
     learning_rate_at_step,
     load_adapter_checkpoint,
     module_state_matches,
@@ -153,6 +154,96 @@ def test_checkpoint_reload_preserves_capped_gate_semantics(tmp_path: Path) -> No
 
     torch.testing.assert_close(actual, expected)
     assert float(restored.effective_residual_scale().detach()) == pytest.approx(0.03)
+
+
+def test_checkpoint_reload_warm_starts_gate_within_active_cap(tmp_path: Path) -> None:
+    config = LayoutAdapterConfig(
+        hidden_size=8,
+        num_queries=2,
+        num_heads=2,
+        mode="attention",
+        max_residual_scale=0.03,
+    )
+    source = PreMergeLayoutAdapter(config).eval()
+    bridge = LayoutAwarePatchMerger(nn.Identity(), source, spatial_merge_size=1)
+    save_adapter_checkpoint(tmp_path, bridge, step=1)
+
+    restored = PreMergeLayoutAdapter(config).eval()
+    restored_bridge = LayoutAwarePatchMerger(nn.Identity(), restored, spatial_merge_size=1)
+    load_adapter_checkpoint(tmp_path, restored_bridge, override_initial_residual_scale=0.01)
+
+    assert float(restored.effective_residual_scale().detach()) == pytest.approx(0.01)
+    assert float(restored.content_gate.detach()) == pytest.approx(
+        torch.atanh(torch.tensor(0.01)).item()
+    )
+    with pytest.raises(ValueError, match="max_residual_scale"):
+        load_adapter_checkpoint(tmp_path, restored_bridge, override_initial_residual_scale=0.1)
+
+
+def test_legacy_layout_checkpoint_upgrades_to_identity_semantic_adapter(
+    tmp_path: Path,
+) -> None:
+    legacy_config = LayoutAdapterConfig(
+        hidden_size=8,
+        num_queries=2,
+        num_heads=2,
+        mode="attention",
+    )
+    source = PreMergeLayoutAdapter(legacy_config).eval()
+    source_bridge = LayoutAwarePatchMerger(nn.Identity(), source, spatial_merge_size=1)
+    save_adapter_checkpoint(tmp_path, source_bridge, step=1)
+
+    recorded = json.loads((tmp_path / "adapter_config.json").read_text(encoding="utf-8"))
+    recorded.pop("sem_adapter_mlp")
+    recorded.pop("sem_adapter_hidden")
+    (tmp_path / "adapter_config.json").write_text(
+        json.dumps(recorded), encoding="utf-8"
+    )
+
+    upgraded_config = LayoutAdapterConfig(
+        hidden_size=8,
+        num_queries=2,
+        num_heads=2,
+        mode="attention",
+        sem_adapter_mlp=True,
+    )
+    restored = PreMergeLayoutAdapter(upgraded_config).eval()
+    restored_bridge = LayoutAwarePatchMerger(nn.Identity(), restored, spatial_merge_size=1)
+    state = load_adapter_checkpoint(tmp_path, restored_bridge)
+
+    assert not any(key.startswith("sem_adapter.") for key in state)
+    assert restored.sem_adapter is not None
+    torch.testing.assert_close(
+        restored.sem_adapter[-1].weight,
+        torch.zeros_like(restored.sem_adapter[-1].weight),
+    )
+    torch.testing.assert_close(
+        restored.sem_adapter[-1].bias,
+        torch.zeros_like(restored.sem_adapter[-1].bias),
+    )
+
+
+def test_optimizer_guard_rejects_frozen_adapter_parameters() -> None:
+    module = PreMergeLayoutAdapter(
+        LayoutAdapterConfig(
+            hidden_size=8,
+            num_queries=2,
+            num_heads=2,
+            mode="geometry",
+            sem_adapter_mlp=True,
+        )
+    )
+    module.query_seed.requires_grad_(False)
+    optimizer = torch.optim.AdamW(module.parameters(), lr=1e-5)
+
+    with pytest.raises(RuntimeError, match="Frozen parameters incorrectly added"):
+        assert_frozen_parameters_excluded(module, optimizer)
+
+    valid_optimizer = torch.optim.AdamW(
+        [parameter for parameter in module.parameters() if parameter.requires_grad],
+        lr=1e-5,
+    )
+    assert_frozen_parameters_excluded(module, valid_optimizer) is None
 
 
 def test_eval_only_state_guard_detects_updates() -> None:

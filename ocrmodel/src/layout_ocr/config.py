@@ -16,6 +16,8 @@ LayoutLossProfile = Literal[
     "history_box_equalized_v1",
     "history_box_equalized_v2",
     "iou_consistent",
+    "iou_consistent_giou10x",
+    "iou_consistent_giou20x",
 ]
 QueryAssignment = Literal["fixed_order", "hungarian"]
 
@@ -47,6 +49,8 @@ class LayoutAdapterConfig:
     region_spatial_iou_threshold: float = 0.8
     box_head_mlp: bool = False
     box_head_hidden: int = 0
+    sem_adapter_mlp: bool = False
+    sem_adapter_hidden: int = 0
     query_refine_layers: int = 0
 
     def __post_init__(self) -> None:
@@ -76,6 +80,8 @@ class LayoutAdapterConfig:
             raise ValueError("invalid region spatial duplicate penalty")
         if self.box_head_hidden < 0:
             raise ValueError("box_head_hidden must be non-negative")
+        if self.sem_adapter_hidden < 0:
+            raise ValueError("sem_adapter_hidden must be non-negative")
         if self.query_refine_layers < 0:
             raise ValueError("query_refine_layers must be non-negative")
         if (
@@ -135,6 +141,22 @@ def layout_loss_config(profile: str) -> LayoutLossConfig:
         return LayoutLossConfig(
             box=1.0,
             giou=2.0,
+            assignment=1.0,
+            order=0.5,
+            direction=0.5,
+        )
+    if profile == "iou_consistent_giou10x":
+        return LayoutLossConfig(
+            box=1.0,
+            giou=20.0,
+            assignment=1.0,
+            order=0.5,
+            direction=0.5,
+        )
+    if profile == "iou_consistent_giou20x":
+        return LayoutLossConfig(
+            box=1.0,
+            giou=40.0,
             assignment=1.0,
             order=0.5,
             direction=0.5,

@@ -2,6 +2,7 @@ import pytest
 import torch
 
 from layout_ocr import LayoutAdapterConfig, PreMergeLayoutAdapter
+from layout_ocr.train_screen import freeze_layout_branch
 
 
 @pytest.mark.parametrize("mode", ["content_only", "attention", "geometry", "layout_ot"])
@@ -45,6 +46,93 @@ def test_zero_gate_preserves_visual_tokens_exactly() -> None:
     tokens = torch.randn(1, 4, 8)
     output = module(tokens, torch.rand(1, 4, 2))
     torch.testing.assert_close(output.merged_tokens, tokens, atol=0.0, rtol=0.0)
+
+
+def test_zero_initialized_sem_adapter_matches_legacy_fusion() -> None:
+    torch.manual_seed(13)
+    base_config = LayoutAdapterConfig(
+        hidden_size=8,
+        num_queries=2,
+        num_heads=2,
+        mode="geometry",
+        max_residual_scale=0.03,
+        initial_residual_scale=0.01,
+    )
+    sem_config = LayoutAdapterConfig(
+        hidden_size=8,
+        num_queries=2,
+        num_heads=2,
+        mode="geometry",
+        max_residual_scale=0.03,
+        initial_residual_scale=0.01,
+        sem_adapter_mlp=True,
+    )
+    base = PreMergeLayoutAdapter(base_config).eval()
+    semantic = PreMergeLayoutAdapter(sem_config).eval()
+    incompatible = semantic.load_state_dict(base.state_dict(), strict=False)
+    assert set(incompatible.missing_keys) == {
+        "sem_adapter.0.weight",
+        "sem_adapter.0.bias",
+        "sem_adapter.2.weight",
+        "sem_adapter.2.bias",
+    }
+
+    tokens = torch.randn(1, 5, 8)
+    positions = torch.rand(1, 5, 2)
+    base_output = base(tokens, positions)
+    semantic_output = semantic(tokens, positions)
+    torch.testing.assert_close(semantic_output.merged_tokens, base_output.merged_tokens)
+    torch.testing.assert_close(semantic_output.layout_queries, base_output.layout_queries)
+    torch.testing.assert_close(semantic_output.boxes, base_output.boxes)
+    torch.testing.assert_close(semantic_output.transport, base_output.transport)
+
+
+def test_frozen_layout_branch_updates_only_semantic_adapter_and_gate() -> None:
+    torch.manual_seed(17)
+    module = PreMergeLayoutAdapter(
+        LayoutAdapterConfig(
+            hidden_size=8,
+            num_queries=2,
+            num_heads=2,
+            mode="geometry",
+            box_head_mlp=True,
+            sem_adapter_mlp=True,
+            sem_adapter_hidden=4,
+            max_residual_scale=0.03,
+            initial_residual_scale=0.01,
+        )
+    )
+    freeze_layout_branch(module)
+    trainable = {
+        name for name, parameter in module.named_parameters() if parameter.requires_grad
+    }
+    assert trainable == {
+        "sem_adapter.0.weight",
+        "sem_adapter.0.bias",
+        "sem_adapter.2.weight",
+        "sem_adapter.2.bias",
+        "content_gate",
+    }
+    before = {
+        name: parameter.detach().clone() for name, parameter in module.named_parameters()
+    }
+    optimizer = torch.optim.SGD(
+        [parameter for parameter in module.parameters() if parameter.requires_grad],
+        lr=0.1,
+    )
+    output = module(torch.randn(1, 6, 8), torch.rand(1, 6, 2))
+    output.merged_tokens.square().mean().backward()
+    assert module.sem_adapter is not None
+    assert module.sem_adapter[-1].weight.grad is not None
+    assert module.query_seed.grad is None
+    assert module.geom_adapter is not None
+    assert module.geom_adapter[0].weight.grad is None
+    optimizer.step()
+
+    assert not torch.equal(module.sem_adapter[-1].weight.detach(), before["sem_adapter.2.weight"])
+    for name, parameter in module.named_parameters():
+        if not name.startswith("sem_adapter.") and name != "content_gate":
+            torch.testing.assert_close(parameter.detach(), before[name])
 
 
 def test_initial_residual_scale_warm_starts_nonzero_fusion() -> None:

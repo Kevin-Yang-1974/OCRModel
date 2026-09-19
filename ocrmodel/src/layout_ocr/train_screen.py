@@ -1760,6 +1760,11 @@ def load_adapter_checkpoint(
         # checkpoint can be upgraded to the new zero-initialized modules.
         recorded.setdefault("box_head_mlp", False)
         recorded.setdefault("box_head_hidden", 0)
+        # Semantic fusion is a one-way legacy -> upgraded transition: old
+        # layout checkpoints have no semantic adapter tensors and start it at
+        # the exact identity mapping.
+        recorded.setdefault("sem_adapter_mlp", False)
+        recorded.setdefault("sem_adapter_hidden", 0)
         recorded.setdefault("query_refine_layers", 0)
         comparable_recorded = dict(recorded)
         comparable_expected = dict(expected)
@@ -1768,6 +1773,8 @@ def load_adapter_checkpoint(
         for key, legacy_value in {
             "box_head_mlp": False,
             "box_head_hidden": 0,
+            "sem_adapter_mlp": False,
+            "sem_adapter_hidden": 0,
             "query_refine_layers": 0,
         }.items():
             if comparable_recorded[key] == legacy_value:
@@ -1811,8 +1818,31 @@ def load_adapter_checkpoint(
     if override_initial_residual_scale is not None:
         if not -1.0 < override_initial_residual_scale < 1.0:
             raise ValueError("override_initial_residual_scale must be strictly between -1 and 1")
+        if (
+            adapter.config.max_residual_scale is not None
+            and abs(override_initial_residual_scale) > adapter.config.max_residual_scale
+        ):
+            raise ValueError(
+                "override_initial_residual_scale must not exceed the checkpoint's "
+                f"max_residual_scale ({adapter.config.max_residual_scale})"
+            )
         with torch.no_grad():
             adapter.content_gate.fill_(math.atanh(override_initial_residual_scale))
+        print(
+            json.dumps(
+                {
+                    "event": "content_gate_warm_started",
+                    "requested_scale": override_initial_residual_scale,
+                    "raw_content_gate": float(adapter.content_gate.detach()),
+                    "effective_residual_scale": float(
+                        adapter.effective_residual_scale().detach()
+                    ),
+                    "max_residual_scale": adapter.config.max_residual_scale,
+                },
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+        )
     return state
 
 
@@ -1934,6 +1964,41 @@ def configure_processor(processor: Any, max_pixels: int) -> None:
     processor.image_processor.size = size
 
 
+def freeze_layout_branch(adapter: torch.nn.Module) -> None:
+    """Freeze every adapter parameter except the stage-two semantic path."""
+
+    adapter = unwrap_module(adapter)
+    if getattr(adapter, "sem_adapter", None) is None:
+        raise ValueError("--freeze-layout-branch requires --sem-adapter-mlp")
+    for name, parameter in adapter.named_parameters():
+        if name == "content_gate" or name.startswith("sem_adapter."):
+            continue
+        parameter.requires_grad_(False)
+
+
+def assert_frozen_parameters_excluded(
+    adapter: torch.nn.Module, optimizer: torch.optim.Optimizer
+) -> None:
+    """Fail fast if a frozen adapter parameter leaked into AdamW."""
+
+    adapter = unwrap_module(adapter)
+    optimizer_parameter_ids = {
+        id(parameter)
+        for parameter_group in optimizer.param_groups
+        for parameter in parameter_group["params"]
+    }
+    frozen_in_optimizer = [
+        name
+        for name, parameter in adapter.named_parameters()
+        if not parameter.requires_grad and id(parameter) in optimizer_parameter_ids
+    ]
+    if frozen_in_optimizer:
+        raise RuntimeError(
+            "Frozen parameters incorrectly added to optimizer: "
+            f"{frozen_in_optimizer}"
+        )
+
+
 def load_model(args: argparse.Namespace, device: torch.device) -> tuple[Any, Any, LayoutAwarePatchMerger]:
     from transformers import AutoModelForImageTextToText, AutoProcessor
 
@@ -1976,6 +2041,8 @@ def load_model(args: argparse.Namespace, device: torch.device) -> tuple[Any, Any
         region_spatial_iou_threshold=getattr(args, "region_spatial_iou_threshold", 0.8),
         box_head_mlp=getattr(args, "box_head_mlp", False),
         box_head_hidden=getattr(args, "box_head_hidden", 0),
+        sem_adapter_mlp=getattr(args, "sem_adapter_mlp", False),
+        sem_adapter_hidden=getattr(args, "sem_adapter_hidden", 0),
         query_refine_layers=getattr(args, "query_refine_layers", 0),
     )
     model.config.use_cache = False
@@ -1997,6 +2064,8 @@ def train(
     )
     model_module = unwrap_module(model)
     adapter_module = unwrap_module(bridge.adapter)
+    if bool(getattr(args, "freeze_layout_branch", False)):
+        freeze_layout_branch(adapter_module)
     gate_parameter = getattr(adapter_module, "content_gate", None)
     adapter_parameters = tuple(adapter_module.parameters())
     lora_parameters = tuple(iter_lora_parameters(model_module))
@@ -2004,14 +2073,16 @@ def train(
     optimizer_parameters = [
         parameter
         for parameter in adapter_parameters
-        if parameter is not gate_parameter and id(parameter) not in lora_parameter_ids
+        if parameter.requires_grad
+        and parameter is not gate_parameter
+        and id(parameter) not in lora_parameter_ids
     ]
     parameter_groups: list[dict[str, Any]] = []
     if optimizer_parameters:
         parameter_groups.append(
             {"params": optimizer_parameters, "weight_decay": 0.01, "group_name": "adapter"}
         )
-    if gate_parameter is not None:
+    if gate_parameter is not None and gate_parameter.requires_grad:
         # A frozen gate is held exactly at its configured warm-start value;
         # decoupled weight decay must not move it while its gradient is zeroed.
         parameter_groups.append(
@@ -2047,6 +2118,8 @@ def train(
     parameter_report = trainable_parameter_report(model_module)
     lora_report = decoder_lora_finite_report(model_module)
     optimizer = torch.optim.AdamW(parameter_groups, lr=args.learning_rate)
+    if bool(getattr(args, "freeze_layout_branch", False)):
+        assert_frozen_parameters_excluded(adapter_module, optimizer)
     loss_weights = layout_loss_config(args.layout_loss_profile)
     lr_schedule_steps = args.lr_schedule_steps or args.max_steps
     accumulation_steps = args.gradient_accumulation_steps
@@ -3154,6 +3227,9 @@ def train(
         "checkpoint_steps": checkpoint_steps,
         "checkpoint_health": checkpoint_health,
         "diagnostic_train": diagnostic_train,
+        "sem_adapter_mlp": bool(getattr(args, "sem_adapter_mlp", False)),
+        "sem_adapter_hidden": int(getattr(args, "sem_adapter_hidden", 0)),
+        "freeze_layout_branch": bool(getattr(args, "freeze_layout_branch", False)),
         "layout_only": layout_only,
         "lr_schedule_steps": lr_schedule_steps,
         "auxiliary_weight_start": auxiliary_weight_start,
@@ -3891,6 +3967,17 @@ def parse_args() -> argparse.Namespace:
         help="use the zero-initialized residual MLP before layout geometry heads",
     )
     parser.add_argument("--box-head-hidden", type=int, default=0)
+    parser.add_argument(
+        "--sem-adapter-mlp",
+        action="store_true",
+        help="add the independently trainable semantic residual adapter for OCR fusion",
+    )
+    parser.add_argument("--sem-adapter-hidden", type=int, default=0)
+    parser.add_argument(
+        "--freeze-layout-branch",
+        action="store_true",
+        help="freeze the layout branch and train only sem_adapter, content_gate, and decoder LoRA",
+    )
     parser.add_argument("--query-refine-layers", type=int, default=0)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
@@ -3912,9 +3999,14 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--init-checkpoint-override-residual-scale",
+        "--warm-start-content-gate",
+        dest="init_checkpoint_override_residual_scale",
         type=float,
         default=None,
-        help="override only the loaded checkpoint content-gate scale",
+        help=(
+            "override only the loaded checkpoint content-gate scale; "
+            "--warm-start-content-gate is the stage-two alias"
+        ),
     )
     parser.add_argument(
         "--init-checkpoint-allow-mode-mismatch",
@@ -3972,6 +4064,8 @@ def parse_args() -> argparse.Namespace:
             "history_box_equalized_v1",
             "history_box_equalized_v2",
             "iou_consistent",
+            "iou_consistent_giou10x",
+            "iou_consistent_giou20x",
         ],
         default="full",
     )
@@ -4198,6 +4292,13 @@ def main() -> None:
             )
         ):
             raise ValueError("--layout-only cannot enable text or rollout objectives")
+    if args.freeze_layout_branch:
+        if not args.sem_adapter_mlp:
+            raise ValueError("--freeze-layout-branch requires --sem-adapter-mlp")
+        if args.layout_only:
+            raise ValueError("--freeze-layout-branch cannot be combined with --layout-only")
+        if args.eval_only:
+            raise ValueError("--freeze-layout-branch is only valid for training runs")
     if args.eval_checkpoint_dir is not None and not args.eval_only:
         raise ValueError("--eval-checkpoint-dir is only valid with --eval-only")
     if args.init_checkpoint_dir is not None and args.eval_only:
@@ -4292,6 +4393,8 @@ def main() -> None:
         raise ValueError("--gradient-accumulation-steps must be positive")
     if args.num_queries <= 0:
         raise ValueError("--num-queries must be positive")
+    if args.sem_adapter_hidden < 0:
+        raise ValueError("--sem-adapter-hidden must be non-negative")
     if args.decoder_lora_rank <= 0:
         raise ValueError("--decoder-lora-rank must be positive")
     if args.decoder_lora_alpha <= 0 or args.decoder_learning_rate <= 0:
@@ -4393,6 +4496,9 @@ def main() -> None:
         "global_step_end": args.global_step_offset + args.max_steps,
         "lr_schedule_steps": lr_schedule_steps,
         "num_queries": args.num_queries,
+        "sem_adapter_mlp": args.sem_adapter_mlp,
+        "sem_adapter_hidden": args.sem_adapter_hidden,
+        "freeze_layout_branch": args.freeze_layout_branch,
         "layout_only": args.layout_only,
         "auxiliary_weight": args.auxiliary_weight,
         "auxiliary_weight_start": args.auxiliary_weight_start,
@@ -4545,6 +4651,8 @@ def main() -> None:
                 "target_count": 0,
                 "targets": [],
             }
+        if args.freeze_layout_branch:
+            freeze_layout_branch(bridge.adapter)
         if distributed.enabled:
             if args.decoder_adaptation == "lora":
                 model = wrap_model(
@@ -4554,6 +4662,7 @@ def main() -> None:
                         args.mode == "content_only"
                         or args.auxiliary_weight == 0.0
                         or args.layout_only
+                        or args.freeze_layout_branch
                     ),
                 )
             else:
@@ -4578,11 +4687,20 @@ def main() -> None:
                 allow_mode_mismatch=args.init_checkpoint_allow_mode_mismatch,
             )
             if args.decoder_adaptation == "lora":
-                load_decoder_lora_checkpoint(args.init_checkpoint_dir, model)
+                init_lora_checkpoint = args.init_checkpoint_dir / "decoder_lora.safetensors"
+                if init_lora_checkpoint.is_file():
+                    load_decoder_lora_checkpoint(args.init_checkpoint_dir, model)
             if continuation_head is not None:
                 load_continuation_head_checkpoint(args.init_checkpoint_dir, continuation_head)
         adapter = unwrap_module(bridge.adapter)
         metadata["adapter_config"] = asdict(adapter.config)
+        metadata["content_gate_after_init"] = {
+            "raw_content_gate": float(adapter.content_gate.detach()),
+            "effective_residual_scale": float(
+                adapter.effective_residual_scale().detach()
+            ),
+            "warm_start_requested_scale": args.init_checkpoint_override_residual_scale,
+        }
         metadata["decoder_lora_config"] = decoder_lora_config
         metadata["continuation_head_config"] = {
             "enabled": continuation_head is not None,

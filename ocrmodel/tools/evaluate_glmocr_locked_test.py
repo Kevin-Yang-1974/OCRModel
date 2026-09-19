@@ -180,6 +180,8 @@ def main() -> None:
         num_queries=args.num_queries,
         box_head_mlp=bool(adapter_config.get("box_head_mlp", False)),
         box_head_hidden=int(adapter_config.get("box_head_hidden", 0)),
+        sem_adapter_mlp=bool(adapter_config.get("sem_adapter_mlp", False)),
+        sem_adapter_hidden=int(adapter_config.get("sem_adapter_hidden", 0)),
         query_refine_layers=int(adapter_config.get("query_refine_layers", 0)),
         residual_scale_cap=args.residual_scale_cap,
         initial_residual_scale=float(

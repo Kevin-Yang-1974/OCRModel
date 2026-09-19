@@ -24,6 +24,7 @@ from layout_ocr.train_screen import (
     load_adapter_checkpoint,
     load_model,
     load_decoder_lora_checkpoint,
+    freeze_layout_branch,
     free_generation_loss_config,
     load_continuation_head_checkpoint,
     natural_loop_config,
@@ -49,11 +50,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-queries", type=int, default=512)
     parser.add_argument("--box-head-mlp", action="store_true")
     parser.add_argument("--box-head-hidden", type=int, default=0)
+    parser.add_argument("--sem-adapter-mlp", action="store_true")
+    parser.add_argument("--sem-adapter-hidden", type=int, default=0)
+    parser.add_argument("--freeze-layout-branch", action="store_true")
     parser.add_argument("--query-refine-layers", type=int, default=0)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--decoder-adaptation", choices=["frozen", "lora"], default="frozen")
     parser.add_argument("--layout-only", action="store_true")
-    parser.add_argument("--init-checkpoint-override-residual-scale", type=float, default=None)
+    parser.add_argument(
+        "--init-checkpoint-override-residual-scale",
+        "--warm-start-content-gate",
+        dest="init_checkpoint_override_residual_scale",
+        type=float,
+        default=None,
+    )
     parser.add_argument("--init-checkpoint-allow-mode-mismatch", action="store_true")
     parser.add_argument("--decoder-lora-rank", type=int, default=8)
     parser.add_argument("--decoder-lora-alpha", type=float, default=8.0)
@@ -76,6 +86,7 @@ def parse_args() -> argparse.Namespace:
             "history_box_equalized_v1",
             "history_box_equalized_v2",
             "iou_consistent",
+            "iou_consistent_giou10x",
         ],
         default="full",
     )
@@ -157,6 +168,12 @@ def main() -> None:
         raise ValueError("decoder LoRA dropout must be in [0, 1)")
     if args.num_queries <= 0:
         raise ValueError("--num-queries must be positive")
+    if args.sem_adapter_hidden < 0:
+        raise ValueError("--sem-adapter-hidden must be non-negative")
+    if args.freeze_layout_branch and not args.sem_adapter_mlp:
+        raise ValueError("--freeze-layout-branch requires --sem-adapter-mlp")
+    if args.freeze_layout_branch and args.layout_only:
+        raise ValueError("--freeze-layout-branch cannot be combined with --layout-only")
     if args.free_generation_loss and args.free_generation_loss_weight <= 0.0:
         raise ValueError("free-generation loss weight must be positive when enabled")
     if args.free_generation_max_new_tokens <= 0:
@@ -202,6 +219,8 @@ def main() -> None:
             num_queries=args.num_queries,
             box_head_mlp=args.box_head_mlp,
             box_head_hidden=args.box_head_hidden,
+            sem_adapter_mlp=args.sem_adapter_mlp,
+            sem_adapter_hidden=args.sem_adapter_hidden,
             query_refine_layers=args.query_refine_layers,
             residual_scale_cap=args.residual_scale_cap,
             initial_residual_scale=args.initial_residual_scale,
@@ -239,6 +258,7 @@ def main() -> None:
                     args.mode == "content_only"
                     or args.auxiliary_weight == 0.0
                     or args.layout_only
+                    or args.freeze_layout_branch
                 ),
             )
         else:
@@ -254,10 +274,14 @@ def main() -> None:
                 allow_mode_mismatch=args.init_checkpoint_allow_mode_mismatch,
             )
             if args.decoder_adaptation == "lora":
-                load_decoder_lora_checkpoint(args.init_checkpoint_dir, model)
+                init_lora_checkpoint = args.init_checkpoint_dir / "decoder_lora.safetensors"
+                if init_lora_checkpoint.is_file():
+                    load_decoder_lora_checkpoint(args.init_checkpoint_dir, model)
             if continuation_head is not None:
                 load_continuation_head_checkpoint(args.init_checkpoint_dir, continuation_head)
             init_checkpoint_loaded = True
+        if args.freeze_layout_branch:
+            freeze_layout_branch(bridge.adapter)
         train_args = argparse.Namespace(
             seed=args.seed,
             max_steps=args.steps,
@@ -288,6 +312,9 @@ def main() -> None:
             gradient_accumulation_steps=1,
             decoder_adaptation=args.decoder_adaptation,
             layout_only=args.layout_only,
+            sem_adapter_mlp=args.sem_adapter_mlp,
+            sem_adapter_hidden=args.sem_adapter_hidden,
+            freeze_layout_branch=args.freeze_layout_branch,
             decoder_learning_rate=args.decoder_learning_rate,
             text_repeat_suppression=args.text_repeat_suppression,
             text_ul_weight=args.text_ul_weight,
