@@ -2452,6 +2452,13 @@ def train(
                 # prepare site would arm once and let the rollout spend it, leaving
                 # this forward -- the differentiable one -- silently prefix-free.
                 forward_inputs = prefix_runtime.extend(forward_inputs)
+                # ``ocr_labels`` was bound to the pre-extension tensor above, and
+                # ``extend_prefix_side_inputs`` builds a *new* labels tensor rather
+                # than resizing in place, so the stale binding is K shorter than
+                # the sequence the model actually consumed.  Every label-based
+                # statistic below pairs it against ``outputs.logits``, which is
+                # length L+K, and raises on the shape mismatch.
+                ocr_labels = forward_inputs["labels"]
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                 outputs = model(**forward_inputs)
             debug(f"step={step} micro={accumulation_index} forward_done")

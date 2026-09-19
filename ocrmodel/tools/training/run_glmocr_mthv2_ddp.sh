@@ -816,6 +816,19 @@ run_inner() {
         (( box_head_mlp == 1 )) && smoke_args+=(--box-head-mlp)
         (( sem_adapter_mlp == 1 )) && smoke_args+=(--sem-adapter-mlp)
         (( freeze_layout_branch == 1 )) && smoke_args+=(--freeze-layout-branch)
+        # The smoke exists to gate the real run, so it has to carry the same
+        # feature flags.  ``smoke_args`` is a hand-maintained duplicate of the
+        # main command, and a flag added only to ``geometry_args`` makes the
+        # smoke exercise a model without the feature: it passes, and it passes
+        # vacuously.  That happened -- on 2026-09-19 a prefix smoke reported
+        # trainable_parameter_count 8457217, identical to the no-prefix baseline,
+        # and the real run then died on a prefix-only bug the smoke should have
+        # caught.
+        if (( prefix_tokens > 0 )); then
+            smoke_args+=(--prefix-tokens "${prefix_tokens}")
+            smoke_args+=(--prefix-payload "${prefix_payload}")
+            smoke_args+=(--prefix-position "${prefix_position}")
+        fi
         [[ -n "${init_checkpoint_dir}" ]] && smoke_args+=(--init-checkpoint-dir "${init_checkpoint_dir}")
         [[ -n "${init_checkpoint_override_residual_scale}" ]] && smoke_args+=(--init-checkpoint-override-residual-scale "${init_checkpoint_override_residual_scale}")
         (( init_checkpoint_allow_mode_mismatch == 1 )) && smoke_args+=(--init-checkpoint-allow-mode-mismatch)
