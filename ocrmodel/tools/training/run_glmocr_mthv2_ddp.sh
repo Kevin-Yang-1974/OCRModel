@@ -52,6 +52,11 @@ validation_interval=432
 # longest_edge=9633792; 1003520 was a deliberate 1280-token budget that
 # downscales every Dunhuang page to about a third of its native pixels.
 max_pixels=1003520
+# Ceiling on |tanh(content_gate)|.  The residual it scales measured only
+# ~2.3% of the visual feature norm at 0.03, and training never pushed the
+# gate past ~0.0155, so this cap is a throttle on the layout branch's
+# influence rather than a safety limit reached in practice.
+residual_scale_cap=0.03
 max_eval_new_tokens=1536
 num_queries=512
 box_head_mlp=0
@@ -158,6 +163,7 @@ while [[ $# -gt 0 ]]; do
         --validation-interval) validation_interval="$2"; shift 2 ;;
         --max-eval-new-tokens) max_eval_new_tokens="$2"; shift 2 ;;
         --max-pixels) max_pixels="$2"; shift 2 ;;
+        --residual-scale-cap) residual_scale_cap="$2"; shift 2 ;;
         --num-queries) num_queries="$2"; shift 2 ;;
         --box-head-mlp) box_head_mlp=1; shift ;;
         --box-head-hidden) box_head_hidden="$2"; shift 2 ;;
@@ -944,7 +950,7 @@ run_inner() {
         --warmup-steps "${warmup_steps}" \
         --lr-schedule-steps "${lr_schedule_steps}" \
         --min-lr-ratio "${min_lr_ratio}" \
-        --residual-scale-cap 0.03 \
+        --residual-scale-cap "${residual_scale_cap}" \
         --initial-residual-scale "${initial_residual_scale}" \
         --gate-freeze-steps "${gate_freeze_steps}" \
         --auxiliary-weight "${auxiliary_weight}" \
