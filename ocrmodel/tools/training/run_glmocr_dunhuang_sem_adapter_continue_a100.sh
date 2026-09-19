@@ -224,7 +224,7 @@ common_wrapper_args() {
             --prefix-payload "${prefix_payload}" --prefix-position "${prefix_position}"
         [[ -z "${prefix_lr}" ]] || printf '%s\n' --prefix-learning-rate "${prefix_lr}"
     fi
-    (( natural_loop == 0 )) || printf '%s\n' --natural-loop-loss
+    (( natural_loop_train == 0 )) || printf '%s\n' --natural-loop-loss
 }
 
 run_smoke() {
