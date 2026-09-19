@@ -1612,6 +1612,95 @@ def write_adapter_config(path: Path, bridge: LayoutAwarePatchMerger) -> None:
     write_json(path, asdict(unwrap_module(bridge.adapter).config))
 
 
+PREFIX_CHECKPOINT_NAME = "layout_prefix.safetensors"
+
+
+def save_prefix_checkpoint(
+    path: Path, bridge: LayoutAwarePatchMerger, step: int
+) -> dict[str, Any] | None:
+    """Serialize the prefix projection, which is not part of ``bridge.adapter``.
+
+    The injector is attached to the decoder rather than to the layout adapter, so
+    it is absent from both ``adapter.safetensors`` and the decoder LoRA file.  A
+    trained prefix would otherwise be written to no artifact at all and every
+    evaluation would silently score the zero-initialised projection instead.
+    """
+
+    runtime = getattr(bridge, "prefix_runtime", None)
+    if runtime is None:
+        return None
+    state = {
+        key: value.detach().cpu().contiguous()
+        for key, value in runtime.injector.state_dict().items()
+    }
+    non_finite = [
+        name for name, value in state.items() if not bool(torch.isfinite(value).all())
+    ]
+    if non_finite:
+        raise FloatingPointError(
+            f"non-finite prefix tensors at checkpoint {step}: {non_finite}"
+        )
+    save_file(state, path / PREFIX_CHECKPOINT_NAME)
+    write_json(
+        path / "layout_prefix_config.json",
+        {
+            "token_count": runtime.token_count,
+            "reserved_ids": runtime.reserved_ids,
+            "payload_mode": runtime.injector.payload_mode,
+            "position": runtime.position,
+        },
+    )
+    return {
+        "tensors": sorted(state),
+        "token_count": runtime.token_count,
+        "payload_mode": runtime.injector.payload_mode,
+        "position": runtime.position,
+        "step": step,
+    }
+
+
+def load_prefix_checkpoint(path: Path, bridge: LayoutAwarePatchMerger) -> dict[str, Any]:
+    """Restore the prefix projection into an already-installed injector.
+
+    The two failure directions are deliberately asymmetric.  A checkpoint that
+    carries a prefix but a run that did not ask for one is an error, because the
+    alternative is scoring an untrained projection while believing it is the
+    trained one.  A checkpoint without a prefix is normal -- it is what the first
+    training run starts from -- and the injector simply stays at its zero
+    initialiser.
+    """
+
+    runtime = getattr(bridge, "prefix_runtime", None)
+    prefix_file = path / PREFIX_CHECKPOINT_NAME
+    if not prefix_file.is_file():
+        return {"status": "absent", "prefix_runtime": runtime is not None}
+    if runtime is None:
+        raise RuntimeError(
+            f"{path} carries a trained layout prefix ({PREFIX_CHECKPOINT_NAME}) but "
+            "this run was not started with --prefix-tokens; scoring it would use the "
+            "untrained projection instead"
+        )
+    state = load_file(str(prefix_file), device="cpu")
+    non_finite = [
+        name for name, value in state.items() if not bool(torch.isfinite(value).all())
+    ]
+    if non_finite:
+        raise FloatingPointError(f"non-finite prefix tensors in {path}: {non_finite}")
+    incompatible = runtime.injector.load_state_dict(state, strict=True)
+    if incompatible.missing_keys or incompatible.unexpected_keys:
+        raise RuntimeError(
+            f"prefix checkpoint mismatch: missing={incompatible.missing_keys} "
+            f"unexpected={incompatible.unexpected_keys}"
+        )
+    return {
+        "status": "loaded",
+        "tensors": sorted(state),
+        "token_count": runtime.token_count,
+        "payload_mode": runtime.injector.payload_mode,
+        "position": runtime.position,
+    }
+
+
 def save_adapter_checkpoint(path: Path, bridge: LayoutAwarePatchMerger, step: int) -> dict[str, Any]:
     adapter = unwrap_module(bridge.adapter)
     report = {
@@ -1630,6 +1719,7 @@ def save_adapter_checkpoint(path: Path, bridge: LayoutAwarePatchMerger, step: in
     }
     save_file(state, path / "adapter.safetensors")
     write_adapter_config(path / "adapter_config.json", bridge)
+    report["prefix"] = save_prefix_checkpoint(path, bridge, step)
     reloaded = load_file(str(path / "adapter.safetensors"), device="cpu")
     non_finite_saved = [
         name for name, value in reloaded.items() if not bool(torch.isfinite(value).all())
@@ -1799,6 +1889,7 @@ def load_adapter_checkpoint(
             "legacy checkpoint has no adapter_config.json; load it with "
             "max_residual_scale=None to preserve its original gate semantics"
         )
+    prefix_report = load_prefix_checkpoint(path, bridge)
     state = load_file(str(path / "adapter.safetensors"), device="cpu")
     non_finite = [name for name, value in state.items() if not bool(torch.isfinite(value).all())]
     if non_finite:
@@ -1811,6 +1902,7 @@ def load_adapter_checkpoint(
                 "path": str(path),
                 "missing_keys": incompatible.missing_keys,
                 "unexpected_keys": incompatible.unexpected_keys,
+                "layout_prefix": prefix_report,
             },
             ensure_ascii=False,
             separators=(",", ":"),
@@ -3280,6 +3372,7 @@ def train(
             for key, value in adapter_module.state_dict().items()
         }
         save_file(state, args.output_dir / "adapter.safetensors")
+        save_prefix_checkpoint(args.output_dir, bridge, global_step)
         lora_state = lora_state_dict(model_module)
         if lora_state:
             save_file(lora_state, args.output_dir / "decoder_lora.safetensors")
@@ -5527,6 +5620,7 @@ def main() -> None:
                 },
                 args.output_dir / "adapter.safetensors",
             )
+            save_prefix_checkpoint(args.output_dir, bridge, global_step)
             final_lora_state = lora_state_dict(model)
             if final_lora_state:
                 save_file(final_lora_state, args.output_dir / "decoder_lora.safetensors")
@@ -5590,6 +5684,7 @@ def main() -> None:
             {key: value.detach().cpu().contiguous() for key, value in adapter.state_dict().items()},
             args.output_dir / "adapter.safetensors",
         )
+        save_prefix_checkpoint(args.output_dir, bridge, global_step)
         final_lora_state = lora_state_dict(model)
         if final_lora_state:
             save_file(final_lora_state, args.output_dir / "decoder_lora.safetensors")

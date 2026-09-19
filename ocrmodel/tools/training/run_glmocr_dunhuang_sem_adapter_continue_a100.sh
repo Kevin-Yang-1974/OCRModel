@@ -36,6 +36,13 @@ decoder_learning_rate="${GLMOCR_DH_CONTINUE_DECODER_LR:-1e-6}"
 warmup_steps="${GLMOCR_DH_CONTINUE_WARMUP_STEPS:-64}"
 min_lr_ratio="${GLMOCR_DH_CONTINUE_MIN_LR_RATIO:-0.1}"
 max_eval_new_tokens="${GLMOCR_DH_CONTINUE_MAX_EVAL_NEW_TOKENS:-1536}"
+# Layout prefix injection.  Off by default so every existing run is unchanged.
+# The same values must reach both the trainer and the post-hoc evaluations:
+# a prefix trained but not installed at eval time would be scored at its
+# zero initialiser, and train_screen raises rather than doing that silently.
+prefix_tokens="${GLMOCR_DH_CONTINUE_PREFIX_TOKENS:-0}"
+prefix_payload="${GLMOCR_DH_CONTINUE_PREFIX_PAYLOAD:-queries}"
+prefix_position="${GLMOCR_DH_CONTINUE_PREFIX_POSITION:-front}"
 # Fixed by the shared DDP runner.  The parallel-validation summarizer rejects
 # any evaluation whose metadata diverges from the training run on these, so the
 # eval-only invocations below have to repeat them verbatim.
@@ -192,6 +199,12 @@ common_wrapper_args() {
         --init-checkpoint-override-residual-scale "${resume_gate}" \
         --max-eval-new-tokens "${max_eval_new_tokens}" \
         --max-pixels "${eval_max_pixels}" --log-steps 16
+    # Off unless asked for: the prefix resizes the embedding, so an unconditional
+    # zero would not be free and would make the metadata ambiguous.
+    if (( prefix_tokens > 0 )); then
+        printf '%s\n' --prefix-tokens "${prefix_tokens}" \
+            --prefix-payload "${prefix_payload}" --prefix-position "${prefix_position}"
+    fi
 }
 
 run_smoke() {
@@ -299,6 +312,14 @@ setup_eval_environment() {
 # checkpoint's own content gate must load as saved, so no residual-scale
 # override is passed here.  --freeze-layout-branch is deliberately absent:
 # it only sets requires_grad, and train_screen rejects it under --eval-only.
+# The evaluation must install the same prefix the training did.  train_screen
+# refuses a checkpoint that carries a prefix into a run that never asked for one,
+# so a mismatch here is loud rather than a quiet zero-initialised score.
+eval_prefix_args=""
+if (( prefix_tokens > 0 )); then
+    eval_prefix_args="--prefix-tokens ${prefix_tokens} --prefix-payload ${prefix_payload} --prefix-position ${prefix_position}"
+fi
+
 launch_eval() {
     local gpu="$1" checkpoint="$2" out="$3" label="$4"
     (
@@ -330,7 +351,8 @@ launch_eval() {
             --max-pixels "${eval_max_pixels}" --max-eval-new-tokens "${max_eval_new_tokens}" \
             --generation-mode "${eval_generation_mode}" \
             --validation-interval "${validation_interval}" --log-steps 16 \
-            --eval-checkpoint-dir "${checkpoint}" --eval-only
+            --eval-checkpoint-dir "${checkpoint}" --eval-only \
+            ${eval_prefix_args}
     ) > "${group_root}/logs/validation-${label}.log" 2>&1 &
 }
 

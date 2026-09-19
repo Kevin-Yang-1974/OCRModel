@@ -72,6 +72,11 @@ initial_valid_probability=""
 validity_gating_mode="legacy_normalized"
 validity_use_transport_evidence=0
 skip_selection=0
+# Layout prefix injection.  Zero keeps the model untouched, so every existing
+# run is unaffected until a launcher asks for it.
+prefix_tokens=0
+prefix_payload="queries"
+prefix_position="front"
 without_test=0
 defer_validation=0
 session=""
@@ -177,6 +182,9 @@ while [[ $# -gt 0 ]]; do
         --initial-valid-probability) initial_valid_probability="$2"; shift 2 ;;
         --validity-gating-mode) validity_gating_mode="$2"; shift 2 ;;
         --validity-use-transport-evidence) validity_use_transport_evidence=1; shift ;;
+        --prefix-tokens) prefix_tokens="$2"; shift 2 ;;
+        --prefix-payload) prefix_payload="$2"; shift 2 ;;
+        --prefix-position) prefix_position="$2"; shift 2 ;;
         --skip-selection) skip_selection=1; shift ;;
         --without-test) without_test=1; shift ;;
         --defer-validation) defer_validation=1; shift ;;
@@ -904,6 +912,14 @@ run_inner() {
     )
     (( box_head_mlp == 1 )) && geometry_args+=(--box-head-mlp)
     (( sem_adapter_mlp == 1 )) && geometry_args+=(--sem-adapter-mlp)
+    # Only forwarded when asked for: an unconditional --prefix-tokens 0 would
+    # be indistinguishable in the metadata from a run that never considered the
+    # feature, and the prefix resizes the embedding, which is not free.
+    if (( prefix_tokens > 0 )); then
+        geometry_args+=(--prefix-tokens "${prefix_tokens}")
+        geometry_args+=(--prefix-payload "${prefix_payload}")
+        geometry_args+=(--prefix-position "${prefix_position}")
+    fi
     [[ -n "${init_checkpoint_dir}" ]] && method_args+=(--init-checkpoint-dir "${init_checkpoint_dir}")
     [[ -n "${init_checkpoint_override_residual_scale}" ]] && method_args+=(--init-checkpoint-override-residual-scale "${init_checkpoint_override_residual_scale}")
     (( init_checkpoint_allow_mode_mismatch == 1 )) && method_args+=(--init-checkpoint-allow-mode-mismatch)
