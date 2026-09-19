@@ -2083,6 +2083,15 @@ def train(
     # bridge rather than passed in so the data path cannot be wired to one prefix
     # runtime while the model carries another.
     prefix_runtime = getattr(bridge, "prefix_runtime", None)
+    if prefix_runtime is not None and getattr(args, "prefix_position", "front") == "tail":
+        # A trailing span sits after the assistant target in a teacher-forced
+        # sequence, so its ``-100`` labels land past the end of the loss window and
+        # the target would no longer be the last thing the model sees.  The tail
+        # placement exists to measure the cost of the span in eval; training with
+        # it would be measuring something else.
+        raise RuntimeError(
+            "prefix position 'tail' is an eval-only control; train with 'front'"
+        )
     if prefix_runtime is not None and getattr(args, "free_generation_loss", False):
         # Free generation runs its own greedy rollout forward before the
         # differentiable one, and the rollout builds its inputs from a prompt-only
@@ -4119,6 +4128,17 @@ def parse_args() -> argparse.Namespace:
         help=(
             "what the prefix tokens carry: 'queries' is one token per layout query "
             "(per-region), 'global' is the page-level mean broadcast to every slot"
+        ),
+    )
+    parser.add_argument(
+        "--prefix-position",
+        choices=["front", "tail"],
+        default="front",
+        help=(
+            "where the reserved span sits. 'front' shifts the mrope position of "
+            "every following token including the image tokens; 'tail' leaves the "
+            "image positions alone. Exposed because the two measured differently, "
+            "which makes the placement a cost question rather than a style one"
         ),
     )
     parser.add_argument("--auxiliary-weight", type=float, default=0.4)

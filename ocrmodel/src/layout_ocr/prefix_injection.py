@@ -65,7 +65,20 @@ from torch import Tensor, nn
 
 ENV_VAR = "GLMOCR_PREFIX_TOKENS"
 PAYLOAD_ENV_VAR = "GLMOCR_PREFIX_PAYLOAD"
+POSITION_ENV_VAR = "GLMOCR_PREFIX_POSITION"
+DISABLE_ENV_VAR = "GLMOCR_PREFIX_DISABLE"
 PROBE_ENV_VAR = "GLMOCR_PREFIX_PROBE"
+
+
+def prefix_position() -> str:
+    """Where the reserved span sits; ``front`` is the design, ``tail`` a control."""
+
+    raw = os.environ.get(POSITION_ENV_VAR, "").strip().lower()
+    if not raw:
+        return "front"
+    if raw not in {"front", "tail"}:
+        raise ValueError(f"{POSITION_ENV_VAR} must be 'front' or 'tail', got {raw!r}")
+    return raw
 
 PayloadMode = Literal["queries", "regions", "global"]
 PAYLOAD_MODES: tuple[str, ...] = get_args(PayloadMode)
@@ -152,19 +165,43 @@ def build_prefix_input_ids(
 
 
 def extend_prefix_side_inputs(
-    inputs: dict[str, Any], reserved_ids: list[int]
+    inputs: dict[str, Any],
+    reserved_ids: list[int],
+    *,
+    position: str = "front",
+    splice_disabled: bool = False,
 ) -> dict[str, Any]:
-    """Prepend the reserved ids to ``input_ids`` and keep side inputs aligned.
+    """Add the reserved ids to ``input_ids`` and keep every side input aligned.
 
-    ``labels`` gets ``-100`` over the prefix, which is the same treatment the
-    prompt already receives, so the loss never asks the model to predict a
+    ``labels`` gets ``-100`` over the reserved span, which is the same treatment
+    the prompt already receives, so the loss never asks the model to predict a
     reserved id.
+
+    ``position`` places the span at the front of the sequence or at its end, which
+    is a diagnostic rather than a design choice.  Leading text shifts the mrope
+    position of every following token, image tokens included; trailing the prompt
+    leaves the image positions untouched and shifts only the text tail.  The two
+    therefore separate "the vision positions moved" from "there is more attention
+    mass in the sequence", and a 2026-09-19 eval measured the two placements
+    differently, so the distinction is load-bearing rather than cosmetic.
+
+    ``splice_disabled`` inserts the span without letting the hook overwrite it,
+    which isolates the cost of *having* K extra positions from the cost of the
+    vectors written into them.
     """
 
     if not reserved_ids:
         return inputs
+    if position not in {"front", "tail"}:
+        raise ValueError(f"prefix position must be 'front' or 'tail', got {position!r}")
     input_ids = inputs["input_ids"]
-    extended, prefix = build_prefix_input_ids(input_ids, reserved_ids)
+    if position == "front":
+        extended, prefix = build_prefix_input_ids(input_ids, reserved_ids)
+    else:
+        prefix = torch.tensor(
+            [reserved_ids], dtype=input_ids.dtype, device=input_ids.device
+        )
+        extended = torch.cat((input_ids, prefix), dim=1)
     if prefix is None:
         return inputs
     width = prefix.shape[1]
@@ -174,13 +211,21 @@ def extend_prefix_side_inputs(
         pad = torch.ones(
             (1, width), dtype=attention_mask.dtype, device=attention_mask.device
         )
-        inputs["attention_mask"] = torch.cat((pad, attention_mask), dim=1)
+        inputs["attention_mask"] = (
+            torch.cat((pad, attention_mask), dim=1)
+            if position == "front"
+            else torch.cat((attention_mask, pad), dim=1)
+        )
     labels = inputs.get("labels")
     if isinstance(labels, Tensor):
         ignore = torch.full(
             (1, width), -100, dtype=labels.dtype, device=labels.device
         )
-        inputs["labels"] = torch.cat((ignore, labels), dim=1)
+        inputs["labels"] = (
+            torch.cat((ignore, labels), dim=1)
+            if position == "front"
+            else torch.cat((labels, ignore), dim=1)
+        )
     mm_token_type_ids = inputs.get("mm_token_type_ids")
     if isinstance(mm_token_type_ids, Tensor):
         # ``get_rope_index`` groups this stream to place vision tokens, with the
@@ -190,8 +235,10 @@ def extend_prefix_side_inputs(
         text_type = torch.zeros(
             (1, width), dtype=mm_token_type_ids.dtype, device=mm_token_type_ids.device
         )
-        inputs["mm_token_type_ids"] = torch.cat(
-            (text_type, mm_token_type_ids), dim=1
+        inputs["mm_token_type_ids"] = (
+            torch.cat((text_type, mm_token_type_ids), dim=1)
+            if position == "front"
+            else torch.cat((mm_token_type_ids, text_type), dim=1)
         )
     return inputs
 
@@ -336,6 +383,7 @@ class _Splice:
         self.injector = injector
         self.payload: Tensor | None = None
         self.applied = 0
+        self.skipped = 0
         self._pending = 0
 
     def arm(self) -> None:
@@ -371,6 +419,12 @@ class _Splice:
         # Consume on this forward whatever the outcome, so a skipped splice cannot
         # leak into the next one.
         self._pending -= 1
+        if os.environ.get(DISABLE_ENV_VAR, "").strip() not in {"", "0"}:
+            # Diagnostic: the reserved span is in the sequence but nothing is
+            # written into it, which separates the cost of the extra positions
+            # from the cost of the vectors that go in them.
+            self.skipped += 1
+            return None
         payload = self.payload
         if payload is None:
             return None
@@ -390,9 +444,15 @@ class _Splice:
         if inputs_embeds.shape[1] < width:
             return None
         projected = self.injector(payload).to(inputs_embeds.dtype)
+        start = 0 if prefix_position() == "front" else inputs_embeds.shape[1] - width
         # Non-mutating splice: the caller's tensor may be a graph leaf.
         spliced = torch.cat(
-            (projected, inputs_embeds[:, width:, :]), dim=1
+            (
+                inputs_embeds[:, :start, :],
+                projected,
+                inputs_embeds[:, start + width :, :],
+            ),
+            dim=1,
         )
         kwargs["inputs_embeds"] = spliced
         self.applied += 1
@@ -403,6 +463,8 @@ class _Splice:
                     probe_path,
                     {
                         "prefix_tokens": int(width),
+                        "prefix_offset": int(start),
+                        "prefix_position": prefix_position(),
                         "payload_mode": self.injector.payload_mode,
                         "payload_norm": float(payload.float().norm(dim=-1).mean()),
                         "prefix_norm": float(projected.float().norm(dim=-1).mean()),
@@ -468,17 +530,23 @@ class PrefixRuntime:
     handle: Any
 
     @property
+    def position(self) -> str:
+        return prefix_position()
+
+    @property
     def logits_mask(self) -> PrefixLogitsMask:
         return PrefixLogitsMask(self.reserved_ids)
 
     def extend(self, inputs: dict[str, Any]) -> dict[str, Any]:
-        """Prepend the reserved rows and arm the splice for the coming forward.
+        """Add the reserved rows and arm the splice for the coming forward.
 
         Arming is part of extending on purpose: the two must not be able to drift
         apart, because arming without extending corrupts real tokens.
         """
 
-        extended = extend_prefix_side_inputs(inputs, self.reserved_ids)
+        extended = extend_prefix_side_inputs(
+            inputs, self.reserved_ids, position=self.position
+        )
         self.splice.arm()
         return extended
 

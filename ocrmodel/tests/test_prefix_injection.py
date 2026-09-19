@@ -197,6 +197,75 @@ def test_extend_prefix_side_inputs_rejects_a_batch() -> None:
         extend_prefix_side_inputs(inputs, [40])
 
 
+def test_tail_position_appends_and_keeps_side_inputs_aligned() -> None:
+    """The control that leaves the image tokens' positions untouched."""
+
+    inputs = {
+        "input_ids": torch.tensor([[1, 1, 0]]),
+        "attention_mask": torch.ones(1, 3, dtype=torch.long),
+        "labels": torch.tensor([[-100, -100, 7]]),
+        "mm_token_type_ids": torch.tensor([[1, 1, 0]]),
+    }
+    out = extend_prefix_side_inputs(inputs, [40, 41], position="tail")
+    assert out["input_ids"].tolist() == [[1, 1, 0, 40, 41]]
+    assert out["attention_mask"].shape == (1, 5)
+    assert out["labels"].tolist() == [[-100, -100, 7, -100, -100]]
+    assert out["mm_token_type_ids"].tolist() == [[1, 1, 0, 0, 0]]
+
+
+def test_position_must_be_front_or_tail() -> None:
+    inputs = {"input_ids": torch.tensor([[5, 6]])}
+    with pytest.raises(ValueError, match="'front' or 'tail'"):
+        extend_prefix_side_inputs(inputs, [40], position="middle")
+
+
+def test_position_env_defaults_to_front(monkeypatch: pytest.MonkeyPatch) -> None:
+    from layout_ocr.prefix_injection import POSITION_ENV_VAR, prefix_position
+
+    monkeypatch.delenv(POSITION_ENV_VAR, raising=False)
+    assert prefix_position() == "front"
+    monkeypatch.setenv(POSITION_ENV_VAR, "tail")
+    assert prefix_position() == "tail"
+    monkeypatch.setenv(POSITION_ENV_VAR, "sideways")
+    with pytest.raises(ValueError, match="'front' or 'tail'"):
+        prefix_position()
+
+
+def test_disable_env_skips_the_splice_but_still_consumes_the_arming(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Isolates the cost of the extra positions from the cost of their contents."""
+
+    from layout_ocr.prefix_injection import DISABLE_ENV_VAR
+
+    monkeypatch.setenv(DISABLE_ENV_VAR, "1")
+    model, _, injector, splice, _ = _installed()
+    with torch.no_grad():
+        injector.projection.weight.copy_(torch.eye(8))
+    publish_prefix_payload(splice, _FakeOutput(torch.ones(1, 4, 8)))
+    splice.arm()
+    embeds = torch.zeros(1, 6, 8)
+    seen = model.model.language_model(input_ids=None, inputs_embeds=embeds)
+    assert torch.equal(seen, embeds)  # nothing written
+    assert splice.applied == 0
+    assert splice.skipped == 1
+    assert splice._pending == 0  # arming still consumed
+
+
+def test_tail_position_splices_at_the_end(monkeypatch: pytest.MonkeyPatch) -> None:
+    from layout_ocr.prefix_injection import POSITION_ENV_VAR
+
+    monkeypatch.setenv(POSITION_ENV_VAR, "tail")
+    model, _, injector, splice, _ = _installed()
+    with torch.no_grad():
+        injector.projection.weight.copy_(torch.eye(8))
+    publish_prefix_payload(splice, _FakeOutput(torch.ones(1, 4, 8)))
+    splice.arm()
+    seen = model.model.language_model(input_ids=None, inputs_embeds=torch.zeros(1, 6, 8))
+    assert torch.allclose(seen[0, 2:], torch.ones(4, 8))
+    assert torch.equal(seen[0, :2], torch.zeros(2, 8))
+
+
 # --- generation masking ---------------------------------------------------
 
 

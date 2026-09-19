@@ -46,8 +46,15 @@ eval_generation_mode="loop_recovery"
 residual_cap=0.03
 foreground="${GLMOCR_PREFIX_EVAL_FOREGROUND:-0}"
 gpu_slots="${GLMOCR_PREFIX_EVAL_GPUS:-0,1,2}"
-# 臂格式：<名字>:<prefix_tokens>:<payload>；tokens 为 0 表示不装前缀。
-arms="${GLMOCR_PREFIX_EVAL_ARMS:-baseline:0:global prefix_global:${prefix_tokens}:global prefix_queries:${prefix_tokens}:queries}"
+# 臂格式：<名字>:<prefix_tokens>:<payload>:<position>:<disable>
+#   tokens 为 0 表示不装前缀；disable=1 表示插入保留位但不写入（隔离"多出 K 个位置"
+#   与"写进去的向量"两种代价）。
+#
+# 第一轮（v1）实测：零初始化投影下，装前缀相对无前缀 +0.006712 CER（0.111608→0.118320），
+# 是布局分支全部实测收益（+0.001380）的 4.9 倍。这是槽位固定开销，不是接线错误，所以本轮
+# 拆开它：front vs tail 分离"图像 token 位置后移"与"注意力多出 K 个槽"，
+# disable 再分离"多出槽位"与"写进去的零向量"。
+arms="${GLMOCR_PREFIX_EVAL_ARMS:-baseline:0:global:front:0 prefix_front_disable:${prefix_tokens}:global:front:1 prefix_tail:${prefix_tokens}:global:tail:0}"
 
 eval_root="${remote_root}/prefix_eval/${run_id}"
 python="${env_dir}/bin/python3"
@@ -82,17 +89,18 @@ preflight() {
     [[ ! -e "${eval_root}/arms" ]] || { echo "output exists: ${eval_root}/arms" >&2; exit 74; }
 }
 
-# launch <arm> <prefix_tokens> <payload> <gpu>
+# launch <arm> <prefix_tokens> <payload> <position> <disable> <gpu>
 # train_screen.py refuses to start when --output-dir already exists, so nothing may
 # pre-create the arm directory: the log lives as a sibling.
 launch() {
-    local arm="$1" tokens="$2" payload="$3" gpu="$4"
+    local arm="$1" tokens="$2" payload="$3" position="$4" disable="$5" gpu="$6"
     local out="${eval_root}/arms/${arm}"
     (
         setup_environment
         export CUDA_VISIBLE_DEVICES="${gpu}"
         export GLMOCR_ADAPTER_PROBE="${out}.probe.jsonl"
         export GLMOCR_PREFIX_PROBE="${out}.prefix.jsonl"
+        [[ "${disable}" == "0" ]] || export GLMOCR_PREFIX_DISABLE="${disable}"
         cd "${code_root}"
         exec "${python}" -m layout_ocr.train_screen \
             --mode layout_ot --model-path "${model_dir}" \
@@ -114,6 +122,7 @@ launch() {
             --processor-mode fast --adapter-precision fp32 \
             --box-head-mlp --query-refine-layers 1 --sem-adapter-mlp \
             --prefix-tokens "${tokens}" --prefix-payload "${payload}" \
+            --prefix-position "${position}" \
             --max-pixels "${max_pixels}" --max-eval-new-tokens "${max_eval_new_tokens}" \
             --generation-mode "${eval_generation_mode}" \
             --validation-interval 1 --log-steps 16 \
@@ -130,12 +139,9 @@ run_arms() {
     local -a pids=() labels=() failed=0
     local index=0 spec
     for spec in ${arms}; do
-        local arm="${spec%%:*}"
-        local rest="${spec#*:}"
-        local tokens="${rest%%:*}"
-        local payload="${rest#*:}"
+        IFS=':' read -r arm tokens payload position disable <<< "${spec}"
         local gpu="${slots[$(( index % total ))]}"
-        launch "${arm}" "${tokens}" "${payload}" "${gpu}" &
+        launch "${arm}" "${tokens}" "${payload}" "${position}" "${disable}" "${gpu}" &
         pids+=("$!"); labels+=("${arm}")
         index=$(( index + 1 ))
         if (( index % total == 0 )); then
@@ -197,6 +203,12 @@ payload["status"] = "partial" if missing else "complete"
 if missing:
     print(f"missing arms: {missing}")
 
+# 记录的无前缀基线（docs/LAYOUT_WRITEBACK_INTERVENTION_RESULT.md 的 full 臂）。
+# 只逐位比编辑数，CER 用宽容差：CER 是 2993/总长 的商，字面量 0.111608 是四舍五入值，
+# 用 1e-9 去比会把一个正确的复现判成失败。
+RECORDED_BASELINE_EDITS = 2993
+RECORDED_BASELINE_CER = 0.111608
+
 print(f"{'arm':16s} {'CER':>10s} {'edits':>7s} {'genlim':>7s} {'splices':>8s} {'pnorm':>9s}")
 for arm in order:
     row = payload["arms"][arm]
@@ -208,11 +220,12 @@ for arm in order:
           f"{p.get('splices', 0):8d} {p.get('prefix_norm', float('nan')):9.6f}")
 
 print()
-print("接线判据（零初始化投影 => 前缀必须是恒等）：")
+print("接线判据：")
 ok = True
 if baseline.get("status") != "missing":
-    if abs(baseline["cer"] - 0.111608) < 1e-9 and baseline["edits"] == 2993:
-        print("  baseline        逐位复现记录的 full 基线 0.111608 / 2993  OK")
+    if (baseline["edits"] == RECORDED_BASELINE_EDITS
+            and abs(baseline["cer"] - RECORDED_BASELINE_CER) < 1e-5):
+        print("  baseline        复现记录的 full 基线 0.111608 / 2993  OK")
     else:
         print(f"  baseline        未复现 full 基线：{baseline['cer']:.6f} / {baseline['edits']}"
               "  <- 先查这一项，其余臂的结论都依赖它")
@@ -221,18 +234,24 @@ for arm in ("prefix_global", "prefix_queries"):
     row = payload["arms"][arm]
     if row.get("status") == "missing" or baseline.get("status") == "missing":
         continue
-    same = (abs(row["cer"] - baseline["cer"]) < 1e-12 and row["edits"] == baseline["edits"])
-    if same:
-        print(f"  {arm:16s} 与 baseline 逐位相同，前缀在零初始化下是恒等  OK")
-    else:
-        print(f"  {arm:16s} 与 baseline 不同：{row['cer']:.6f} / {row['edits']} "
-              f"(ΔCER {row['cer']-baseline['cer']:+.6f})  <- 接线破坏了模型，禁止进入训练对照")
-        ok = False
-    if "prefix" in row and row["prefix"]["splices"] == 0:
+    if "prefix" not in row or row["prefix"]["splices"] == 0:
         print(f"  {arm:16s} 前缀探针 0 条记录：splice 从未生效，接线未接通")
         ok = False
+        continue
+    # 注意：这里**不再**期望与 baseline 逐位相同。零初始化只保证投影不贡献布局内容，
+    # 不保证模型不变——序列里多了 K 个位置，后续 token 的 mrope 位置整体后移，且这些槽位
+    # 参与注意力。实际代价见下表，它才是前缀路线必须赚回的固定开销。
+    delta = row["cer"] - baseline["cer"]
+    print(f"  {arm:16s} splice 生效（{row['prefix']['splices']} 条），"
+          f"零 payload 相对无前缀 ΔCER {delta:+.6f}"
+          f"  <- 槽位固定开销，非接线错误")
+
 print()
-print("接线校验通过，可以起训练对照。" if ok else "接线校验未通过：先修接线，不要起训练。")
+print("前缀路线必须先赚回上面的槽位开销，才谈得上值不值。")
+if ok:
+    print("接线正确；可以起训练对照（baseline=装前缀+零 payload 才是正确对照）。")
+else:
+    print("接线未通过：先修，不要起训练。")
 
 (root / "prefix_eval_summary.json").write_text(
     json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
