@@ -379,8 +379,16 @@ def _probe(path: str, record: dict) -> None:
 class _Splice:
     """State shared between the bridge and the text-model pre-hook."""
 
-    def __init__(self, injector: PrefixInjector) -> None:
+    def __init__(self, injector: PrefixInjector, position: str = "front") -> None:
         self.injector = injector
+        # Resolved once at install time from the caller, not read from the
+        # environment on every forward.  An earlier revision read the env var here
+        # and ignored the ``--prefix-position`` argument entirely, so a run that
+        # asked for ``tail`` reported ``pos=front`` in its own probe and measured
+        # the wrong arm without failing.
+        if position not in {"front", "tail"}:
+            raise ValueError(f"prefix position must be 'front' or 'tail', got {position!r}")
+        self.position = position
         self.payload: Tensor | None = None
         self.applied = 0
         self.skipped = 0
@@ -444,7 +452,7 @@ class _Splice:
         if inputs_embeds.shape[1] < width:
             return None
         projected = self.injector(payload).to(inputs_embeds.dtype)
-        start = 0 if prefix_position() == "front" else inputs_embeds.shape[1] - width
+        start = 0 if self.position == "front" else inputs_embeds.shape[1] - width
         # Non-mutating splice: the caller's tensor may be a graph leaf.
         spliced = torch.cat(
             (
@@ -464,7 +472,7 @@ class _Splice:
                     {
                         "prefix_tokens": int(width),
                         "prefix_offset": int(start),
-                        "prefix_position": prefix_position(),
+                        "prefix_position": self.position,
                         "payload_mode": self.injector.payload_mode,
                         "payload_norm": float(payload.float().norm(dim=-1).mean()),
                         "prefix_norm": float(projected.float().norm(dim=-1).mean()),
@@ -481,6 +489,7 @@ def install_prefix_injection(
     token_count: int,
     reserved_ids: list[int],
     payload_mode_: PayloadMode | None = None,
+    position: str | None = None,
 ) -> tuple[PrefixInjector, _Splice, Any]:
     """Route the bridge's branch output into ``K`` reserved prefix positions.
 
@@ -513,7 +522,7 @@ def install_prefix_injection(
     if getattr(text_model, PREFIX_MODULE_NAME, None) is not None:
         raise RuntimeError(f"{PREFIX_MODULE_NAME} is already installed on the decoder")
     text_model.add_module(PREFIX_MODULE_NAME, injector)
-    splice = _Splice(injector)
+    splice = _Splice(injector, position or prefix_position())
     bridge.prefix_splice = splice
     handle = text_model.register_forward_pre_hook(splice.hook, with_kwargs=True)
     return injector, splice, handle
@@ -531,7 +540,10 @@ class PrefixRuntime:
 
     @property
     def position(self) -> str:
-        return prefix_position()
+        # Single source of truth: the splice resolved it at install time from the
+        # caller's argument.  Reading the environment here instead would let the
+        # CLI flag and the actual placement disagree.
+        return self.splice.position
 
     @property
     def logits_mask(self) -> PrefixLogitsMask:
@@ -561,6 +573,7 @@ def enable_prefix_injection(
     *,
     token_count: int,
     payload_mode_: PayloadMode | None = None,
+    position: str | None = None,
 ) -> PrefixRuntime:
     """Reserve the tokens, resize the embedding, install, and return the runtime.
 
@@ -586,6 +599,7 @@ def enable_prefix_injection(
         token_count=token_count,
         reserved_ids=reserved_ids,
         payload_mode_=payload_mode_,
+        position=position,
     )
     return PrefixRuntime(
         token_count=token_count,

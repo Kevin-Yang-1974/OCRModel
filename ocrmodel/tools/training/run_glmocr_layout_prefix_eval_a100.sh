@@ -167,7 +167,10 @@ from pathlib import Path
 
 root = Path(sys.argv[1])
 arms_dir = root / "arms"
-order = ["baseline", "prefix_global", "prefix_queries"]
+# Discover the arms from the directory rather than a hardcoded list: a fixed list
+# silently reports every arm it does not know about as MISSING, which reads as a
+# failed run when the run in fact succeeded.
+order = sorted(p.name for p in arms_dir.iterdir() if p.is_dir()) if arms_dir.exists() else []
 payload = {"status": "complete", "arms": {}}
 missing = []
 for arm in order:
@@ -230,7 +233,7 @@ if baseline.get("status") != "missing":
         print(f"  baseline        未复现 full 基线：{baseline['cer']:.6f} / {baseline['edits']}"
               "  <- 先查这一项，其余臂的结论都依赖它")
         ok = False
-for arm in ("prefix_global", "prefix_queries"):
+for arm in [a for a in order if a != "baseline"]:
     row = payload["arms"][arm]
     if row.get("status") == "missing" or baseline.get("status") == "missing":
         continue

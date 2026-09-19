@@ -252,6 +252,44 @@ def test_disable_env_skips_the_splice_but_still_consumes_the_arming(
     assert splice._pending == 0  # arming still consumed
 
 
+def test_explicit_position_wins_over_the_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The regression: reading the env var in the hook ignored --prefix-position.
+
+    A run that asked for ``tail`` therefore measured ``front`` and reported
+    ``pos=front`` in its own probe -- a wrong number that never raised.
+    """
+
+    from layout_ocr.prefix_injection import POSITION_ENV_VAR
+
+    monkeypatch.setenv(POSITION_ENV_VAR, "tail")
+    model = _FakeModel(vocab=64, hidden=8)
+    bridge = _FakeBridge(hidden=8)
+    injector, splice, _ = install_prefix_injection(
+        model, bridge, token_count=4, reserved_ids=[50, 51, 52, 53],
+        position="front",
+    )
+    assert splice.position == "front"
+    with torch.no_grad():
+        injector.projection.weight.copy_(torch.eye(8))
+    publish_prefix_payload(splice, _FakeOutput(torch.ones(1, 4, 8)))
+    splice.arm()
+    seen = model.model.language_model(input_ids=None, inputs_embeds=torch.zeros(1, 6, 8))
+    # Front, despite the environment saying tail.
+    assert torch.allclose(seen[0, :4], torch.ones(4, 8))
+    assert torch.equal(seen[0, 4:], torch.zeros(2, 8))
+
+
+def test_install_rejects_an_unknown_position() -> None:
+    model = _FakeModel()
+    with pytest.raises(ValueError, match="'front' or 'tail'"):
+        install_prefix_injection(
+            model, _FakeBridge(), token_count=4, reserved_ids=[50, 51, 52, 53],
+            position="middle",
+        )
+
+
 def test_tail_position_splices_at_the_end(monkeypatch: pytest.MonkeyPatch) -> None:
     from layout_ocr.prefix_injection import POSITION_ENV_VAR
 

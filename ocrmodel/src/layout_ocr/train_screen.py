@@ -2061,6 +2061,7 @@ def load_model(args: argparse.Namespace, device: torch.device) -> tuple[Any, Any
             tokenizer,
             token_count=prefix_tokens,
             payload_mode_=getattr(args, "prefix_payload", "queries"),
+            position=getattr(args, "prefix_position", "front"),
         )
     model.config.use_cache = False
     return model, processor, bridge
