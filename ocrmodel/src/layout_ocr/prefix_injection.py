@@ -86,38 +86,55 @@ ORACLE_FEATURE_DIM = 4 + 1 + 3 + 1
 
 
 class LayoutOracleEncoder(nn.Module):
-    """Encode ground-truth regions into ``K`` slot vectors.
+    """Pool ground-truth regions into ``K`` slot vectors.
 
-    This is the upper bound the layout branch never had the capacity to reach: the
-    input is exact region geometry and reading order, and the encoding is learned
-    rather than inherited from the branch's transport.  If a trainable encoder with
-    correct input cannot make the decoder recognise better, then no amount of
-    improving the branch will -- which is the question an oracle arm exists to
-    answer, and the one the branch's own output cannot answer for itself.
+    The input is exact region geometry, reading order and writing direction, and the
+    encoding is learned rather than inherited from the branch's transport -- which
+    is what makes this an upper bound rather than another re-parameterisation.
+
+    The regions are *pooled*, not truncated or one-per-slot.  A page here carries
+    27-30 regions, so a per-region design forces K >= 32 and gives up the ability to
+    ask what a small number of slots can carry; truncating to a small K would drop
+    exactly the later regions that reading order exists to distinguish. K learned
+    queries attending over the region set compress without either compromise, and
+    the count is a free parameter rather than a property of the corpus.
     """
 
-    def __init__(self, hidden_size: int, feature_dim: int = ORACLE_FEATURE_DIM) -> None:
+    def __init__(
+        self,
+        hidden_size: int,
+        slots: int,
+        feature_dim: int = ORACLE_FEATURE_DIM,
+        heads: int = 4,
+    ) -> None:
         super().__init__()
         inner = 4 * hidden_size
-        self.encoder = nn.Sequential(
+        self.slots = slots
+        self.region = nn.Sequential(
             nn.Linear(feature_dim, inner),
             nn.GELU(),
             nn.Linear(inner, hidden_size),
         )
+        self.queries = nn.Parameter(torch.empty(slots, hidden_size))
+        nn.init.normal_(self.queries, std=0.02)
+        self.attend = nn.MultiheadAttention(
+            hidden_size, heads, dropout=0.0, batch_first=True
+        )
         self.norm = nn.LayerNorm(hidden_size)
         # Small but nonzero: an exactly-zero slot vector sits on RMSNorm's gradient
         # singularity, the same reason the prefix slots carry a base.
-        nn.init.normal_(self.encoder[-1].weight, std=0.02)
-        nn.init.zeros_(self.encoder[-1].bias)
+        nn.init.normal_(self.region[-1].weight, std=0.02)
+        nn.init.zeros_(self.region[-1].bias)
 
     def forward(self, features: Tensor) -> Tensor:
-        # Cast to the encoder's own dtype rather than to float32.  Forcing float32
-        # works under training's autocast -- which casts the linear inputs anyway --
-        # and fails in validation, which runs without autocast, with "mat1 and mat2
-        # must have the same dtype, but got Float and BFloat16".  A dtype that
-        # depends on whether autocast happens to be active is not a dtype choice.
-        weight = self.encoder[0].weight
-        return self.norm(self.encoder(features.to(weight.dtype)))
+        # Cast to the encoder's own dtype rather than to float32: forcing float32
+        # works under training's autocast, which casts the linear inputs anyway, and
+        # fails in validation, which runs without autocast.
+        weight = self.region[0].weight
+        regions = self.region(features.to(weight.dtype))
+        queries = self.queries.unsqueeze(0).expand(regions.shape[0], -1, -1)
+        pooled, _ = self.attend(queries, regions, regions, need_weights=False)
+        return self.norm(pooled + queries)
 
 
 PayloadMode = Literal["queries", "regions", "global", "oracle"]
@@ -184,9 +201,7 @@ def reserve_prefix_tokens(tokenizer: Any, count: int) -> list[int]:
 DIRECTION_IDS = {"vertical_rtl": 0, "horizontal_ltr": 1, "unknown": 2}
 
 
-def region_feature_tensor(
-    regions: list[dict[str, Any]], slots: int, device: Any
-) -> Tensor:
+def region_feature_tensor(regions: list[dict[str, Any]], device: Any) -> Tensor:
     """``[1, slots, ORACLE_FEATURE_DIM]`` of ground-truth regions in reading order.
 
     Boxes and order are normalized, direction is one-hot, and the last feature is a
@@ -197,12 +212,11 @@ def region_feature_tensor(
     """
 
     ordered = sorted(regions, key=lambda item: int(item["reading_order"]))
-    if len(ordered) > slots:
-        raise ValueError(
-            f"page has {len(ordered)} regions but only {slots} prefix slots; "
-            "raise --prefix-tokens"
-        )
-    features = torch.zeros(1, slots, ORACLE_FEATURE_DIM, device=device)
+    if not ordered:
+        raise ValueError("page has no ground-truth regions")
+    # One row per actual region: the encoder pools them, so ``slots`` is neither
+    # a truncation limit nor a padding target.
+    features = torch.zeros(1, len(ordered), ORACLE_FEATURE_DIM, device=device)
     count = max(len(ordered), 1)
     for index, region in enumerate(ordered):
         box = region["bbox"]
@@ -396,7 +410,9 @@ class PrefixInjector(nn.Module):
         nn.init.normal_(self.slot_bias, std=0.02)
         self.oracle_encoder: LayoutOracleEncoder | None = None
         if self.payload_mode == "oracle":
-            self.oracle_encoder = LayoutOracleEncoder(model_hidden_size)
+            self.oracle_encoder = LayoutOracleEncoder(
+                model_hidden_size, token_count
+            )
         if dtype is not None:
             self.to(dtype=dtype)
 
@@ -418,11 +434,8 @@ class PrefixInjector(nn.Module):
 
         if self.oracle_encoder is None:
             raise ValueError("payload mode is not 'oracle'")
-        if features.shape[1] != self.token_count:
-            raise ValueError(
-                f"oracle features have {features.shape[1]} regions but "
-                f"{self.token_count} slots are allocated"
-            )
+        if features.shape[1] < 1:
+            raise ValueError("oracle features must contain at least one region")
         return self.oracle_encoder(features).to(self.projection.weight.dtype)
 
 
@@ -716,9 +729,7 @@ class PrefixRuntime:
                 )
             self.splice.set_oracle_features(
                 region_feature_tensor(
-                    regions,
-                    self.token_count,
-                    next(self.injector.parameters()).device,
+                    regions, next(self.injector.parameters()).device
                 )
             )
         extended = extend_prefix_side_inputs(
