@@ -47,14 +47,15 @@ residual_cap=0.03
 foreground="${GLMOCR_PREFIX_EVAL_FOREGROUND:-0}"
 gpu_slots="${GLMOCR_PREFIX_EVAL_GPUS:-0,1,2}"
 # 臂格式：<名字>:<prefix_tokens>:<payload>:<position>:<disable>
-#   tokens 为 0 表示不装前缀；disable=1 表示插入保留位但不写入（隔离"多出 K 个位置"
-#   与"写进去的向量"两种代价）。
+#   tokens 为 0 表示不装前缀；disable=1 表示插入保留位但不写入；oracle=1 表示把
+#   几何项里的预测箱子换成真值箱子（其余通路一字不动），用来分离「解码器不用布局
+#   信息」与「喂进去的箱子不够准」。
 #
 # 第一轮（v1）实测：零初始化投影下，装前缀相对无前缀 +0.006712 CER（0.111608→0.118320），
 # 是布局分支全部实测收益（+0.001380）的 4.9 倍。这是槽位固定开销，不是接线错误，所以本轮
 # 拆开它：front vs tail 分离"图像 token 位置后移"与"注意力多出 K 个槽"，
 # disable 再分离"多出槽位"与"写进去的零向量"。
-arms="${GLMOCR_PREFIX_EVAL_ARMS:-baseline:0:global:front:0 prefix_front_disable:${prefix_tokens}:global:front:1 prefix_tail:${prefix_tokens}:global:tail:0}"
+arms="${GLMOCR_PREFIX_EVAL_ARMS:-baseline:0:global:front:0:0 oracle_boxes:0:global:front:0:1}"
 
 eval_root="${remote_root}/prefix_eval/${run_id}"
 python="${env_dir}/bin/python3"
@@ -93,7 +94,7 @@ preflight() {
 # train_screen.py refuses to start when --output-dir already exists, so nothing may
 # pre-create the arm directory: the log lives as a sibling.
 launch() {
-    local arm="$1" tokens="$2" payload="$3" position="$4" disable="$5" gpu="$6"
+    local arm="$1" tokens="$2" payload="$3" position="$4" disable="$5" oracle="$6" gpu="$7"
     local out="${eval_root}/arms/${arm}"
     (
         setup_environment
@@ -101,6 +102,7 @@ launch() {
         export GLMOCR_ADAPTER_PROBE="${out}.probe.jsonl"
         export GLMOCR_PREFIX_PROBE="${out}.prefix.jsonl"
         [[ "${disable}" == "0" ]] || export GLMOCR_PREFIX_DISABLE="${disable}"
+        [[ "${oracle}" == "0" ]] || export GLMOCR_ORACLE_BOXES="${oracle}"
         cd "${code_root}"
         exec "${python}" -m layout_ocr.train_screen \
             --mode layout_ot --model-path "${model_dir}" \
@@ -139,9 +141,9 @@ run_arms() {
     local -a pids=() labels=() failed=0
     local index=0 spec
     for spec in ${arms}; do
-        IFS=':' read -r arm tokens payload position disable <<< "${spec}"
+        IFS=':' read -r arm tokens payload position disable oracle <<< "${spec}"
         local gpu="${slots[$(( index % total ))]}"
-        launch "${arm}" "${tokens}" "${payload}" "${position}" "${disable}" "${gpu}" &
+        launch "${arm}" "${tokens}" "${payload}" "${position}" "${disable}" "${oracle}" "${gpu}" &
         pids+=("$!"); labels+=("${arm}")
         index=$(( index + 1 ))
         if (( index % total == 0 )); then

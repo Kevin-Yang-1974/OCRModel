@@ -110,6 +110,9 @@ class LayoutAwarePatchMerger(nn.Module):
         # also published as decoder prefix tokens; the write-back is left alone,
         # so the two routes can be run together or one at a time.
         self.prefix_splice: Any | None = None
+        # Ground-truth region boxes for the oracle arm, or None for the normal
+        # run.  Set per page by the caller; see ``set_oracle_boxes``.
+        self._oracle_boxes: tuple[Tensor, Tensor] | None = None
 
     def set_grid_thw(self, grid_thw: Tensor) -> None:
         self._grid_thw = grid_thw
@@ -118,6 +121,18 @@ class LayoutAwarePatchMerger(nn.Module):
         """Set training-only ordered region targets for the AR decoder."""
 
         self._region_targets = targets
+
+    def set_oracle_boxes(self, boxes: Tensor | None, mask: Tensor | None) -> None:
+        """Substitute ground-truth regions for the predicted ones in the context.
+
+        Eval-only and deliberately narrow: only the box values that feed the
+        geometry term change, so an oracle run differs from a normal one in the
+        *accuracy* of the layout and nothing else.  Without this the branch's own
+        output cannot distinguish "the decoder ignores layout" from "the decoder
+        is handed layout too inaccurate to be worth using".
+        """
+
+        self._oracle_boxes = None if boxes is None else (boxes, mask)
 
     def set_region_decode_controls(
         self, *, pointer_mask: bool | None = None, spatial_penalty: bool | None = None
@@ -145,6 +160,8 @@ class LayoutAwarePatchMerger(nn.Module):
                     region_targets=self._region_targets,
                     region_pointer_mask=self._region_pointer_mask,
                     region_spatial_penalty=self._region_spatial_penalty,
+                    oracle_boxes=None if self._oracle_boxes is None else self._oracle_boxes[0],
+                    oracle_mask=None if self._oracle_boxes is None else self._oracle_boxes[1],
                 )
         else:
             output = self.adapter(
@@ -153,6 +170,8 @@ class LayoutAwarePatchMerger(nn.Module):
                 region_targets=self._region_targets,
                 region_pointer_mask=self._region_pointer_mask,
                 region_spatial_penalty=self._region_spatial_penalty,
+                oracle_boxes=None if self._oracle_boxes is None else self._oracle_boxes[0],
+                oracle_mask=None if self._oracle_boxes is None else self._oracle_boxes[1],
             )
         self.last_output = output
         self.last_patch_positions = positions

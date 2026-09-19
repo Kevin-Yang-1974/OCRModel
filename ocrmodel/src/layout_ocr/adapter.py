@@ -34,7 +34,7 @@ class LayoutAdapterOutput:
 
 def _probe_layout_writeback(path: str, token_weights: Tensor | None, layout_context: Tensor,
                             visual_tokens: Tensor, residual_scale: Tensor | None = None,
-                            intervention: str = "full") -> None:
+                            intervention: str = "full", oracle: bool = False) -> None:
     """Diagnostic hook: how much spatial information the write-back actually carries.
 
     The residual reaches the decoder only as ``layout_context[p]``, a per-patch
@@ -78,6 +78,7 @@ def _probe_layout_writeback(path: str, token_weights: Tensor | None, layout_cont
             # The number the "amplitude is sufficient" claim depends on.
             "inj_over_vt": None if scale is None else float(scale * context_norm / visual_norm),
             "intervention": intervention,
+            "oracle_boxes": bool(oracle),
         }
     with open(path, "a", encoding="utf-8") as handle:
         handle.write(json.dumps(record) + chr(10))
@@ -253,7 +254,22 @@ class PreMergeLayoutAdapter(nn.Module):
         region_targets: dict[str, Tensor] | None = None,
         region_pointer_mask: bool | None = None,
         region_spatial_penalty: bool | None = None,
+        oracle_boxes: Tensor | None = None,
+        oracle_mask: Tensor | None = None,
     ) -> LayoutAdapterOutput:
+        """``oracle_boxes`` substitutes ground-truth regions for the predicted ones.
+
+        Everything else in the context path is left alone -- the queries, the
+        geometry temperature, the transport, ``content_norm``, the residual scale --
+        so the difference between an oracle run and a normal one is the accuracy of
+        the boxes and nothing else.  That is the only way to separate "the decoder
+        does not use layout information" from "the decoder is handed boxes too
+        inaccurate to use", which the branch's own output cannot distinguish.
+
+        Unused queries are pushed to a very negative score rather than zeroed after
+        the fact, so the transport keeps its own normalisation and the substitution
+        stays inside the path the decoder was trained on.
+        """
         if visual_tokens.ndim != 3:
             raise ValueError("visual_tokens must have shape [batch, tokens, hidden]")
         queries = self._queries(visual_tokens)
@@ -294,7 +310,17 @@ class PreMergeLayoutAdapter(nn.Module):
                 validity_probs = validity_logits.sigmoid()
             merged = visual_tokens
         else:
-            scores = self._scores(queries, visual_tokens, boxes, patch_positions)
+            scores = self._scores(
+                queries,
+                visual_tokens,
+                boxes if oracle_boxes is None else oracle_boxes,
+                patch_positions,
+            )
+            if oracle_mask is not None:
+                # A query with no region behind it must not attract transport mass.
+                scores = scores.masked_fill(
+                    ~oracle_mask.unsqueeze(-1).to(torch.bool), -1e4
+                )
             if self.config.mode == "layout_ot":
                 transport = self.ot(scores)
             else:

@@ -3597,8 +3597,18 @@ def evaluate(
     }
     started = time.time()
     prefix_runtime = getattr(bridge, "prefix_runtime", None)
+    # Oracle arm: substitute ground-truth region boxes for the predicted ones, so
+    # the run differs from the normal one in the accuracy of the layout and nothing
+    # else.  Eval-only; the branch's own output cannot separate "the decoder
+    # ignores layout" from "the decoder is handed layout too inaccurate to use".
+    oracle_boxes_enabled = bool(os.environ.get("GLMOCR_ORACLE_BOXES", "").strip() not in {"", "0"})
     for record in validation_records:
         inputs = prepare_inference_inputs(processor, record, device)
+        if oracle_boxes_enabled:
+            truth = region_decoder_targets(record, device, args.num_queries)
+            bridge.set_oracle_boxes(truth["target_boxes"], truth["query_mask"])
+        else:
+            bridge.set_oracle_boxes(None, None)
         if prefix_runtime is not None:
             # Both consuming forwards below are armed here, in the order they run
             # (teacher-forcing, then the generation prefill); the splice counter
