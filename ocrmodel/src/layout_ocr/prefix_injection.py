@@ -290,12 +290,21 @@ class PrefixInjector(nn.Module):
         self.reserved_ids = [int(token_id) for token_id in reserved_ids]
         self.payload_mode: PayloadMode = payload_mode_ or "queries"
         self.projection = nn.Linear(source_hidden_size, model_hidden_size)
-        # Start as an exact no-op contribution: the prefix rows are the projection
-        # of a zero vector, so the feature can be switched on without perturbing
-        # the checkpoint it is attached to.  This mirrors the zero-initialised
-        # residual gate, for the same reason.
+        # The projection is zero-initialised so the layout branch contributes no
+        # content at step 0 and any movement is attributable to training it.
         nn.init.zeros_(self.projection.weight)
         nn.init.zeros_(self.projection.bias)
+        # The slots need a small nonzero base of their own, at the scale ordinary
+        # token embeddings are drawn at.  Zero-initialising the *slots* as well --
+        # which is what a bare zero projection produces -- puts an exactly-zero
+        # hidden state at the first RMSNorm, and RMSNorm is
+        # ``x * rsqrt(mean(x^2) + eps)``: at x = 0 the backward pass is
+        # ``0.5 * eps**-1.5 ~ 5e8`` times the upstream gradient.  A DDP smoke
+        # measured the amplification at 1.0e3 for an all-zero row against 0.12 for
+        # a row drawn at 0.02, and the real run then died with non-finite gradients
+        # in layer 0's attention LoRA -- the first layer to consume these rows.
+        self.slot_bias = nn.Parameter(torch.empty(token_count, model_hidden_size))
+        nn.init.normal_(self.slot_bias, std=0.02)
         if dtype is not None:
             self.to(dtype=dtype)
 
@@ -309,7 +318,8 @@ class PrefixInjector(nn.Module):
                 f"payload has {payload.shape[1]} entries but {self.token_count} "
                 "reserved tokens are allocated"
             )
-        return self.projection(payload.to(self.projection.weight.dtype))
+        projected = self.projection(payload.to(self.projection.weight.dtype))
+        return projected + self.slot_bias.unsqueeze(0)
 
 
 def _select_payload(output: Any, mode: PayloadMode, token_count: int) -> Tensor:

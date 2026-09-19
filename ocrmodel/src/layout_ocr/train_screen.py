@@ -1612,6 +1612,32 @@ def write_adapter_config(path: Path, bridge: LayoutAwarePatchMerger) -> None:
     write_json(path, asdict(unwrap_module(bridge.adapter).config))
 
 
+def non_finite_gradient_names(
+    model: Any, continuation_head: torch.nn.Module | None = None, limit: int = 8
+) -> list[str]:
+    """Names of trainable parameters whose gradient is not finite.
+
+    ``clip_grad_norm_`` collapses every parameter into a single scalar, so a
+    non-finite norm says nothing about where it came from.  A prefix run failed on
+    this check with no name attached and the only way to localise it was to guess;
+    reporting the names turns that into a read.
+    """
+
+    offending: list[str] = []
+    modules: list[tuple[str, torch.nn.Module]] = [("", model)]
+    if continuation_head is not None:
+        modules.append(("continuation_head.", continuation_head))
+    for prefix, module in modules:
+        for name, parameter in module.named_parameters():
+            if not parameter.requires_grad or parameter.grad is None:
+                continue
+            if not bool(torch.isfinite(parameter.grad).all()):
+                offending.append(f"{prefix}{name}")
+                if len(offending) >= limit:
+                    return offending
+    return offending
+
+
 PREFIX_CHECKPOINT_NAME = "layout_prefix.safetensors"
 
 
@@ -2889,7 +2915,9 @@ def train(
         if not all_finite(
             bool(torch.isfinite(gradient_norm).all()), distributed, device
         ):
-            raise FloatingPointError(f"non-finite gradient at step {step}")
+            raise FloatingPointError(
+                f"non-finite gradient at step {step}: {non_finite_gradient_names(model_module, continuation_head)}"
+            )
         optimizer.step()
         debug(f"step={step} optimizer_done")
         finite_report = adapter_finite_report(adapter_module)

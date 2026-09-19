@@ -240,8 +240,7 @@ def test_disable_env_skips_the_splice_but_still_consumes_the_arming(
 
     monkeypatch.setenv(DISABLE_ENV_VAR, "1")
     model, _, injector, splice, _ = _installed()
-    with torch.no_grad():
-        injector.projection.weight.copy_(torch.eye(8))
+    _force_identity(injector)
     publish_prefix_payload(splice, _FakeOutput(torch.ones(1, 4, 8)))
     splice.arm()
     embeds = torch.zeros(1, 6, 8)
@@ -271,8 +270,7 @@ def test_explicit_position_wins_over_the_environment(
         position="front",
     )
     assert splice.position == "front"
-    with torch.no_grad():
-        injector.projection.weight.copy_(torch.eye(8))
+    _force_identity(injector)
     publish_prefix_payload(splice, _FakeOutput(torch.ones(1, 4, 8)))
     splice.arm()
     seen = model.model.language_model(input_ids=None, inputs_embeds=torch.zeros(1, 6, 8))
@@ -318,8 +316,7 @@ def test_tail_position_splices_at_the_end(monkeypatch: pytest.MonkeyPatch) -> No
 
     monkeypatch.setenv(POSITION_ENV_VAR, "tail")
     model, _, injector, splice, _ = _installed()
-    with torch.no_grad():
-        injector.projection.weight.copy_(torch.eye(8))
+    _force_identity(injector)
     publish_prefix_payload(splice, _FakeOutput(torch.ones(1, 4, 8)))
     splice.arm()
     seen = model.model.language_model(input_ids=None, inputs_embeds=torch.zeros(1, 6, 8))
@@ -389,13 +386,39 @@ def test_injector_validates_its_arguments() -> None:
         PrefixInjector(8, 8, 2, [1])
 
 
-def test_injector_is_zero_initialised_so_installing_it_changes_nothing() -> None:
-    """A checkpoint with the prefix attached must reproduce itself exactly."""
+def test_projection_is_zero_initialised_but_the_slots_are_not() -> None:
+    """The projection carries no content at step 0; the slots must not be zero.
+
+    An exactly-zero prefix row puts a zero hidden state at the first RMSNorm, whose
+    backward is ``0.5 * eps**-1.5``-ish at that point -- measured at 1.0e3 times the
+    upstream gradient against 0.12 for a row drawn at 0.02.  A zero-init projection
+    with no slot base therefore produced non-finite gradients in layer 0.
+    """
 
     injector = PrefixInjector(8, 8, 3, [50, 51, 52])
     assert torch.equal(injector.projection.weight, torch.zeros(8, 8))
+    assert torch.equal(injector.projection.bias, torch.zeros(8))
     payload = torch.randn(1, 3, 8)
-    assert torch.equal(injector(payload), torch.zeros(1, 3, 8))
+    out = injector(payload)
+    # No layout content at init: the output is exactly the per-slot base, so the
+    # payload has no influence until the projection is trained.
+    assert torch.allclose(out[0], injector.slot_bias.detach())
+    # Slots differ from each other, like ordinary token embeddings.
+    assert not torch.allclose(out[0, 0], out[0, 2])
+    # And none of them is zero, which is the point.
+    assert out.abs().min() > 0
+    assert 0.005 < float(out.detach().std()) < 0.06
+    assert injector.slot_bias.requires_grad
+
+
+def test_injector_gradient_stays_finite_at_initialisation() -> None:
+    """The bug this replaced: a zero row made layer-0 RMSNorm backward explode."""
+
+    injector = PrefixInjector(8, 8, 3, [50, 51, 52])
+    payload = torch.randn(1, 3, 8, requires_grad=True)
+    injector(payload).sum().backward()
+    assert torch.isfinite(injector.projection.weight.grad).all()
+    assert torch.isfinite(injector.slot_bias.grad).all()
 
 
 def test_injector_projects_shapes() -> None:
@@ -411,6 +434,21 @@ def test_injector_rejects_a_batch() -> None:
 
 
 # --- the splice itself ----------------------------------------------------
+
+
+
+def _force_identity(injector: PrefixInjector) -> None:
+    """Make the injector pass its payload through unchanged, for splice tests.
+
+    The slot base has to be zeroed alongside the projection: it is what keeps the
+    prefix rows away from RMSNorm's gradient singularity at zero, so it is nonzero
+    by default and would otherwise ride on top of every spliced row.
+    """
+
+    with torch.no_grad():
+        injector.projection.weight.copy_(torch.eye(injector.projection.weight.shape[0]))
+        injector.projection.bias.zero_()
+        injector.slot_bias.zero_()
 
 
 def _installed(hidden: int = 8, tokens: int = 4, payload_mode_: str = "queries"):
@@ -469,9 +507,7 @@ def test_bridge_publishes_and_hook_splices_in_the_same_forward() -> None:
     """The ordering that makes one vision pass enough: image features first."""
 
     model, bridge, injector, splice, _ = _installed(hidden=8, tokens=4)
-    with torch.no_grad():
-        injector.projection.weight.copy_(torch.eye(8))
-        injector.projection.bias.zero_()
+    _force_identity(injector)
     queries = torch.randn(1, 4, 8)
     publish_prefix_payload(splice, _FakeOutput(queries))
     assert torch.allclose(splice.payload, queries)
@@ -501,8 +537,7 @@ def test_hook_does_nothing_unless_armed() -> None:
     """
 
     model, _, injector, splice, _ = _installed()
-    with torch.no_grad():
-        injector.projection.weight.copy_(torch.eye(8))
+    _force_identity(injector)
     publish_prefix_payload(splice, _FakeOutput(torch.ones(1, 4, 8)))
     embeds = torch.zeros(1, 6, 8)
     seen = model.model.language_model(input_ids=None, inputs_embeds=embeds)
@@ -514,8 +549,7 @@ def test_arming_is_consumed_once() -> None:
     """A skipped prefill must not leak the armed flag into the decode steps."""
 
     model, _, injector, splice, _ = _installed()
-    with torch.no_grad():
-        injector.projection.weight.copy_(torch.eye(8))
+    _force_identity(injector)
     publish_prefix_payload(splice, _FakeOutput(torch.ones(1, 4, 8)))
     splice.arm()
     first = model.model.language_model(input_ids=None, inputs_embeds=torch.zeros(1, 6, 8))
@@ -549,8 +583,7 @@ def test_interleaved_forwards_each_consume_their_own_arming() -> None:
     from layout_ocr.prefix_injection import PrefixRuntime
 
     model, _, injector, splice, handle = _installed()
-    with torch.no_grad():
-        injector.projection.weight.copy_(torch.eye(8))
+    _force_identity(injector)
     runtime = PrefixRuntime(
         token_count=4, reserved_ids=[50, 51, 52, 53],
         injector=injector, splice=splice, handle=handle,
@@ -592,8 +625,7 @@ def test_hook_does_not_resplice_during_decoding() -> None:
             return 12
 
     model, _, injector, splice, _ = _installed()
-    with torch.no_grad():
-        injector.projection.weight.copy_(torch.eye(8))
+    _force_identity(injector)
     publish_prefix_payload(splice, _FakeOutput(torch.randn(1, 4, 8)))
     embeds = torch.zeros(1, 1, 8)
     splice.arm()
@@ -608,8 +640,7 @@ def test_hook_refuses_to_drop_the_prefix_silently() -> None:
     """If the caller passes only input_ids the prefix would vanish; say so."""
 
     model, _, injector, splice, _ = _installed()
-    with torch.no_grad():
-        injector.projection.weight.copy_(torch.eye(8))
+    _force_identity(injector)
     publish_prefix_payload(splice, _FakeOutput(torch.randn(1, 4, 8)))
     splice.arm()
     with pytest.raises(RuntimeError, match="expected inputs_embeds"):
@@ -618,8 +649,7 @@ def test_hook_refuses_to_drop_the_prefix_silently() -> None:
 
 def test_hook_ignores_a_sequence_shorter_than_the_prefix() -> None:
     model, _, injector, splice, _ = _installed()
-    with torch.no_grad():
-        injector.projection.weight.copy_(torch.eye(8))
+    _force_identity(injector)
     publish_prefix_payload(splice, _FakeOutput(torch.randn(1, 4, 8)))
     splice.arm()
     embeds = torch.zeros(1, 2, 8)
@@ -632,8 +662,7 @@ def test_splice_respects_the_intervention_arms(monkeypatch: pytest.MonkeyPatch) 
 
     monkeypatch.setenv("GLMOCR_LAYOUT_INTERVENE", "zero")
     model, _, injector, splice, _ = _installed()
-    with torch.no_grad():
-        injector.projection.weight.copy_(torch.eye(8))
+    _force_identity(injector)
     publish_prefix_payload(splice, _FakeOutput(torch.ones(1, 4, 8)))
     assert torch.equal(splice.payload, torch.zeros(1, 4, 8))
     splice.arm()
@@ -662,8 +691,7 @@ def test_splice_trains_the_projection() -> None:
 def test_global_payload_arm_reaches_the_hook_as_a_page_vector() -> None:
     model, _, injector, splice, _ = _installed(payload_mode_="global")
     assert injector.payload_mode == "global"
-    with torch.no_grad():
-        injector.projection.weight.copy_(torch.eye(8))
+    _force_identity(injector)
     queries = torch.randn(1, 4, 8)
     publish_prefix_payload(splice, _FakeOutput(queries))
     # Every slot gets the same page-level vector, which is what makes this the
@@ -710,10 +738,11 @@ def test_enable_reserves_resizes_freezes_and_installs_in_order() -> None:
     # Only the injector trains.
     assert runtime.injector.projection.weight.requires_grad
     assert runtime.injector.projection.bias.requires_grad
-    assert [id(p) for p in runtime.parameters()] == [
+    assert {id(p) for p in runtime.parameters()} == {
         id(runtime.injector.projection.weight),
         id(runtime.injector.projection.bias),
-    ]
+        id(runtime.injector.slot_bias),
+    }
     assert bridge.prefix_splice is runtime.splice
 
 
