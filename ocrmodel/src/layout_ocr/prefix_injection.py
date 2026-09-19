@@ -430,8 +430,28 @@ class _Splice:
         if os.environ.get(DISABLE_ENV_VAR, "").strip() not in {"", "0"}:
             # Diagnostic: the reserved span is in the sequence but nothing is
             # written into it, which separates the cost of the extra positions
-            # from the cost of the vectors that go in them.
+            # from the cost of the vectors that go in them.  Note this is not the
+            # same as "no vectors in the slots": the slots then hold whatever the
+            # reserved tokens' own embedding rows contain, which are untrained.
             self.skipped += 1
+            probe_path = os.environ.get(PROBE_ENV_VAR)
+            if probe_path:
+                # Recorded so the artifact distinguishes "the splice was
+                # deliberately disabled" from "the splice never fired", which
+                # otherwise look identical downstream.
+                _probe(
+                    probe_path,
+                    {
+                        "prefix_tokens": 0,
+                        "prefix_offset": None,
+                        "prefix_position": self.position,
+                        "payload_mode": self.injector.payload_mode,
+                        "splice_disabled": True,
+                        "payload_norm": None,
+                        "prefix_norm": None,
+                        "embeds_norm": None,
+                    },
+                )
             return None
         payload = self.payload
         if payload is None:

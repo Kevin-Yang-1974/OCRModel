@@ -290,6 +290,29 @@ def test_install_rejects_an_unknown_position() -> None:
         )
 
 
+def test_disabled_arm_writes_a_probe_record(
+    tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A deliberately disabled splice must not look like one that never fired."""
+
+    import json
+
+    from layout_ocr.prefix_injection import DISABLE_ENV_VAR, PROBE_ENV_VAR
+
+    probe = tmp_path / "prefix.jsonl"
+    monkeypatch.setenv(DISABLE_ENV_VAR, "1")
+    monkeypatch.setenv(PROBE_ENV_VAR, str(probe))
+    model, _, injector, splice, _ = _installed()
+    publish_prefix_payload(splice, _FakeOutput(torch.ones(1, 4, 8)))
+    splice.arm()
+    model.model.language_model(input_ids=None, inputs_embeds=torch.zeros(1, 6, 8))
+    records = [json.loads(line) for line in probe.read_text().splitlines()]
+    assert len(records) == 1
+    assert records[0]["splice_disabled"] is True
+    assert records[0]["prefix_norm"] is None
+    assert records[0]["prefix_position"] == "front"
+
+
 def test_tail_position_splices_at_the_end(monkeypatch: pytest.MonkeyPatch) -> None:
     from layout_ocr.prefix_injection import POSITION_ENV_VAR
 

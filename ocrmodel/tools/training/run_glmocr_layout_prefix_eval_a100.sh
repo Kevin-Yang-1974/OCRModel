@@ -190,14 +190,26 @@ for arm in order:
     prefix_path = arm_dir.with_name(arm_dir.name + ".prefix.jsonl")
     if prefix_path.exists():
         rows = [json.loads(line) for line in prefix_path.read_text(encoding="utf-8").splitlines()]
+        # A disabled arm writes records with null norms on purpose; the median has
+        # to skip them rather than raise, or the arm summarises as a crash.
+        applied = [r for r in rows if r.get("prefix_norm") is not None]
+        disabled = [r for r in rows if r.get("splice_disabled")]
         if rows:
             record["prefix"] = {
-                "splices": len(rows),
-                "prefix_tokens": rows[0]["prefix_tokens"],
+                "splices": len(applied),
+                "disabled_records": len(disabled),
+                "splice_disabled": bool(disabled) and not applied,
+                "prefix_tokens": applied[0]["prefix_tokens"] if applied else rows[0]["prefix_tokens"],
                 "payload_mode": rows[0]["payload_mode"],
-                "payload_norm": statistics.median([r["payload_norm"] for r in rows]),
-                "prefix_norm": statistics.median([r["prefix_norm"] for r in rows]),
-                "embeds_norm": statistics.median([r["embeds_norm"] for r in rows]),
+                "payload_norm": (
+                    statistics.median([r["payload_norm"] for r in applied]) if applied else None
+                ),
+                "prefix_norm": (
+                    statistics.median([r["prefix_norm"] for r in applied]) if applied else None
+                ),
+                "embeds_norm": (
+                    statistics.median([r["embeds_norm"] for r in applied]) if applied else None
+                ),
             }
     payload["arms"][arm] = record
 
@@ -238,8 +250,13 @@ for arm in [a for a in order if a != "baseline"]:
     if row.get("status") == "missing" or baseline.get("status") == "missing":
         continue
     if "prefix" not in row or row["prefix"]["splices"] == 0:
-        print(f"  {arm:16s} 前缀探针 0 条记录：splice 从未生效，接线未接通")
-        ok = False
+        # A disabled arm records a probe per forward with splice_disabled set, so
+        # a genuinely silent splice is distinguishable from a deliberate one.
+        if row.get("prefix", {}).get("splice_disabled"):
+            print(f"  {arm:16s} 刻意关闭写入（对照臂），探针记录正常")
+        else:
+            print(f"  {arm:16s} 前缀探针 0 条记录：splice 从未生效，接线未接通")
+            ok = False
         continue
     # 注意：这里**不再**期望与 baseline 逐位相同。零初始化只保证投影不贡献布局内容，
     # 不保证模型不变——序列里多了 K 个位置，后续 token 的 mrope 位置整体后移，且这些槽位
