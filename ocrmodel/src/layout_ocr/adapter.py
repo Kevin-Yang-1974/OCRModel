@@ -32,6 +32,39 @@ class LayoutAdapterOutput:
     region_output: RegionDecoderOutput | None = None
 
 
+def _probe_layout_writeback(path: str, token_weights: Tensor, layout_context: Tensor,
+                            visual_tokens: Tensor) -> None:
+    """Diagnostic hook: how much spatial information the write-back actually carries.
+
+    The residual reaches the decoder only as ``layout_context[p]``, a per-patch
+    combination of query features.  If that vector barely varies across patches it
+    degenerates into a global offset, and no amount of layout-branch quality can
+    put spatial or reading-order information into it.  ``lc_flat`` <= ~0.1 is that
+    degenerate regime; ``vt_flat`` is the same statistic for the visual tokens, so a
+    comparison is against a representation that is known to be patch-specific.
+    """
+    import json, os
+
+    with torch.no_grad():
+        def flatness(x: Tensor) -> float:
+            x = x.float()
+            centred = x - x.mean(dim=1, keepdim=True)
+            return float((centred.norm(dim=-1).mean() / x.norm(dim=-1).mean().clamp_min(1e-12)))
+
+        record = {
+            "patches": int(visual_tokens.shape[1]),
+            "lc_flat": flatness(layout_context),
+            "vt_flat": flatness(visual_tokens),
+            "tw_flat": float(token_weights.float().std(dim=1).mean()) if token_weights is not None else None,
+            "lc_norm_over_vt": float(
+                layout_context.float().norm(dim=-1).mean()
+                / visual_tokens.float().norm(dim=-1).mean().clamp_min(1e-12)
+            ),
+        }
+    with open(path, "a", encoding="utf-8") as handle:
+        handle.write(json.dumps(record) + chr(10))
+
+
 class PreMergeLayoutAdapter(nn.Module):
     """Generate layout queries from whole-page visual tokens before VLM merging.
 
@@ -291,6 +324,13 @@ class PreMergeLayoutAdapter(nn.Module):
             if region_output is not None:
                 layout_context = self._region_context(
                     region_output, patch_positions, visual_tokens.shape[1]
+                )
+            import os as _os
+            _probe_path = _os.environ.get("GLMOCR_ADAPTER_PROBE")
+            if _probe_path:
+                _probe_layout_writeback(
+                    _probe_path, token_weights,
+                    layout_context, visual_tokens
                 )
             merged = visual_tokens + self.effective_residual_scale() * layout_context
 
