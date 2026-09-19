@@ -43,6 +43,12 @@ max_eval_new_tokens="${GLMOCR_DH_CONTINUE_MAX_EVAL_NEW_TOKENS:-1536}"
 prefix_tokens="${GLMOCR_DH_CONTINUE_PREFIX_TOKENS:-0}"
 prefix_payload="${GLMOCR_DH_CONTINUE_PREFIX_PAYLOAD:-queries}"
 prefix_position="${GLMOCR_DH_CONTINUE_PREFIX_POSITION:-front}"
+# 0 保持历史行为（无循环抑制）。开启后它同时做两件事：给训练加一个 loop loss 项，
+# 并让 generate 真的挂上 AdaptiveCycleLogitsProcessor —— 后者只在 natural_loop_loss
+# 为真时生效，否则 generation_mode=loop_recovery 是个空转的名字。改动训练目标，
+# 所以对照臂必须同批重跑。
+natural_loop="${GLMOCR_DH_CONTINUE_NATURAL_LOOP:-0}"
+prefix_lr="${GLMOCR_DH_CONTINUE_PREFIX_LR:-}"
 # Fixed by the shared DDP runner.  The parallel-validation summarizer rejects
 # any evaluation whose metadata diverges from the training run on these, so the
 # eval-only invocations below have to repeat them verbatim.
@@ -209,7 +215,9 @@ common_wrapper_args() {
     if (( prefix_tokens > 0 )); then
         printf '%s\n' --prefix-tokens "${prefix_tokens}" \
             --prefix-payload "${prefix_payload}" --prefix-position "${prefix_position}"
+        [[ -z "${prefix_lr}" ]] || printf '%s\n' --prefix-learning-rate "${prefix_lr}"
     fi
+    (( natural_loop == 0 )) || printf '%s\n' --natural-loop-loss
 }
 
 run_smoke() {
@@ -321,6 +329,7 @@ setup_eval_environment() {
 # refuses a checkpoint that carries a prefix into a run that never asked for one,
 # so a mismatch here is loud rather than a quiet zero-initialised score.
 eval_prefix_args=""
+(( natural_loop == 0 )) || eval_prefix_args="--natural-loop-loss"
 if (( prefix_tokens > 0 )); then
     eval_prefix_args="--prefix-tokens ${prefix_tokens} --prefix-payload ${prefix_payload} --prefix-position ${prefix_position}"
 fi
