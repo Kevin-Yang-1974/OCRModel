@@ -1,5 +1,7 @@
-* text=auto
-*.py text eol=lf
-*.toml text eol=lf
-*.md text eol=lf
-*.jsonl text eol=lf
+# `core.autocrlf=true` on this checkout rewrites LF to CRLF on checkout, which
+# breaks every shell launcher on the Linux runner: bash reads the first real
+# statement as `set -Eeuo pipefail\r` and exits 2 with
+# `set: pipefail: invalid option name` before any of the script's own validation.
+# Forcing LF for shell scripts makes the working tree match what actually runs.
+# tests/test_shell_line_endings.py checks the raw bytes as a second line of defence.
+*.sh text eol=lf
