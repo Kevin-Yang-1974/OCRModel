@@ -1,0 +1,440 @@
+"""Tests for routing the layout branch into decoder prefix tokens."""
+
+from __future__ import annotations
+
+import math
+from typing import Any
+
+import pytest
+import torch
+from torch import Tensor, nn
+
+from layout_ocr.prefix_injection import (
+    ENV_VAR,
+    PAYLOAD_ENV_VAR,
+    PREFIX_TAG,
+    PrefixInjector,
+    PrefixLogitsMask,
+    _find_text_model,
+    _select_payload,
+    extend_prefix_side_inputs,
+    install_prefix_injection,
+    payload_mode,
+    prefix_token_count,
+    publish_prefix_payload,
+    reserve_prefix_tokens,
+)
+
+
+class _FakeTokenizer:
+    """Minimal stand-in: the real one is only used for its vocab bookkeeping."""
+
+    def __init__(self, base: int = 100) -> None:
+        self._vocab = {f"tok{index}": index for index in range(base)}
+        self._next = base
+
+    def get_vocab(self) -> dict[str, int]:
+        return dict(self._vocab)
+
+    def add_tokens(self, names: list[str], special_tokens: bool = False) -> int:
+        added = 0
+        for name in names:
+            if name in self._vocab:
+                continue
+            self._vocab[name] = self._next
+            self._next += 1
+            added += 1
+        return added
+
+    def convert_tokens_to_ids(self, name: str) -> int:
+        return self._vocab.get(name, -1)
+
+
+class _FakeOutput:
+    def __init__(self, queries: Tensor, regions: Tensor | None = None) -> None:
+        self.layout_queries = queries
+        self.region_output = None if regions is None else _FakeRegionOutput(regions)
+
+
+class _FakeRegionOutput:
+    def __init__(self, features: Tensor) -> None:
+        self.region_features = features
+
+
+class _FakeTextModel(nn.Module):
+    """Receives assembled ``inputs_embeds`` exactly like ``GlmOcrTextModel``."""
+
+    def __init__(self, embed: nn.Embedding) -> None:
+        super().__init__()
+        self.embed_tokens = embed
+        self.hidden_size = embed.weight.shape[1]
+        self.seen_embeds: Tensor | None = None
+
+    def forward(self, input_ids=None, inputs_embeds=None, **kwargs: Any):
+        if inputs_embeds is None:
+            inputs_embeds = self.embed_tokens(input_ids)
+        self.seen_embeds = inputs_embeds
+        return inputs_embeds
+
+
+class _FakeBridge:
+    """Mirrors ``LayoutAwarePatchMerger``: ``adapter.config.hidden_size``."""
+
+    def __init__(self, hidden: int = 8) -> None:
+        self.adapter = nn.Module()
+        self.adapter.config = type("C", (), {"hidden_size": hidden})()
+        self.prefix_splice = None
+
+
+class _FakeModel(nn.Module):
+    def __init__(self, vocab: int = 64, hidden: int = 8) -> None:
+        super().__init__()
+        self.embed = nn.Embedding(vocab, hidden)
+        self.model = nn.Module()
+        self.model.language_model = _FakeTextModel(self.embed)
+
+    def get_input_embeddings(self) -> nn.Embedding:
+        return self.embed
+
+
+# --- environment plumbing -------------------------------------------------
+
+
+def test_prefix_count_defaults_to_off(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv(ENV_VAR, raising=False)
+    assert prefix_token_count() == 0
+    # Off means off: the unconfigured model is untouched.
+    assert prefix_token_count(default=7) == 7
+
+
+def test_prefix_count_rejects_garbage(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv(ENV_VAR, "many")
+    with pytest.raises(ValueError, match="must be an integer"):
+        prefix_token_count()
+    monkeypatch.setenv(ENV_VAR, "-1")
+    with pytest.raises(ValueError, match="non-negative"):
+        prefix_token_count()
+
+
+def test_payload_mode_defaults_and_validates(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv(PAYLOAD_ENV_VAR, raising=False)
+    assert payload_mode() == "queries"
+    monkeypatch.setenv(PAYLOAD_ENV_VAR, "global")
+    assert payload_mode() == "global"
+    monkeypatch.setenv(PAYLOAD_ENV_VAR, "boxes")
+    with pytest.raises(ValueError, match="must be one of"):
+        payload_mode()
+
+
+# --- reserved tokens ------------------------------------------------------
+
+
+def test_reserve_prefix_tokens_returns_distinct_ids() -> None:
+    tokenizer = _FakeTokenizer()
+    ids = reserve_prefix_tokens(tokenizer, 4)
+    assert len(ids) == 4
+    assert len(set(ids)) == 4
+    assert all(token_id >= 100 for token_id in ids)
+    assert reserve_prefix_tokens(tokenizer, 0) == []
+
+
+def test_reserve_prefix_tokens_refuses_a_collision() -> None:
+    """A pre-existing name would hand back a real token id and splice over it."""
+
+    tokenizer = _FakeTokenizer()
+    tokenizer.add_tokens([f"{PREFIX_TAG[:-1]}_0|>"], special_tokens=True)
+    with pytest.raises(ValueError, match="already in the vocabulary"):
+        reserve_prefix_tokens(tokenizer, 2)
+
+
+def test_extend_prefix_side_inputs_keeps_every_side_input_aligned() -> None:
+    inputs = {
+        "input_ids": torch.tensor([[5, 6, 7]]),
+        "attention_mask": torch.ones(1, 3, dtype=torch.long),
+        "labels": torch.tensor([[5, 6, 7]]),
+        "mm_token_type_ids": torch.tensor([[1, 1, 0]]),
+    }
+    out = extend_prefix_side_inputs(inputs, [40, 41])
+    assert out["input_ids"].tolist() == [[40, 41, 5, 6, 7]]
+    assert out["attention_mask"].shape == (1, 5)
+    # The prefix is prompt, so the loss must never ask for it.
+    assert out["labels"].tolist() == [[-100, -100, 5, 6, 7]]
+    # Text-stream type, matching what ``data.py`` does for the appended EOS.
+    assert out["mm_token_type_ids"].tolist() == [[1, 1, 1, 1, 0]]
+
+
+def test_extend_prefix_side_inputs_is_a_no_op_without_reserved_ids() -> None:
+    inputs = {"input_ids": torch.tensor([[5, 6]])}
+    assert extend_prefix_side_inputs(dict(inputs), [])["input_ids"].tolist() == [[5, 6]]
+
+
+def test_extend_prefix_side_inputs_rejects_a_batch() -> None:
+    inputs = {"input_ids": torch.tensor([[5], [6]])}
+    with pytest.raises(ValueError, match="single-page"):
+        extend_prefix_side_inputs(inputs, [40])
+
+
+# --- generation masking ---------------------------------------------------
+
+
+def test_logits_mask_forces_reserved_ids_out() -> None:
+    mask = PrefixLogitsMask([40, 41])
+    scores = torch.zeros(1, 4, 64)
+    masked = mask(torch.zeros(1, 4, dtype=torch.long), scores)
+    assert torch.isinf(masked[..., 40]).all() and masked[..., 40].max() < 0
+    assert torch.isinf(masked[..., 41]).all() and masked[..., 41].max() < 0
+    assert masked[..., 0].eq(0).all()
+    # Untouched entries must be the same object values, not merely finite.
+    assert masked[..., 3].eq(0).all()
+
+
+def test_logits_mask_is_a_no_op_when_nothing_is_reserved() -> None:
+    scores = torch.zeros(1, 2, 8)
+    assert PrefixLogitsMask([])(torch.zeros(1, 2, dtype=torch.long), scores) is scores
+
+
+# --- payload selection ----------------------------------------------------
+
+
+def test_select_payload_queries_is_per_region() -> None:
+    queries = torch.randn(1, 4, 8)
+    payload = _select_payload(_FakeOutput(queries), "queries", 4)
+    assert torch.equal(payload, queries)
+
+
+def test_select_payload_global_is_page_level() -> None:
+    """The ablation arm: one vector repeated, so no region content survives."""
+
+    queries = torch.randn(1, 4, 8)
+    payload = _select_payload(_FakeOutput(queries), "global", 4)
+    assert payload.shape == (1, 4, 8)
+    assert torch.allclose(payload[:, 0], payload[:, 3])
+    assert torch.allclose(payload[0, 0], queries[0].mean(dim=0), atol=1e-6)
+    # And it genuinely differs from the per-region payload.
+    assert not torch.allclose(payload, queries)
+
+
+def test_select_payload_regions_requires_the_ar_branch() -> None:
+    with pytest.raises(ValueError, match="requires the AR region decoder"):
+        _select_payload(_FakeOutput(torch.randn(1, 4, 8)), "regions", 4)
+
+
+def test_select_payload_enforces_the_reserved_width() -> None:
+    """A mismatch must fail loudly: silently truncating would drop regions."""
+
+    with pytest.raises(ValueError, match="layout_queries has"):
+        _select_payload(_FakeOutput(torch.randn(1, 4, 8)), "queries", 8)
+
+
+# --- injector -------------------------------------------------------------
+
+
+def test_injector_validates_its_arguments() -> None:
+    with pytest.raises(ValueError, match="token_count > 0"):
+        PrefixInjector(8, 8, 0, [])
+    with pytest.raises(ValueError, match="reserved ids"):
+        PrefixInjector(8, 8, 2, [1])
+
+
+def test_injector_is_zero_initialised_so_installing_it_changes_nothing() -> None:
+    """A checkpoint with the prefix attached must reproduce itself exactly."""
+
+    injector = PrefixInjector(8, 8, 3, [50, 51, 52])
+    assert torch.equal(injector.projection.weight, torch.zeros(8, 8))
+    payload = torch.randn(1, 3, 8)
+    assert torch.equal(injector(payload), torch.zeros(1, 3, 8))
+
+
+def test_injector_projects_shapes() -> None:
+    injector = PrefixInjector(6, 8, 3, [50, 51, 52])
+    out = injector(torch.randn(1, 3, 6))
+    assert out.shape == (1, 3, 8)
+
+
+def test_injector_rejects_a_batch() -> None:
+    injector = PrefixInjector(6, 8, 3, [50, 51, 52])
+    with pytest.raises(ValueError, match="single page"):
+        injector(torch.randn(2, 3, 6))
+
+
+# --- the splice itself ----------------------------------------------------
+
+
+def _installed(hidden: int = 8, tokens: int = 4, payload_mode_: str = "queries"):
+    model = _FakeModel(vocab=64, hidden=hidden)
+    bridge = _FakeBridge(hidden=hidden)
+    injector, splice, handle = install_prefix_injection(
+        model, bridge, token_count=tokens, reserved_ids=[50, 51, 52, 53],
+        payload_mode_=payload_mode_,
+    )
+    return model, bridge, injector, splice, handle
+
+
+def test_install_finds_the_text_model_not_the_embedding() -> None:
+    """Splicing at ``embed_tokens`` would miss the scattered image features."""
+
+    model = _FakeModel()
+    assert _find_text_model(model) is model.model.language_model
+    assert _find_text_model(model) is not model.embed
+
+
+def test_install_hooks_the_bridge_both_ways() -> None:
+    model, bridge, _, splice, handle = _installed()
+    assert bridge.prefix_splice is splice
+    handle.remove()
+    assert bridge.prefix_splice is splice  # removing the hook is the caller's job
+
+
+def test_injector_lands_in_model_parameters_so_it_can_be_optimized() -> None:
+    """A detached injector would run, look correct, and never train.
+
+    ``train_screen`` builds its optimizer from named parameter sets rather than
+    from ``model.parameters()``, and DDP only reduces parameters it can see by
+    walking the wrapped module.  Registration on the decoder is what puts the
+    projection in front of both.
+    """
+
+    model, _, injector, _, _ = _installed()
+    names = [name for name, _ in model.named_parameters()]
+    assert any(name.endswith("projection.weight") for name in names), names
+    parameter_ids = {id(parameter) for parameter in model.parameters()}
+    assert id(injector.projection.weight) in parameter_ids
+    assert injector.projection.weight.requires_grad
+
+
+def test_install_refuses_a_double_install() -> None:
+    """Two injectors would fight over the same reserved rows."""
+
+    model, bridge, _, _, _ = _installed()
+    with pytest.raises(RuntimeError, match="already installed"):
+        install_prefix_injection(
+            model, bridge, token_count=4, reserved_ids=[50, 51, 52, 53]
+        )
+
+
+def test_bridge_publishes_and_hook_splices_in_the_same_forward() -> None:
+    """The ordering that makes one vision pass enough: image features first."""
+
+    model, bridge, injector, splice, _ = _installed(hidden=8, tokens=4)
+    with torch.no_grad():
+        injector.projection.weight.copy_(torch.eye(8))
+        injector.projection.bias.zero_()
+    queries = torch.randn(1, 4, 8)
+    publish_prefix_payload(splice, _FakeOutput(queries))
+    assert torch.allclose(splice.payload, queries)
+
+    input_ids = torch.tensor([[50, 51, 52, 53, 5, 6]])
+    seen = model.model.language_model(input_ids=input_ids, inputs_embeds=torch.zeros(1, 6, 8))
+    assert seen.shape == (1, 6, 8)
+    # The reserved rows now carry the payload, and the rest is untouched.
+    assert torch.allclose(seen[0, :4], queries[0], atol=1e-6)
+    assert torch.allclose(seen[0, 4:], torch.zeros(2, 8))
+
+
+def test_hook_is_skipped_when_no_payload_was_published() -> None:
+    model, _, _, _, _ = _installed()
+    embeds = torch.zeros(1, 6, 8)
+    seen = model.model.language_model(input_ids=None, inputs_embeds=embeds)
+    assert torch.equal(seen, embeds)
+
+
+def test_hook_does_not_resplice_during_decoding() -> None:
+    """At decode time the reserved rows live in the KV cache, not in the input."""
+
+    class _Past:
+        def get_seq_length(self) -> int:
+            return 12
+
+    model, _, injector, splice, _ = _installed()
+    with torch.no_grad():
+        injector.projection.weight.copy_(torch.eye(8))
+    publish_prefix_payload(splice, _FakeOutput(torch.randn(1, 4, 8)))
+    embeds = torch.zeros(1, 1, 8)
+    seen = model.model.language_model(
+        input_ids=None, inputs_embeds=embeds, past_key_values=_Past()
+    )
+    assert torch.equal(seen, embeds)
+    assert splice.applied == 0
+
+
+def test_hook_refuses_to_drop_the_prefix_silently() -> None:
+    """If the caller passes only input_ids the prefix would vanish; say so."""
+
+    model, _, injector, splice, _ = _installed()
+    with torch.no_grad():
+        injector.projection.weight.copy_(torch.eye(8))
+    publish_prefix_payload(splice, _FakeOutput(torch.randn(1, 4, 8)))
+    with pytest.raises(RuntimeError, match="expected inputs_embeds"):
+        model.model.language_model(input_ids=torch.tensor([[50, 51, 52, 53, 5]]))
+
+
+def test_hook_ignores_a_sequence_shorter_than_the_prefix() -> None:
+    model, _, injector, splice, _ = _installed()
+    with torch.no_grad():
+        injector.projection.weight.copy_(torch.eye(8))
+    publish_prefix_payload(splice, _FakeOutput(torch.randn(1, 4, 8)))
+    embeds = torch.zeros(1, 2, 8)
+    seen = model.model.language_model(input_ids=None, inputs_embeds=embeds)
+    assert torch.equal(seen, embeds)
+
+
+def test_splice_respects_the_intervention_arms(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The prefix route is attributable with the same arms as the residual route."""
+
+    monkeypatch.setenv("GLMOCR_LAYOUT_INTERVENE", "zero")
+    model, _, injector, splice, _ = _installed()
+    with torch.no_grad():
+        injector.projection.weight.copy_(torch.eye(8))
+    publish_prefix_payload(splice, _FakeOutput(torch.ones(1, 4, 8)))
+    assert torch.equal(splice.payload, torch.zeros(1, 4, 8))
+    seen = model.model.language_model(
+        input_ids=None, inputs_embeds=torch.ones(1, 6, 8)
+    )
+    assert torch.equal(seen[0, :4], torch.zeros(4, 8))
+    assert torch.equal(seen[0, 4:], torch.ones(2, 8))
+
+
+def test_splice_trains_the_projection() -> None:
+    """The whole point: the projection must receive gradient from the LM loss."""
+
+    model, _, injector, splice, _ = _installed()
+    payload = torch.randn(1, 4, 8, requires_grad=True)
+    publish_prefix_payload(splice, _FakeOutput(payload))
+    seen = model.model.language_model(
+        input_ids=None, inputs_embeds=torch.zeros(1, 6, 8)
+    )
+    seen[0, :4].sum().backward()
+    assert injector.projection.weight.grad is not None
+    assert injector.projection.weight.grad.abs().sum() > 0
+
+
+def test_global_payload_arm_reaches_the_hook_as_a_page_vector() -> None:
+    model, _, injector, splice, _ = _installed(payload_mode_="global")
+    assert injector.payload_mode == "global"
+    with torch.no_grad():
+        injector.projection.weight.copy_(torch.eye(8))
+    queries = torch.randn(1, 4, 8)
+    publish_prefix_payload(splice, _FakeOutput(queries))
+    # Every slot gets the same page-level vector, which is what makes this the
+    # control for "is it region information or page conditioning?".
+    assert torch.allclose(splice.payload[:, 0], splice.payload[:, 3])
+    assert torch.allclose(
+        splice.payload[0, 0], queries[0].mean(dim=0), atol=1e-6
+    )
+
+
+def test_payload_width_uses_the_region_decoder_width_when_asked() -> None:
+    """``regions`` payloads are narrower than the adapter width."""
+
+    model = _FakeModel(vocab=64, hidden=8)
+    bridge = _FakeBridge(hidden=8)
+    decoder_config = type("C", (), {"decoder_hidden_size": 5})()
+    bridge.adapter.region_decoder = type("D", (), {"config": decoder_config})()
+    injector, _, _ = install_prefix_injection(
+        model, bridge, token_count=4, reserved_ids=[50, 51, 52, 53],
+        payload_mode_="regions",
+    )
+    assert injector.projection.in_features == 5
+    assert math.isclose(
+        float(injector.projection.weight.detach().sum()), 0.0, abs_tol=1e-9
+    )
