@@ -57,6 +57,7 @@ from __future__ import annotations
 
 import json
 import os
+from dataclasses import dataclass
 from typing import Any, Literal, get_args
 
 import torch
@@ -182,10 +183,15 @@ def extend_prefix_side_inputs(
         inputs["labels"] = torch.cat((ignore, labels), dim=1)
     mm_token_type_ids = inputs.get("mm_token_type_ids")
     if isinstance(mm_token_type_ids, Tensor):
-        # Text-stream type, matching what the appended EOS uses in ``data.py``.
-        tail = mm_token_type_ids[:, :1].clone()
+        # ``get_rope_index`` groups this stream to place vision tokens, with the
+        # documented convention text=0, image=1, video=2.  The prefix is text, so
+        # it is filled with text rather than copied from the first real token --
+        # copying would be wrong the moment a template leads with an image.
+        text_type = torch.zeros(
+            (1, width), dtype=mm_token_type_ids.dtype, device=mm_token_type_ids.device
+        )
         inputs["mm_token_type_ids"] = torch.cat(
-            (tail.expand(-1, width), mm_token_type_ids), dim=1
+            (text_type, mm_token_type_ids), dim=1
         )
     return inputs
 
@@ -330,6 +336,26 @@ class _Splice:
         self.injector = injector
         self.payload: Tensor | None = None
         self.applied = 0
+        self._pending = 0
+
+    def arm(self) -> None:
+        """Declare that one coming forward's ``input_ids`` carry the reserved ids.
+
+        The hook cannot see ``input_ids`` -- ``GlmOcrModel`` calls the text model
+        with ``input_ids=None`` and assembled embeddings -- so it cannot confirm
+        from the sequence that positions ``0..K-1`` are the reserved rows.  Without
+        this flag the hook would happily overwrite the first K *real* tokens on any
+        forward whose inputs were never extended, which is a silent corruption
+        rather than a visible failure.  Arming is therefore explicit, so an
+        un-extended forward splices nothing.
+
+        A counter rather than a flag because validation interleaves forwards: the
+        teacher-forcing pass and the generation prefill both consume extended
+        inputs, in that order, within one page.  A flag would be spent by the first
+        and the second would silently lose its prefix.
+        """
+
+        self._pending += 1
 
     def set_payload(self, payload: Tensor) -> None:
         from .writeback_intervention import apply_intervention, intervention_mode
@@ -340,6 +366,11 @@ class _Splice:
         self.payload = payload
 
     def hook(self, module: nn.Module, args: Any, kwargs: dict) -> Any:
+        if self._pending <= 0:
+            return None
+        # Consume on this forward whatever the outcome, so a skipped splice cannot
+        # leak into the next one.
+        self._pending -= 1
         payload = self.payload
         if payload is None:
             return None
@@ -424,6 +455,77 @@ def install_prefix_injection(
     bridge.prefix_splice = splice
     handle = text_model.register_forward_pre_hook(splice.hook, with_kwargs=True)
     return injector, splice, handle
+
+
+@dataclass
+class PrefixRuntime:
+    """Everything the data path and the optimizer need to know about the prefix."""
+
+    token_count: int
+    reserved_ids: list[int]
+    injector: PrefixInjector
+    splice: _Splice
+    handle: Any
+
+    @property
+    def logits_mask(self) -> PrefixLogitsMask:
+        return PrefixLogitsMask(self.reserved_ids)
+
+    def extend(self, inputs: dict[str, Any]) -> dict[str, Any]:
+        """Prepend the reserved rows and arm the splice for the coming forward.
+
+        Arming is part of extending on purpose: the two must not be able to drift
+        apart, because arming without extending corrupts real tokens.
+        """
+
+        extended = extend_prefix_side_inputs(inputs, self.reserved_ids)
+        self.splice.arm()
+        return extended
+
+    def parameters(self) -> tuple[nn.Parameter, ...]:
+        return tuple(self.injector.parameters())
+
+
+def enable_prefix_injection(
+    model: nn.Module,
+    bridge: Any,
+    tokenizer: Any,
+    *,
+    token_count: int,
+    payload_mode_: PayloadMode | None = None,
+) -> PrefixRuntime:
+    """Reserve the tokens, resize the embedding, install, and return the runtime.
+
+    Order matters.  ``resize_token_embeddings`` builds a *new* embedding module, so
+    the splice must be installed after it or it would hook a discarded module; and
+    it leaves the fresh rows with ``requires_grad=True`` on a model whose
+    parameters were all frozen before the adapter was installed, so the freeze is
+    reapplied before the injector is added.  Without that second step the whole
+    embedding matrix would silently become trainable.
+    """
+
+    if token_count <= 0:
+        raise ValueError("enable_prefix_injection requires token_count > 0")
+    reserved_ids = reserve_prefix_tokens(tokenizer, token_count)
+    model.resize_token_embeddings(len(tokenizer), mean_resizing=False)
+    # The resize un-freezes the embedding it just built; restore the contract that
+    # only the adapter, LoRA and the injector train.
+    for parameter in model.parameters():
+        parameter.requires_grad_(False)
+    injector, splice, handle = install_prefix_injection(
+        model,
+        bridge,
+        token_count=token_count,
+        reserved_ids=reserved_ids,
+        payload_mode_=payload_mode_,
+    )
+    return PrefixRuntime(
+        token_count=token_count,
+        reserved_ids=reserved_ids,
+        injector=injector,
+        splice=splice,
+        handle=handle,
+    )
 
 
 def _find_text_model(model: nn.Module) -> nn.Module:

@@ -49,6 +49,11 @@ class _FakeTokenizer:
     def convert_tokens_to_ids(self, name: str) -> int:
         return self._vocab.get(name, -1)
 
+    def __len__(self) -> int:
+        # What ``resize_token_embeddings`` is given, so the fake must agree with
+        # the real tokenizer's contract here.
+        return self._next
+
 
 class _FakeOutput:
     def __init__(self, queries: Tensor, regions: Tensor | None = None) -> None:
@@ -95,6 +100,23 @@ class _FakeModel(nn.Module):
 
     def get_input_embeddings(self) -> nn.Embedding:
         return self.embed
+
+    def resize_token_embeddings(
+        self, new_size: int, mean_resizing: bool = True
+    ) -> nn.Embedding:
+        """Mirrors the real call: a *new* module, rebound at both access paths.
+
+        Reproducing that matters, because installing the splice before the resize
+        would hook the discarded module and the failure would be invisible.
+        """
+
+        old = self.embed
+        fresh = nn.Embedding(new_size, old.weight.shape[1])
+        with torch.no_grad():
+            fresh.weight[: old.weight.shape[0]] = old.weight
+        self.embed = fresh
+        self.model.language_model.embed_tokens = fresh
+        return fresh
 
 
 # --- environment plumbing -------------------------------------------------
@@ -159,8 +181,9 @@ def test_extend_prefix_side_inputs_keeps_every_side_input_aligned() -> None:
     assert out["attention_mask"].shape == (1, 5)
     # The prefix is prompt, so the loss must never ask for it.
     assert out["labels"].tolist() == [[-100, -100, 5, 6, 7]]
-    # Text-stream type, matching what ``data.py`` does for the appended EOS.
-    assert out["mm_token_type_ids"].tolist() == [[1, 1, 1, 1, 0]]
+    # Text type (0) by the documented convention, even though this sequence
+    # leads with an image token -- copying the first token's type would be wrong.
+    assert out["mm_token_type_ids"].tolist() == [[0, 0, 1, 1, 0]]
 
 
 def test_extend_prefix_side_inputs_is_a_no_op_without_reserved_ids() -> None:
@@ -324,6 +347,7 @@ def test_bridge_publishes_and_hook_splices_in_the_same_forward() -> None:
     assert torch.allclose(splice.payload, queries)
 
     input_ids = torch.tensor([[50, 51, 52, 53, 5, 6]])
+    splice.arm()
     seen = model.model.language_model(input_ids=input_ids, inputs_embeds=torch.zeros(1, 6, 8))
     assert seen.shape == (1, 6, 8)
     # The reserved rows now carry the payload, and the rest is untouched.
@@ -338,6 +362,98 @@ def test_hook_is_skipped_when_no_payload_was_published() -> None:
     assert torch.equal(seen, embeds)
 
 
+def test_hook_does_nothing_unless_armed() -> None:
+    """Without arming the splice would overwrite real tokens, not reserved ones.
+
+    The hook cannot see ``input_ids`` -- the text model is reached with
+    ``input_ids=None`` -- so it has no way to check the sequence itself.  An
+    un-extended forward must therefore splice nothing.
+    """
+
+    model, _, injector, splice, _ = _installed()
+    with torch.no_grad():
+        injector.projection.weight.copy_(torch.eye(8))
+    publish_prefix_payload(splice, _FakeOutput(torch.ones(1, 4, 8)))
+    embeds = torch.zeros(1, 6, 8)
+    seen = model.model.language_model(input_ids=None, inputs_embeds=embeds)
+    assert torch.equal(seen, embeds)
+    assert splice.applied == 0
+
+
+def test_arming_is_consumed_once() -> None:
+    """A skipped prefill must not leak the armed flag into the decode steps."""
+
+    model, _, injector, splice, _ = _installed()
+    with torch.no_grad():
+        injector.projection.weight.copy_(torch.eye(8))
+    publish_prefix_payload(splice, _FakeOutput(torch.ones(1, 4, 8)))
+    splice.arm()
+    first = model.model.language_model(input_ids=None, inputs_embeds=torch.zeros(1, 6, 8))
+    assert torch.allclose(first[0, :4], torch.ones(4, 8))
+    # Second call without re-arming: untouched.
+    second = model.model.language_model(input_ids=None, inputs_embeds=torch.zeros(1, 6, 8))
+    assert torch.equal(second, torch.zeros(1, 6, 8))
+    assert splice.applied == 1
+
+
+def test_runtime_extend_arms_the_splice() -> None:
+    """Arming and extending must not be able to drift apart."""
+
+    from layout_ocr.prefix_injection import PrefixRuntime
+
+    model, _, injector, splice, handle = _installed()
+    runtime = PrefixRuntime(
+        token_count=4, reserved_ids=[50, 51, 52, 53],
+        injector=injector, splice=splice, handle=handle,
+    )
+    assert splice._pending == 0
+    inputs = {"input_ids": torch.tensor([[5, 6]]), "attention_mask": torch.ones(1, 2, dtype=torch.long)}
+    out = runtime.extend(inputs)
+    assert out["input_ids"].tolist() == [[50, 51, 52, 53, 5, 6]]
+    assert splice._pending == 1
+
+
+def test_interleaved_forwards_each_consume_their_own_arming() -> None:
+    """Validation arms two forwards per page; a flag would starve the second."""
+
+    from layout_ocr.prefix_injection import PrefixRuntime
+
+    model, _, injector, splice, handle = _installed()
+    with torch.no_grad():
+        injector.projection.weight.copy_(torch.eye(8))
+    runtime = PrefixRuntime(
+        token_count=4, reserved_ids=[50, 51, 52, 53],
+        injector=injector, splice=splice, handle=handle,
+    )
+    runtime.extend({"input_ids": torch.tensor([[5, 6]])})
+    runtime.extend({"input_ids": torch.tensor([[5, 6]])})
+    assert splice._pending == 2
+    publish_prefix_payload(splice, _FakeOutput(torch.ones(1, 4, 8)))
+    first = model.model.language_model(input_ids=None, inputs_embeds=torch.zeros(1, 6, 8))
+    second = model.model.language_model(input_ids=None, inputs_embeds=torch.zeros(1, 6, 8))
+    third = model.model.language_model(input_ids=None, inputs_embeds=torch.zeros(1, 6, 8))
+    assert torch.allclose(first[0, :4], torch.ones(4, 8))
+    assert torch.allclose(second[0, :4], torch.ones(4, 8))
+    # Third forward was never armed: untouched rather than corrupted.
+    assert torch.equal(third, torch.zeros(1, 6, 8))
+    assert splice.applied == 2
+    assert splice._pending == 0
+
+
+def test_runtime_logits_mask_covers_the_reserved_ids() -> None:
+    from layout_ocr.prefix_injection import PrefixRuntime
+
+    model, _, injector, splice, handle = _installed()
+    runtime = PrefixRuntime(
+        token_count=4, reserved_ids=[50, 51, 52, 53],
+        injector=injector, splice=splice, handle=handle,
+    )
+    scores = torch.zeros(1, 2, 64)
+    masked = runtime.logits_mask(torch.zeros(1, 2, dtype=torch.long), scores)
+    assert torch.isinf(masked[..., 53]).all()
+    assert masked[..., 0].eq(0).all()
+
+
 def test_hook_does_not_resplice_during_decoding() -> None:
     """At decode time the reserved rows live in the KV cache, not in the input."""
 
@@ -350,6 +466,7 @@ def test_hook_does_not_resplice_during_decoding() -> None:
         injector.projection.weight.copy_(torch.eye(8))
     publish_prefix_payload(splice, _FakeOutput(torch.randn(1, 4, 8)))
     embeds = torch.zeros(1, 1, 8)
+    splice.arm()
     seen = model.model.language_model(
         input_ids=None, inputs_embeds=embeds, past_key_values=_Past()
     )
@@ -364,6 +481,7 @@ def test_hook_refuses_to_drop_the_prefix_silently() -> None:
     with torch.no_grad():
         injector.projection.weight.copy_(torch.eye(8))
     publish_prefix_payload(splice, _FakeOutput(torch.randn(1, 4, 8)))
+    splice.arm()
     with pytest.raises(RuntimeError, match="expected inputs_embeds"):
         model.model.language_model(input_ids=torch.tensor([[50, 51, 52, 53, 5]]))
 
@@ -373,6 +491,7 @@ def test_hook_ignores_a_sequence_shorter_than_the_prefix() -> None:
     with torch.no_grad():
         injector.projection.weight.copy_(torch.eye(8))
     publish_prefix_payload(splice, _FakeOutput(torch.randn(1, 4, 8)))
+    splice.arm()
     embeds = torch.zeros(1, 2, 8)
     seen = model.model.language_model(input_ids=None, inputs_embeds=embeds)
     assert torch.equal(seen, embeds)
@@ -387,6 +506,7 @@ def test_splice_respects_the_intervention_arms(monkeypatch: pytest.MonkeyPatch) 
         injector.projection.weight.copy_(torch.eye(8))
     publish_prefix_payload(splice, _FakeOutput(torch.ones(1, 4, 8)))
     assert torch.equal(splice.payload, torch.zeros(1, 4, 8))
+    splice.arm()
     seen = model.model.language_model(
         input_ids=None, inputs_embeds=torch.ones(1, 6, 8)
     )
@@ -400,6 +520,7 @@ def test_splice_trains_the_projection() -> None:
     model, _, injector, splice, _ = _installed()
     payload = torch.randn(1, 4, 8, requires_grad=True)
     publish_prefix_payload(splice, _FakeOutput(payload))
+    splice.arm()
     seen = model.model.language_model(
         input_ids=None, inputs_embeds=torch.zeros(1, 6, 8)
     )
@@ -421,6 +542,59 @@ def test_global_payload_arm_reaches_the_hook_as_a_page_vector() -> None:
     assert torch.allclose(
         splice.payload[0, 0], queries[0].mean(dim=0), atol=1e-6
     )
+
+
+def test_enable_reserves_resizes_freezes_and_installs_in_order() -> None:
+    """The ordering is the whole point, and every step of it is silent if wrong.
+
+    ``resize_token_embeddings`` builds a *new* embedding module, so installing the
+    splice before it would hook a discarded module; and it leaves the fresh rows
+    with ``requires_grad=True`` on a model that had been frozen wholesale, so
+    without the re-freeze the entire embedding matrix quietly becomes trainable.
+    """
+
+    from layout_ocr.prefix_injection import enable_prefix_injection
+
+    hidden = 8
+    model = _FakeModel(vocab=64, hidden=hidden)
+    bridge = _FakeBridge(hidden=hidden)
+    tokenizer = _FakeTokenizer(base=64)
+    for parameter in model.parameters():
+        parameter.requires_grad_(False)
+
+    runtime = enable_prefix_injection(
+        model, bridge, tokenizer, token_count=3, payload_mode_="queries"
+    )
+
+    assert runtime.token_count == 3
+    assert runtime.reserved_ids == [64, 65, 66]
+    assert model.embed.weight.shape[0] == 67
+    # The resize must not have re-opened the frozen embedding.
+    assert not model.embed.weight.requires_grad
+    injector_ids = {id(p) for p in runtime.injector.parameters()}
+    assert all(
+        not p.requires_grad
+        for p in model.parameters()
+        if id(p) not in injector_ids
+    )
+    # Only the injector trains.
+    assert runtime.injector.projection.weight.requires_grad
+    assert runtime.injector.projection.bias.requires_grad
+    assert [id(p) for p in runtime.parameters()] == [
+        id(runtime.injector.projection.weight),
+        id(runtime.injector.projection.bias),
+    ]
+    assert bridge.prefix_splice is runtime.splice
+
+
+def test_enable_rejects_a_zero_count() -> None:
+    from layout_ocr.prefix_injection import enable_prefix_injection
+
+    model = _FakeModel()
+    with pytest.raises(ValueError, match="token_count > 0"):
+        enable_prefix_injection(
+            model, _FakeBridge(), _FakeTokenizer(), token_count=0
+        )
 
 
 def test_payload_width_uses_the_region_decoder_width_when_asked() -> None:

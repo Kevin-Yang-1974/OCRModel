@@ -804,12 +804,21 @@ def generate_with_loop_recovery(
     max_new_tokens: int,
     mode: str = "loop_recovery",
     continuation_head: ContinuationStopHead | None = None,
+    reserved_token_ids: Iterable[int] = (),
 ) -> Tensor:
     """Run deterministic generation in plain or stateful recovery mode."""
 
     if mode not in {"plain", "loop_recovery"}:
         raise ValueError("generation mode must be plain or loop_recovery")
     processors = []
+    if reserved_token_ids:
+        # The reserved prefix ids are tied to the same embedding matrix whose rows
+        # the prefix overwrites on the input side, so their output-side rows stay at
+        # their initialiser and remain samplable.  A reserved id in the decoded text
+        # would be meaningless, so they are forced out of the distribution.
+        from .prefix_injection import PrefixLogitsMask
+
+        processors.append(PrefixLogitsMask(list(reserved_token_ids)))
     if mode == "loop_recovery" and config.enabled:
         processors.append(
             AdaptiveCycleLogitsProcessor(

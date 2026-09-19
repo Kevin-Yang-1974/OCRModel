@@ -43,6 +43,7 @@ from .distributed import (
     wrap_model,
 )
 from .glm_bridge import LayoutAwarePatchMerger, install_layout_adapter
+from .prefix_injection import enable_prefix_injection
 from .lora import (
     decoder_lora_finite_report,
     inject_decoder_lora,
@@ -2045,6 +2046,22 @@ def load_model(args: argparse.Namespace, device: torch.device) -> tuple[Any, Any
         sem_adapter_hidden=getattr(args, "sem_adapter_hidden", 0),
         query_refine_layers=getattr(args, "query_refine_layers", 0),
     )
+    prefix_tokens = int(getattr(args, "prefix_tokens", 0) or 0)
+    if prefix_tokens > 0:
+        # Installed after the adapter so the reserved ids are added once, to a
+        # model that already has its layout branch.  ``enable_prefix_injection``
+        # owns the ordering inside itself (reserve -> resize -> re-freeze ->
+        # splice) because getting it wrong is silent, not loud.
+        tokenizer = getattr(processor, "tokenizer", None)
+        if tokenizer is None:
+            raise RuntimeError("prefix injection requires a processor with a tokenizer")
+        bridge.prefix_runtime = enable_prefix_injection(
+            model,
+            bridge,
+            tokenizer,
+            token_count=prefix_tokens,
+            payload_mode_=getattr(args, "prefix_payload", "queries"),
+        )
     model.config.use_cache = False
     return model, processor, bridge
 
@@ -2062,6 +2079,19 @@ def train(
     distributed = distributed or DistributedInfo(
         strategy="none", rank=0, local_rank=0, world_size=1
     )
+    # Set by ``load_model`` when ``--prefix-tokens`` is non-zero.  Read off the
+    # bridge rather than passed in so the data path cannot be wired to one prefix
+    # runtime while the model carries another.
+    prefix_runtime = getattr(bridge, "prefix_runtime", None)
+    if prefix_runtime is not None and getattr(args, "free_generation_loss", False):
+        # Free generation runs its own greedy rollout forward before the
+        # differentiable one, and the rollout builds its inputs from a prompt-only
+        # slice this wiring does not extend.  Refusing is deliberate: the failure
+        # mode is a silently prefix-free forward, not an error.
+        raise RuntimeError(
+            "prefix injection is not wired for free generation; run with the "
+            "teacher-forced path or extend collect_free_generation_rollout first"
+        )
     model_module = unwrap_module(model)
     adapter_module = unwrap_module(bridge.adapter)
     if bool(getattr(args, "freeze_layout_branch", False)):
@@ -2096,6 +2126,30 @@ def train(
                 "weight_decay": 0.01,
                 "lr": decoder_learning_rate,
                 "group_name": "decoder_lora",
+            }
+        )
+    prefix_parameters: tuple[torch.nn.Parameter, ...] = ()
+    if prefix_runtime is not None:
+        # The injector is attached to the decoder, which is inside the DDP-wrapped
+        # module, so it is deliberately *not* in ``adapter_module.parameters()``.
+        # Without this group it would still receive gradients and still be
+        # all-reduced, but the optimizer would never step it and the projection
+        # would sit at its zero initialiser -- a prefix of K constant vectors that
+        # looks exactly like a working feature.
+        prefix_parameters = tuple(
+            parameter
+            for parameter in prefix_runtime.parameters()
+            if parameter.requires_grad
+        )
+    if prefix_parameters:
+        # Decoder-side adaptation, so it shares the decoder learning rate rather
+        # than the adapter's: it writes directly into the decoder's input space.
+        parameter_groups.append(
+            {
+                "params": list(prefix_parameters),
+                "weight_decay": 0.01,
+                "lr": getattr(args, "decoder_learning_rate", 5e-6),
+                "group_name": "layout_prefix",
             }
         )
     continuation_parameters = (
@@ -2289,6 +2343,13 @@ def train(
                 bridge.set_region_decode_controls()
                 forward_inputs = free_rollout["prefix_inputs"]
                 ocr_labels = forward_inputs["labels"]
+            if prefix_runtime is not None:
+                # Extended here rather than at ``prepare_training_inputs`` because
+                # arming is consumed by the next forward, and the free-generation
+                # path performs one of its own before this one.  Extending at the
+                # prepare site would arm once and let the rollout spend it, leaving
+                # this forward -- the differentiable one -- silently prefix-free.
+                forward_inputs = prefix_runtime.extend(forward_inputs)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                 outputs = model(**forward_inputs)
             debug(f"step={step} micro={accumulation_index} forward_done")
@@ -3406,8 +3467,14 @@ def evaluate(
         "dense": [],
     }
     started = time.time()
+    prefix_runtime = getattr(bridge, "prefix_runtime", None)
     for record in validation_records:
         inputs = prepare_inference_inputs(processor, record, device)
+        if prefix_runtime is not None:
+            # Both consuming forwards below are armed here, in the order they run
+            # (teacher-forcing, then the generation prefill); the splice counter
+            # matches them one for one.
+            inputs = prefix_runtime.extend(inputs)
         bridge.set_grid_thw(inputs["image_grid_thw"])
         bridge.set_region_decode_controls(
             pointer_mask=(getattr(args, "region_pointer_mask", True) if region_enabled else None),
@@ -3424,6 +3491,11 @@ def evaluate(
                 else None
             )
             teacher_inputs = prepare_training_inputs(processor, record, device, eos_ids)
+            if prefix_runtime is not None:
+                # Both sides of the audit must be extended together or the prompt
+                # prefixes would differ by exactly the reserved rows and every page
+                # would be reported as a mismatch.
+                teacher_inputs = prefix_runtime.extend(teacher_inputs)
             audit = prompt_target_audit(processor, inputs, teacher_inputs, eos_ids)
             teacher_forced_target_tokens += int(audit["target_token_count"])
             teacher_forced_eos_labels += int(audit["eos_label_count"])
@@ -3467,6 +3539,9 @@ def evaluate(
             config=repeat_config,
             max_new_tokens=args.max_eval_new_tokens,
             mode=args.generation_mode,
+            reserved_token_ids=(
+                prefix_runtime.reserved_ids if prefix_runtime is not None else ()
+            ),
             continuation_head=(
                 unwrap_module(continuation_head)
                 if continuation_head is not None
@@ -4027,6 +4102,25 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-lr-ratio", type=float, default=0.1)
     parser.add_argument("--residual-scale-cap", type=optional_positive_float, default=0.03)
     parser.add_argument("--initial-residual-scale", type=float, default=0.0)
+    parser.add_argument(
+        "--prefix-tokens",
+        type=int,
+        default=0,
+        help=(
+            "reserve this many decoder prefix tokens for the layout branch output; "
+            "0 leaves the model untouched. The prefix is a separate route from the "
+            "residual write-back and can be trained with it or alone"
+        ),
+    )
+    parser.add_argument(
+        "--prefix-payload",
+        choices=["queries", "global", "regions"],
+        default="queries",
+        help=(
+            "what the prefix tokens carry: 'queries' is one token per layout query "
+            "(per-region), 'global' is the page-level mean broadcast to every slot"
+        ),
+    )
     parser.add_argument("--auxiliary-weight", type=float, default=0.4)
     parser.add_argument(
         "--auxiliary-weight-start",
