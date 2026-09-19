@@ -923,3 +923,21 @@ def test_extend_requires_regions_in_oracle_mode() -> None:
     )
     with pytest.raises(RuntimeError, match="ground-truth regions"):
         runtime.extend({"input_ids": torch.tensor([[5, 6]])})
+
+
+def test_oracle_encoder_matches_its_own_dtype_without_autocast() -> None:
+    """Validation runs without autocast; training runs with it.
+
+    Forcing float32 inside the encoder worked under training's autocast, which
+    casts the linear inputs anyway, and died in validation with "mat1 and mat2 must
+    have the same dtype, but got Float and BFloat16".
+    """
+
+    from layout_ocr.prefix_injection import LayoutOracleEncoder, ORACLE_FEATURE_DIM
+
+    encoder = LayoutOracleEncoder(16).to(dtype=torch.bfloat16)
+    features = torch.randn(1, 4, ORACLE_FEATURE_DIM)  # float32, as the builder makes it
+    with torch.no_grad():
+        out = encoder(features)
+    assert out.dtype == torch.bfloat16
+    assert torch.isfinite(out.float()).all()

@@ -111,7 +111,13 @@ class LayoutOracleEncoder(nn.Module):
         nn.init.zeros_(self.encoder[-1].bias)
 
     def forward(self, features: Tensor) -> Tensor:
-        return self.norm(self.encoder(features.float()))
+        # Cast to the encoder's own dtype rather than to float32.  Forcing float32
+        # works under training's autocast -- which casts the linear inputs anyway --
+        # and fails in validation, which runs without autocast, with "mat1 and mat2
+        # must have the same dtype, but got Float and BFloat16".  A dtype that
+        # depends on whether autocast happens to be active is not a dtype choice.
+        weight = self.encoder[0].weight
+        return self.norm(self.encoder(features.to(weight.dtype)))
 
 
 PayloadMode = Literal["queries", "regions", "global", "oracle"]
