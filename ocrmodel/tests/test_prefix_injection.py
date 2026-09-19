@@ -849,3 +849,77 @@ def test_payload_width_uses_the_region_decoder_width_when_asked() -> None:
     assert math.isclose(
         float(injector.projection.weight.detach().sum()), 0.0, abs_tol=1e-9
     )
+
+
+# --- oracle encoder -------------------------------------------------------
+
+
+def test_oracle_features_carry_box_order_direction_and_validity() -> None:
+    from layout_ocr.prefix_injection import ORACLE_FEATURE_DIM, region_feature_tensor
+
+    regions = [
+        {"bbox": [0.5, 0.6, 0.7, 0.8], "reading_order": 1, "writing_direction": "horizontal_ltr"},
+        {"bbox": [0.1, 0.2, 0.3, 0.4], "reading_order": 0, "writing_direction": "vertical_rtl"},
+    ]
+    f = region_feature_tensor(regions, 4, torch.device("cpu"))
+    assert f.shape == (1, 4, ORACLE_FEATURE_DIM)
+    # Sorted into reading order, so the vertical_rtl region lands in slot 0.
+    assert f[0, 0, 0:4].tolist() == pytest.approx([0.1, 0.2, 0.3, 0.4], abs=1e-6)
+    assert f[0, 0, 5].item() == 1.0  # vertical_rtl one-hot
+    # One-hot occupies 5:8 in the fixed order vertical_rtl, horizontal_ltr, unknown.
+    assert f[0, 1, 6].item() == 1.0  # horizontal_ltr
+    # Reading order normalized over the real regions and increasing.
+    assert 0 < f[0, 0, 4].item() < f[0, 1, 4].item() <= 1.0
+    # Validity separates real regions from padding.
+    assert f[0, :, 8].tolist() == [1.0, 1.0, 0.0, 0.0]
+
+
+def test_oracle_features_reject_more_regions_than_slots() -> None:
+    from layout_ocr.prefix_injection import region_feature_tensor
+
+    regions = [
+        {"bbox": [0, 0, 1, 1], "reading_order": i, "writing_direction": "unknown"}
+        for i in range(3)
+    ]
+    with pytest.raises(ValueError, match="only 2 prefix slots"):
+        region_feature_tensor(regions, 2, torch.device("cpu"))
+
+
+def test_oracle_encoder_is_trainable_and_finite() -> None:
+    from layout_ocr.prefix_injection import (
+        LayoutOracleEncoder,
+        ORACLE_FEATURE_DIM,
+    )
+
+    encoder = LayoutOracleEncoder(16)
+    features = torch.randn(1, 4, ORACLE_FEATURE_DIM, requires_grad=True)
+    out = encoder(features)
+    assert out.shape == (1, 4, 16)
+    assert torch.isfinite(out).all()
+    out.sum().backward()
+    assert features.grad is not None and torch.isfinite(features.grad).all()
+
+
+def test_oracle_mode_requires_the_encoder_and_the_features() -> None:
+    injector = PrefixInjector(8, 8, 3, [50, 51, 52], payload_mode_="oracle")
+    assert injector.oracle_encoder is not None
+    # Wrong slot count is a loud error, not a silent truncation.
+    with pytest.raises(ValueError, match="regions but"):
+        injector.from_oracle(torch.randn(1, 5, 9))
+    # A non-oracle mode has no encoder to call.
+    plain = PrefixInjector(8, 8, 3, [50, 51, 52], payload_mode_="queries")
+    assert plain.oracle_encoder is None
+    with pytest.raises(ValueError, match="not 'oracle'"):
+        plain.from_oracle(torch.randn(1, 3, 9))
+
+
+def test_extend_requires_regions_in_oracle_mode() -> None:
+    from layout_ocr.prefix_injection import PrefixRuntime
+
+    model, _, injector, splice, handle = _installed(payload_mode_="oracle")
+    runtime = PrefixRuntime(
+        token_count=4, reserved_ids=[50, 51, 52, 53],
+        injector=injector, splice=splice, handle=handle,
+    )
+    with pytest.raises(RuntimeError, match="ground-truth regions"):
+        runtime.extend({"input_ids": torch.tensor([[5, 6]])})

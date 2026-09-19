@@ -403,6 +403,7 @@ class PreMergeLayoutAdapter(nn.Module):
                 _probe_layout_writeback(
                     _probe_path, token_weights,
                     layout_context, visual_tokens, _scale, _intervention,
+                    oracle=oracle_boxes is not None,
                 )
             merged = visual_tokens + _scale * layout_context
 

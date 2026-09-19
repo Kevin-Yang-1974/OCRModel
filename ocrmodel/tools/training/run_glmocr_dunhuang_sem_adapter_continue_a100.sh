@@ -72,7 +72,12 @@ while [[ $# -gt 0 ]]; do
 done
 
 [[ "${seed}" =~ ^[0-9]+$ && "${num_queries}" == "32" ]] || exit 64
-[[ "${steps}" == "256" && "${validation_interval}" == "64" && "${warmup_steps}" == "64" ]] || exit 64
+# Bounded numerically rather than pinned to the original 256/64/64 schedule: the
+# oracle-encoder arm needs a longer horizon to have a chance of learning an
+# encoding, and pinning the schedule to specific values meant that asking for a
+# longer run failed with a bare exit 64 and no message.
+[[ "${steps}" =~ ^[1-9][0-9]*$ && "${validation_interval}" =~ ^[1-9][0-9]*$ && "${warmup_steps}" =~ ^[0-9]+$ ]] || exit 64
+(( steps >= validation_interval )) || exit 64
 [[ "${gpu_ids}" =~ ^[0-9]+(,[0-9]+)*$ ]] || exit 64
 [[ "${gpu_utilization_limit}" =~ ^[1-9][0-9]*$ && "${max_eval_new_tokens}" =~ ^[1-9][0-9]*$ ]] || exit 64
 for candidate in "${parent_run_id}" "${run_id}" "${session}"; do

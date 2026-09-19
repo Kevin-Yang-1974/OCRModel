@@ -2468,7 +2468,9 @@ def train(
                 # path performs one of its own before this one.  Extending at the
                 # prepare site would arm once and let the rollout spend it, leaving
                 # this forward -- the differentiable one -- silently prefix-free.
-                forward_inputs = prefix_runtime.extend(forward_inputs)
+                forward_inputs = prefix_runtime.extend(
+                    forward_inputs, record.get("regions")
+                )
                 # ``ocr_labels`` was bound to the pre-extension tensor above, and
                 # ``extend_prefix_side_inputs`` builds a *new* labels tensor rather
                 # than resizing in place, so the stale binding is K shorter than
@@ -3613,7 +3615,7 @@ def evaluate(
             # Both consuming forwards below are armed here, in the order they run
             # (teacher-forcing, then the generation prefill); the splice counter
             # matches them one for one.
-            inputs = prefix_runtime.extend(inputs)
+            inputs = prefix_runtime.extend(inputs, record.get("regions"))
         bridge.set_grid_thw(inputs["image_grid_thw"])
         bridge.set_region_decode_controls(
             pointer_mask=(getattr(args, "region_pointer_mask", True) if region_enabled else None),
@@ -3634,7 +3636,9 @@ def evaluate(
                 # Both sides of the audit must be extended together or the prompt
                 # prefixes would differ by exactly the reserved rows and every page
                 # would be reported as a mismatch.
-                teacher_inputs = prefix_runtime.extend(teacher_inputs)
+                teacher_inputs = prefix_runtime.extend(
+                    teacher_inputs, record.get("regions")
+                )
             audit = prompt_target_audit(processor, inputs, teacher_inputs, eos_ids)
             teacher_forced_target_tokens += int(audit["target_token_count"])
             teacher_forced_eos_labels += int(audit["eos_label_count"])
@@ -4253,7 +4257,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--prefix-payload",
-        choices=["queries", "global", "regions"],
+        choices=["queries", "global", "regions", "oracle"],
         default="queries",
         help=(
             "what the prefix tokens carry: 'queries' is one token per layout query "

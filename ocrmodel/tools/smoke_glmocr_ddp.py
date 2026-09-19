@@ -56,7 +56,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--query-refine-layers", type=int, default=0)
     parser.add_argument("--prefix-tokens", type=int, default=0)
     parser.add_argument(
-        "--prefix-payload", choices=["queries", "global", "regions"], default="queries"
+        "--prefix-payload",
+        choices=["queries", "global", "regions", "oracle"],
+        default="queries",
     )
     parser.add_argument("--prefix-position", choices=["front", "tail"], default="front")
     parser.add_argument("--seed", type=int, default=42)

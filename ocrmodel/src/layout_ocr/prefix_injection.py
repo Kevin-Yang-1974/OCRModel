@@ -80,7 +80,41 @@ def prefix_position() -> str:
         raise ValueError(f"{POSITION_ENV_VAR} must be 'front' or 'tail', got {raw!r}")
     return raw
 
-PayloadMode = Literal["queries", "regions", "global"]
+# Per-region oracle features: box, normalized reading order, one-hot direction,
+# and a validity flag for the padding slots.
+ORACLE_FEATURE_DIM = 4 + 1 + 3 + 1
+
+
+class LayoutOracleEncoder(nn.Module):
+    """Encode ground-truth regions into ``K`` slot vectors.
+
+    This is the upper bound the layout branch never had the capacity to reach: the
+    input is exact region geometry and reading order, and the encoding is learned
+    rather than inherited from the branch's transport.  If a trainable encoder with
+    correct input cannot make the decoder recognise better, then no amount of
+    improving the branch will -- which is the question an oracle arm exists to
+    answer, and the one the branch's own output cannot answer for itself.
+    """
+
+    def __init__(self, hidden_size: int, feature_dim: int = ORACLE_FEATURE_DIM) -> None:
+        super().__init__()
+        inner = 4 * hidden_size
+        self.encoder = nn.Sequential(
+            nn.Linear(feature_dim, inner),
+            nn.GELU(),
+            nn.Linear(inner, hidden_size),
+        )
+        self.norm = nn.LayerNorm(hidden_size)
+        # Small but nonzero: an exactly-zero slot vector sits on RMSNorm's gradient
+        # singularity, the same reason the prefix slots carry a base.
+        nn.init.normal_(self.encoder[-1].weight, std=0.02)
+        nn.init.zeros_(self.encoder[-1].bias)
+
+    def forward(self, features: Tensor) -> Tensor:
+        return self.norm(self.encoder(features.float()))
+
+
+PayloadMode = Literal["queries", "regions", "global", "oracle"]
 PAYLOAD_MODES: tuple[str, ...] = get_args(PayloadMode)
 
 PREFIX_TAG = "<|layout_prefix|>"
@@ -139,6 +173,38 @@ def reserve_prefix_tokens(tokenizer: Any, count: int) -> list[int]:
     if min(ids) < 0:
         raise ValueError("prefix token id could not be resolved")
     return ids
+
+
+DIRECTION_IDS = {"vertical_rtl": 0, "horizontal_ltr": 1, "unknown": 2}
+
+
+def region_feature_tensor(
+    regions: list[dict[str, Any]], slots: int, device: Any
+) -> Tensor:
+    """``[1, slots, ORACLE_FEATURE_DIM]`` of ground-truth regions in reading order.
+
+    Boxes and order are normalized, direction is one-hot, and the last feature is a
+    validity flag so the encoder can tell a real region from padding.  Reading order
+    is carried explicitly because it is the one piece of layout information that is
+    about the *sequence* rather than about any single patch, and it is what the
+    branch's per-patch context provably cannot represent.
+    """
+
+    ordered = sorted(regions, key=lambda item: int(item["reading_order"]))
+    if len(ordered) > slots:
+        raise ValueError(
+            f"page has {len(ordered)} regions but only {slots} prefix slots; "
+            "raise --prefix-tokens"
+        )
+    features = torch.zeros(1, slots, ORACLE_FEATURE_DIM, device=device)
+    count = max(len(ordered), 1)
+    for index, region in enumerate(ordered):
+        box = region["bbox"]
+        features[0, index, 0:4] = torch.tensor(box, dtype=torch.float32, device=device)
+        features[0, index, 4] = (index + 1) / count
+        features[0, index, 5 + DIRECTION_IDS.get(region.get("writing_direction", "unknown"), 2)] = 1.0
+        features[0, index, 8] = 1.0
+    return features
 
 
 def build_prefix_input_ids(
@@ -322,6 +388,9 @@ class PrefixInjector(nn.Module):
         # in layer 0's attention LoRA -- the first layer to consume these rows.
         self.slot_bias = nn.Parameter(torch.empty(token_count, model_hidden_size))
         nn.init.normal_(self.slot_bias, std=0.02)
+        self.oracle_encoder: LayoutOracleEncoder | None = None
+        if self.payload_mode == "oracle":
+            self.oracle_encoder = LayoutOracleEncoder(model_hidden_size)
         if dtype is not None:
             self.to(dtype=dtype)
 
@@ -337,6 +406,18 @@ class PrefixInjector(nn.Module):
             )
         projected = self.projection(payload.to(self.projection.weight.dtype))
         return projected + self.slot_bias.unsqueeze(0)
+
+    def from_oracle(self, features: Tensor) -> Tensor:
+        """Encode ground-truth region features into the slot vectors."""
+
+        if self.oracle_encoder is None:
+            raise ValueError("payload mode is not 'oracle'")
+        if features.shape[1] != self.token_count:
+            raise ValueError(
+                f"oracle features have {features.shape[1]} regions but "
+                f"{self.token_count} slots are allocated"
+            )
+        return self.oracle_encoder(features).to(self.projection.weight.dtype)
 
 
 def _select_payload(output: Any, mode: PayloadMode, token_count: int) -> Tensor:
@@ -378,6 +459,10 @@ def _select_payload(output: Any, mode: PayloadMode, token_count: int) -> Tensor:
     if mode == "global":
         queries = output.layout_queries
         return queries.mean(dim=1, keepdim=True).expand(-1, token_count, -1)
+    if mode == "oracle":
+        # Not derived from the branch at all: the caller supplies exact geometry
+        # and the encoder is what turns it into slots.
+        raise ValueError("oracle payloads come from the encoder, not from `output`")
     raise ValueError(f"unsupported payload mode: {mode}")
 
 
@@ -391,6 +476,15 @@ def publish_prefix_payload(splice: Any, output: Any) -> None:
     that decided the residual seam.
     """
 
+    if splice.injector.payload_mode == "oracle":
+        features = splice.oracle_features
+        if features is None:
+            raise RuntimeError(
+                "oracle payload mode needs ground-truth region features for this "
+                "page; extend() supplies them"
+            )
+        splice.set_payload(splice.injector.from_oracle(features))
+        return
     splice.set_payload(
         _select_payload(
             output, splice.injector.payload_mode, splice.injector.token_count
@@ -420,6 +514,7 @@ class _Splice:
         self.applied = 0
         self.skipped = 0
         self._pending = 0
+        self.oracle_features: Tensor | None = None
 
     def arm(self) -> None:
         """Declare that one coming forward's ``input_ids`` carry the reserved ids.
@@ -439,6 +534,9 @@ class _Splice:
         """
 
         self._pending += 1
+
+    def set_oracle_features(self, features: Tensor | None) -> None:
+        self.oracle_features = features
 
     def set_payload(self, payload: Tensor) -> None:
         from .writeback_intervention import apply_intervention, intervention_mode
@@ -596,13 +694,27 @@ class PrefixRuntime:
     def logits_mask(self) -> PrefixLogitsMask:
         return PrefixLogitsMask(self.reserved_ids)
 
-    def extend(self, inputs: dict[str, Any]) -> dict[str, Any]:
+    def extend(
+        self, inputs: dict[str, Any], regions: list[dict[str, Any]] | None = None
+    ) -> dict[str, Any]:
         """Add the reserved rows and arm the splice for the coming forward.
 
         Arming is part of extending on purpose: the two must not be able to drift
         apart, because arming without extending corrupts real tokens.
         """
 
+        if self.injector.payload_mode == "oracle":
+            if regions is None:
+                raise RuntimeError(
+                    "oracle payload mode requires the page's ground-truth regions"
+                )
+            self.splice.set_oracle_features(
+                region_feature_tensor(
+                    regions,
+                    self.token_count,
+                    next(self.injector.parameters()).device,
+                )
+            )
         extended = extend_prefix_side_inputs(
             inputs, self.reserved_ids, position=self.position
         )
