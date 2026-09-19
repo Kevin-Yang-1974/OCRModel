@@ -54,6 +54,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sem-adapter-hidden", type=int, default=0)
     parser.add_argument("--freeze-layout-branch", action="store_true")
     parser.add_argument("--query-refine-layers", type=int, default=0)
+    parser.add_argument("--prefix-tokens", type=int, default=0)
+    parser.add_argument(
+        "--prefix-payload", choices=["queries", "global", "regions"], default="queries"
+    )
+    parser.add_argument("--prefix-position", choices=["front", "tail"], default="front")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--decoder-adaptation", choices=["frozen", "lora"], default="frozen")
     parser.add_argument("--layout-only", action="store_true")
@@ -236,8 +241,21 @@ def main() -> None:
             region_pointer_mask=args.region_pointer_mask,
             region_spatial_penalty=args.region_spatial_penalty,
             region_spatial_iou_threshold=args.region_spatial_iou_threshold,
+            prefix_tokens=args.prefix_tokens,
+            prefix_payload=args.prefix_payload,
+            prefix_position=args.prefix_position,
         )
         model, processor, bridge = load_model(model_args, device)
+        if args.prefix_tokens > 0 and getattr(bridge, "prefix_runtime", None) is None:
+            # The smoke is the only cheap gate in front of a multi-hour run, and a
+            # flag that reaches the smoke but not the model turns it into a gate
+            # that cannot fail.  On 2026-09-19 exactly that happened: the prefix
+            # smoke reported the no-prefix trainable count and passed, and the real
+            # run then died on the first optimizer step.
+            raise RuntimeError(
+                f"--prefix-tokens {args.prefix_tokens} was requested but no prefix "
+                "runtime was installed; the smoke would not be exercising the feature"
+            )
         continuation_head = (
             ContinuationStopHead(hidden_size=args.continuation_head_hidden_size).to(device)
             if args.continuation_head
@@ -315,6 +333,7 @@ def main() -> None:
             sem_adapter_mlp=args.sem_adapter_mlp,
             sem_adapter_hidden=args.sem_adapter_hidden,
             freeze_layout_branch=args.freeze_layout_branch,
+            prefix_position=args.prefix_position,
             decoder_learning_rate=args.decoder_learning_rate,
             text_repeat_suppression=args.text_repeat_suppression,
             text_ul_weight=args.text_ul_weight,
