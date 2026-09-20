@@ -166,6 +166,78 @@ def _launcher_text() -> str:
     return LAUNCHER.read_text(encoding="utf-8")
 
 
+def _probe_report(**overrides):
+    report = {
+        "page_id": "p0",
+        "layers": [0, 4],
+        "heads": None,
+        "visual_tokens": 4,
+        "visual_start": 1,
+        "num_regions": 2,
+        "decoding_steps": 3,
+        "grid_missing_steps": 0,
+        "emitted_missing_steps": 1,
+        "layer_geometry": {"0": {"num_heads": 4, "num_kv_heads": 2, "head_dim": 2, "scaling": 1.0}},
+        "transform_failed": {},
+        "steps": [
+            {"step": 1, "text_keys": 3, "heads": [{"layer": 0, "head": 0, "m_t": 0.5}]},
+            {"step": 2, "text_keys": 4, "heads": [{"layer": 4, "head": 1, "m_t": 0.25}]},
+        ],
+    }
+    report.update(overrides)
+    return report
+
+
+def test_the_summary_carries_every_key_the_launcher_reads():
+    """The summary producer and the launcher are two files apart.
+
+    This is the contract that broke on the first real run: the launcher read a key the
+    evaluation summary did not carry, so the report crashed *after* both arms had
+    already been paid for.  Nothing was lost, but the run ended with a traceback
+    instead of a verdict.
+    """
+
+    from layout_ocr.train_screen import _probe_summary
+
+    summary = _probe_summary([_probe_report()])
+    # Exactly the keys run_glmocr_layout_attention_probe_a100.sh indexes.  Adding a
+    # read there means adding it here too, which is the point of naming them.
+    for key in (
+        "pages",
+        "pages_with_steps",
+        "layers",
+        "heads",
+        "visual_tokens",
+        "decoding_steps",
+        "grid_missing_steps",
+        "emitted_missing_steps",
+        "mean_visual_mass",
+        "transform_failed",
+        "layer_geometry",
+    ):
+        assert key in summary, f"the launcher reads {key!r} but the summary never writes it"
+    assert summary["decoding_steps"] == 3
+    assert summary["emitted_missing_steps"] == 1
+    assert summary["pages_with_steps"] == 1
+
+
+def test_the_summary_is_absent_rather_than_empty_when_the_probe_is_off():
+    """A run without the probe must not report zero steps as if it had observed none."""
+
+    from layout_ocr.train_screen import _probe_summary
+
+    assert _probe_summary([]) is None
+
+
+def test_the_summary_reports_which_layers_failed_their_transform():
+    """A failed transform means those layers' numbers do not exist, not that they are low."""
+
+    from layout_ocr.train_screen import _probe_summary
+
+    summary = _probe_summary([_probe_report(transform_failed={"4": "RuntimeError: no embeds"})])
+    assert summary["transform_failed"] == {"p0": {"4": "RuntimeError: no embeds"}}
+
+
 def test_the_launcher_runs_a_no_probe_control(tmp_path):
     """Without a control that installs nothing, a probe cost has no baseline."""
 

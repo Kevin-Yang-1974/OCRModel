@@ -312,8 +312,12 @@ else:
         if probe["transform_failed"]:
             print(f"  **探针变换失败**（这些层的数字不可信）：{probe['transform_failed']}")
             ok = False
-    if not noroute_path.exists() or noroute_path.stat().st_size > 0:
-        print("  noroute 臂写出了探针文件：它不该装探针")
+    # Absent is correct, not suspicious: nothing in the control arm calls write_probe,
+    # so the file is never created.  Only a *non-empty* file means the control was
+    # really running a probe.  (An earlier version of this check failed a correct run
+    # by treating "does not exist" as "wrote a report".)
+    if noroute_path.exists() and noroute_path.stat().st_size > 0:
+        print(f"  noroute 臂写出了探针文件（{noroute_path.stat().st_size} 字节）：它不该装探针")
         ok = False
 
 print()
