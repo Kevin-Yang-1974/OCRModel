@@ -247,15 +247,40 @@ def test_an_insertion_is_not_itself_near_a_drop():
     assert near_dropped[1] is False
 
 
-def test_a_repeated_trigram_marks_its_neighbourhood():
+def test_a_cycle_marks_its_whole_stretch():
+    """The failure a line constraint answers for is a stretch the model got stuck on."""
+
     from analyze_attention_localization import neighbourhood_flags
 
-    generated = "甲乙丙甲乙丙丁"
+    # 甲乙 repeated four times back to back is a loop; the trailing 丙丁 is not.
+    generated = "甲乙甲乙甲乙甲乙丙丁"
     mapping = align(generated, generated)
     _, near_repeated = neighbourhood_flags(generated, generated, mapping, window=0)
-    # 甲乙丙 occurs twice, so all six characters inside those two occurrences are marked
-    # -- including the middle of each stretch, which a per-start-position flag would miss.
-    assert near_repeated == [True] * 6 + [False]
+    assert near_repeated == [True] * 8 + [False] * 2
+
+
+def test_ordinary_recurring_text_is_not_a_repetition():
+    """In Chinese, common trigrams recur constantly; that is the language, not a failure.
+
+    Using ``repeated_trigram_rate``'s page-level notion as a per-character flag marked 75%
+    of a validation page, which is not a measurement of anything.
+    """
+
+    from analyze_attention_localization import neighbourhood_flags
+
+    generated = "天地玄黄宇宙洪荒日月盈昃辰宿列张"
+    mapping = align(generated, generated)
+    _, near_repeated = neighbourhood_flags(generated, generated, mapping, window=0)
+    assert not any(near_repeated)
+
+
+def test_two_repeats_are_not_yet_a_loop():
+    from analyze_attention_localization import neighbourhood_flags
+
+    generated = "甲乙甲乙丙丁戊己庚辛"
+    mapping = align(generated, generated)
+    _, near_repeated = neighbourhood_flags(generated, generated, mapping, window=0)
+    assert not any(near_repeated)
 
 
 def test_a_page_with_no_failures_has_no_marked_characters():

@@ -322,28 +322,42 @@ def neighbourhood_flags(
 
     ``dropped[j]``      reference position ``j`` that no generated character was aligned
                         to -- a character the model skipped.
-    ``repeated[i]``     the trigram starting at generated position ``i`` occurs more than
-                        once in the generated text, which is the same notion of repetition
-                        the training side measures.
+    ``repeated[i]``     generated position ``i`` lies inside a run of a short substring
+                        repeated back to back at least three times -- the loop the
+                        training side's cycle processor targets.
+
+    ``repeated`` deliberately does **not** use ``repeated_trigram_rate``'s notion, which
+    counts any trigram occurring more than once in the page.  That is a page-level rate
+    over ordinary text: in Chinese, common trigrams recur constantly, and as a per-character
+    flag it marked 75% of a validation page, which measures the language rather than the
+    failure.  What a line constraint is meant to answer for is a stretch the model got
+    stuck on, so the test is a consecutive cycle.
     """
 
     mapped = {index for index in mapping if index is not None}
     dropped = [index not in mapped for index in range(len(reference))]
 
-    seen: dict[str, int] = {}
-    starts = max(0, len(generated) - 2)
-    for index in range(starts):
-        trigram = generated[index : index + 3]
-        seen[trigram] = seen.get(trigram, 0) + 1
-    # Mark the whole occurrence, not just the position the repeat starts at: a character
-    # in the middle of a repeated stretch is part of the repetition, and a per-start flag
-    # would leave it unmarked and make the stretch look mostly clean.
     repeated = [False] * len(generated)
-    for index in range(starts):
-        if seen[generated[index : index + 3]] > 1:
-            for offset in range(3):
-                if index + offset < len(repeated):
-                    repeated[index + offset] = True
+    index = 0
+    while index < len(generated):
+        span = 0
+        for period in range(1, 9):
+            if index + period * 3 > len(generated):
+                continue
+            unit = generated[index : index + period]
+            repeats = 1
+            while (
+                generated[index + repeats * period : index + (repeats + 1) * period] == unit
+            ):
+                repeats += 1
+            if repeats >= 3:
+                span = max(span, period * repeats)
+        if span:
+            for offset in range(span):
+                repeated[index + offset] = True
+            index += span
+        else:
+            index += 1
 
     dropped_counts = _prefix_counts(dropped)
     repeated_counts = _prefix_counts(repeated)
@@ -470,6 +484,7 @@ def score_page(
         "reference_chars": len(reference),
         "prediction_chars": len(prediction),
         "emitted_matches_prediction": emitted_matches,
+        "num_regions": len(ordered),
         "rows": scored,
     }
 
@@ -717,6 +732,19 @@ def main(argv: list[str] | None = None) -> int:
         per_page = {page["page_id"]: page["rows"] for page in chosen}
         report[name] = summarise(rows, args.confidence, per_page)
         report[name]["pages"] = [page["page_id"] for page in chosen]
+        # Per page, because a half-to-half difference can be page composition rather than
+        # a property of the readout, and the plan asks for grouped statistics when pages
+        # from one book are strongly correlated.  An aggregate alone cannot tell the two
+        # apart.
+        report[name]["per_page"] = {
+            page["page_id"]: {
+                "scored": page["scored"],
+                "accuracy": accuracy(page["rows"]),
+                "inserted": page["inserted"],
+                "regions": page["num_regions"],
+            }
+            for page in sorted(chosen, key=lambda item: item["page_id"])
+        }
         report[name]["alignment"] = {
             "scored_chars": sum(page["scored"] for page in chosen),
             "inserted_chars": sum(page["inserted"] for page in chosen),
