@@ -575,6 +575,54 @@ def test_a_prefill_is_stored_and_a_decode_step_is_observed(monkeypatch):
     assert runtime.report()["decoding_steps"] == 3
 
 
+def test_every_selected_layer_records_a_row_for_the_same_step(monkeypatch):
+    """Counting the step once must not skip the observation.
+
+    The first version advanced a shared counter and returned early for every layer that
+    did not advance it, so four probed layers produced one layer's worth of rows.  The
+    step count was right and the per-layer statistics -- the thing the plan selects
+    layers on -- were three quarters missing, with nothing in the report to say so.
+    """
+
+    _identity_rotary(monkeypatch)
+    runtime = AttentionProbe(_bridge(), IMAGE_TOKEN_ID, layers=(0, 4))
+    runtime.set_page("p0", [], PROMPT_LENGTH, _prompt_ids())
+    modules = []
+    for index in (0, 4):
+        module = _FakeAttention()
+        module._probe_layer_idx = index
+        modules.append(module)
+    prefill = {
+        "hidden_states": torch.randn(1, PROMPT_LENGTH, 8),
+        "position_embeddings": (torch.ones(1, PROMPT_LENGTH, 2), torch.zeros(1, PROMPT_LENGTH, 2)),
+    }
+    for module, index in zip(modules, (0, 4)):
+        runtime._pre(module, (), prefill)
+        runtime._post(module, (), prefill, None)
+        assert runtime._visual_keys[index].shape == (1, 2, VISUAL_COUNT, 2)
+
+    for step in range(3):
+        decode = {
+            "hidden_states": torch.randn(1, 1, 8),
+            "position_embeddings": (torch.ones(1, 1, 2), torch.zeros(1, 1, 2)),
+            "cache_position": torch.tensor([PROMPT_LENGTH + step]),
+        }
+        for module in modules:
+            runtime._pre(module, (), decode)
+            runtime._post(module, (), decode, None)
+
+    records = runtime.report()["steps"]
+    # Two layers x three steps, all numbered with the same three steps.
+    assert len(records) == 6
+    assert sorted({record["step"] for record in records}) == [1, 2, 3]
+    assert sorted({head["layer"] for record in records for head in record["heads"]}) == [0, 4]
+    for step in (1, 2, 3):
+        layers = {head["layer"] for record in records if record["step"] == step for head in record["heads"]}
+        assert layers == {0, 4}, step
+    # And the step was still counted once, not twice.
+    assert runtime.report()["decoding_steps"] == 3
+
+
 def test_position_ids_are_not_a_substitute_for_position_embeddings(monkeypatch):
     """The trap: ``position_ids`` is not an argument of the attention forward."""
 

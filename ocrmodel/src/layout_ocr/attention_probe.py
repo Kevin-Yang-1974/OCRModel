@@ -660,25 +660,33 @@ class AttentionProbe:
         setattr(module, "_probe_position_embeddings", position_embeddings)
         setattr(module, "_probe_mask", kwargs.get("attention_mask"))
 
-    def _next_step(self, layer: int, cache_position: Any) -> int | None:
-        """Advance the decode-step counter once per forward, not once per probed layer.
+    def _step_index(self, layer: int, cache_position: Any) -> int:
+        """The step index for this forward, advancing the counter once per step.
 
-        Every selected layer runs this hook on the same forward, so a naive count
-        would report the decoding steps multiplied by the depth of the model -- and
-        that number is reported as the arm's coverage.  ``cache_position`` identifies
-        the forward; when it is unavailable the first selected layer stands in for it.
+        Every selected layer runs this hook on the same forward, so a naive count would
+        report the decoding steps multiplied by the depth of the model -- and that number
+        is the arm's coverage.  ``cache_position`` identifies the forward; when it is
+        unavailable the first selected layer stands in for it.
+
+        This returns the step for *every* layer, including the ones that do not advance
+        the counter.  An earlier version returned ``None`` for those, which counted
+        correctly and skipped their observation entirely: four probed layers produced one
+        layer's worth of rows, and the per-layer statistics the plan asks for were three
+        quarters missing while looking complete.
         """
 
         current = None
         if isinstance(cache_position, Tensor) and cache_position.numel():
             current = int(cache_position.reshape(-1)[-1].item())
-        if current is None:
-            if layer != self.layers[0]:
-                return None
-        elif current == self._step_key:
-            return None
-        self._step_key = current
-        self.steps += 1
+        if current is not None:
+            if current != self._step_key:
+                self._step_key = current
+                self.steps += 1
+            return self.steps
+        # Without a cache_position the layers are indistinguishable, so the counter rides
+        # on the first selected layer, which runs before the others in layer order.
+        if layer == self.layers[0]:
+            self.steps += 1
         return self.steps
 
     def _post(self, module: nn.Module, args: Any, kwargs: dict, output: Any) -> None:
@@ -710,9 +718,7 @@ class AttentionProbe:
                 # reconstructing the KV cache.
                 self._store_prompt(layer, key)
                 return
-            step = self._next_step(layer, cache_position)
-            if step is None:
-                return
+            step = self._step_index(layer, cache_position)
             self._gen_keys.setdefault(layer, []).append(key.detach())
             self._observe_step(layer, step, query, mask)
 
