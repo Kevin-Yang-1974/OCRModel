@@ -154,7 +154,10 @@ def main(argv: list[str] | None = None) -> int:
     buckets: dict[str, list[dict[str, Any]]] = {}
     for page in pages:
         regions = page["regions"]
-        label = "<=16" if regions <= 16 else "17-24" if regions <= 24 else "25-32" if regions <= 32 else ">32"
+        label = next(
+            name for limit, name in ((16, "<=16"), (24, "17-24"), (32, "25-32"), (10**6, ">32"))
+            if regions <= limit
+        )
         buckets.setdefault(label, []).append(page)
     result["by_region_bucket"] = {}
     for label in ("<=16", "17-24", "25-32", ">32"):
@@ -212,8 +215,8 @@ def main(argv: list[str] | None = None) -> int:
     print(f"  median multiple-of-uniform       {result['multiple_of_uniform_median']:.2f}x")
     print()
     print("by line count:")
-    header = f"  {'bucket':>7} {'pages':>6} {'scored':>7} {'coverage':>9} {'accuracy':>9} {'med regions':>12}"
-    print(header)
+    print(f"  {'bucket':>7} {'pages':>6} {'scored':>7} {'coverage':>9} {'accuracy':>9} "
+          f"{'med regions':>12}")
     for label, stats in result["by_region_bucket"].items():
         print(f"  {label:>7} {stats['pages']:6d} {stats['scored']:7d} "
               f"{stats['coverage_0_5']:9.4f} {stats['accuracy']:9.4f} "
