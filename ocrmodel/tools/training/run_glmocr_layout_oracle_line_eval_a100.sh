@@ -132,7 +132,10 @@ launch() {
         fi
         route_flags+=(--layout-routing-line-map "${line_map}")
         if [[ "${line_map}" == "predicted" ]]; then
-            [[ -n "${predicted_lines}" ]]                 || { echo "line_map predicted needs GLMOCR_ORACLE_PREDICTED_LINES" >&2; exit 64; }
+            [[ -n "${predicted_lines}" ]] || {
+                echo "line_map predicted needs GLMOCR_ORACLE_PREDICTED_LINES" >&2
+                exit 64
+            }
             route_flags+=(--layout-routing-predicted-lines "${predicted_lines}")
         fi
         if [[ "${line_source}" == "tracked" ]]; then
@@ -228,6 +231,31 @@ arms_dir = root / "arms"
 # which reads as a failed run when the run in fact succeeded.
 order = [p.name for p in sorted(arms_dir.iterdir()) if p.is_dir()] if arms_dir.exists() else []
 payload = {"status": "complete", "pointer": None, "iterations": ITERATIONS, "arms": {}}
+
+# A control supplied from an earlier run is registered here, before anything reads it. Registering
+# it in the bootstrap section instead left the wiring check running first, so it reported "no
+# control" while the bootstrap below was comparing against one -- the verdict and its own evidence
+# disagreeing in the same output.
+reused_baseline = os.environ.get("GLMOCR_ORACLE_BASELINE_DIR", "").strip()
+reused_predictions = Path(reused_baseline) / "validation_predictions.jsonl" if reused_baseline else None
+if reused_predictions is not None and reused_predictions.is_file() and "noroute" not in order:
+    sidecar = Path(reused_baseline) / "summary.json"
+    entry = {"status": "reused", "pages": 0}
+    if sidecar.is_file():
+        metrics = json.loads(sidecar.read_text(encoding="utf-8"))["validation"]
+        entry.update({
+            "pages": metrics["pages"],
+            "cer": metrics["cer"],
+            "substitutions": metrics["substitutions"],
+            "insertions": metrics["insertions"],
+            "deletions": metrics["deletions"],
+            "edits": metrics["substitutions"] + metrics["insertions"] + metrics["deletions"],
+            "generation_limit_hits": metrics["generation_limit_hits"],
+            "layout_routing": metrics.get("layout_routing"),
+        })
+    payload["arms"]["noroute"] = entry
+    payload["baseline_reused_from"] = reused_baseline
+    order = ["noroute"] + order
 missing = []
 for arm in order:
     summary_path = arms_dir / arm / "summary.json"
@@ -372,24 +400,6 @@ if not baseline.is_file():
     ok = False
 else:
     rows_a = load_predictions(baseline)
-    if "noroute" not in payload["arms"]:
-        # A reused control still has to appear as an arm: the wiring check and the delta table both
-        # read it by name, and its absence said "no control" while the bootstrap below was quietly
-        # using one.
-        sidecar = baseline.parent / "summary.json"
-        reused = {"status": "reused", "pages": len(rows_a), "cer": cer(rows_a)}
-        if sidecar.is_file():
-            metrics = json.loads(sidecar.read_text(encoding="utf-8"))["validation"]
-            reused.update({
-                "substitutions": metrics["substitutions"],
-                "insertions": metrics["insertions"],
-                "deletions": metrics["deletions"],
-                "edits": metrics["substitutions"] + metrics["insertions"] + metrics["deletions"],
-                "generation_limit_hits": metrics["generation_limit_hits"],
-                "layout_routing": metrics.get("layout_routing"),
-            })
-        payload["arms"]["noroute"] = reused
-        order = ["noroute"] + [arm for arm in order if arm != "noroute"]
     payload["comparisons"] = {}
     for arm in order:
         if arm == "noroute":
