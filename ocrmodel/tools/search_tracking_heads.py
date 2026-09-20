@@ -10,6 +10,12 @@ Everything here is offline over a recorded probe file, so a candidate costs noth
 selection runs on the select pages and is reported on the check pages, because choosing a subset
 on the pages it is then scored on is the one way this could produce a number that does not
 reproduce -- the same rule stage 0 registered for the layer and head choice.
+
+Coverage travels with accuracy in every row, and the ranking bar is the lowest one in the sweep.
+Averaging fewer heads smooths the distribution less, so a small subset clears a fixed bar on more
+steps; comparing two subsets at one bar compares them at two doses, which is exactly the confound
+§9.1 measured on the gate. At the floor bar every subset is near saturation and the comparison is
+between estimates rather than between doses.
 """
 
 from __future__ import annotations
@@ -40,7 +46,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--select-pages", type=Path, required=True)
     parser.add_argument("--check-pages", type=Path, required=True)
     parser.add_argument("--bias", type=float, default=1.0)
-    parser.add_argument("--bar", type=float, default=6.0)
+    parser.add_argument("--bars", type=float, nargs="+", default=[6.0])
     parser.add_argument("--corrected", action="store_true")
     parser.add_argument("--min-heads", type=int, default=1)
     parser.add_argument("--max-heads", type=int, default=8)
@@ -75,8 +81,8 @@ def page_inputs(report: dict[str, Any], record: dict[str, Any]) -> dict[str, Any
             continue
         truth = line_of_char[mapping[position]] if mapping[position] < len(line_of_char) else -1
         if truth >= 0:
-            # One line per step: the first scored character's, matching the replay's convention of
-            # scoring the applied line rather than each character separately.
+            # One line per step: the first scored character's, which is the step's own label. The
+            # replay tool scores per character; the ranking here only needs a consistent unit.
             truth_of_step.setdefault(step, truth)
     return {
         "ordered": ordered,
@@ -87,9 +93,8 @@ def page_inputs(report: dict[str, Any], record: dict[str, Any]) -> dict[str, Any
 
 
 def mean_distribution(
-    heads: list[dict[str, Any]], layers, chosen: tuple[int, ...], bias: float
+    heads: list[dict[str, Any]], layers, chosen: tuple[int, ...]
 ) -> list[float] | None:
-    width = 0
     total: list[float] | None = None
     count = 0
     for row in heads:
@@ -99,9 +104,8 @@ def mean_distribution(
         if not probs:
             continue
         if total is None:
-            width = len(probs)
-            total = [0.0] * width
-        elif len(probs) != width:
+            total = [0.0] * len(probs)
+        elif len(probs) != len(total):
             continue
         for index, value in enumerate(probs):
             total[index] += value
@@ -121,26 +125,30 @@ def apply_correction(probs: list[float], biased_line: int, bias: float) -> list[
     return [value / total for value in adjusted] if total > 0 else adjusted
 
 
-def score_page(page: dict[str, Any], chosen: tuple[int, ...], args) -> tuple[int, int]:
-    """Applied-line hits and scored steps, for one subset on one page."""
+def score_page(
+    page: dict[str, Any], chosen: tuple[int, ...], args, bar: float
+) -> tuple[int, int, int]:
+    """Applied-line hits, scored steps and biased steps, for one subset on one page."""
 
     state = -1
     hits = 0
     scored = 0
+    biased = 0
     for step in page["ordered"]:
         truth = page["truth"].get(step)
         if truth is not None:
             scored += 1
             hits += int(state == truth)
-        probs = mean_distribution(page["steps"][step]["heads"], args.layers, chosen, args.bias)
+            biased += int(state >= 0)
+        probs = mean_distribution(page["steps"][step]["heads"], args.layers, chosen)
         if probs is None:
             state = -1
             continue
         if args.corrected:
             probs = apply_correction(probs, state, args.bias)
         best = max(range(len(probs) - 1), key=lambda index: probs[index])
-        state = best if probs[best] * page["num_regions"] >= args.bar else -1
-    return hits, scored
+        state = best if probs[best] * page["num_regions"] >= bar else -1
+    return hits, scored, biased
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -175,56 +183,70 @@ def main(argv: list[str] | None = None) -> int:
     ]
     print(f"pages {len(pages)}  select {len(select_ids & set(pages))}  "
           f"check {len(check_ids & set(pages))}  subsets {len(subsets)}  "
-          f"bar {args.bar}  corrected {args.corrected}")
+          f"bars {args.bars}  corrected {args.corrected}")
 
-    results = []
+    results: list[dict[str, Any]] = []
     for subset in subsets:
-        select_hits = select_scored = check_hits = check_scored = 0
-        for page_id, page in pages.items():
-            hits, scored = score_page(page, subset, args)
-            if page_id in select_ids:
-                select_hits += hits
-                select_scored += scored
-            elif page_id in check_ids:
-                check_hits += hits
-                check_scored += scored
-        results.append(
-            {
-                "heads": list(subset),
-                "size": len(subset),
-                "select_accuracy": select_hits / select_scored if select_scored else None,
-                "select_steps": select_scored,
-                "check_accuracy": check_hits / check_scored if check_scored else None,
-                "check_steps": check_scored,
-            }
-        )
+        for bar in args.bars:
+            select_hits = select_scored = select_biased = 0
+            check_hits = check_scored = check_biased = 0
+            for page_id, page in pages.items():
+                hits, scored, biased = score_page(page, subset, args, bar)
+                if page_id in select_ids:
+                    select_hits += hits
+                    select_scored += scored
+                    select_biased += biased
+                elif page_id in check_ids:
+                    check_hits += hits
+                    check_scored += scored
+                    check_biased += biased
+            results.append(
+                {
+                    "heads": list(subset),
+                    "size": len(subset),
+                    "bar": bar,
+                    "select_accuracy": select_hits / select_scored if select_scored else None,
+                    "select_coverage": select_biased / select_scored if select_scored else None,
+                    "select_steps": select_scored,
+                    "check_accuracy": check_hits / check_scored if check_scored else None,
+                    "check_coverage": check_biased / check_scored if check_scored else None,
+                    "check_steps": check_scored,
+                }
+            )
 
-    ranked = sorted(results, key=lambda row: -(row["select_accuracy"] or 0.0))
-    print()
-    print(f"{'heads':>28} {'sel_acc':>8} {'chk_acc':>8}")
-    for row in ranked[: args.top]:
-        print(f"{str(row['heads']):>28} {row['select_accuracy']:8.4f} {row['check_accuracy']:8.4f}")
-    registered = next(
-        (row for row in results if row["heads"] == list(args.heads)), None
+    # Ranked at the lowest bar in the sweep: there every subset is close to saturation on coverage
+    # and the comparison is between estimates rather than between doses.
+    floor = min(args.bars)
+    ranked = sorted(
+        (row for row in results if row["bar"] == floor),
+        key=lambda row: -(row["select_accuracy"] or 0.0),
     )
-    if registered:
-        print()
-        print(f"registered set {registered['heads']}  select {registered['select_accuracy']:.4f}  "
-              f"check {registered['check_accuracy']:.4f}")
-    best_single = max((row for row in results if row["size"] == 1),
-                      key=lambda row: row["select_accuracy"] or 0.0)
-    print(f"best single head on select: {best_single['heads']}  "
-          f"select {best_single['select_accuracy']:.4f}  check {best_single['check_accuracy']:.4f}")
+    header = f"{'heads':>30} {'sel_acc':>8} {'sel_cov':>8} {'chk_acc':>8} {'chk_cov':>8}"
+    print()
+    print(f"ranked at bar {floor}:")
+    print(header)
+    for row in ranked[: args.top]:
+        print(f"{str(row['heads']):>30} {row['select_accuracy']:8.4f} {row['select_coverage']:8.4f} "
+              f"{row['check_accuracy']:8.4f} {row['check_coverage']:8.4f}")
+
+    watch = [list(args.heads)] + [row["heads"] for row in ranked[:3]]
+    if [2] not in watch:
+        watch.append([2])
+    print()
+    print("every bar swept, for the registered set and the leading candidates:")
+    print(f"{'heads':>30} {'bar':>5} {'sel_acc':>8} {'sel_cov':>8} {'chk_acc':>8} {'chk_cov':>8}")
+    for heads in watch:
+        for row in results:
+            if row["heads"] == heads:
+                print(f"{str(heads):>30} {row['bar']:5.1f} {row['select_accuracy']:8.4f} "
+                      f"{row['select_coverage']:8.4f} {row['check_accuracy']:8.4f} "
+                      f"{row['check_coverage']:8.4f}")
 
     if args.output:
         args.output.parent.mkdir(parents=True, exist_ok=True)
         args.output.write_text(
             json.dumps(
-                {
-                    "bar": args.bar,
-                    "corrected": args.corrected,
-                    "results": results,
-                },
+                {"bars": list(args.bars), "corrected": args.corrected, "results": results},
                 ensure_ascii=False,
                 indent=2,
             )

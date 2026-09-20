@@ -166,9 +166,9 @@ launch() {
     # What the arm was, written next to its log.  The gate and the correction are two variables
     # and the verdict has to be able to say which one moved, so the flags are recorded here
     # rather than reconstructed from the arm's name.
-    printf '{"arm":"%s","bias":"%s","box_source":"%s","line_source":"%s","line_map":"%s","confidence":"%s","predicted_lines":"%s","corrected":%s}\n' \
+    printf '{"arm":"%s","bias":"%s","box_source":"%s","line_source":"%s","line_map":"%s","confidence":"%s","predicted_lines":"%s","corrected":%s,"next_line_scale":%s}\n' \
         "${arm}" "${bias}" "${box_source}" "${line_source}" "${line_map}" "${confidence}" \
-        "${arm_lines}" "${arm_corrected:-0}" > "${out}.arm.json"
+        "${arm_lines}" "${arm_corrected:-0}" "${arm_next_scale:-0}" > "${out}.arm.json"
     (
         setup_environment
         export CUDA_VISIBLE_DEVICES="${gpu}"
@@ -218,7 +218,7 @@ run_arms() {
         fi
         local gpu="${slots[$(( index % total ))]}"
         launch "${arm}" "${bias}" "${box_source}" "${line_source}" "${line_map}" "${confidence}" \
-            "${arm_predicted}" "${arm_corrected}" "${gpu}" &
+            "${arm_predicted}" "${arm_corrected}" "${arm_next_scale}" "${gpu}" &
         pids+=("$!"); labels+=("${arm}")
         index=$(( index + 1 ))
         if (( index % total == 0 )); then

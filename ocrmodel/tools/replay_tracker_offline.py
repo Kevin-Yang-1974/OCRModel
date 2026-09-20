@@ -230,6 +230,8 @@ def replay_page(
             accepted = 0
             observations = 0
             gated_equivalent = 0
+            changes = 0
+            shifts = 0
             for step in ordered:
                 applied[step] = state
                 biased_line = state
@@ -243,9 +245,18 @@ def replay_page(
                 if row is not None:
                     observations += 1
                     confidence = float(row["top_line_mass"]) * len(regions)
+                    previous = state
                     state = policy(state, int(row["argmax_line"]), confidence, bar)
                     if state >= 0:
                         accepted += 1
+                    # How restless the estimate is. §9.1 measured that the gate and the dose are
+                    # one knob; this measures the other thing the bias does -- it inflates the mass
+                    # of the line already in use, which makes consecutive estimates agree. Divide
+                    # that out and the tracker may chase its own noise, which would show up here
+                    # and in the deletions long before it showed up in a localization rate.
+                    if state >= 0 and previous >= 0:
+                        changes += int(state != previous)
+                        shifts += abs(state - previous)
             hit = sum(1 for step, truth in scored if applied.get(step, -1) == truth)
             biased_chars = sum(1 for step, _ in scored if applied.get(step, -1) >= 0)
             # The lag costs the characters right after a line boundary: the bias is still aimed
@@ -287,6 +298,8 @@ def replay_page(
                 "accepted_steps": accepted,
                 "observations": observations,
                 "gated_equivalent": gated_equivalent,
+                "line_changes": changes,
+                "line_shift_total": shifts,
                 "accepted_fraction": accepted / observations if observations else None,
                 # Accuracy restricted to the characters the policy actually biased: this is the
                 # quantity the CER gain runs through, and it separates "aimed at nothing" from
@@ -348,6 +361,8 @@ def merge(totals: dict[str, dict[str, float]], page: dict[str, Any]) -> None:
                 "accepted": 0,
                 "observations": 0,
                 "gated_equivalent": 0,
+                "line_changes": 0,
+                "line_shift_total": 0,
                 "ahead_by_one": 0,
                 "ahead_by_one_early": 0,
                 "window_next_correct": 0,
@@ -361,6 +376,8 @@ def merge(totals: dict[str, dict[str, float]], page: dict[str, Any]) -> None:
         bucket["accepted"] += entry["accepted_steps"]
         bucket["observations"] += entry["observations"]
         bucket["gated_equivalent"] += entry["gated_equivalent"]
+        bucket["line_changes"] += entry["line_changes"]
+        bucket["line_shift_total"] += entry["line_shift_total"]
         bucket["ahead_by_one"] += entry["ahead_by_one"]
         bucket["ahead_by_one_early"] += entry["ahead_by_one_early"]
         bucket["window_next_correct"] += entry["window_next_correct"]
@@ -420,6 +437,7 @@ def main(argv: list[str] | None = None) -> int:
               f"{_ratio(entry, 'window_both_correct'):8.4f} "
               f"{(entry['ahead_by_one'] / entry['chars'] if entry['chars'] else 0.0):8.4f} "
               f"{(entry['ahead_by_one_early'] / entry['ahead_by_one'] if entry['ahead_by_one'] else 0.0):8.4f} "
+              f"{_ratio(entry, 'line_changes'):9.4f} "
               f"{_biased_accuracy(entry):11.4f} {entry['chars']:7d}")
 
     check = verify_against_routing_report(args.routing_report, totals, args.bias)
@@ -450,6 +468,10 @@ def main(argv: list[str] | None = None) -> int:
 
 
 def _ratio(entry: dict[str, float], key: str) -> float:
+    # Share of the accepted steps for the change counters, share of the characters for the
+    # windows; the two denominators are different and both are named by the key's meaning.
+    if key in ("line_changes", "line_shift_total"):
+        return entry[key] / entry["accepted"] if entry["accepted"] else 0.0
     return entry[key] / entry["chars"] if entry["chars"] else 0.0
 
 
