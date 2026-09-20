@@ -4395,9 +4395,11 @@ def parse_args() -> argparse.Namespace:
         help=(
             "additive bias, in attention logits, on the visual keys inside the box "
             "of the character being generated. Passing 0 installs the route with an "
-            "all-zero mask -- the wiring-checked baseline; not passing the flag at "
-            "all leaves the model untouched. Requires a manifest carrying the "
-            "per-character box channel (see tools/prepare_mthv2_char_manifest.py)"
+            "all-zero mask: no bias, but the wiring is exercised and the SDPA kernel "
+            "is the one every biased arm runs -- so it is the right arm to compare "
+            "the others against, and not the same as leaving the flag out. Requires "
+            "a manifest carrying the per-character box channel (see "
+            "tools/prepare_mthv2_char_manifest.py)"
         ),
     )
     parser.add_argument(

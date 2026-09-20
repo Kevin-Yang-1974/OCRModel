@@ -152,7 +152,7 @@ run_arms() {
 
 summarize() {
     setup_environment
-    "${python}" - "${eval_root}" "${RECORDED_BASELINE_CER}" <<'PY'
+    "${python}" - "${eval_root}" "${RECORDED_BASELINE_CER}" "${max_pixels}" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -164,6 +164,11 @@ from tools.analyze_cer_significance import cer, load_predictions, paired_bootstr
 
 root = Path(sys.argv[1])
 recorded_baseline = float(sys.argv[2])
+max_pixels = int(sys.argv[3])
+# The recorded value was measured at 1003520.  A run at another resolution has no
+# historical number to reproduce, and asserting against one from a different
+# resolution reports a correct run as broken.
+BASELINE_MAX_PIXELS = 1003520
 ITERATIONS = 10000
 
 arms_dir = root / "arms"
@@ -203,6 +208,17 @@ for arm in order:
 # CER(bias0) - CER(arm), so a positive interval means the arm is better.
 baseline_predictions = arms_dir / "bias0" / "validation_predictions.jsonl"
 payload["comparisons"] = {}
+standalone_noroute = None
+_noroute_summary = root / "noroute" / "noroute" / "summary.json"
+if _noroute_summary.is_file():
+    standalone_noroute = json.loads(_noroute_summary.read_text(encoding="utf-8"))["validation"]
+    payload["noroute"] = {
+        "cer": standalone_noroute["cer"],
+        "edits": standalone_noroute["substitutions"] + standalone_noroute["insertions"]
+        + standalone_noroute["deletions"],
+        "generation_limit_hits": standalone_noroute["generation_limit_hits"],
+        "layout_routing": standalone_noroute.get("layout_routing"),
+    }
 if baseline_predictions.is_file():
     rows_a = load_predictions(baseline_predictions)
     payload["comparisons"]["cer_bias0"] = cer(rows_a)
@@ -260,12 +276,17 @@ else:
     else:
         print(f"  bias0           路由已装并逐步记录（{routing['decoding_steps']} 步），"
               f"bias=0 故偏置为零 —— 这是正确的无偏置对照")
-    delta = baseline["cer"] - recorded_baseline
-    if abs(delta) < 1e-5:
-        print(f"  bias0           复现记录的 validation CER {recorded_baseline:.6f}  OK")
+    if max_pixels != BASELINE_MAX_PIXELS:
+        print(f"  bias0           本分辨率 {max_pixels} 没有记录基线可复现"
+              f"（记录值 {recorded_baseline:.6f} 是 {BASELINE_MAX_PIXELS} 下的）。"
+              f"本臂的有效性由上面的 biased_fraction 与逐步 probe 保证")
     else:
-        print(f"  bias0           未复现记录基线：{baseline['cer']:.6f} vs {recorded_baseline:.6f}"
-              f"（Δ{delta:+.6f}）<- 先查这一项，其余臂的结论都依赖它")
+        delta = baseline["cer"] - recorded_baseline
+        if abs(delta) < 1e-5:
+            print(f"  bias0           复现记录的 validation CER {recorded_baseline:.6f}  OK")
+        else:
+            print(f"  bias0           未复现记录基线：{baseline['cer']:.6f} vs {recorded_baseline:.6f}"
+                  f"（Δ{delta:+.6f}）<- 先查这一项，其余臂的结论都依赖它")
 for arm in [name for name in order if name != "bias0"]:
     row = payload["arms"][arm]
     if row.get("status") == "missing":
@@ -287,6 +308,23 @@ if "cer_bias0" not in comparisons:
     print("  没有 bias0 的预测文件，无法做配对比较")
     ok = False
 else:
+    if ("cer_bias0" in comparisons and standalone_noroute is not None
+            and (root / "noroute" / "noroute" / "validation_predictions.jsonl").is_file()):
+        rows_n = load_predictions(root / "noroute" / "noroute" / "validation_predictions.jsonl")
+        low, high, share = paired_bootstrap(rows_a, rows_n, ITERATIONS, 0)
+        stats = {
+            "cer": cer(rows_n),
+            "delta_cer_bias0_minus_arm": cer(rows_a) - cer(rows_n),
+            "ci_low": low, "ci_high": high, "p_bias0_not_worse": share,
+            "significant": low > 0 or high < 0,
+            "favours": "noroute" if low > 0 else ("bias0" if high < 0 else "neither"),
+        }
+        comparisons["noroute"] = stats
+        print(f"  noroute  CER {stats['cer']:.6f}  "
+              f"ΔCER(bias0-noroute) {stats['delta_cer_bias0_minus_arm']:+.6f}  "
+              f"CI [{low:+.6f}, {high:+.6f}]  ← 安装代价")
+        print("           bias0 高于 noroute 的部分就是「装上这条路由」本身的成本；"
+              "bias>0 臂的增益要超过它才算真的有用")
     for arm in [name for name in order if name != "bias0"]:
         stats = comparisons.get(arm)
         if stats is None:
@@ -297,13 +335,44 @@ else:
               f"  （利好：{stats['favours']}）")
 
 print()
+# The claim has to be "a bias arm beats no route at all", not "beats bias0": bias0
+# carries the same mask cost as the biased arms, so a gain over bias0 can be the
+# bias buying back the cost of installing it.
+rows_n = None
+if standalone_noroute is not None and ("cer_bias0" in comparisons):
+    rows_n = load_predictions(root / "noroute" / "noroute" / "validation_predictions.jsonl")
+    payload["vs_noroute"] = {}
+    for arm in [name for name in order if name != "bias0"]:
+        path = arms_dir / arm / "validation_predictions.jsonl"
+        if not path.is_file():
+            continue
+        rows_b = load_predictions(path)
+        low, high, share = paired_bootstrap(rows_n, rows_b, ITERATIONS, 0)
+        payload["vs_noroute"][arm] = {
+            "delta_cer_noroute_minus_arm": cer(rows_n) - cer(rows_b),
+            "ci_low": low, "ci_high": high,
+            "significant": low > 0 or high < 0,
+        }
+    print()
+    print("对 noroute 的配对比较（这才是判据：bias0 与 bias>0 臂共享掩码成本）：")
+    for arm, stats in payload["vs_noroute"].items():
+        tag = "显著" if stats["significant"] else "不显著"
+        print(f"  {arm:8s} DeltaCER(noroute-arm) {stats['delta_cer_noroute_minus_arm']:+.6f}  "
+              f"CI [{stats['ci_low']:+.6f}, {stats['ci_high']:+.6f}]  {tag}")
+
 if not ok:
+    print()
     print("接线未通过：先修，不要读结果。")
-elif any(stats["significant"] for stats in comparisons.values() if isinstance(stats, dict)):
-    print("至少一条 bias>0 臂的配对 CI 不含零 → 注意力路由有效。")
+elif rows_n is None:
+    print()
+    print("没有 noroute 对照：只能相对 bias0 读，且无法区分「偏置有用」与「偏置赚回安装成本」。")
+elif any(stats["significant"] and stats["delta_cer_noroute_minus_arm"] > 0
+         for stats in payload.get("vs_noroute", {}).values()):
+    print()
+    print("至少一条 bias>0 臂显著优于完全不装路由 → 注意力路由有效。")
 else:
-    print("四条臂两两比较均不显著 → 在这个分辨率与这个 checkpoint 上，注意力路由收口。")
-    print("注意：结论仅在「模型有能力利用该信号」的前提下成立，需与分辨率对照一起读。")
+    print()
+    print("没有 bias>0 臂显著优于 noroute → 相对 bias0 的增益只是赚回了安装成本，路由收口。")
 
 (root / "routing_eval_summary.json").write_text(
     json.dumps(payload, ensure_ascii=False, indent=2) + chr(10), encoding="utf-8"

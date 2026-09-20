@@ -10,9 +10,15 @@ inside a given box.
 
 ``bias`` is the strength in logits.  Zero is a *usable* arm, not an off switch: the
 hooks are installed and fire on every decoding step while the mask they add stays
-all-zero, so the arm is bit-identical to a run without this module *and* proves the
-wiring.  A run that does not ask for the route at all -- no ``--layout-routing-bias``
--- is the one this module leaves untouched.
+all-zero, so the arm carries no bias and proves the wiring.
+
+It is **not** the same run as "no route at all", and the difference is worth being
+explicit about.  An all-zero mask is a no-op on the attention logits, but a
+non-``None`` mask takes SDPA off the flash path and makes ``use_gqa_in_sdpa`` return
+false, so ``repeat_kv`` materialises the key and value heads instead of using
+``enable_gqa``.  Every arm that passes a mask pays that cost, which is what makes
+them comparable *with each other*; separating "the bias helps" from "the bias buys
+back what installing it cost" needs a run with no ``--layout-routing-bias`` at all.
 
 ## Why only the decoding steps
 
