@@ -81,6 +81,8 @@ def main(argv: list[str] | None = None) -> int:
         attn_implementation="eager",  # the only path that returns its weights
         local_files_only=True,
     )
+    for parameter in model.parameters():
+        parameter.requires_grad_(False)
     model.to(device).eval()
 
     records = load_records(args.manifest)
@@ -116,6 +118,24 @@ def main(argv: list[str] | None = None) -> int:
                 "mask": hook_kwargs.get("attention_mask"),
             }
         return hook
+
+    def causal_mask(q_len: int, kv_len: int, device, dtype) -> torch.Tensor:
+        """The mask the model did not have to pass, rebuilt for the comparison.
+
+        The attention forward is routinely called with ``attention_mask=None`` and
+        ``is_causal`` left to the kernel, so the causal structure never appears as a
+        tensor.  A decode step does not care -- one query at the end of the sequence
+        attends to everything, which is what an absent mask means -- but a prefill
+        compared without it would put mass on keys no query position can see, and the
+        difference would look like a broken transform rather than a missing mask.
+        """
+
+        rows = torch.arange(q_len, device=device).unsqueeze(1)
+        keys = torch.arange(kv_len, device=device).unsqueeze(0) + (kv_len - q_len)
+        allowed = keys <= rows
+        return torch.zeros(q_len, kv_len, device=device, dtype=dtype).masked_fill(
+            ~allowed, float("-inf")
+        )
 
     handles = [
         modules[layer].register_forward_hook(capture(layer), with_kwargs=True) for layer in layers
@@ -162,9 +182,11 @@ def main(argv: list[str] | None = None) -> int:
         probe.visual_count = visual_count
         probe._store_prompt(layer, key)
         mask = entry["mask"]
-        mask_vis = mask_text = None
-        if mask is not None:
-            mask_vis, mask_text = probe._split_mask(mask, layer)
+        mask_source = "forward"
+        if mask is None:
+            mask = causal_mask(prompt_length, prompt_length, hidden.device, torch.float32)
+            mask_source = "synthesized_causal"
+        mask_vis, mask_text = probe._split_mask(mask, layer)
         visual = probe._visual_keys[layer]
         mass, dist, _lse_vis, _lse_text = probe._reduce(
             layer, query, visual, probe._text_keys(layer), mask_vis, mask_text
@@ -200,6 +222,7 @@ def main(argv: list[str] | None = None) -> int:
             "status": "compared",
             "heads": int(heads),
             "query_positions": int(mine_mass.shape[1]),
+            "mask_source": mask_source,
             "dtype": str(dist.dtype),
             "weights_dtype": str(weights.dtype),
             "mass_max_abs_error": float(mass_error.max()),

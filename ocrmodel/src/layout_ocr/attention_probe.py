@@ -398,17 +398,24 @@ class AttentionProbe:
             mask = torch.zeros_like(mask, dtype=torch.float32).masked_fill(
                 ~mask, float("-inf")
             )
-        flat = mask.reshape(-1, mask.shape[-1])[0].float()
+        # Flatten everything but the key axis.  A decode step arrives as a single row, but
+        # a prefill arrives with one row *per query position* -- the causal mask is not
+        # one row -- and taking row 0 there would silently compare every position against
+        # the first position's visible set.
+        rows = mask.reshape(-1, mask.shape[-1]).float()
         expected = self._text_key_count(layer) + int(self.visual_count or 0)
-        if flat.shape[-1] != expected:
+        if rows.shape[-1] != expected:
             raise RuntimeError(
                 "attention probe cannot align the mask with its captured keys on layer "
-                f"{layer}: the mask covers {flat.shape[-1]} keys, the probe holds {expected}"
+                f"{layer}: the mask covers {rows.shape[-1]} keys, the probe holds {expected}"
             )
         if self.visual_start is None or not self.visual_count:
-            return None, flat
+            return None, rows.unsqueeze(0).unsqueeze(0)
         end = self.visual_start + self.visual_count
-        return flat[self.visual_start : end], torch.cat((flat[: self.visual_start], flat[end:]))
+        visual = rows[:, self.visual_start : end]
+        text = torch.cat((rows[:, : self.visual_start], rows[:, end:]), dim=-1)
+        # Two leading axes to broadcast against ``[kv_heads, groups, q_len, keys]``.
+        return visual.unsqueeze(0).unsqueeze(0), text.unsqueeze(0).unsqueeze(0)
 
     # -- reduction ----------------------------------------------------------
 

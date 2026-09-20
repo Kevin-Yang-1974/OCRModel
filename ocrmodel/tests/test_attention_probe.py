@@ -320,9 +320,9 @@ def test_a_boolean_mask_excludes_rather_than_adds():
     mask = torch.ones(1, 1, 1, VISUAL_COUNT + 2, dtype=torch.bool)
     mask[0, 0, 0, 4] = False
     visual, text = runtime._split_mask(mask, 0)
-    assert visual[:3].tolist() == [0.0, 0.0, 0.0]
-    assert visual[3].item() == float("-inf")  # excluded, not boosted by +1
-    assert text.tolist() == [0.0, 0.0]
+    assert visual.flatten()[:3].tolist() == [0.0, 0.0, 0.0]
+    assert visual.flatten()[3].item() == float("-inf")  # excluded, not boosted by +1
+    assert text.flatten().tolist() == [0.0, 0.0]
 
 
 def test_a_mask_that_does_not_match_the_captured_keys_is_refused():
@@ -353,6 +353,53 @@ def test_a_layer_without_visual_keys_records_nothing():
     # No ``_visual_keys`` for this layer: the prefill's transform failed.
     runtime._observe_step(0, 1, _queries(), None)
     assert runtime.report()["steps"] == []
+
+
+def test_the_reduction_handles_a_multi_position_query():
+    """The single-step eager check reduces a whole prefill, so this path must work.
+
+    It is the same math as a decode step with one position, but a shape error here would
+    only show up in the validation harness -- which is the thing that decides whether the
+    decode-step numbers are trustworthy in the first place.
+    """
+
+    runtime = AttentionProbe(_bridge(), IMAGE_TOKEN_ID, layers=(0,))
+    runtime.visual_count = VISUAL_COUNT
+    runtime.visual_start = 1
+    runtime._geometry[0] = (4, 2, 1, 1.0)
+    # [1, 4 heads, 2 positions, 1]: position 0 has q = 1 for every head, position 1 has
+    # q = 0, so the second position sees all-zero logits and a uniform distribution.
+    query = torch.ones(1, 4, 2, 1)
+    query[:, :, 1, :] = 0.0
+    mass, dist, lse_vis, lse_text = runtime._reduce(
+        0, query, _visual_keys(), torch.zeros(1, 2, 2, 1)
+    )
+    assert mass.shape == (4, 2)
+    assert dist.shape == (4, 2, VISUAL_COUNT)
+    # Position 0 for head 0: logits [1,0,0,0] against KV head 0's keys.
+    assert dist[0, 0].tolist() == pytest.approx(_softmax([1.0, 0.0, 0.0, 0.0]))
+    # Position 1: a zero query gives logits [0,0,0,0], so uniform over the four tokens.
+    assert dist[0, 1].tolist() == pytest.approx([0.25] * 4)
+    # Every row is still a distribution, and the two log-sum-exps come back for the
+    # length normalization the report needs.
+    assert dist.sum(-1).flatten().tolist() == pytest.approx([1.0] * 8)  # 4 heads x 2 positions
+    assert lse_vis.shape == (4, 2) and lse_text.shape == (4, 2)
+
+
+def test_the_reduction_is_the_same_for_one_position_as_for_a_batch_of_one():
+    """A decode step is the prefill case with one position; they must not diverge."""
+
+    runtime = AttentionProbe(_bridge(), IMAGE_TOKEN_ID, layers=(0,))
+    runtime.visual_count = VISUAL_COUNT
+    runtime.visual_start = 1
+    runtime._geometry[0] = (4, 2, 1, 1.0)
+    single = torch.ones(1, 4, 1, 1)
+    two = single.repeat(1, 1, 2, 1)
+    mass_one, dist_one, _, _ = runtime._reduce(0, single, _visual_keys(), torch.zeros(1, 2, 2, 1))
+    mass_two, dist_two, _, _ = runtime._reduce(0, two, _visual_keys(), torch.zeros(1, 2, 2, 1))
+    assert dist_two[:, 0].flatten().tolist() == pytest.approx(dist_one[:, 0].flatten().tolist())
+    assert dist_two[:, 1].flatten().tolist() == pytest.approx(dist_one[:, 0].flatten().tolist())
+    assert mass_two[:, 0].tolist() == pytest.approx(mass_one[:, 0].tolist())
 
 
 def test_observing_a_prefill_query_is_refused():
@@ -416,8 +463,33 @@ def test_the_mask_is_split_the_way_the_keys_were():
     # One row of ``kv_len`` entries, which is what the routing hook builds.
     mask = torch.tensor([[[[1.0, 2.0, 10.0, 11.0, 12.0, 3.0]]]])
     visual, text = runtime._split_mask(mask, 0)
-    assert visual.tolist() == [10.0, 11.0, 12.0]
-    assert text.tolist() == [1.0, 2.0, 3.0]
+    # Two leading axes so the halves broadcast against [kv_heads, groups, q_len, keys].
+    assert visual.shape == (1, 1, 1, 3)
+    assert visual.flatten().tolist() == [10.0, 11.0, 12.0]
+    assert text.flatten().tolist() == [1.0, 2.0, 3.0]
+
+
+def test_each_query_position_keeps_its_own_mask_row():
+    """A prefill's causal mask has one row per query position.
+
+    Taking row 0 for all of them would compare every position against the first
+    position's visible set -- which is exactly the shape of error that made the eager
+    check report a broken transform when only the mask was missing.
+    """
+
+    runtime = AttentionProbe(_bridge(), IMAGE_TOKEN_ID, layers=(0,))
+    runtime.visual_start = 2
+    runtime.visual_count = 2
+    runtime._prompt_text_keys[0] = torch.zeros(1, 1, 3, 1)
+    # Five keys, two query rows: row 0 sees key 0 only, row 1 sees keys 0..3.
+    neg = float("-inf")
+    mask = torch.tensor([[[[0.0, neg, neg, neg, neg], [0.0, 1.0, 2.0, 3.0, neg]]]])
+    visual, text = runtime._split_mask(mask, 0)
+    assert visual.shape == (1, 1, 2, 2)
+    assert visual[0, 0, 0].tolist() == [neg, neg]
+    assert visual[0, 0, 1].tolist() == [2.0, 3.0]
+    assert text[0, 0, 0].tolist() == [0.0, neg, neg]
+    assert text[0, 0, 1].tolist() == [0.0, 1.0, neg]
 
 
 # -- the transform -------------------------------------------------------
@@ -617,7 +689,12 @@ def test_every_selected_layer_records_a_row_for_the_same_step(monkeypatch):
     assert sorted({record["step"] for record in records}) == [1, 2, 3]
     assert sorted({head["layer"] for record in records for head in record["heads"]}) == [0, 4]
     for step in (1, 2, 3):
-        layers = {head["layer"] for record in records if record["step"] == step for head in record["heads"]}
+        layers = {
+            head["layer"]
+            for record in records
+            if record["step"] == step
+            for head in record["heads"]
+        }
         assert layers == {0, 4}, step
     # And the step was still counted once, not twice.
     assert runtime.report()["decoding_steps"] == 3
