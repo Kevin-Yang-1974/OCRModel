@@ -42,6 +42,7 @@ from .distributed import (
     wrap_adapter,
     wrap_model,
 )
+from .attention_routing import ROUTING_ATTR, install_attention_routing
 from .glm_bridge import LayoutAwarePatchMerger, install_layout_adapter
 from .prefix_injection import enable_prefix_injection
 from .lora import (
@@ -1536,6 +1537,15 @@ def optional_positive_float(value: str) -> float | None:
     return parsed
 
 
+def non_negative_float(value: str) -> float:
+    """Accepts zero, unlike ``optional_positive_float``: zero is how a route is off."""
+
+    parsed = float(value)
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("value must be non-negative")
+    return parsed
+
+
 def optional_positive_int(value: str) -> int | None:
     if value.lower() in {"none", "off"}:
         return None
@@ -2164,6 +2174,26 @@ def load_model(args: argparse.Namespace, device: torch.device) -> tuple[Any, Any
         sem_adapter_hidden=getattr(args, "sem_adapter_hidden", 0),
         query_refine_layers=getattr(args, "query_refine_layers", 0),
     )
+    # A spatial bias on the visual keys, applied per decoding step.  Eval-only for
+    # now: the boxes it routes by are annotation truth, not something the model
+    # predicts, so it measures whether the route is worth building rather than
+    # being deployable itself.
+    # ``None`` (the flag was not passed) leaves the model untouched; an explicit
+    # zero installs the hooks with an all-zero mask, which is the arm that shows
+    # the route fires on every step without changing the score.
+    routing_strength = getattr(args, "layout_routing_bias", None)
+    if routing_strength is not None:
+        routing_runtime, _ = install_attention_routing(
+            model,
+            bridge,
+            bias=routing_strength,
+            tokenizer=getattr(processor, "tokenizer", None),
+            pointer=args.layout_routing_pointer,
+        )
+        # On the top-level model rather than the bridge: this is a text-decoder
+        # route and has nothing to do with the layout adapter, but the eval loop
+        # already holds the model and needs to arm it per page.
+        setattr(model, ROUTING_ATTR, routing_runtime)
     prefix_tokens = int(getattr(args, "prefix_tokens", 0) or 0)
     if prefix_tokens > 0:
         # Installed after the adapter so the reserved ids are added once, to a
@@ -3497,6 +3527,35 @@ def train(
     }
 
 
+def _routing_summary(reports: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """Aggregate the per-page routing reports; ``None`` when the route is off.
+
+    ``biased_fraction`` is the wiring check.  A route that never fired scores
+    exactly like the unbiased baseline, so the two have to be distinguishable from
+    the summary alone rather than from a probe file nobody opens.
+    """
+
+    if not reports:
+        return None
+    steps = sum(report["decoding_steps"] for report in reports)
+    biased = sum(report["biased_steps"] for report in reports)
+    hits = [
+        report["mean_boxes_hit"]
+        for report in reports
+        if report["mean_boxes_hit"] is not None
+    ]
+    return {
+        "pages": len(reports),
+        "bias": reports[0]["bias"],
+        "decoding_steps": steps,
+        "biased_steps": biased,
+        "biased_fraction": biased / max(1, steps),
+        "missing_box_steps": sum(report["missing_box_steps"] for report in reports),
+        "mean_boxes_hit": sum(hits) / len(hits) if hits else None,
+        "visual_tokens": reports[0]["visual_tokens"],
+    }
+
+
 @torch.inference_mode()
 def evaluate(
     args: argparse.Namespace,
@@ -3602,6 +3661,12 @@ def evaluate(
     }
     started = time.time()
     prefix_runtime = getattr(bridge, "prefix_runtime", None)
+    # Installed by ``load_model`` when ``--layout-routing-bias`` is set; absent on
+    # every other run, in which case the eval loop below is unchanged.
+    routing_runtime = getattr(model_module, ROUTING_ATTR, None)
+    if routing_runtime is None:
+        routing_runtime = getattr(model, ROUTING_ATTR, None)
+    routing_reports: list[dict[str, Any]] = []
     # Oracle arm: substitute ground-truth region boxes for the predicted ones, so
     # the run differs from the normal one in the accuracy of the layout and nothing
     # else.  Eval-only; the branch's own output cannot separate "the decoder
@@ -3677,6 +3742,24 @@ def evaluate(
             bridge.set_grid_thw(inputs["image_grid_thw"])
         bridge.set_region_targets(None)
         prompt_length = inputs["input_ids"].shape[1]
+        if routing_runtime is not None:
+            characters = record.get("characters")
+            if characters is None:
+                # Scoring this as unbiased would look identical to "the bias does
+                # nothing", which is the one conclusion the arm must not reach by
+                # accident.
+                raise RuntimeError(
+                    f"attention routing is on but {record['page_id']} carries no "
+                    "character boxes; point the run at a manifest written by "
+                    "tools/prepare_mthv2_char_manifest.py"
+                )
+            routing_runtime.set_page(
+                record["page_id"],
+                characters,
+                prompt_length,
+                inputs["input_ids"],
+                reference=record["page_text"],
+            )
         generated = generate_with_loop_recovery(
             model_module,
             inputs,
@@ -3694,6 +3777,10 @@ def evaluate(
                 else None
             ),
         )
+        if routing_runtime is not None:
+            routing_runtime.write_probe()
+            routing_reports.append(routing_runtime.report())
+            routing_runtime.clear_page()
         generated_tokens = generated[0, prompt_length:]
         generation_length = int(generated_tokens.shape[0])
         generation_lengths.append(generation_length)
@@ -3920,6 +4007,7 @@ def evaluate(
             "generation_max_new_tokens": args.max_eval_new_tokens,
             "generation_limit_hits": generation_limit_hits,
             "generation_limit_hit_rate": generation_limit_hits / max(1, len(validation_records)),
+            "layout_routing": _routing_summary(routing_reports),
             "generation_lengths": generation_lengths,
             "generation_mean_new_tokens": sum(generation_lengths) / max(1, len(generation_lengths)),
             "generation_max_new_tokens_observed": max(generation_lengths, default=0),
@@ -4256,6 +4344,29 @@ def parse_args() -> argparse.Namespace:
             "reserve this many decoder prefix tokens for the layout branch output; "
             "0 leaves the model untouched. The prefix is a separate route from the "
             "residual write-back and can be trained with it or alone"
+        ),
+    )
+    parser.add_argument(
+        "--layout-routing-bias",
+        type=non_negative_float,
+        default=None,
+        help=(
+            "additive bias, in attention logits, on the visual keys inside the box "
+            "of the character being generated. Passing 0 installs the route with an "
+            "all-zero mask -- the wiring-checked baseline; not passing the flag at "
+            "all leaves the model untouched. Requires a manifest carrying the "
+            "per-character box channel (see tools/prepare_mthv2_char_manifest.py)"
+        ),
+    )
+    parser.add_argument(
+        "--layout-routing-pointer",
+        choices=["step", "synced"],
+        default="synced",
+        help=(
+            "'synced' points at the character the model has actually reached by "
+            "walking the truth text alongside the generated one; 'step' points at "
+            "the t-th character, which is what a detector could supply but drifts "
+            "by a median of 6 and up to 1271 characters on this checkpoint"
         ),
     )
     parser.add_argument(
