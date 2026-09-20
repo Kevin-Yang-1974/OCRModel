@@ -371,6 +371,118 @@ class _FakeModel(nn.Module):
         return self.model.language_model.embed_tokens
 
 
+# Two lines side by side, so a character on one is not inside the other's box.
+LINE_LEFT = {"bbox": [0.0, 0.0, 0.5, 1.0], "reading_order": 0}
+LINE_RIGHT = {"bbox": [0.5, 0.0, 1.0, 1.0], "reading_order": 1}
+
+
+def _line_runtime(boxes, regions=(LINE_LEFT, LINE_RIGHT)):
+    """A line-source runtime whose boxes sit at character indices 1..N.
+
+    Index 0 is a placeholder: the first character is sampled from the prefill and is never
+    biased, so every box these tests exercise has to sit at index 1 or later.
+    """
+
+    runtime = AttentionRouting(
+        _bridge(), BIAS, IMAGE_TOKEN_ID, _FakeTokenizer({}), "step", "line"
+    )
+    runtime.set_page(
+        "p0",
+        [{"bbox": None}] + [{"bbox": box} for box in boxes],
+        PROMPT_LENGTH,
+        torch.tensor([[1, IMAGE_TOKEN_ID, IMAGE_TOKEN_ID, IMAGE_TOKEN_ID,
+                       IMAGE_TOKEN_ID, 2]]),
+        regions=[dict(region) for region in regions],
+    )
+    return runtime
+
+
+def test_the_line_source_biases_the_whole_line_not_the_character():
+    """A character box covers part of a line; the line covers all of it.
+
+    The four visual tokens are the corners of the page, so the left column holds the first
+    and third.  A character box in the top-left corner would take only the first, and the
+    line takes both -- which is the coarsening being measured.
+    """
+
+    runtime = _line_runtime([[0.0, 0.0, 0.25, 0.25]])
+    # Index 0 is the placeholder for the prefill's character, which is never biased.
+    assert runtime._char_lines == [-1, 0]
+    mask = _call(runtime, [PROMPT_LENGTH])["attention_mask"]
+    assert mask[0, 0, 0, 1:5].tolist() == [BIAS, 0.0, BIAS, 0.0]
+
+    # Same character, character source: only the token whose centre is inside its box.
+    char_runtime = _runtime(characters=_characters([0.0, 0.0, 0.25, 0.25]))
+    char_mask = _call(char_runtime, [PROMPT_LENGTH])["attention_mask"]
+    assert char_mask[0, 0, 0, 1:5].tolist() == [BIAS, 0.0, 0.0, 0.0]
+
+
+def test_a_character_box_picks_its_line_geometrically():
+    """Resolved by centre-in-box in reading order, not by trusting the manifest order."""
+
+    runtime = _line_runtime(
+        [[0.6, 0.1, 0.9, 0.4]],  # right half
+        regions=(dict(LINE_LEFT, reading_order=1), dict(LINE_RIGHT, reading_order=0)),
+    )
+    # Sorting by reading order puts LINE_RIGHT first, so the right-half character is line 0.
+    assert runtime.regions[0]["bbox"] == LINE_RIGHT["bbox"]
+    assert runtime._char_lines == [-1, 0]
+
+
+def test_a_character_without_a_box_has_no_line_and_is_counted():
+    """No character box means no line, and an unbiasing step is reported, not invented."""
+
+    runtime = _line_runtime([None, [0.0, 0.0, 0.25, 0.25]])
+    assert runtime._char_lines == [-1, -1, 0]
+    assert "attention_mask" not in _call(runtime, [PROMPT_LENGTH])
+    assert runtime.missing == 1
+    runtime._cache_key = None
+    mask = _call(runtime, [PROMPT_LENGTH + 1])["attention_mask"]
+    assert mask[0, 0, 0, 1:5].tolist() == [BIAS, 0.0, BIAS, 0.0]
+    assert runtime.biased == 1
+
+
+def test_a_character_off_every_line_is_counted_and_left_unbiased():
+    runtime = _line_runtime([[0.6, 0.6, 0.7, 0.7]], regions=(LINE_LEFT,))
+    assert runtime._char_lines == [-1, -1]
+    assert "attention_mask" not in _call(runtime, [PROMPT_LENGTH])
+    assert runtime.missing == 1
+
+
+def test_the_line_source_needs_regions_but_does_not_fail_without_them():
+    """A manifest without regions is a gap to report, not a crash mid-evaluation."""
+
+    runtime = AttentionRouting(
+        _bridge(), BIAS, IMAGE_TOKEN_ID, _FakeTokenizer({}), "step", "line"
+    )
+    runtime.set_page(
+        "p0",
+        [{"bbox": None}, {"bbox": [0.0, 0.0, 0.25, 0.25]}],
+        PROMPT_LENGTH,
+        torch.tensor([[1, IMAGE_TOKEN_ID, IMAGE_TOKEN_ID, IMAGE_TOKEN_ID,
+                       IMAGE_TOKEN_ID, 2]]),
+    )
+    assert runtime._char_lines == [-1, -1]
+    assert "attention_mask" not in _call(runtime, [PROMPT_LENGTH])
+    assert runtime.missing == 1
+    assert runtime.report()["box_source"] == "line"
+
+
+def test_an_unknown_box_source_is_refused():
+    with pytest.raises(ValueError, match="box_source must be one of"):
+        AttentionRouting(_bridge(), BIAS, IMAGE_TOKEN_ID, _FakeTokenizer({}), "step", "column")
+
+
+def test_the_character_source_still_ignores_regions():
+    """The recorded arm must be unchanged by this: its result is the baseline."""
+
+    runtime = _runtime(characters=_characters(LEFT_COLUMN["bbox"]))
+    kwargs = _call(runtime, [PROMPT_LENGTH])
+    assert kwargs["attention_mask"][0, 0, 0, 1:5].tolist() == [BIAS, 0.0, BIAS, 0.0]
+    assert runtime.report()["box_source"] == "char"
+    assert runtime.report()["characters_on_a_line"] is None
+
+
 def test_installation_hooks_every_decoder_layer():
     model = _FakeModel()
     runtime, handles = install_attention_routing(

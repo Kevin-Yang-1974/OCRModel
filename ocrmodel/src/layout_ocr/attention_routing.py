@@ -75,6 +75,19 @@ POINTER_ENV_VAR = "GLMOCR_ROUTING_POINTER"
 PROBE_ENV_VAR = "GLMOCR_ROUTING_PROBE"
 ROUTING_ATTR = "layout_attention_routing"
 
+# Which box the bias is aimed at.
+#
+# ``char``  the character being generated, from the character box channel.  This is the arm
+#           the recorded result used, and it is an oracle in the strong sense: it needs a box
+#           per character, which only the annotation supplies.
+# ``line``  the line (region) that character sits on.  Coarser, and the coarseness is the
+#           whole question.  The recorded gain was concentrated in deletions falling by half,
+#           which is what "do not skip" looks like, and a line is exactly the scale at which a
+#           deployable page map could plausibly exist.  If a line box carries none of that
+#           gain, then the character-level precision -- which nothing deployable supplies --
+#           was where the gain lived, and the route has no deployable form.
+BOX_SOURCES = ("char", "line")
+
 # How the box for the current step is chosen.
 #
 # ``step``   the t-th box for the t-th generated character.  This is the only
@@ -125,11 +138,14 @@ class AttentionRouting:
         image_token_id: int | None,
         tokenizer: Any | None = None,
         pointer: str = "synced",
+        box_source: str = "char",
     ) -> None:
         if bias < 0:
             raise ValueError("AttentionRouting needs a non-negative bias")
         if pointer not in POINTER_MODES:
             raise ValueError(f"pointer must be one of {POINTER_MODES}, got {pointer!r}")
+        if box_source not in BOX_SOURCES:
+            raise ValueError(f"box_source must be one of {BOX_SOURCES}, got {box_source!r}")
         if pointer == "synced" and tokenizer is None:
             raise ValueError("the synced pointer needs a tokenizer to read the generated ids")
         self.bridge = bridge
@@ -137,6 +153,11 @@ class AttentionRouting:
         self.image_token_id = image_token_id
         self.tokenizer = tokenizer
         self.pointer = pointer
+        self.box_source = box_source
+        # The line each character sits on, resolved once per page from the character boxes and
+        # the region boxes.  Per character index, not per step, so a step only looks it up.
+        self.regions: list[dict[str, Any]] = []
+        self._char_lines: list[int] = []
         self.characters: list[dict[str, Any]] | None = None
         self.prompt_length: int | None = None
         self.visual_start: int | None = None
@@ -164,14 +185,25 @@ class AttentionRouting:
         prompt_length: int,
         input_ids: Tensor,
         reference: str | None = None,
+        regions: list[dict[str, Any]] | None = None,
     ) -> None:
         """Point the route at one page's character boxes.
 
         The visual span is read off the prompt's own token ids rather than assumed
         to sit at a fixed offset, so a prefix span or a template change moves it
         with the sequence instead of silently biasing the wrong keys.
+
+        ``regions`` is only needed by the ``line`` box source.  It is sorted by reading order
+        here, matching ``layout_targets`` and the probe, so a line index means the same thing
+        in all three.
         """
 
+        self.regions = sorted(regions or [], key=lambda item: int(item["reading_order"]))
+        # Only the line source needs the character-to-line map; computing it for the character
+        # source would put a number in the report that the arm never used.
+        self._char_lines = (
+            self._resolve_char_lines(characters) if self.box_source == "line" else []
+        )
         self.characters = characters
         self.prompt_length = int(prompt_length)
         self.page_id = page_id
@@ -193,8 +225,44 @@ class AttentionRouting:
         self.visual_count = int(positions.numel())
         self.visual_start = int(positions[0].item()) if self.visual_count else None
 
+    def _resolve_char_lines(self, characters: list[dict[str, Any]] | None) -> list[int]:
+        """The region each character sits on, or ``-1`` when no box holds it.
+
+        Resolved geometrically -- the first region in reading order whose box contains the
+        character's centre -- rather than by trusting the manifest's ``line_index`` to be in the
+        same order as ``regions``.  That rule is identical to ``layout_targets`` and to the
+        probe's token map, so the three agree on what "line 4" means.
+        """
+
+        if not characters or not self.regions:
+            return [-1] * len(characters or [])
+        boxes = [(region["bbox"], index) for index, region in enumerate(self.regions)]
+        resolved: list[int] = []
+        for entry in characters:
+            box = (entry or {}).get("bbox")
+            if not box:
+                # The manifest could not place this character, so there is no line to bias.
+                # Fabricating one would put an invented location under the arm whose whole
+                # point is spatial truth.
+                resolved.append(-1)
+                continue
+            x = (float(box[0]) + float(box[2])) / 2.0
+            y = (float(box[1]) + float(box[3])) / 2.0
+            found = -1
+            for region_box, index in boxes:
+                if (
+                    float(region_box[0]) <= x <= float(region_box[2])
+                    and float(region_box[1]) <= y <= float(region_box[3])
+                ):
+                    found = index
+                    break
+            resolved.append(found)
+        return resolved
+
     def clear_page(self) -> None:
         self.characters = None
+        self.regions = []
+        self._char_lines = []
         self.prompt_length = None
         self.visual_start = None
         self.visual_count = None
@@ -270,7 +338,16 @@ class AttentionRouting:
             return None
         if not 0 <= step < len(self.characters):
             return None
-        box = (self.characters[step] or {}).get("bbox")
+        if self.box_source == "line":
+            # The line the character being read sits on.  A missing character box means no
+            # line either -- see _resolve_char_lines.
+            line = self._char_lines[step] if step < len(self._char_lines) else -1
+            if line < 0 or line >= len(self.regions):
+                self.missing += 1
+                return None
+            box = self.regions[line]["bbox"]
+        else:
+            box = (self.characters[step] or {}).get("bbox")
         if box is None:
             # The annotation has no box for this character.  Fabricating one would
             # put an invented location under the one arm whose point is spatial
@@ -356,6 +433,10 @@ class AttentionRouting:
             "page_id": self.page_id,
             "bias": self.bias,
             "pointer": self.pointer,
+            "box_source": self.box_source,
+            "characters_on_a_line": (
+                sum(1 for line in self._char_lines if line >= 0) if self._char_lines else None
+            ),
             "pointer_position": self.position if self.pointer == "synced" else None,
             "reference_characters": len(self.reference) if self.reference else None,
             "decoding_steps": self.steps,
@@ -374,6 +455,7 @@ def install_attention_routing(
     bias: float,
     tokenizer: Any | None = None,
     pointer: str = "synced",
+    box_source: str = "char",
 ) -> tuple[AttentionRouting, list[Any]]:
     """Register the bias hook on every text decoder layer.
 
@@ -390,7 +472,7 @@ def install_attention_routing(
     image_token_id = getattr(model.config, "image_token_id", None)
     if image_token_id is None:
         image_token_id = getattr(getattr(model.config, "text_config", None), "image_token_id", None)
-    runtime = AttentionRouting(bridge, bias, image_token_id, tokenizer, pointer)
+    runtime = AttentionRouting(bridge, bias, image_token_id, tokenizer, pointer, box_source)
     handles = [
         # The model's own pre-hook first: it runs outside every layer, so the
         # pointer it advances is the one those layers use for this same forward.

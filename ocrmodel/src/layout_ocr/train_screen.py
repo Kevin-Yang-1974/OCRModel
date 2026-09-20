@@ -2246,6 +2246,7 @@ def load_model(args: argparse.Namespace, device: torch.device) -> tuple[Any, Any
             bias=routing_strength,
             tokenizer=getattr(processor, "tokenizer", None),
             pointer=args.layout_routing_pointer,
+            box_source=args.layout_routing_box_source,
         )
         # On the top-level model rather than the bridge: this is a text-decoder
         # route and has nothing to do with the layout adapter, but the eval loop
@@ -3883,6 +3884,8 @@ def evaluate(
                 prompt_length,
                 inputs["input_ids"],
                 reference=record["page_text"],
+                # Only the ``line`` box source reads these; the character arm ignores them.
+                regions=record.get("regions"),
             )
         if probe_runtime is not None:
             # Armed after the site that may run a teacher-forcing forward above: its
@@ -4510,6 +4513,19 @@ def parse_args() -> argparse.Namespace:
             "the others against, and not the same as leaving the flag out. Requires "
             "a manifest carrying the per-character box channel (see "
             "tools/prepare_mthv2_char_manifest.py)"
+        ),
+    )
+    parser.add_argument(
+        "--layout-routing-box-source",
+        choices=["char", "line"],
+        default="char",
+        help=(
+            "'char' biases the box of the character being generated -- the arm the recorded "
+            "result used, and an oracle in the strong sense: it needs a box per character, "
+            "which only the annotation supplies. 'line' biases the whole line that character "
+            "sits on, which is the coarser map a deployable page predictor could actually "
+            "produce. Whether the recorded gain survives the coarsening is the question that "
+            "decides whether this route has a deployable form at all"
         ),
     )
     parser.add_argument(
