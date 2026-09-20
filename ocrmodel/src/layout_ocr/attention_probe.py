@@ -412,75 +412,122 @@ class AttentionProbe:
 
     # -- reduction ----------------------------------------------------------
 
-    def _observe_step(self, layer: int, step: int, query: Tensor, mask: Tensor | None) -> None:
-        """Reduce one decode step's attention over the visual keys and record it."""
+    def _reduce(
+        self,
+        layer: int,
+        query: Tensor,
+        visual: Tensor,
+        text: Tensor | None,
+        mask_vis: Tensor | None = None,
+        mask_text: Tensor | None = None,
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+        """Per-head visual total mass and visual-conditional distribution.
 
-        visual = self._visual_keys.get(layer)
-        if visual is None or not self.visual_count:
-            # The prefill stored no visual keys for this layer (the transform
-            # failed), so there is nothing to score and a fabricated row would be
-            # worse than a missing one.
-            return
-        if query.shape[2] != 1:
-            raise RuntimeError(
-                f"the probe reduces one decode step at a time, but layer {layer} got a "
-                f"query of length {query.shape[2]}; a prefill should have gone to "
-                "_store_prompt instead"
-            )
+        Shapes: ``query`` is ``[1, num_heads, q_len, head_dim]``, ``visual`` is
+        ``[1, kv_heads, V, head_dim]``, ``text`` is ``[1, kv_heads, T, head_dim]``.
+        Returns ``mass``, ``dist``, ``lse_vis`` and ``lse_text`` as
+        ``[num_heads, q_len]``, ``[num_heads, q_len, V]``, ``[num_heads, q_len]`` and
+        ``[num_heads, q_len]``.  The two log-sum-exps come back because the report keeps
+        them: ``m_t`` alone cannot separate "looks at the image" from "generated a lot",
+        and the difference between them is what removes the length effect.
+
+        Kept as its own function, taking the keys rather than reading the captured state,
+        for one reason: it is the only place the probe's recomputed logits become a
+        number, and the single-step eager check has to run this same math over key
+        tensors it projected itself.  Two copies of it would let the validated version
+        and the run version drift apart.
+        """
+
         num_heads, kv_heads, head_dim, scale = self._geometry[layer]
         groups = num_heads // kv_heads
+        q_len = int(query.shape[2])
         # Map each query head onto its KV head (GQA).  The flatten is kv-major so that
         # query head ``kv * groups + g`` reads KV head ``kv``, which is the layout
-        # ``repeat_kv`` produces; the other order (groups-major) is a silent
-        # permutation of the heads and would mislabel every per-head number.
-        probe = query[0, :, 0, :].reshape(kv_heads, groups, head_dim).float()
+        # ``repeat_kv`` produces; the other order (groups-major) is a silent permutation
+        # of the heads and would mislabel every per-head number.
+        probe = query[0].reshape(kv_heads, groups, q_len, head_dim).float()
         vis = visual.reshape(kv_heads, -1, head_dim).float()
-        # sdpa_attention_forward scales first and adds the mask to the scaled logits,
-        # so the mask is added unscaled: multiplying it by ``scale`` would divide the
-        # routing arm's B by sqrt(head_dim) and report a different arm than the one
-        # that ran.
-        logits_vis = torch.einsum("khd,kvd->khv", probe, vis) * scale
-        text = self._text_keys(layer)
+        # sdpa_attention_forward scales first and adds the mask to the scaled logits, so
+        # the mask is added unscaled: multiplying it by ``scale`` would divide the routing
+        # arm's B by sqrt(head_dim) and report a different arm than the one that ran.
+        logits_vis = torch.einsum("khqd,kvd->khqv", probe, vis) * scale
         if text is not None:
             logits_text = torch.einsum(
-                "khd,ktd->kht", probe, text.reshape(kv_heads, -1, head_dim).float()
+                "khqd,ktd->khqt", probe, text.reshape(kv_heads, -1, head_dim).float()
             ) * scale
         else:
-            logits_text = torch.empty(*logits_vis.shape[:2], 0, dtype=torch.float32)
-        if mask is not None:
-            mask_vis, mask_text = self._split_mask(mask, layer)
-            # Both halves are one entry per key, so they broadcast along the trailing
-            # axis of the ``[kv_heads, groups, keys]`` logits; a reshape would need
-            # ``kv_heads * groups`` copies of the row and is the wrong shape for any
-            # GQA model.
-            if mask_vis is not None:
-                logits_vis = logits_vis + mask_vis
-            if mask_text is not None and logits_text.shape[-1]:
-                logits_text = logits_text + mask_text
-        logits_vis = logits_vis.reshape(num_heads, -1)
-        logits_text = logits_text.reshape(num_heads, -1)
+            logits_text = torch.empty(*logits_vis.shape[:3], 0, dtype=torch.float32)
+        # Both mask halves are one entry per key, so they broadcast along the trailing
+        # axis of the ``[kv_heads, groups, q_len, keys]`` logits; a reshape would need
+        # ``kv_heads * groups`` copies of the row and is the wrong shape for any GQA model.
+        if mask_vis is not None:
+            logits_vis = logits_vis + mask_vis
+        if mask_text is not None and logits_text.shape[-1]:
+            logits_text = logits_text + mask_text
+        logits_vis = logits_vis.reshape(num_heads, q_len, -1)
+        logits_text = logits_text.reshape(num_heads, q_len, -1)
 
         lse_vis = _logsumexp(logits_vis)
         lse_text = _logsumexp(logits_text)
         lse_all = torch.logaddexp(lse_vis, lse_text)
-        # A row a mask emptied entirely leaves ``lse_all`` at ``-inf``, and
-        # ``-inf - -inf`` is ``nan``.  Zero is the honest reading of "this head had no
-        # mass anywhere"; ``nan`` would spread through every downstream mean.
+        # A row a mask emptied entirely leaves ``lse_all`` at ``-inf``, and ``-inf - -inf``
+        # is ``nan``.  Zero is the honest reading of "this head had no mass anywhere";
+        # ``nan`` would spread through every downstream mean.
         mass = torch.where(
             torch.isfinite(lse_vis) & torch.isfinite(lse_all),
             (lse_vis - lse_all).exp(),
             torch.zeros_like(lse_vis),
         )
-
-        # A fully-masked visual row gives every logit ``-inf``; subtracting an ``-inf``
-        # lse would make the whole row ``nan``.  An all-zero row is the honest answer:
-        # this head saw no visual token at all.
+        # A fully-masked visual row gives every logit ``-inf``; subtracting an ``-inf`` lse
+        # would make the whole row ``nan``.  An all-zero row is the honest answer: this
+        # head saw no visual token at all.
         visible = torch.isfinite(lse_vis).unsqueeze(-1)
         dist = torch.where(
             visible,
             (logits_vis - lse_vis.unsqueeze(-1)).softmax(dim=-1),
             torch.zeros_like(logits_vis),
         )
+        return mass, dist, lse_vis, lse_text
+
+    def reduce_captured(
+        self, layer: int, query: Tensor, mask: Tensor | None = None
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor] | None:
+        """Reduce a query against the keys captured for this page.
+
+        The mask is split here rather than inside ``_reduce`` because it arrives as one
+        whole-sequence tensor that has to be cut against the captured key counts.
+        """
+
+        visual = self._visual_keys.get(layer)
+        if visual is None or not self.visual_count:
+            return None
+        mask_vis = mask_text = None
+        if mask is not None:
+            mask_vis, mask_text = self._split_mask(mask, layer)
+        return self._reduce(layer, query, visual, self._text_keys(layer), mask_vis, mask_text)
+
+    def _observe_step(self, layer: int, step: int, query: Tensor, mask: Tensor | None) -> None:
+        """Reduce one decode step's attention over the visual keys and record it."""
+
+        if query.shape[2] != 1:
+            raise RuntimeError(
+                f"the probe reduces one decode step at a time, but layer {layer} got a "
+                f"query of length {query.shape[2]}; a prefill should have gone to "
+                "_store_prompt instead"
+            )
+        reduced = self.reduce_captured(layer, query, mask)
+        if reduced is None:
+            # The prefill stored no visual keys for this layer (the transform failed), so
+            # there is nothing to score and a fabricated row would be worse than a missing
+            # one.
+            return
+        mass, dist, lse_vis, lse_text = reduced
+        # One query position per observed step, so the step's numbers are position 0.
+        mass = mass[:, 0]
+        dist = dist[:, 0]
+        lse_vis = lse_vis[:, 0]
+        lse_text = lse_text[:, 0]
+        num_heads = dist.shape[0]
         entropy = -(dist * dist.clamp_min(1e-12).log()).sum(dim=-1)
         # Normalized by log|V| so the number is comparable across resolutions: the
         # 1M and 4M arms see 630 and 2496 visual tokens.
