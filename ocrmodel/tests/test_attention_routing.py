@@ -61,12 +61,34 @@ def _runtime(bridge=None, characters=None, pointer="step", reference=None, mappi
     return runtime
 
 
-def _observe(runtime, token_ids):
-    """Feed a step's full sequence to the top-level hook, as ``generate`` would."""
+def _observe(runtime, new_ids, position):
+    """Feed one step the way ``generate`` does: only the positions it has not seen.
 
-    full = torch.tensor([[1, IMAGE_TOKEN_ID, IMAGE_TOKEN_ID, IMAGE_TOKEN_ID, IMAGE_TOKEN_ID, 2]
-                         + list(token_ids)])
-    runtime.observe_inputs(None, (), {"input_ids": full})
+    This is the shape that matters.  ``prepare_inputs_for_generation`` slices
+    ``input_ids`` with ``cache_position``, so a decode step hands the model a
+    one-token tensor while the prefill hands it the whole prompt.  A helper that
+    passed the full sequence would have hidden the bug this pins: a length-based
+    pointer reads a negative "generated so far" on every decode step and stays at
+    character zero for the whole page.
+    """
+
+    runtime.observe_inputs(
+        None,
+        (),
+        {
+            "input_ids": torch.tensor([list(new_ids)]),
+            "cache_position": torch.tensor([position]),
+        },
+    )
+
+
+def _observe_prefill(runtime):
+    prompt = [1, IMAGE_TOKEN_ID, IMAGE_TOKEN_ID, IMAGE_TOKEN_ID, IMAGE_TOKEN_ID, 2]
+    runtime.observe_inputs(
+        None,
+        (),
+        {"input_ids": torch.tensor([prompt]), "cache_position": torch.arange(len(prompt))},
+    )
 
 
 def _call(runtime, cache_position, q_len=1, dtype=torch.float32, existing=None):
@@ -193,6 +215,9 @@ def test_one_mask_serves_every_layer_of_a_step():
         _call(runtime, [PROMPT_LENGTH])
     assert len(calls) == 1
     assert runtime.biased == 1
+    # One decoding step, not one per layer: the count is reported as the arm's
+    # coverage, so a per-layer count would make every arm look 16x under-covered.
+    assert runtime.steps == 1
 
 
 def test_the_probe_counts_the_decoding_steps():
@@ -232,14 +257,16 @@ def test_the_synced_pointer_picks_the_box_not_the_step():
         mapping={7: "甲", 8: "乙"},
     )
     assert runtime.position == 0
-    _observe(runtime, [7])
+    _observe_prefill(runtime)
+    assert runtime.position == 0
+    _observe(runtime, [7], PROMPT_LENGTH)
     assert runtime.position == 1
     runtime._cache_key = None
     # Pointer 1 is the bottom-right box, which holds only the fourth token.
     assert _call(runtime, [PROMPT_LENGTH])["attention_mask"][0, 0, 0, 1:5].tolist() == [
         0.0, 0.0, 0.0, BIAS,
     ]
-    _observe(runtime, [7, 8])
+    _observe(runtime, [8], PROMPT_LENGTH + 1)
     assert runtime.position == 2
     runtime._cache_key = None
     # Pointer 2 is the left column, which holds the first and third tokens -- a
@@ -254,7 +281,8 @@ def test_the_synced_pointer_jumps_over_a_skipped_reference_character():
 
     runtime = _runtime(characters=_characters("a"), pointer="synced",
                        reference="甲乙丙丁戊", mapping={7: "甲", 9: "丁"})
-    _observe(runtime, [7, 9])
+    _observe(runtime, [7], PROMPT_LENGTH)
+    _observe(runtime, [9], PROMPT_LENGTH + 1)
     assert runtime.position == 4
 
 
@@ -263,8 +291,8 @@ def test_the_synced_pointer_ignores_an_inserted_character():
 
     runtime = _runtime(characters=_characters("a"), pointer="synced",
                        reference="甲乙丙丁戊", mapping={7: "甲", 1: "Z"})
-    _observe(runtime, [7])
-    _observe(runtime, [7, 1])
+    _observe(runtime, [7], PROMPT_LENGTH)
+    _observe(runtime, [1], PROMPT_LENGTH + 1)
     assert runtime.position == 1
 
 
@@ -274,8 +302,8 @@ def test_the_synced_pointer_lookahead_is_bounded():
     reference = "甲" * 100 + "乙"
     runtime = _runtime(characters=_characters("a"), pointer="synced",
                        reference=reference, mapping={7: "甲"})
-    _observe(runtime, [7])
-    _observe(runtime, [7, 7])
+    _observe(runtime, [7], PROMPT_LENGTH)
+    _observe(runtime, [7], PROMPT_LENGTH + 1)
     assert runtime.position == 2  # advanced, not jumped to a later 甲
 
 
@@ -298,9 +326,31 @@ def test_the_synced_pointer_only_decodes_the_new_tail():
                      torch.tensor([[1, IMAGE_TOKEN_ID, IMAGE_TOKEN_ID, IMAGE_TOKEN_ID,
                                     IMAGE_TOKEN_ID, 2]]),
                      reference="甲乙丙")
-    _observe(runtime, [7])
-    _observe(runtime, [7, 8])
+    _observe(runtime, [7], PROMPT_LENGTH)
+    _observe(runtime, [8], PROMPT_LENGTH + 1)
     assert decoded == [[7], [8]]
+
+
+def test_re_observing_a_position_does_not_advance_twice():
+    runtime = _runtime(characters=_characters("a"), pointer="synced",
+                       reference="甲乙丙丁戊", mapping={7: "甲"})
+    _observe(runtime, [7], PROMPT_LENGTH)
+    assert runtime.position == 1
+    _observe(runtime, [7], PROMPT_LENGTH)
+    assert runtime.position == 1
+
+
+def test_ids_that_do_not_match_the_positions_are_refused():
+    """A misaligned pair would advance the pointer by the wrong token."""
+
+    runtime = _runtime(characters=_characters("a"), pointer="synced",
+                       reference="甲乙丙丁戊", mapping={7: "甲"})
+    with pytest.raises(RuntimeError, match="cannot align input_ids"):
+        runtime.observe_inputs(
+            None,
+            (),
+            {"input_ids": torch.tensor([[7, 7]]), "cache_position": torch.tensor([PROMPT_LENGTH])},
+        )
 
 
 class _FakeTextModel(nn.Module):

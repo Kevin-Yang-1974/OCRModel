@@ -134,11 +134,11 @@ class AttentionRouting:
         self.visual_start: int | None = None
         self.visual_count: int | None = None
         self.page_id: str | None = None
-        # Synced-pointer state: the truth text, the generated text so far, how many
-        # generated ids have been decoded, and the truth index reached.
+        # Synced-pointer state: the truth text, the truth index reached, and the
+        # highest sequence position already folded into it.
         self.reference: str | None = None
         self.position = 0
-        self._decoded_ids = 0
+        self._last_observed = -1
         # One mask serves every layer of a forward: they all see the same
         # ``cache_position`` and the same page, so rebuilding it per layer would
         # repeat identical work 32 times per step.
@@ -169,7 +169,7 @@ class AttentionRouting:
         self.page_id = page_id
         self.reference = reference
         self.position = 0
-        self._decoded_ids = 0
+        self._last_observed = -1
         self._cache_key = None
         self._cache_mask = None
         self.steps = 0
@@ -216,12 +216,19 @@ class AttentionRouting:
                 self.position = found + 1
 
     def observe_inputs(self, module: nn.Module, args: Any, kwargs: dict) -> None:
-        """Read the current step's sequence off the top-level model call.
+        """Read this step's new tokens off the top-level model call.
 
         Hooked on the model ``generate`` calls rather than on the decoder layers
         because this is the only place the *token ids* are visible -- the text model
         is reached with assembled embeddings.  It runs before any layer, so the
         layers of this same forward see the pointer this sets.
+
+        The ids are aligned by ``cache_position`` and not by length.  ``generate``
+        slices the model's ``input_ids`` to the positions it has not yet seen -- the
+        prefill carries the whole prompt, a decode step carries exactly the one new
+        token -- so a length-based rule reads a negative "generated so far" on every
+        decode step and silently leaves the pointer at zero.  That is exactly what
+        the first run of this arm did: every step biased the first character's box.
         """
 
         if self.pointer != "synced" or self.characters is None or self.prompt_length is None:
@@ -231,12 +238,23 @@ class AttentionRouting:
             input_ids = args[0]
         if not isinstance(input_ids, Tensor) or input_ids.ndim != 2:
             return None
-        generated = input_ids.shape[1] - self.prompt_length
-        if generated <= self._decoded_ids:
+        cache_position = kwargs.get("cache_position")
+        if not isinstance(cache_position, Tensor):
             return None
-        tail = input_ids[0, self.prompt_length + self._decoded_ids :]
-        self._decoded_ids = generated
-        self._advance(self.tokenizer.decode(tail, skip_special_tokens=True))
+        positions = cache_position.flatten()
+        if positions.numel() != input_ids.shape[1]:
+            raise RuntimeError(
+                "attention routing cannot align input_ids with cache_position: "
+                f"{input_ids.shape[1]} ids for {positions.numel()} positions"
+            )
+        generated = positions >= self.prompt_length
+        if not bool(generated.any()):
+            return None  # the prefill: nothing has been generated yet
+        first = int(positions[generated][0].item())
+        if first <= self._last_observed:
+            return None  # this step has already been folded in
+        self._last_observed = int(positions[generated][-1].item())
+        self._advance(self.tokenizer.decode(input_ids[0][generated], skip_special_tokens=True))
         return None
 
     def _mask_for(self, step: int, kv_length: int, device: Any, dtype: torch.dtype) -> Tensor | None:
@@ -283,7 +301,6 @@ class AttentionRouting:
         if cache_position is None or self.prompt_length is None:
             return None
         current = int(cache_position[-1].item())
-        self.steps += 1
         if self.pointer == "synced":
             step = self.position
         else:
@@ -292,7 +309,10 @@ class AttentionRouting:
             # that emits character ``t``.
             step = current - self.prompt_length + 1
         if self._cache_key != current:
+            # Every decoder layer runs this hook, so a per-layer count would report
+            # the decoding steps multiplied by the depth of the model.
             self._cache_key = current
+            self.steps += 1
             self._cache_mask = self._mask_for(
                 step, current + 1, hidden_states.device, hidden_states.dtype
             )
