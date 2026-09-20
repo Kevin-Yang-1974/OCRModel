@@ -153,11 +153,19 @@ run_arms() {
 summarize() {
     setup_environment
     "${python}" - "${eval_root}" "${RECORDED_BASELINE_CER}" <<'PY'
-import json, sys
+import json
+import sys
 from pathlib import Path
+
+# The judge is the paired bootstrap, never the point estimate.  Imported rather
+# than re-implemented so the arm comparison and every other CER comparison in this
+# project are the same test.
+from tools.analyze_cer_significance import cer, load_predictions, paired_bootstrap
 
 root = Path(sys.argv[1])
 recorded_baseline = float(sys.argv[2])
+ITERATIONS = 10000
+
 arms_dir = root / "arms"
 # Discovered rather than hardcoded: a fixed list reports an arm it does not know
 # about as MISSING, which reads as a failed run when the run in fact succeeded.
@@ -167,7 +175,7 @@ order = [
         key=lambda name: int(name.replace("bias", "")) if name.startswith("bias") else -1,
     )
 ] if arms_dir.exists() else []
-payload = {"status": "complete", "pointer": None, "arms": {}}
+payload = {"status": "complete", "pointer": None, "iterations": ITERATIONS, "arms": {}}
 missing = []
 for arm in order:
     summary_path = arms_dir / arm / "summary.json"
@@ -191,6 +199,33 @@ for arm in order:
             payload["pointer"] = rows[0]["pointer"]
     payload["arms"][arm] = record
 
+# Paired bootstrap against the zero-bias arm.  The CI is for
+# CER(bias0) - CER(arm), so a positive interval means the arm is better.
+baseline_predictions = arms_dir / "bias0" / "validation_predictions.jsonl"
+payload["comparisons"] = {}
+if baseline_predictions.is_file():
+    rows_a = load_predictions(baseline_predictions)
+    payload["comparisons"]["cer_bias0"] = cer(rows_a)
+    for arm in order:
+        if arm == "bias0":
+            continue
+        path = arms_dir / arm / "validation_predictions.jsonl"
+        if not path.is_file():
+            continue
+        rows_b = load_predictions(path)
+        low, high, share = paired_bootstrap(rows_a, rows_b, ITERATIONS, 0)
+        payload["comparisons"][arm] = {
+            "cer": cer(rows_b),
+            # Same direction as the interval, so a reader cannot take the point
+            # estimate and the CI to mean opposite things.
+            "delta_cer_bias0_minus_arm": cer(rows_a) - cer(rows_b),
+            "ci_low": low,
+            "ci_high": high,
+            "p_bias0_not_worse": share,
+            "significant": low > 0 or high < 0,
+            "favours": "arm" if low > 0 else ("bias0" if high < 0 else "neither"),
+        }
+
 payload["status"] = "partial" if missing else "complete"
 if missing:
     print(f"missing arms: {missing}")
@@ -207,9 +242,14 @@ for arm in order:
 
 print()
 print("接线判据：")
-baseline = payload["arms"].get("bias0", {})
+baseline = payload["arms"].get("bias0")
 ok = True
-if baseline.get("status") != "missing":
+if baseline is None or baseline.get("status") == "missing":
+    # A missing control has to be reported rather than indexed: the whole run's
+    # verdict is a comparison against it, and an absent arm is not a neutral one.
+    print("  bias0           缺少 bias0 臂：没有无偏置对照，无法判定")
+    ok = False
+else:
     routing = baseline.get("layout_routing")
     if routing is None:
         print("  bias0           无 layout_routing 段：路由未装上，bias0 不是路由基线")
@@ -228,23 +268,47 @@ if baseline.get("status") != "missing":
               f"（Δ{delta:+.6f}）<- 先查这一项，其余臂的结论都依赖它")
 for arm in [name for name in order if name != "bias0"]:
     row = payload["arms"][arm]
-    if row.get("status") == "missing" or baseline.get("status") == "missing":
+    if row.get("status") == "missing":
         continue
     routing = row.get("layout_routing") or {}
     fraction = routing.get("biased_fraction", 0.0)
     if fraction < 0.9:
         print(f"  {arm:8s} 只有 {fraction:.1%} 的解码步拿到偏置：接线未接通，本臂无效")
         ok = False
-        continue
-    print(f"  {arm:8s} {fraction:.1%} 的解码步拿到偏置，"
-          f"平均命中 {routing.get('mean_boxes_hit')} 个视觉 token，ΔCER {row['cer'] - baseline['cer']:+.6f}")
-    print(f"           CI 需另跑 analyze_cer_significance.py 配对 bootstrap，点估计不作判据")
+    else:
+        print(f"  {arm:8s} {fraction:.1%} 的解码步拿到偏置，"
+              f"平均命中 {routing.get('mean_boxes_hit')} 个视觉 token")
 
 print()
-print("判据：任一 bias>0 臂的配对 CI 不含零 → 路由有效；三条都含零 → 注意力路由收口。")
+print(f"配对 bootstrap（{ITERATIONS} 次重采样，按页配对）：")
+print("  CI 是 CER(bias0) - CER(arm)，正区间表示该臂更好；点估计不作判据。")
+comparisons = payload.get("comparisons") or {}
+if "cer_bias0" not in comparisons:
+    print("  没有 bias0 的预测文件，无法做配对比较")
+    ok = False
+else:
+    for arm in [name for name in order if name != "bias0"]:
+        stats = comparisons.get(arm)
+        if stats is None:
+            continue
+        tag = "显著" if stats["significant"] else "不显著"
+        print(f"  {arm:8s} ΔCER(bias0-arm) {stats['delta_cer_bias0_minus_arm']:+.6f}  "
+              f"CI [{stats['ci_low']:+.6f}, {stats['ci_high']:+.6f}]  {tag}"
+              f"  （利好：{stats['favours']}）")
+
+print()
+if not ok:
+    print("接线未通过：先修，不要读结果。")
+elif any(stats["significant"] for stats in comparisons.values() if isinstance(stats, dict)):
+    print("至少一条 bias>0 臂的配对 CI 不含零 → 注意力路由有效。")
+else:
+    print("四条臂两两比较均不显著 → 在这个分辨率与这个 checkpoint 上，注意力路由收口。")
+    print("注意：结论仅在「模型有能力利用该信号」的前提下成立，需与分辨率对照一起读。")
+
 (root / "routing_eval_summary.json").write_text(
-    json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+    json.dumps(payload, ensure_ascii=False, indent=2) + chr(10), encoding="utf-8"
 )
+
 PY
 }
 
