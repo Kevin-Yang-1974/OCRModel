@@ -2254,6 +2254,16 @@ def load_model(args: argparse.Namespace, device: torch.device) -> tuple[Any, Any
         tracked_state = TrackedLineState(args.layout_tracking_confidence)
     if (
         routing_strength is not None
+        and getattr(args, "layout_routing_line_map", "regions") == "predicted"
+        and not getattr(args, "layout_routing_predicted_lines", None)
+    ):
+        # Without the boxes there is nothing to express the readout in, and the tracked arm would
+        # find no box under the line it names.
+        raise RuntimeError(
+            "--layout-routing-line-map predicted needs --layout-routing-predicted-lines"
+        )
+    if (
+        routing_strength is not None
         and args.layout_routing_box_source == "pred_static"
         and not getattr(args, "layout_routing_predicted_lines", None)
     ):
@@ -2273,6 +2283,7 @@ def load_model(args: argparse.Namespace, device: torch.device) -> tuple[Any, Any
             box_source=args.layout_routing_box_source,
             line_source=args.layout_routing_line_source,
             tracked=tracked_state,
+            line_map=args.layout_routing_line_map,
         )
         # On the top-level model rather than the bridge: this is a text-decoder
         # route and has nothing to do with the layout adapter, but the eval loop
@@ -2293,6 +2304,8 @@ def load_model(args: argparse.Namespace, device: torch.device) -> tuple[Any, Any
             heads=args.layout_attention_probe_heads or probe_heads(),
             # The same object the routing bias reads, when an arm is aimed by the estimate.
             tracked=tracked_state,
+            # And the same box list, so line index i means one box on both sides of the handoff.
+            box_map=args.layout_routing_line_map,
         )
         # On the top-level model, like the routing runtime: the eval loop already
         # holds the model and arms the probe per page.
@@ -3945,6 +3958,8 @@ def evaluate(
                 list(record.get("regions") or []),
                 prompt_length,
                 inputs["input_ids"],
+                # Only the predicted map reads these.
+                predicted_lines=predicted_lines.get(record["page_id"]),
             )
         generated = generate_with_loop_recovery(
             model_module,
@@ -4585,6 +4600,18 @@ def parse_args() -> argparse.Namespace:
             "behind, with no reference text anywhere in the path -- the arm that decides whether "
             "the deployable form of this route can exist. Requires --layout-attention-probe, since "
             "the probe is what produces the estimate"
+        ),
+    )
+    parser.add_argument(
+        "--layout-routing-line-map",
+        choices=["regions", "predicted"],
+        default="regions",
+        help=(
+            "'regions' expresses the line readout and the bias in the annotation's lines, which "
+            "every result so far uses. 'predicted' uses the detector's boxes for both, so nothing "
+            "in the tracked arm's path reads the annotation -- the map has to be one a detector "
+            "could produce, or the tracker is aiming at a map that will not exist at run time. "
+            "Requires --layout-routing-predicted-lines"
         ),
     )
     parser.add_argument(

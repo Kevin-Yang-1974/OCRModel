@@ -110,6 +110,12 @@ BOX_SOURCES = ("char", "line", "pred_static")
 #              this is the arm that says whether the deployable form can exist at all.
 LINE_SOURCES = ("pointer", "tracked")
 
+# Which box list a line index refers to.  ``regions`` is the annotation, which every result so
+# far is expressed in; ``predicted`` is the detector's, and it is what makes the tracked arm
+# deployable -- with this set, nothing in the tracker's path reads the annotation.
+LINE_MAPS = ("regions", "predicted")
+
+
 # How the box for the current step is chosen.
 #
 # ``step``   the t-th box for the t-th generated character.  This is the only
@@ -163,6 +169,7 @@ class AttentionRouting:
         box_source: str = "char",
         line_source: str = "pointer",
         tracked: Any | None = None,
+        line_map: str = "regions",
     ) -> None:
         if bias < 0:
             raise ValueError("AttentionRouting needs a non-negative bias")
@@ -172,6 +179,8 @@ class AttentionRouting:
             raise ValueError(f"box_source must be one of {BOX_SOURCES}, got {box_source!r}")
         if line_source not in LINE_SOURCES:
             raise ValueError(f"line_source must be one of {LINE_SOURCES}, got {line_source!r}")
+        if line_map not in LINE_MAPS:
+            raise ValueError(f"line_map must be one of {LINE_MAPS}, got {line_map!r}")
         if line_source == "tracked" and (box_source != "line" or tracked is None):
             # The tracked source replaces the pointer for choosing *which* line, so it only means
             # anything where a line is what gets biased, and it needs the state to read from.
@@ -193,6 +202,7 @@ class AttentionRouting:
         self.pointer = pointer
         self.box_source = box_source
         self.line_source = line_source
+        self.line_map = line_map
         self.tracked = tracked
         self.gated = 0
         # The line each character sits on, resolved once per page from the character boxes and
@@ -447,10 +457,17 @@ class AttentionRouting:
             if line < 0:
                 self.gated += 1
                 return None
-            if line >= len(self.regions):
-                self.missing += 1
-                return None
-            box = self.regions[line]["bbox"]
+            if self.line_map == "predicted":
+                boxes = self.predicted_lines
+                if line >= len(boxes):
+                    self.missing += 1
+                    return None
+                box = list(boxes[line])
+            else:
+                if line >= len(self.regions):
+                    self.missing += 1
+                    return None
+                box = self.regions[line]["bbox"]
         else:
             # Everything else is driven by the character being read, so it needs the character
             # channel.  Guarding that here rather than above keeps the tracked source from being
@@ -554,6 +571,7 @@ class AttentionRouting:
             "pointer": self.pointer,
             "box_source": self.box_source,
             "line_source": self.line_source,
+            "line_map": self.line_map,
             "gated_steps": self.gated,
             "tracked": (self.tracked.report() if self.line_source == "tracked" else None),
             "characters_on_a_line": (
@@ -583,6 +601,7 @@ def install_attention_routing(
     box_source: str = "char",
     line_source: str = "pointer",
     tracked: Any | None = None,
+    line_map: str = "regions",
 ) -> tuple[AttentionRouting, list[Any]]:
     """Register the bias hook on every text decoder layer.
 
@@ -600,7 +619,7 @@ def install_attention_routing(
     if image_token_id is None:
         image_token_id = getattr(getattr(model.config, "text_config", None), "image_token_id", None)
     runtime = AttentionRouting(
-        bridge, bias, image_token_id, tokenizer, pointer, box_source, line_source, tracked
+        bridge, bias, image_token_id, tokenizer, pointer, box_source, line_source, tracked, line_map
     )
     handles = [
         # The model's own pre-hook first: it runs outside every layer, so the

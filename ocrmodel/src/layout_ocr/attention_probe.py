@@ -97,6 +97,15 @@ PROBE_ATTR = "layout_attention_probe"
 # config and records what it actually found rather than trusting these numbers.
 DEFAULT_LAYERS = (0, 4, 8, 12)
 
+# Which box list the line readout is expressed in.
+#
+# ``regions``    the page's annotated lines.  Every localization number reported so far is in this
+#                space, and it is an oracle: the labels exist only in the annotation.
+# ``predicted``  the detector's boxes.  Nothing in the path then needs the annotation, which is what
+#                makes a tracked arm deployable -- the line it names has to be a line a detector
+#                could have produced, or the tracker is aiming at a map that will not exist.
+BOX_MAPS = ("regions", "predicted")
+
 
 def probe_path() -> str | None:
     """Where the per-page attention report is appended, if anywhere."""
@@ -242,7 +251,11 @@ class AttentionProbe:
         layers: tuple[int, ...] = DEFAULT_LAYERS,
         heads: tuple[int, ...] | None = None,
         tracked: Any | None = None,
+        box_map: str = "regions",
     ) -> None:
+        if box_map not in BOX_MAPS:
+            raise ValueError(f"box_map must be one of {BOX_MAPS}, got {box_map!r}")
+        self.box_map = box_map
         self.bridge = bridge
         self.image_token_id = image_token_id
         self.layers = tuple(layers)
@@ -281,6 +294,7 @@ class AttentionProbe:
         regions: list[dict[str, Any]],
         prompt_length: int,
         input_ids: Tensor,
+        predicted_lines: list[list[float]] | None = None,
     ) -> None:
         """Point the probe at one page: resolve the visual span and the line map."""
 
@@ -310,7 +324,16 @@ class AttentionProbe:
         # manifest's own order is not guaranteed to be reading order.  Sorting here
         # rather than at the call site keeps the probe's labels and the truth's
         # labels the same kind of thing.
-        self._regions = sorted(regions, key=lambda item: int(item["reading_order"]))
+        if self.box_map == "predicted":
+            # The same ordered list the bias reads, so an index means one box on both sides.  A
+            # predicted box has no direction -- deriving it is a separate problem, and the in-line
+            # position only wants it as an axis choice.
+            self._regions = [
+                {"bbox": list(box), "reading_order": index}
+                for index, box in enumerate(predicted_lines or [])
+            ]
+        else:
+            self._regions = sorted(regions, key=lambda item: int(item["reading_order"]))
         self.num_regions = len(self._regions)
         self._line_direction = [
             region.get("writing_direction", "unknown") for region in self._regions
@@ -554,6 +577,27 @@ class AttentionProbe:
         owners = self.owners.to(dist.device) if self.owners is not None else None
         heads = self.heads if self.heads is not None else range(num_heads)
         records: list[dict[str, Any]] = []
+        # Every head at once.  The per-head loop this replaces did a scatter and a masked
+        # weighted sum per head per step, which at four layers, sixteen heads and a few hundred
+        # steps a page is millions of small torch calls -- the probe's own overhead on top of the
+        # generation it is watching, and the one part of it that is mine to remove.
+        per_line_by_head: list[list[float]] | None = None
+        in_line_by_head: list[float] | None = None
+        argmax_by_head: list[int] | None = None
+        if owners is not None and self.num_regions:
+            # The last slot holds everything off every line -- background, or a token no box
+            # covers.  Keeping it visible matters: a high background share means the "line"
+            # readout is reading noise, not a line.
+            slots = owners.clamp_min(0) + (owners < 0).long() * self.num_regions
+            per_line = torch.zeros(
+                dist.shape[0], self.num_regions + 1, dtype=dist.dtype, device=dist.device
+            )
+            per_line.index_add_(1, slots, dist)
+            lines_out = per_line[:, : self.num_regions]
+            in_line_by_head = self._in_line_position(dist, owners, int(lines_out.shape[1]))
+            per_line_by_head = per_line.tolist()
+            argmax_by_head = lines_out.argmax(dim=1).tolist()
+
         for head in heads:
             head = int(head)
             row: dict[str, Any] = {
@@ -564,21 +608,14 @@ class AttentionProbe:
                 "lse_text": float(lse_text[head]),
                 "entropy_norm": float(entropy_norm[head]),
             }
-            if owners is not None and self.num_regions:
-                # Mass per line, with the last slot holding everything off every
-                # line -- background, or a token no box covers.  Keeping it visible
-                # matters: a high background share means the "line" readout is
-                # reading noise, not a line.
-                slots = owners.clamp_min(0) + (owners < 0).long() * self.num_regions
-                per_line = torch.zeros(self.num_regions + 1, dtype=dist.dtype, device=dist.device)
-                per_line.index_add_(0, slots, dist[head])
-                line_probs = per_line.tolist()
-                argmax = int(per_line[: self.num_regions].argmax())
+            if per_line_by_head is not None:
+                line_probs = per_line_by_head[head]
+                argmax = int(argmax_by_head[head])
                 row["line_probs"] = line_probs
                 row["argmax_line"] = argmax
                 row["top_line_mass"] = line_probs[argmax]
                 row["background_mass"] = line_probs[-1]
-                row["in_line_pos"] = self._in_line_position(dist[head], owners, argmax)
+                row["in_line_pos"] = in_line_by_head[head]
             records.append(row)
         # One entry per layer per step: ``heads`` carries the layer, so the offline
         # tool can group by step without the probe having to accumulate a nested
@@ -595,27 +632,58 @@ class AttentionProbe:
             line, confidence = aggregate_line_estimate(records, int(self.num_regions or 0))
             self.tracked.observe(line, confidence)
 
-    def _in_line_position(self, dist: Tensor, owners: Tensor, line: int) -> float:
-        """Attention-weighted position along the chosen line's reading direction.
+    def _in_line_position(self, dist: Tensor, owners: Tensor, num_lines: int) -> list[float]:
+        """Attention-weighted position along each line's reading direction, one per head.
 
-        A vertical column is read top-to-bottom, so the position axis is ``y``; a
-        horizontal line uses ``x``.  Returns ``-1.0`` rather than a fabricated
-        coordinate when the line is unmatched or unrepresented.
+        A vertical column is read top-to-bottom, so the position axis is ``y``; a horizontal line
+        uses ``x``.  A line that holds no token, or a head that put no weight on it, comes back as
+        ``-1.0`` rather than a fabricated coordinate.
+
+        Every token belongs to exactly one line, so its coordinate along *its own* line's axis is a
+        single per-token number, and both the numerator and the denominator are then one grouped sum
+        per head and line.  The per-head version this replaces did all of that once per head per
+        step, which at four layers and sixteen heads over a few hundred steps is the probe's own
+        cost sitting on top of the generation it is watching -- and the only part of that cost that
+        is mine rather than the model's.
         """
 
-        if line < 0 or line >= len(self._line_direction):
-            return -1.0
+        heads = int(dist.shape[0])
+        out = [-1.0] * heads
         grid = getattr(self.bridge, "last_patch_positions", None)
-        if grid is None:
-            return -1.0
-        in_line = owners == line
-        if not bool(in_line.any()):
-            return -1.0
-        weights = dist[in_line]
-        weights = weights / weights.sum().clamp_min(1e-12)
-        axis = 1 if self._line_direction[line] == "vertical_rtl" else 0
-        coords = grid[0, in_line, axis].float()
-        return float((weights * coords).sum())
+        # A line whose direction was never recorded gets no position: choosing an axis for it would
+        # be inventing the reading direction the number is measured along.
+        known = [line < len(self._line_direction) for line in range(num_lines)]
+        if grid is None or num_lines <= 0 or not any(known):
+            return out
+        inside = owners >= 0
+        if not bool(inside.any()):
+            return out
+        token_line = owners[inside]
+        weights = dist[:, inside].float()
+        # Which axis each token's own line is read along, so one gather serves every line.
+        vertical = torch.tensor(
+            [
+                known[line] and self._line_direction[line] == "vertical_rtl"
+                for line in range(num_lines)
+            ],
+            device=dist.device,
+        )
+        points = grid[0].to(dist.device).float()[inside]
+        coords = torch.where(vertical[token_line], points[:, 1], points[:, 0])
+
+        numerator = torch.zeros(heads, num_lines, dtype=weights.dtype, device=dist.device)
+        denominator = torch.zeros_like(numerator)
+        numerator.index_add_(1, token_line, weights * coords)
+        denominator.index_add_(1, token_line, weights)
+
+        positions = (numerator / denominator.clamp_min(1e-12)).tolist()
+        present = (denominator > 0).tolist()
+        for head in range(heads):
+            for line in range(num_lines):
+                if known[line] and present[head][line]:
+                    out[head] = positions[head][line]
+                    break
+        return out
 
     # -- the transform (validate on A100) -----------------------------------
 
@@ -840,6 +908,7 @@ class AttentionProbe:
             "visual_tokens": self.visual_count,
             "visual_start": self.visual_start,
             "num_regions": self.num_regions,
+            "box_map": self.box_map,
             "decoding_steps": self.steps,
             "grid_missing_steps": self.grid_missing,
             "emitted_missing_steps": self.emitted_missing,
@@ -938,6 +1007,7 @@ def install_attention_probe(
     layers: tuple[int, ...] = DEFAULT_LAYERS,
     heads: tuple[int, ...] | None = None,
     tracked: Any | None = None,
+    box_map: str = "regions",
 ) -> tuple[AttentionProbe, list[Any]]:
     """Register observation hooks on the selected decoder attention modules.
 
@@ -949,7 +1019,9 @@ def install_attention_probe(
     image_token_id = getattr(model.config, "image_token_id", None)
     if image_token_id is None:
         image_token_id = getattr(getattr(model.config, "text_config", None), "image_token_id", None)
-    runtime = AttentionProbe(bridge, image_token_id, layers=layers, heads=heads, tracked=tracked)
+    runtime = AttentionProbe(
+        bridge, image_token_id, layers=layers, heads=heads, tracked=tracked, box_map=box_map
+    )
     candidates = _find_attention_modules(model)
     available = {index for index, _ in candidates}
     missing = [index for index in layers if index not in available]

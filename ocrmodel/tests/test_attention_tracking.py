@@ -197,6 +197,87 @@ def test_the_report_carries_the_gate_rate():
     assert report["accepted_fraction"] == pytest.approx(2 / 3)
 
 
+def _predicted_runtime(state, boxes):
+    """A tracked runtime whose map is the detector's boxes, with no regions at all."""
+
+    runtime = AttentionRouting(
+        _bridge(), BIAS, IMAGE_TOKEN_ID, None, "synced", "line", "tracked", state, "predicted"
+    )
+    runtime.set_page(
+        "p0",
+        None,
+        PROMPT_LENGTH,
+        torch.tensor([[1, IMAGE_TOKEN_ID, IMAGE_TOKEN_ID, IMAGE_TOKEN_ID, IMAGE_TOKEN_ID, 2]]),
+        regions=None,  # no annotation anywhere on this path
+        predicted_lines=boxes,
+    )
+    return runtime
+
+
+def test_the_predicted_map_takes_the_boxes_from_the_detector():
+    """Nothing in the tracked path reads the annotation once the map is predicted."""
+
+    state = TrackedLineState(confidence=6.0)
+    runtime = _predicted_runtime(state, [LINE_LEFT["bbox"], LINE_RIGHT["bbox"]])
+    assert runtime.regions == []
+    state.observe(1, 9.0)
+    mask = _step(runtime, PROMPT_LENGTH)["attention_mask"]
+    assert mask[0, 0, 0, 1:5].tolist() == [0.0, BIAS, 0.0, BIAS]
+    state.observe(0, 9.0)
+    runtime._cache_key = None
+    mask = _step(runtime, PROMPT_LENGTH + 1)["attention_mask"]
+    assert mask[0, 0, 0, 1:5].tolist() == [BIAS, 0.0, BIAS, 0.0]
+    assert runtime.report()["line_map"] == "predicted"
+
+
+def test_a_line_index_past_the_predicted_boxes_is_a_missing_box():
+    """The detector may have found fewer lines than the tracker names."""
+
+    state = TrackedLineState(confidence=6.0)
+    runtime = _predicted_runtime(state, [LINE_LEFT["bbox"]])
+    state.observe(5, 9.0)
+    assert "attention_mask" not in _step(runtime, PROMPT_LENGTH)
+    assert runtime.missing == 1
+    assert runtime.gated == 0
+
+
+def test_the_probe_expresses_its_readout_in_the_predicted_boxes():
+    """The two sides must agree on what index i means, or the bias aims at another line."""
+
+    from layout_ocr.attention_probe import BOX_MAPS, AttentionProbe
+
+    assert BOX_MAPS == ("regions", "predicted")
+    probe = AttentionProbe(_bridge(), IMAGE_TOKEN_ID, layers=(8,), box_map="predicted")
+    probe.set_page(
+        "p0",
+        [{"bbox": [0.0, 0.0, 1.0, 1.0], "reading_order": 0}],  # annotation present but ignored
+        PROMPT_LENGTH,
+        torch.tensor([[1, IMAGE_TOKEN_ID, IMAGE_TOKEN_ID, IMAGE_TOKEN_ID, IMAGE_TOKEN_ID, 2]]),
+        predicted_lines=[LINE_RIGHT["bbox"], LINE_LEFT["bbox"]],
+    )
+    assert probe.num_regions == 2
+    assert [region["bbox"] for region in probe._regions] == [
+        LINE_RIGHT["bbox"],
+        LINE_LEFT["bbox"],
+    ]
+    assert probe.report()["box_map"] == "predicted"
+
+
+def test_an_unknown_box_map_is_refused():
+    from layout_ocr.attention_probe import AttentionProbe
+
+    with pytest.raises(ValueError, match="box_map must be one of"):
+        AttentionProbe(_bridge(), IMAGE_TOKEN_ID, layers=(8,), box_map="vibes")
+
+
+def test_an_unknown_line_map_is_refused():
+    with pytest.raises(ValueError, match="line_map must be one of"):
+        AttentionRouting(
+            _bridge(), BIAS, IMAGE_TOKEN_ID, None, "synced", "line", "tracked",
+            TrackedLineState(), "vibes",
+        )
+
+
 def test_a_tracked_runtime_without_a_state_is_refused():
     with pytest.raises(ValueError, match="needs box_source='line'"):
         AttentionRouting(_bridge(), BIAS, IMAGE_TOKEN_ID, None, "synced", "line", "tracked", None)

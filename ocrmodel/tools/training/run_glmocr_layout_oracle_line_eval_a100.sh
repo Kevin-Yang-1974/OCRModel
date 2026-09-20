@@ -55,6 +55,11 @@ predicted_lines="${GLMOCR_ORACLE_PREDICTED_LINES:-}"
 probe_layers="${GLMOCR_ORACLE_PROBE_LAYERS:-8}"
 probe_heads="${GLMOCR_ORACLE_PROBE_HEADS:-2,3,8,10,11,12,14,15}"
 tracking_confidence="${GLMOCR_ORACLE_TRACKING_CONFIDENCE:-6.0}"
+# A previous run's `noroute` arm directory.  The control does not depend on which arm is being
+# tested, and it is the single most expensive thing to recompute: 149 pages of generation that
+# is identical every time.  Pointing this at an earlier run of the same page set removes one
+# arm from the wall clock, which on five GPUs is a fifth of it.
+baseline_dir="${GLMOCR_ORACLE_BASELINE_DIR:-}"
 foreground="${GLMOCR_ORACLE_FOREGROUND:-0}"
 gpu_slots="${GLMOCR_ORACLE_GPUS:-0,1,2,3}"
 
@@ -169,6 +174,11 @@ run_arms() {
     for spec in ${arms}; do
         IFS=':' read -r arm bias box_source line_source <<< "${spec}"
         line_source="${line_source:-pointer}"
+        if [[ "${arm}" == "noroute" && -n "${baseline_dir}" ]]; then
+            # Reused rather than recomputed; the summarize reads it from there.
+            echo "{\"event\":\"glmocr_oracle_baseline_reused\",\"from\":\"${baseline_dir}\"}"
+            continue
+        fi
         local gpu="${slots[$(( index % total ))]}"
         launch "${arm}" "${bias}" "${box_source}" "${line_source}" "${gpu}" &
         pids+=("$!"); labels+=("${arm}")
@@ -193,6 +203,7 @@ summarize() {
     "${python}" - "${eval_root}" "${RECORDED_NOROUTE_CER}" "${RECORDED_CHAR2_CER}" \
         "${max_pixels}" "${RECORDED_MAX_PIXELS}" <<'PY'
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -292,6 +303,11 @@ print()
 print(f"配对 bootstrap（{ITERATIONS} 次重采样，按页配对），基准 noroute：")
 print("  CI 是 CER(noroute) - CER(arm)，正区间表示该臂更好。")
 baseline = arms_dir / "noroute" / "validation_predictions.jsonl"
+if not baseline.is_file():
+    reused = os.environ.get("GLMOCR_ORACLE_BASELINE_DIR", "").strip()
+    if reused:
+        baseline = Path(reused) / "validation_predictions.jsonl"
+        payload["baseline_reused_from"] = reused
 if not baseline.is_file():
     print("  没有 noroute 的预测文件，无法做配对比较")
     ok = False
