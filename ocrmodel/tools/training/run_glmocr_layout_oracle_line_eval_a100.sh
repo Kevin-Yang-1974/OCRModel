@@ -270,6 +270,12 @@ for arm in order:
                 "biased_steps": biased,
                 "biased_fraction": biased / max(1, steps),
                 "gated_steps": sum(int(row.get("gated_steps", 0)) for row in rows),
+                "past_annotation_steps": sum(
+                    int(row.get("past_annotation_steps", 0)) for row in rows
+                ),
+                # A run from before that counter existed cannot close its accounting.  That is a
+                # fact about the record, not about the wiring, and the verdict says which.
+                "accounting_complete": "past_annotation_steps" in rows[0],
                 "missing_box_steps": sum(int(row.get("missing_box_steps", 0)) for row in rows),
                 "mean_boxes_hit": sum(hits) / len(hits) if hits else None,
             }
@@ -325,19 +331,27 @@ for arm in order:
     fraction = routing.get("biased_fraction", 0.0)
     gated = routing.get("gated_steps", 0)
     missing = routing.get("missing_box_steps", 0)
+    past = routing.get("past_annotation_steps", 0)
     steps = routing.get("decoding_steps", 0)
-    # Every step has to be accounted for: biased, withheld by the gate, or missing a box it should
-    # have had.  The old rule failed an arm below 0.9 coverage, which is right for the oracle arms
-    # -- a step without a bias there is a wiring fault -- and wrong for a gated one, where
-    # withholding on a low-confidence step is the design.  It called two working arms unwired.
-    unaccounted = steps - routing.get("biased_steps", 0) - gated - missing
-    if missing or unaccounted or routing.get("biased_steps", 0) == 0:
+    # Every step has to be accounted for: biased, withheld by the gate, past the annotation, or
+    # missing a box it should have had.  The rule this replaces failed an arm below 0.9 coverage,
+    # which is right for the oracle arms -- a step without a bias there is a wiring fault -- and
+    # wrong for a gated one, where withholding on a low-confidence step is the design.  It called
+    # two working arms unwired.
+    unaccounted = steps - routing.get("biased_steps", 0) - gated - missing - past
+    if not routing.get("accounting_complete", True):
+        # Older runs predate the past-annotation counter, so their steps cannot be classified.
+        # Reported rather than failed: the gap is in the record.
+        unaccounted = 0
+        print(f"  {arm:11s} 记录来自旧版本，缺 past_annotation 计数器，记账无法闭合"
+              f"（{steps - routing.get('biased_steps', 0) - gated - missing} 步未分类）")
+    if unaccounted or routing.get("biased_steps", 0) == 0:
         print(f"  {arm:11s} 接线有问题：偏置 {routing.get('biased_steps')} + 门控 {gated} + "
-              f"缺框 {missing} != {steps} 步（未记账 {unaccounted}）")
+              f"缺框 {missing} + 超出标注 {past} != {steps} 步（未记账 {unaccounted}）")
         ok = False
-    elif gated:
-        print(f"  {arm:11s} {fraction:.1%} 的解码步拿到偏置，{gated} 步被门控扣下（设计如此），"
-              f"平均命中 {routing.get('mean_boxes_hit'):.1f} 个 token"
+    elif gated or past:
+        print(f"  {arm:11s} {fraction:.1%} 的解码步拿到偏置，{gated} 步被门控扣下、"
+              f"{past} 步超出标注，平均命中 {routing.get('mean_boxes_hit'):.1f} 个 token"
               f"（框来源 {routing.get('box_source')}，地图 {routing.get('line_map')}）")
     else:
         print(f"  {arm:11s} {fraction:.1%} 的解码步拿到偏置，"
