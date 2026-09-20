@@ -205,6 +205,7 @@ class AttentionRouting:
         self.line_map = line_map
         self.tracked = tracked
         self.gated = 0
+        self.past_annotation = 0
         # The line each character sits on, resolved once per page from the character boxes and
         # the region boxes.  Per character index, not per step, so a step only looks it up.
         self.regions: list[dict[str, Any]] = []
@@ -256,6 +257,7 @@ class AttentionRouting:
         """
 
         self.gated = 0
+        self.past_annotation = 0
         if self.tracked is not None:
             # A new page invalidates the estimate: the previous page's line says nothing about
             # this one, and leaving it would aim the first steps at a line that may not exist.
@@ -473,6 +475,11 @@ class AttentionRouting:
             # channel.  Guarding that here rather than above keeps the tracked source from being
             # rejected for lacking something it never uses.
             if self.characters is None or not 0 <= step < len(self.characters):
+                # The pointer has walked past the annotation -- the model generated more
+                # characters than the reference has boxes for.  Counted, because an
+                # uncounted return here is a step that silently disappears from the
+                # wiring accounting.
+                self.past_annotation += 1
                 return None
             if self.box_source == "line":
                 # The line that character sits on.  A missing character box means no line either --
@@ -576,6 +583,7 @@ class AttentionRouting:
             "line_source": self.line_source,
             "line_map": self.line_map,
             "gated_steps": self.gated,
+            "past_annotation_steps": self.past_annotation,
             "tracked": (self.tracked.report() if self.line_source == "tracked" else None),
             "characters_on_a_line": (
                 sum(1 for line in self._char_lines if line >= 0) if self._char_lines else None

@@ -358,6 +358,24 @@ if not baseline.is_file():
     ok = False
 else:
     rows_a = load_predictions(baseline)
+    if "noroute" not in payload["arms"]:
+        # A reused control still has to appear as an arm: the wiring check and the delta table both
+        # read it by name, and its absence said "no control" while the bootstrap below was quietly
+        # using one.
+        sidecar = baseline.parent / "summary.json"
+        reused = {"status": "reused", "pages": len(rows_a), "cer": cer(rows_a)}
+        if sidecar.is_file():
+            metrics = json.loads(sidecar.read_text(encoding="utf-8"))["validation"]
+            reused.update({
+                "substitutions": metrics["substitutions"],
+                "insertions": metrics["insertions"],
+                "deletions": metrics["deletions"],
+                "edits": metrics["substitutions"] + metrics["insertions"] + metrics["deletions"],
+                "generation_limit_hits": metrics["generation_limit_hits"],
+                "layout_routing": metrics.get("layout_routing"),
+            })
+        payload["arms"]["noroute"] = reused
+        order = ["noroute"] + [arm for arm in order if arm != "noroute"]
     payload["comparisons"] = {}
     for arm in order:
         if arm == "noroute":
