@@ -363,7 +363,10 @@ print(f"      --probe {probe_path} \\")
 print(f"      --predictions {arms_dir / 'probe_only' / 'validation_predictions.jsonl'} \\")
 print(f"      --manifest {root / 'validation_subset_stage.jsonl'} \\")
 print(f"      --select-pages {root / 'select_pages.txt'} --check-pages {root / 'check_pages.txt'} \\")
-print(f"      --layers {probe['layers'] if probe else '0 4 8 12'} --output {analyzer}")
+# Space-separated, because the analyzer takes nargs="+": printing the Python list
+# repr produces a command that fails when pasted.
+layers_arg = " ".join(str(layer) for layer in (probe["layers"] if probe else [0, 4, 8, 12]))
+print(f"      --layers {layers_arg} --output {analyzer}")
 
 payload["status"] = "partial" if missing else "complete"
 if missing:
