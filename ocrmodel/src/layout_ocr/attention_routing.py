@@ -565,6 +565,9 @@ class AttentionRouting:
             _probe(path, self.report())
 
     def report(self) -> dict[str, Any]:
+        # Reported whenever the arm actually reads them: the count is part of the dose,
+        # since the confidence unit multiplies by it.
+        reads_predicted = self.box_source == "pred_static" or self.line_map == "predicted"
         return {
             "page_id": self.page_id,
             "bias": self.bias,
@@ -577,9 +580,7 @@ class AttentionRouting:
             "characters_on_a_line": (
                 sum(1 for line in self._char_lines if line >= 0) if self._char_lines else None
             ),
-            "predicted_lines": (
-                len(self.predicted_lines) if self.box_source == "pred_static" else None
-            ),
+            "predicted_lines": len(self.predicted_lines) if reads_predicted else None,
             "pointer_position": self.position if self.pointer == "synced" else None,
             "reference_characters": len(self.reference) if self.reference else None,
             "decoding_steps": self.steps,
