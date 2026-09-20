@@ -93,6 +93,10 @@ def main(argv: list[str] | None = None) -> int:
         if not rows:
             continue
         regions = page["num_regions"] or 1
+        # Each row carries its page's line count, so the scale-free criterion below can be
+        # evaluated per row without threading the page through.
+        for row in rows:
+            row["regions"] = regions
         confidences = [row["confidence"] for row in rows]
         pages.append(
             {
@@ -193,6 +197,55 @@ def main(argv: list[str] | None = None) -> int:
         )
     result["threshold_sweep"] = sweep
 
+    # The candidate fix for the confound: a bar on how much the readout concentrates
+    # relative to a uniform distribution over the page's lines, so the same number means
+    # the same thing on a ten-line page and a forty-line one.  Reported per line-count
+    # bucket, because the whole point is whether it stops tracking the line count -- a
+    # criterion that is merely lower is not the same as one that is scale-free.
+    scale_free = []
+    for step in range(1, 21):
+        multiple = step / 2  # 0.5x .. 10x uniform
+        subset = [row for row in all_rows if row["confidence"] * row["regions"] >= multiple]
+        entry: dict[str, Any] = {
+            "multiple_of_uniform": multiple,
+            "coverage": len(subset) / total,
+            "accuracy": (
+                sum(1 for row in subset if row["pred"] == row["truth"]) / len(subset)
+                if subset
+                else None
+            ),
+            "by_bucket": {},
+        }
+        for label in result["by_region_bucket"]:
+            group_rows = [
+                row for page in buckets[label] for row in page["rows"]
+            ]
+            kept = [row for row in group_rows if row["confidence"] * row["regions"] >= multiple]
+            entry["by_bucket"][label] = {
+                "coverage": len(kept) / len(group_rows) if group_rows else None,
+                "accuracy": (
+                    sum(1 for row in kept if row["pred"] == row["truth"]) / len(kept)
+                    if kept
+                    else None
+                ),
+            }
+        scale_free.append(entry)
+    result["scale_free_sweep"] = scale_free
+    # Spread of coverage across the buckets at each bar: a scale-free criterion keeps this
+    # small, an absolute one does not.
+    result["scale_free_bucket_spread"] = [
+        {
+            "multiple_of_uniform": entry["multiple_of_uniform"],
+            "coverage_spread": (
+                max(b["coverage"] for b in entry["by_bucket"].values())
+                - min(b["coverage"] for b in entry["by_bucket"].values())
+                if entry["by_bucket"]
+                else None
+            ),
+        }
+        for entry in scale_free
+    ]
+
     text = json.dumps(result, ensure_ascii=False, indent=2)
     if args.output:
         args.output.parent.mkdir(parents=True, exist_ok=True)
@@ -222,7 +275,7 @@ def main(argv: list[str] | None = None) -> int:
               f"{stats['coverage_0_5']:9.4f} {stats['accuracy']:9.4f} "
               f"{stats['median_regions']:12.1f}")
     print()
-    print("threshold sweep (coverage, accuracy of the covered):")
+    print("threshold sweep, absolute bar (coverage, accuracy of the covered):")
     for point in sweep:
         acc = point["accuracy"]
         mark = ""
@@ -230,6 +283,33 @@ def main(argv: list[str] | None = None) -> int:
             mark = "  <- clears both targets"
         print(f"  t={point['threshold']:.2f}  coverage {point['coverage']:.4f}  "
               f"accuracy {'n/a' if acc is None else f'{acc:.4f}'}{mark}")
+
+    print()
+    print("scale-free sweep: coverage by line-count bucket, at each bar.")
+    print("  (a bar that stops tracking the line count keeps the columns close)")
+    labels = list(result["by_region_bucket"])
+    head = "  {:>6} {:>9} {:>9}".format("bar", "coverage", "accuracy")
+    for label in labels:
+        head += f" {label:>9}"
+    print(head)
+    for entry in scale_free:
+        acc = entry["accuracy"]
+        spread = next(
+            item["coverage_spread"]
+            for item in result["scale_free_bucket_spread"]
+            if item["multiple_of_uniform"] == entry["multiple_of_uniform"]
+        )
+        row = "  {:>5.1f}x {:>9.4f} {:>9}".format(
+            entry["multiple_of_uniform"],
+            entry["coverage"],
+            "n/a" if acc is None else f"{acc:.4f}",
+        )
+        for label in labels:
+            value = entry["by_bucket"][label]["coverage"]
+            row += " {:>9}".format("n/a" if value is None else f"{value:.4f}")
+        if spread is not None:
+            row += f"   spread {spread:.3f}"
+        print(row)
     return 0
 
 
