@@ -2239,6 +2239,17 @@ def load_model(args: argparse.Namespace, device: torch.device) -> tuple[Any, Any
     # zero installs the hooks with an all-zero mask, which is the arm that shows
     # the route fires on every step without changing the score.
     routing_strength = getattr(args, "layout_routing_bias", None)
+    if (
+        routing_strength is not None
+        and args.layout_routing_box_source == "pred_static"
+        and not getattr(args, "layout_routing_predicted_lines", None)
+    ):
+        # Without the file this arm would bias nothing at all and score exactly like no route,
+        # which is the one conclusion it must not reach by accident.
+        raise RuntimeError(
+            "the pred_static box source needs --layout-routing-predicted-lines; without it the "
+            "arm biases nothing and would look like 'the predicted map does not help'"
+        )
     if routing_strength is not None:
         routing_runtime, _ = install_attention_routing(
             model,
@@ -3791,6 +3802,18 @@ def evaluate(
     if routing_runtime is None:
         routing_runtime = getattr(model, ROUTING_ATTR, None)
     routing_reports: list[dict[str, Any]] = []
+    # The detector's boxes, for the box source that biases a predicted map instead of the
+    # annotation.  Loaded once: one entry per page, in page-normalized coordinates.
+    predicted_lines: dict[str, list[list[float]]] = {}
+    predicted_path = getattr(args, "layout_routing_predicted_lines", None)
+    if predicted_path is not None:
+        with Path(predicted_path).open(encoding="utf-8") as handle:
+            for line in handle:
+                if line.strip():
+                    row = json.loads(line)
+                    predicted_lines[row["page_id"]] = row["boxes"]
+        if not predicted_lines:
+            raise RuntimeError(f"no predicted line boxes in {predicted_path}")
     # Installed by ``load_model`` when ``--layout-attention-probe`` is set.  It only
     # observes: the generation below runs the same whether or not it is armed.
     probe_runtime = getattr(model_module, PROBE_ATTR, None)
@@ -3891,6 +3914,9 @@ def evaluate(
                 reference=record["page_text"],
                 # Only the ``line`` box source reads these; the character arm ignores them.
                 regions=record.get("regions"),
+                # Only ``pred_static`` reads these, and it is the one arm that must not see the
+                # annotation: the boxes come from the detector, which saw only the image.
+                predicted_lines=predicted_lines.get(record["page_id"]),
             )
         if probe_runtime is not None:
             # Armed after the site that may run a teacher-forcing forward above: its
@@ -4521,8 +4547,19 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--layout-routing-predicted-lines",
+        type=Path,
+        default=None,
+        help=(
+            "JSONL of {page_id, boxes} written by tools/predict_lines_for_routing.py, giving the "
+            "detector's line boxes in page-normalized coordinates. Required by the pred_static "
+            "box source, which biases their union: this is the arm whose boxes come from the "
+            "image rather than the annotation"
+        ),
+    )
+    parser.add_argument(
         "--layout-routing-box-source",
-        choices=["char", "line"],
+        choices=["char", "line", "pred_static"],
         default="char",
         help=(
             "'char' biases the box of the character being generated -- the arm the recorded "
