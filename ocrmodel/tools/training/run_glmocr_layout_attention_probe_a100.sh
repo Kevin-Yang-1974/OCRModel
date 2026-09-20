@@ -282,7 +282,7 @@ run_arms() {
 
 summarize() {
     setup_environment
-    "${python}" - "${eval_root}" "${stage}" "${max_pixels}" "${page_count}" \n        "${sequential}" <<'PY'
+    "${python}" - "${eval_root}" "${stage}" "${max_pixels}" "${page_count}" "${sequential}" <<'PY'
 import json
 import sys
 from pathlib import Path
