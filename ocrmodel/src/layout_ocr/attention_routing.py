@@ -12,13 +12,15 @@ inside a given box.
 hooks are installed and fire on every decoding step while the mask they add stays
 all-zero, so the arm carries no bias and proves the wiring.
 
-It is **not** the same run as "no route at all", and the difference is worth being
-explicit about.  An all-zero mask is a no-op on the attention logits, but a
-non-``None`` mask takes SDPA off the flash path and makes ``use_gqa_in_sdpa`` return
-false, so ``repeat_kv`` materialises the key and value heads instead of using
-``enable_gqa``.  Every arm that passes a mask pays that cost, which is what makes
-them comparable *with each other*; separating "the bias helps" from "the bias buys
-back what installing it cost" needs a run with no ``--layout-routing-bias`` at all.
+A zero mask is not *obviously* the same run as no route at all: a non-``None`` mask
+can take SDPA off the flash path and make ``use_gqa_in_sdpa`` return false, so
+``repeat_kv`` would materialise the heads instead of using ``enable_gqa``.  That
+worry was measured rather than argued, with an otherwise identical run that installs
+nothing: the two came out bit-identical (identical edit counts on every page, paired
+bootstrap CI ``[+0.000000, +0.000000]``), so on this model the kernel difference has
+no effect and a gain over the zero arm is a gain over no route.  The arm that
+established that is kept in the results, because the next model or shape may not be
+so forgiving.
 
 ## Why only the decoding steps
 
