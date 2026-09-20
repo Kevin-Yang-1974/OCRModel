@@ -15,6 +15,9 @@
 #
 # **判据 2（成本）**：probe_only 减 noroute 的每页耗时、峰值显存。阶段 0 的工程目标
 # 是额外推理时延不超过 20%，这是待测目标，不是既有性能。超了就减层/减头/降频。
+# **必须串行测**（GLMOCR_PROBE_SEQUENTIAL=1）：探针开销主要在 Python 侧，两臂并行会
+# 争抢同一主机的 CPU。实测同一比较在两批页上给出 +14.2% 与 **−4.4%**，噪声盖过信号。
+# 负开销不可能（探针只增加工作），出现即判为测量无效，不得记为达标。
 #
 # **判据 3（信号是否存在）**：summary 里 layout_attention_probe.mean_visual_mass。
 # 若 m_t 始终很低（模型主要靠 token 间注意力、不怎么看图），说明连信号都没有，
@@ -59,6 +62,10 @@ probe_heads="${GLMOCR_PROBE_HEADS:-}"
 # of this draw, so a re-run is not judged on the pages that produced the result it is
 # re-examining.  Empty means no exclusion (a first run has nothing to exclude).
 subset_exclude="${GLMOCR_PROBE_SUBSET_EXCLUDE:-}"
+# 1 runs the arms one after another on a single card instead of in parallel, so the two
+# per-page timings are measured under the same conditions.  Required for the cost criterion:
+# in parallel the arms contend for the CPU the probe's reduction runs on.
+sequential="${GLMOCR_PROBE_SEQUENTIAL:-0}"
 
 eval_root="${remote_root}/attention_probe/${run_id}"
 python="${env_dir}/bin/python3"
@@ -113,11 +120,14 @@ if len(rows) < count:
 # independent of that result; it does not make the sample a blind one, and the
 # pre-registration says so.
 excluded = set()
-if exclude_path:
-    prior = Path(exclude_path)
+# ':'-separated so several prior runs can be excluded at once; no path contains a colon.
+for entry in (exclude_path or "").split(":"):
+    if not entry:
+        continue
+    prior = Path(entry)
     if not prior.is_file():
         raise SystemExit(f"--subset-exclude file not found: {prior}")
-    excluded = {
+    excluded |= {
         json.loads(line)["page_id"]
         for line in prior.read_text(encoding="utf-8").splitlines()
         if line.strip()
@@ -230,7 +240,22 @@ run_arms() {
     mkdir -p "${eval_root}/arms"
     IFS=',' read -r -a slots <<< "${gpu_slots}"
     local total="${#slots[@]}"
-    echo "{\"event\":\"glmocr_probe_eval_started\",\"run_id\":\"${run_id}\",\"stage\":\"${stage}\",\"pages\":\"${page_count}\",\"layers\":\"${probe_layers}\",\"heads\":\"${probe_heads:-all}\"}"
+    echo "{\"event\":\"glmocr_probe_eval_started\",\"run_id\":\"${run_id}\",\"stage\":\"${stage}\",\"pages\":\"${page_count}\",\"layers\":\"${probe_layers}\",\"heads\":\"${probe_heads:-all}\",\"sequential\":\"${sequential}\"}"
+
+    if (( sequential == 1 )); then
+        # One arm at a time on the same card.  The probe's cost is largely Python-side, so
+        # two arms on one host contend for the CPU it runs on: the same comparison measured
+        # +14.2% on one page set and -4.4% on another, and a negative overhead is a
+        # measurement artifact rather than a speedup.  Sequential runs make the two timings
+        # comparable, which is the only way the cost criterion can be decided.
+        local spec with_probe arm
+        for spec in "noroute:no" "probe_only:yes"; do
+            IFS=':' read -r arm with_probe <<< "${spec}"
+            launch "${arm}" "${slots[0]}" "${with_probe}" \
+                || { echo "{\"event\":\"glmocr_probe_eval_arm_failed\",\"arm\":\"${arm}\"}" >&2; exit 1; }
+        done
+        return
+    fi
 
     local -a pids=() labels=() failed=0
     local index=0 spec with_probe
@@ -257,12 +282,14 @@ run_arms() {
 
 summarize() {
     setup_environment
-    "${python}" - "${eval_root}" "${stage}" "${max_pixels}" "${page_count}" <<'PY'
+    "${python}" - "${eval_root}" "${stage}" "${max_pixels}" "${page_count}" \n        "${sequential}" <<'PY'
 import json
 import sys
 from pathlib import Path
 
-root, stage, max_pixels, page_count = Path(sys.argv[1]), sys.argv[2], int(sys.argv[3]), int(sys.argv[4])
+root, stage = Path(sys.argv[1]), sys.argv[2]
+max_pixels, page_count = int(sys.argv[3]), int(sys.argv[4])
+sequential = int(sys.argv[5])
 arms_dir = root / "arms"
 ITERATIONS = 10000
 # Stage 0's engineering target.  A target, not a measurement: it is what the stage is
@@ -369,10 +396,23 @@ if base and probed and base.get("status") != "missing" and probed.get("status") 
     if a_s and b_s:
         ratio = (b_s - a_s) / a_s
         payload["latency_overhead"] = ratio
-        verdict = "在预算内" if ratio <= LATENCY_BUDGET else "超出预算"
-        print(f"  每页 {a_s:.2f}s -> {b_s:.2f}s，{ratio:+.1%}  {verdict}（预算 {LATENCY_BUDGET:.0%}）")
-        if ratio > LATENCY_BUDGET:
-            print("  -> 先减层/减头或降观测频率，再进入阶段 1")
+        payload["sequential"] = sequential
+        # A negative overhead cannot be real: the probe only adds work.  It means the two
+        # timings were not measured under the same conditions -- in parallel the arms
+        # contend for the CPU the probe's reduction runs on.  The same comparison gave
+        # +14.2% on one page set and -4.4% on another, so this is reported as an invalid
+        # measurement rather than as a pass.
+        if ratio < 0:
+            print(f"  每页 {a_s:.2f}s -> {b_s:.2f}s，{ratio:+.1%}  **测量无效**（负开销不可能；"
+                  f"两臂需串行）")
+            print("  -> 成本判据本次未通过验证，不要记为达标")
+            ok = False
+        else:
+            verdict = "在预算内" if ratio <= LATENCY_BUDGET else "超出预算"
+            print(f"  每页 {a_s:.2f}s -> {b_s:.2f}s，{ratio:+.1%}  {verdict}"
+                  f"（预算 {LATENCY_BUDGET:.0%}）")
+            if ratio > LATENCY_BUDGET:
+                print("  -> 先减层/减头或降观测频率，再进入阶段 1")
     a_m, b_m = base.get("cuda_peak_memory_bytes"), probed.get("cuda_peak_memory_bytes")
     if a_m and b_m:
         payload["peak_memory_overhead_bytes"] = b_m - a_m
@@ -438,6 +478,7 @@ main() {
 "export GLMOCR_PROBE_LAYERS=$(printf '%q' "${probe_layers}"); "\
 "export GLMOCR_PROBE_HEADS=$(printf '%q' "${probe_heads}"); "\
 "export GLMOCR_PROBE_SUBSET_EXCLUDE=$(printf '%q' "${subset_exclude}"); "\
+"export GLMOCR_PROBE_SEQUENTIAL=$(printf '%q' "${sequential}"); "\
 "export GLMOCR_PROBE_MAX_PIXELS=$(printf '%q' "${max_pixels}"); "\
 "export GLMOCR_PROBE_CHECKPOINT=$(printf '%q' "${checkpoint}"); "\
 "export GLMOCR_PROBE_PROTOCOL=$(printf '%q' "${protocol_file}"); "\
