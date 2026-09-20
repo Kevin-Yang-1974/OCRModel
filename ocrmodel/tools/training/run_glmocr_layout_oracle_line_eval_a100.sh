@@ -330,7 +330,12 @@ else:
     elif worsened_limits:
         print("  -> 有改善但有臂触顶恶化：剂量区间需下调，先减 Bmax 再判")
     else:
-        print("  -> 行框偏置有改善趋势且无触顶恶化：值得继续（阶段 3 的预测地图）")
+        # Says nothing about the predicted map: this block judges the *oracle* arms, and the
+        # deployable form is a separate question judged separately below.  An earlier version
+        # ended this line with "worth continuing into the predicted map", which read as an
+        # endorsement of the exact arm that then came out null.
+        print("  -> oracle 行框偏置有改善趋势且无触顶恶化：真值行框这条路成立。"
+              "注意这只说明 oracle 有效，不说明预测地图有效——见下面的静态地图判定。")
     # The recorded gain was concentrated in deletions; a line bias that only moves
     # substitutions has not reproduced the mechanism.
     noroute_row = payload["arms"].get("noroute", {})
@@ -341,6 +346,66 @@ else:
         print(f"  {arm:9s} 删除 {noroute_row.get('deletions')} -> {row['deletions']}，"
               f"插入 {noroute_row.get('insertions')} -> {row['insertions']}，"
               f"替换 {noroute_row.get('substitutions')} -> {row['substitutions']}")
+
+# ---------------------------------------------------------------------------------------
+# The predicted-map arms answer a different question from the oracle ones above, and the
+# first version of this script did not judge them at all: its arm filter was `line*`, so a
+# static arm could collapse on the token limit and go unmentioned while the verdict line
+# talked about the oracle.
+#
+# What the static arms test is whether the *deployable* form of the bias exists. An oracle
+# line box says which line to look at; a predicted map biasing every line says only "look at
+# text". The dose is reported alongside, because the two are not comparable otherwise and the
+# plan asks for the static and dynamic arms to be matched on total bias weight -- without
+# that, a static arm that looks better may only be looking at more of the page.
+# ---------------------------------------------------------------------------------------
+def box_source_of(arm):
+    row = payload["arms"].get(arm, {})
+    return row.get("box_source") or (row.get("layout_routing") or {}).get("box_source")
+
+
+static_arms = [arm for arm in order if box_source_of(arm) == "pred_static" or arm.startswith("static")]
+if static_arms:
+    print()
+    print("静态预测地图的判定（只从图像出框、无指针、无标注）：")
+    noroute_row = payload["arms"].get("noroute", {})
+    noroute_limits = noroute_row.get("generation_limit_hits", 0)
+    improved_static = []
+    for arm in static_arms:
+        row = payload["arms"][arm]
+        if row.get("status") == "missing":
+            print(f"  {arm:13s} MISSING")
+            continue
+        routing = row.get("layout_routing") or {}
+        bias = routing.get("bias")
+        tokens = routing.get("mean_boxes_hit")
+        # The dose that has to be compared, not the bias value: the same B over a page-wide
+        # union is a different intervention from the same B over one line.
+        mass = (bias * tokens) if isinstance(bias, (int, float)) and isinstance(tokens, (int, float)) else None
+        stats = payload.get("comparisons", {}).get(arm, {})
+        delta = stats.get("delta_noroute_minus_arm")
+        if delta is not None and delta > 0 and stats.get("significant"):
+            improved_static.append(arm)
+        limits = row.get("generation_limit_hits", 0)
+        # Built outside the f-string: a backslash inside an f-string expression is a syntax
+        # error on the 3.11 that runs this, and nesting one is how that got here.
+        delta_text = "n/a" if delta is None else f"{delta:+.6f}"
+        ci_text = (
+            "n/a"
+            if delta is None
+            else "[{:+.6f}, {:+.6f}]".format(stats["ci_low"], stats["ci_high"])
+        )
+        mass_text = "n/a" if mass is None else f"{mass:.1f}"
+        tokens_text = 0.0 if tokens is None else tokens
+        print(f"  {arm:13s} CER {row['cer']:.6f}  ΔCER {delta_text}  CI {ci_text}  "
+              f"tokens/step {tokens_text:.1f}  total bias/step {mass_text}  触顶 {limits}"
+              + ("  <- 触顶恶化" if limits > noroute_limits else ""))
+    if not improved_static:
+        print("  -> 没有一个静态臂显著优于 noroute：**收益不来自「多看文字」，而来自「看对那一行」**。")
+        print("     静态地图这条路走不通；可部署形态必须逐步知道读的是哪一行，")
+        print("     即预测框 + 行状态（predmap_track），而它的前置是 gtmap_track。")
+    else:
+        print(f"  -> 静态预测地图有改善：{improved_static}")
 
 payload["status"] = "partial" if missing else "complete"
 if missing:
