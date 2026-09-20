@@ -23,12 +23,14 @@ import torch
 from layout_ocr.data import load_records, validate_records
 from layout_ocr.train_screen import (
     configure_deterministic_execution,
+    declared_prefix_config,
     decoder_lora_finite_report,
     evaluate,
     inject_decoder_lora,
     load_adapter_checkpoint,
     load_decoder_lora_checkpoint,
     load_model,
+    prefix_model_args,
     write_json,
 )
 
@@ -201,8 +203,27 @@ def main() -> None:
             adapter_config.get("validity_use_transport_evidence", False)
         ),
         adapter_precision=args.adapter_precision,
+        # The checkpoint declares the prefix its weights were trained with.  Taking
+        # it from the artifact rather than from a flag is what makes a prefix arm
+        # scorable at all: this evaluator is reached from launchers that never knew
+        # about the prefix, and load_adapter_checkpoint refuses to score a prefix
+        # checkpoint without one.
+        **prefix_model_args(checkpoint_dir),
     )
     model, processor, bridge = load_model(model_args, device)
+    declared_prefix = declared_prefix_config(checkpoint_dir)
+    if declared_prefix is not None:
+        runtime = getattr(bridge, "prefix_runtime", None)
+        if runtime is None:
+            raise RuntimeError("the prefix was declared but load_model did not install it")
+        # The reserved ids are rebuilt from the tokenizer here, so they are only
+        # the training ones if the vocabulary is unchanged.  A mismatch would write
+        # the trained slots into rows that mean something else.
+        if list(runtime.reserved_ids) != [int(value) for value in declared_prefix["reserved_ids"]]:
+            raise ValueError(
+                f"reserved prefix ids differ from the checkpoint's declaration: "
+                f"{runtime.reserved_ids} vs {declared_prefix['reserved_ids']}"
+            )
     decoder_lora_loaded = False
     decoder_lora_report = {
         "enabled": False,
@@ -279,6 +300,7 @@ def main() -> None:
         "decoder_lora_config": decoder_lora_config,
         "decoder_lora_loaded": decoder_lora_loaded,
         "decoder_lora_finite": decoder_lora_report,
+        "prefix": declared_prefix,
         "metrics": metrics,
         "test_used_for_selection": False,
     }

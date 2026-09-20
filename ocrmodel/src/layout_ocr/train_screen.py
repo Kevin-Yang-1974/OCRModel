@@ -1649,6 +1649,11 @@ def non_finite_gradient_names(
 
 
 PREFIX_CHECKPOINT_NAME = "layout_prefix.safetensors"
+# Written beside the weights so a checkpoint declares the prefix it carries.  An
+# evaluator that has to be *told* the configuration instead gets it wrong silently
+# the moment a caller forgets to forward the flags -- which is exactly how every
+# prefix arm's locked test came to die inside ``load_prefix_checkpoint``.
+PREFIX_CONFIG_NAME = "layout_prefix_config.json"
 
 
 def save_prefix_checkpoint(
@@ -1678,7 +1683,7 @@ def save_prefix_checkpoint(
         )
     save_file(state, path / PREFIX_CHECKPOINT_NAME)
     write_json(
-        path / "layout_prefix_config.json",
+        path / PREFIX_CONFIG_NAME,
         {
             "token_count": runtime.token_count,
             "reserved_ids": runtime.reserved_ids,
@@ -1692,6 +1697,41 @@ def save_prefix_checkpoint(
         "payload_mode": runtime.injector.payload_mode,
         "position": runtime.position,
         "step": step,
+    }
+
+
+def declared_prefix_config(path: Path) -> dict[str, Any] | None:
+    """The prefix a checkpoint declares, or ``None`` when it carries none.
+
+    Read off the artifact rather than taken from the caller's flags because the
+    checkpoint is the only thing that knows which prefix its weights were trained
+    with.  An evaluator that relies on being told has to forward four arguments
+    through three layers, and a single missed one makes it score an untrained
+    projection -- or, as the locked test did, refuse to load at all.
+    """
+
+    config_path = path / PREFIX_CONFIG_NAME
+    if not config_path.is_file():
+        return None
+    value = json.loads(config_path.read_text(encoding="utf-8"))
+    if not isinstance(value, dict):
+        raise ValueError(f"expected a JSON object: {config_path}")
+    missing = [key for key in ("token_count", "reserved_ids", "payload_mode", "position") if key not in value]
+    if missing:
+        raise ValueError(f"{config_path} is missing {missing}")
+    return value
+
+
+def prefix_model_args(path: Path) -> dict[str, Any]:
+    """The ``load_model`` arguments a checkpoint's declared prefix implies."""
+
+    declared = declared_prefix_config(path)
+    if declared is None:
+        return {"prefix_tokens": 0, "prefix_payload": "queries", "prefix_position": "front"}
+    return {
+        "prefix_tokens": int(declared["token_count"]),
+        "prefix_payload": str(declared["payload_mode"]),
+        "prefix_position": str(declared["position"]),
     }
 
 
@@ -1713,8 +1753,10 @@ def load_prefix_checkpoint(path: Path, bridge: LayoutAwarePatchMerger) -> dict[s
     if runtime is None:
         raise RuntimeError(
             f"{path} carries a trained layout prefix ({PREFIX_CHECKPOINT_NAME}) but "
-            "this run was not started with --prefix-tokens; scoring it would use the "
-            "untrained projection instead"
+            "the model was built without one, so scoring it would use the untrained "
+            "projection instead. The checkpoint declares its prefix in "
+            f"{PREFIX_CONFIG_NAME}; pass those values as --prefix-tokens/"
+            "--prefix-payload/--prefix-position, or use prefix_model_args()."
         )
     state = load_file(str(prefix_file), device="cpu")
     non_finite = [
