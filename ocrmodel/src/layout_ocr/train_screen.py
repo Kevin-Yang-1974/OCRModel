@@ -42,6 +42,7 @@ from .distributed import (
     wrap_adapter,
     wrap_model,
 )
+from .attention_tracking import TrackedLineState
 from .attention_probe import (
     PROBE_ATTR,
     install_attention_probe,
@@ -2239,6 +2240,18 @@ def load_model(args: argparse.Namespace, device: torch.device) -> tuple[Any, Any
     # zero installs the hooks with an all-zero mask, which is the arm that shows
     # the route fires on every step without changing the score.
     routing_strength = getattr(args, "layout_routing_bias", None)
+    tracked_state = None
+    if getattr(args, "layout_routing_line_source", "pointer") == "tracked":
+        if not getattr(args, "layout_attention_probe", False):
+            # Without the probe nothing writes estimates, every step would be gated, and the arm
+            # would score as no-route while looking like a failed tracker.
+            raise RuntimeError(
+                "--layout-routing-line-source tracked needs --layout-attention-probe: the probe "
+                "is what produces the line estimate the bias is aimed by"
+            )
+        if routing_strength is None:
+            raise RuntimeError("--layout-routing-line-source is meaningless without a routing bias")
+        tracked_state = TrackedLineState(args.layout_tracking_confidence)
     if (
         routing_strength is not None
         and args.layout_routing_box_source == "pred_static"
@@ -2258,6 +2271,8 @@ def load_model(args: argparse.Namespace, device: torch.device) -> tuple[Any, Any
             tokenizer=getattr(processor, "tokenizer", None),
             pointer=args.layout_routing_pointer,
             box_source=args.layout_routing_box_source,
+            line_source=args.layout_routing_line_source,
+            tracked=tracked_state,
         )
         # On the top-level model rather than the bridge: this is a text-decoder
         # route and has nothing to do with the layout adapter, but the eval loop
@@ -2276,6 +2291,8 @@ def load_model(args: argparse.Namespace, device: torch.device) -> tuple[Any, Any
             # default; both readers are only consulted on a run that asked for a probe.
             layers=args.layout_attention_probe_layers or probe_layers(),
             heads=args.layout_attention_probe_heads or probe_heads(),
+            # The same object the routing bias reads, when an arm is aimed by the estimate.
+            tracked=tracked_state,
         )
         # On the top-level model, like the routing runtime: the eval loop already
         # holds the model and arms the probe per page.
@@ -4555,6 +4572,29 @@ def parse_args() -> argparse.Namespace:
             "detector's line boxes in page-normalized coordinates. Required by the pred_static "
             "box source, which biases their union: this is the arm whose boxes come from the "
             "image rather than the annotation"
+        ),
+    )
+    parser.add_argument(
+        "--layout-routing-line-source",
+        choices=["pointer", "tracked"],
+        default="pointer",
+        help=(
+            "'pointer' is the recorded design: walk the reference text alongside the generated one "
+            "and bias the line of the character the model has reached. It needs the reference, so "
+            "it is an oracle. 'tracked' takes the line from the model's own attention, one step "
+            "behind, with no reference text anywhere in the path -- the arm that decides whether "
+            "the deployable form of this route can exist. Requires --layout-attention-probe, since "
+            "the probe is what produces the estimate"
+        ),
+    )
+    parser.add_argument(
+        "--layout-tracking-confidence",
+        type=float,
+        default=6.0,
+        help=(
+            "the gate for the tracked source, in the scale-free unit stage 1 registered: "
+            "top_line_mass * num_regions. Below this the estimate is dropped and the step left "
+            "unbiased, rather than carrying a stale line forward"
         ),
     )
     parser.add_argument(

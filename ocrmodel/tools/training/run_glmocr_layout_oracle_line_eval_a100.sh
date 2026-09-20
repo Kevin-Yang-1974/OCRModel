@@ -50,10 +50,18 @@ pointer="${GLMOCR_ORACLE_POINTER:-synced}"
 # tools/predict_lines_for_routing.py after the detector is trained; required by, and only by,
 # the arms whose boxes come from an image rather than the annotation.
 predicted_lines="${GLMOCR_ORACLE_PREDICTED_LINES:-}"
+# Stage 1's frozen probe configuration, for the tracked line source: the estimate comes
+# from layer 8 over the eight heads that localized above 93% on the select pages.
+probe_layers="${GLMOCR_ORACLE_PROBE_LAYERS:-8}"
+probe_heads="${GLMOCR_ORACLE_PROBE_HEADS:-2,3,8,10,11,12,14,15}"
+tracking_confidence="${GLMOCR_ORACLE_TRACKING_CONFIDENCE:-6.0}"
 foreground="${GLMOCR_ORACLE_FOREGROUND:-0}"
 gpu_slots="${GLMOCR_ORACLE_GPUS:-0,1,2,3}"
 
-# 臂格式：<名字>:<bias|none>:<框来源>
+# 臂格式：<名字>:<bias|none>:<框来源>[:<行来源>]，行来源缺省 pointer。
+#   pointer  沿真值文本走，取读到那个字所在的行 —— oracle，就是 26.6% 那个臂
+#   tracked  行来自模型自己的注意力（滞后一步、按登记门槛门控），路径里没有参考文本
+# tracked 必须同时装探针，否则没有估计、每一步都被门控，该臂会以「无路由」的分数收场。
 arms="${GLMOCR_ORACLE_ARMS:-noroute:none:none char2:2:char line025:0.25:line line050:0.5:line}"
 
 # 记录值（4M，149 页 validation，见 docs/LAYOUT_ATTENTION_ROUTING_RESULT.md §5）。
@@ -102,17 +110,24 @@ preflight() {
 # train_screen.py refuses to start when --output-dir already exists, so nothing may
 # pre-create the arm directory: the log lives as a sibling.
 launch() {
-    local arm="$1" bias="$2" box_source="$3" gpu="$4"
+    local arm="$1" bias="$2" box_source="$3" line_source="$4" gpu="$5"
     local out="${eval_root}/arms/${arm}"
     local -a route_flags=()
     if [[ "${bias}" != "none" ]]; then
         route_flags=(--layout-routing-bias "${bias}"
                      --layout-routing-pointer "${pointer}"
-                     --layout-routing-box-source "${box_source}")
+                     --layout-routing-box-source "${box_source}"
+                     --layout-routing-line-source "${line_source}")
         if [[ "${box_source}" == "pred_static" ]]; then
             [[ -n "${predicted_lines}" ]] \
                 || { echo "pred_static needs GLMOCR_ORACLE_PREDICTED_LINES" >&2; exit 64; }
             route_flags+=(--layout-routing-predicted-lines "${predicted_lines}")
+        fi
+        if [[ "${line_source}" == "tracked" ]]; then
+            route_flags+=(--layout-attention-probe
+                          --layout-attention-probe-layers "${probe_layers}"
+                          --layout-attention-probe-heads "${probe_heads}"
+                          --layout-tracking-confidence "${tracking_confidence}")
         fi
     fi
     (
@@ -120,6 +135,7 @@ launch() {
         export CUDA_VISIBLE_DEVICES="${gpu}"
         export GLMOCR_ADAPTER_PROBE="${out}.adapter.jsonl"
         export GLMOCR_ROUTING_PROBE="${out}.routing.jsonl"
+        export GLMOCR_ATTENTION_PROBE="${out}.attention.jsonl"
         cd "${code_root}"
         exec "${python}" -m layout_ocr.train_screen \
             --mode geometry --model-path "${model_dir}" \
@@ -151,9 +167,10 @@ run_arms() {
     local -a pids=() labels=() failed=0
     local index=0 spec
     for spec in ${arms}; do
-        IFS=':' read -r arm bias box_source <<< "${spec}"
+        IFS=':' read -r arm bias box_source line_source <<< "${spec}"
+        line_source="${line_source:-pointer}"
         local gpu="${slots[$(( index % total ))]}"
-        launch "${arm}" "${bias}" "${box_source}" "${gpu}" &
+        launch "${arm}" "${bias}" "${box_source}" "${line_source}" "${gpu}" &
         pids+=("$!"); labels+=("${arm}")
         index=$(( index + 1 ))
         if (( index % total == 0 )); then
@@ -442,10 +459,15 @@ main() {
 "export GLMOCR_ORACLE_MAX_PIXELS=$(printf '%q' "${max_pixels}"); "\
 "export GLMOCR_ORACLE_CHECKPOINT=$(printf '%q' "${checkpoint}"); "\
 "export GLMOCR_ORACLE_PROTOCOL=$(printf '%q' "${protocol_file}"); "\
-"export GLMOCR_ORACLE_PREDICTED_LINES=$(printf '%q' "${predicted_lines}"); "
+"export GLMOCR_ORACLE_PREDICTED_LINES=$(printf '%q' "${predicted_lines}"); "\
+"export GLMOCR_ORACLE_PROBE_LAYERS=$(printf '%q' "${probe_layers}"); "\
+"export GLMOCR_ORACLE_PROBE_HEADS=$(printf '%q' "${probe_heads}"); "\
+"export GLMOCR_ORACLE_TRACKING_CONFIDENCE=$(printf '%q' "${tracking_confidence}"); "
     local required name
     for name in GLMOCR_ORACLE_PREDICTED_LINES GLMOCR_ORACLE_ARMS GLMOCR_ORACLE_POINTER \
-                GLMOCR_ORACLE_MAX_PIXELS GLMOCR_ORACLE_CHECKPOINT GLMOCR_ORACLE_PROTOCOL; do
+                GLMOCR_ORACLE_MAX_PIXELS GLMOCR_ORACLE_CHECKPOINT GLMOCR_ORACLE_PROTOCOL \
+                GLMOCR_ORACLE_PROBE_LAYERS GLMOCR_ORACLE_PROBE_HEADS \
+                GLMOCR_ORACLE_TRACKING_CONFIDENCE; do
         case "${tmux_env}" in
             *"export ${name}="*) ;;
             *) echo "re-export missing for ${name}: the tmux shell would not see it" >&2; exit 64 ;;

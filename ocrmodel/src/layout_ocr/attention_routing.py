@@ -100,6 +100,16 @@ ROUTING_ATTR = "layout_attention_routing"
 #               that looks better may only be looking at more of the page.
 BOX_SOURCES = ("char", "line", "pred_static")
 
+# What decides *which* box gets biased, for the sources where that is a separate question.
+#
+# ``pointer``  the recorded design: walk the reference text alongside the generated one and take the
+#              line of the character the model has reached.  Needs the reference, so it is an
+#              oracle, and it is what the 26.6% arm uses.
+# ``tracked``  the model's own attention estimate of the current line, taken from
+#              ``attention_tracking`` one step behind.  No reference text anywhere in the path:
+#              this is the arm that says whether the deployable form can exist at all.
+LINE_SOURCES = ("pointer", "tracked")
+
 # How the box for the current step is chosen.
 #
 # ``step``   the t-th box for the t-th generated character.  This is the only
@@ -151,6 +161,8 @@ class AttentionRouting:
         tokenizer: Any | None = None,
         pointer: str = "synced",
         box_source: str = "char",
+        line_source: str = "pointer",
+        tracked: Any | None = None,
     ) -> None:
         if bias < 0:
             raise ValueError("AttentionRouting needs a non-negative bias")
@@ -158,7 +170,21 @@ class AttentionRouting:
             raise ValueError(f"pointer must be one of {POINTER_MODES}, got {pointer!r}")
         if box_source not in BOX_SOURCES:
             raise ValueError(f"box_source must be one of {BOX_SOURCES}, got {box_source!r}")
-        if pointer == "synced" and tokenizer is None:
+        if line_source not in LINE_SOURCES:
+            raise ValueError(f"line_source must be one of {LINE_SOURCES}, got {line_source!r}")
+        if line_source == "tracked" and (box_source != "line" or tracked is None):
+            # The tracked source replaces the pointer for choosing *which* line, so it only means
+            # anything where a line is what gets biased, and it needs the state to read from.
+            raise ValueError(
+                "line_source='tracked' needs box_source='line' and a tracked state to read"
+            )
+        # The tokenizer is only needed when a pointer will actually decide something. The static
+        # source biases every line and the tracked source reads its line from the attention, so in
+        # both the pointer is inert and demanding a tokenizer for it would be a requirement on
+        # nothing -- and would push a caller into passing the reference text to an arm whose point
+        # is that it has none.
+        pointer_in_use = box_source != "pred_static" and line_source != "tracked"
+        if pointer == "synced" and pointer_in_use and tokenizer is None:
             raise ValueError("the synced pointer needs a tokenizer to read the generated ids")
         self.bridge = bridge
         self.bias = float(bias)
@@ -166,6 +192,9 @@ class AttentionRouting:
         self.tokenizer = tokenizer
         self.pointer = pointer
         self.box_source = box_source
+        self.line_source = line_source
+        self.tracked = tracked
+        self.gated = 0
         # The line each character sits on, resolved once per page from the character boxes and
         # the region boxes.  Per character index, not per step, so a step only looks it up.
         self.regions: list[dict[str, Any]] = []
@@ -216,6 +245,11 @@ class AttentionRouting:
         in all three.
         """
 
+        self.gated = 0
+        if self.tracked is not None:
+            # A new page invalidates the estimate: the previous page's line says nothing about
+            # this one, and leaving it would aim the first steps at a line that may not exist.
+            self.tracked.set_page()
         self.predicted_lines = [list(box) for box in (predicted_lines or [])]
         self._static_inside = None
         self.regions = sorted(regions or [], key=lambda item: int(item["reading_order"]))
@@ -402,20 +436,37 @@ class AttentionRouting:
         if self.box_source == "pred_static":
             # No pointer and no annotation: the mask is the page's, not the step's.
             return self._static_mask(kv_length, device, dtype)
-        if self.characters is None or self.visual_count in (None, 0) or self.visual_start is None:
+        if self.visual_count in (None, 0) or self.visual_start is None:
             return None
-        if not 0 <= step < len(self.characters):
-            return None
-        if self.box_source == "line":
-            # The line the character being read sits on.  A missing character box means no
-            # line either -- see _resolve_char_lines.
-            line = self._char_lines[step] if step < len(self._char_lines) else -1
-            if line < 0 or line >= len(self.regions):
+        if self.box_source == "line" and self.line_source == "tracked":
+            # Reads the attention's line, so it needs neither the character channel nor the
+            # reference.  A gated or not-yet-available estimate is counted apart from a missing
+            # box: "the gate withheld the bias" and "there was no box to bias" are different
+            # failures and the report has to tell them apart.
+            line = int(getattr(self.tracked, "line", -1))
+            if line < 0:
+                self.gated += 1
+                return None
+            if line >= len(self.regions):
                 self.missing += 1
                 return None
             box = self.regions[line]["bbox"]
         else:
-            box = (self.characters[step] or {}).get("bbox")
+            # Everything else is driven by the character being read, so it needs the character
+            # channel.  Guarding that here rather than above keeps the tracked source from being
+            # rejected for lacking something it never uses.
+            if self.characters is None or not 0 <= step < len(self.characters):
+                return None
+            if self.box_source == "line":
+                # The line that character sits on.  A missing character box means no line either --
+                # see _resolve_char_lines.
+                line = self._char_lines[step] if step < len(self._char_lines) else -1
+                if line < 0 or line >= len(self.regions):
+                    self.missing += 1
+                    return None
+                box = self.regions[line]["bbox"]
+            else:
+                box = (self.characters[step] or {}).get("bbox")
         if box is None:
             # The annotation has no box for this character.  Fabricating one would
             # put an invented location under the one arm whose point is spatial
@@ -502,6 +553,9 @@ class AttentionRouting:
             "bias": self.bias,
             "pointer": self.pointer,
             "box_source": self.box_source,
+            "line_source": self.line_source,
+            "gated_steps": self.gated,
+            "tracked": (self.tracked.report() if self.line_source == "tracked" else None),
             "characters_on_a_line": (
                 sum(1 for line in self._char_lines if line >= 0) if self._char_lines else None
             ),
@@ -527,6 +581,8 @@ def install_attention_routing(
     tokenizer: Any | None = None,
     pointer: str = "synced",
     box_source: str = "char",
+    line_source: str = "pointer",
+    tracked: Any | None = None,
 ) -> tuple[AttentionRouting, list[Any]]:
     """Register the bias hook on every text decoder layer.
 
@@ -543,7 +599,9 @@ def install_attention_routing(
     image_token_id = getattr(model.config, "image_token_id", None)
     if image_token_id is None:
         image_token_id = getattr(getattr(model.config, "text_config", None), "image_token_id", None)
-    runtime = AttentionRouting(bridge, bias, image_token_id, tokenizer, pointer, box_source)
+    runtime = AttentionRouting(
+        bridge, bias, image_token_id, tokenizer, pointer, box_source, line_source, tracked
+    )
     handles = [
         # The model's own pre-hook first: it runs outside every layer, so the
         # pointer it advances is the one those layers use for this same forward.

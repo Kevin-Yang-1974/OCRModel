@@ -241,11 +241,15 @@ class AttentionProbe:
         *,
         layers: tuple[int, ...] = DEFAULT_LAYERS,
         heads: tuple[int, ...] | None = None,
+        tracked: Any | None = None,
     ) -> None:
         self.bridge = bridge
         self.image_token_id = image_token_id
         self.layers = tuple(layers)
         self.heads = None if heads is None else tuple(heads)
+        # Where to publish this step's line estimate, for an arm that aims the bias by it.  The
+        # probe does not know or care what reads it; see attention_tracking.
+        self.tracked = tracked
         # Per-page state, resolved by ``set_page``.
         self.page_id: str | None = None
         self.visual_start: int | None = None
@@ -582,6 +586,14 @@ class AttentionProbe:
         self._records.append(
             {"step": step, "text_keys": self._text_key_count(layer), "heads": records}
         )
+        if self.tracked is not None:
+            # Publish this step's estimate for an arm that aims its bias by it.  Written here, on a
+            # post-hook, so a reader hooked earlier in the next forward sees the previous step's
+            # value -- which is the one-step lag the plan asks for, and it needs no extra state.
+            from .attention_tracking import aggregate_line_estimate
+
+            line, confidence = aggregate_line_estimate(records, int(self.num_regions or 0))
+            self.tracked.observe(line, confidence)
 
     def _in_line_position(self, dist: Tensor, owners: Tensor, line: int) -> float:
         """Attention-weighted position along the chosen line's reading direction.
@@ -925,6 +937,7 @@ def install_attention_probe(
     *,
     layers: tuple[int, ...] = DEFAULT_LAYERS,
     heads: tuple[int, ...] | None = None,
+    tracked: Any | None = None,
 ) -> tuple[AttentionProbe, list[Any]]:
     """Register observation hooks on the selected decoder attention modules.
 
@@ -936,7 +949,7 @@ def install_attention_probe(
     image_token_id = getattr(model.config, "image_token_id", None)
     if image_token_id is None:
         image_token_id = getattr(getattr(model.config, "text_config", None), "image_token_id", None)
-    runtime = AttentionProbe(bridge, image_token_id, layers=layers, heads=heads)
+    runtime = AttentionProbe(bridge, image_token_id, layers=layers, heads=heads, tracked=tracked)
     candidates = _find_attention_modules(model)
     available = {index for index, _ in candidates}
     missing = [index for index in layers if index not in available]

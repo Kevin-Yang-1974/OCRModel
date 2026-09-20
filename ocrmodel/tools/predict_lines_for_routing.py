@@ -49,7 +49,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--min-size", type=int, default=1000)
     parser.add_argument("--max-size", type=int, default=2000)
-    parser.add_argument("--score-threshold", type=float, default=0.3)
+    parser.add_argument(
+        "--score-threshold",
+        type=float,
+        default=0.2,
+        help=(
+            "detections below this are dropped. The audit's score sweep found recall and "
+            "precision identical at 0.05, 0.10 and 0.20 -- nothing lands in between, the score "
+            "distribution is confident-or-absent -- so anything at or below 0.2 keeps the same "
+            "boxes, and 0.3 throws away 2.3 recall points that a union bias wants. 0.2 rather "
+            "than 0.05 only keeps the file smaller"
+        ),
+    )
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--limit", type=int, default=0)
     return parser.parse_args(argv)
