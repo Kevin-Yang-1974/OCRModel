@@ -3667,11 +3667,21 @@ def _routing_summary(reports: list[dict[str, Any]]) -> dict[str, Any] | None:
         # biased a character or a whole line, and that distinction is the entire reason the
         # line arms exist.
         "box_source": reports[0].get("box_source"),
+        # Which box list a line index refers to, and where the line came from.  An arm whose map
+        # is the detector reads no annotation, and that is the difference the deployability
+        # question turns on, so it belongs next to the score.
+        "line_map": reports[0].get("line_map"),
+        "line_source": reports[0].get("line_source"),
         "characters_on_a_line": reports[0].get("characters_on_a_line"),
+        "predicted_lines": reports[0].get("predicted_lines"),
         "decoding_steps": steps,
         "biased_steps": biased,
         "biased_fraction": biased / max(1, steps),
         "missing_box_steps": sum(report["missing_box_steps"] for report in reports),
+        # Steps the gate withheld.  Kept apart from a missing box because they mean opposite
+        # things: a gated step is the design working, a missing box is a gap in the map.
+        "gated_steps": sum(report.get("gated_steps", 0) for report in reports),
+        "tracked": reports[0].get("tracked"),
         "mean_boxes_hit": sum(hits) / len(hits) if hits else None,
         "visual_tokens": reports[0]["visual_tokens"],
     }

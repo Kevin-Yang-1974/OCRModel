@@ -247,12 +247,35 @@ for arm in order:
         "generation_mean_new_tokens": metrics.get("generation_mean_new_tokens"),
         "layout_routing": metrics.get("layout_routing"),
     }
+    # The routing aggregates come from the per-page probe file rather than from summary.json: it is
+    # the raw evidence, it is written by the routing module itself, and reading it means a verdict
+    # can be recomputed from a past run without redoing any inference -- and cannot go blind because
+    # an older summary block happened not to carry a field.
     probe_path = arms_dir / (arm + ".routing.jsonl")
     if probe_path.exists():
         rows = [json.loads(line) for line in probe_path.read_text(encoding="utf-8").splitlines() if line.strip()]
         if rows:
-            payload["pointer"] = rows[0]["pointer"]
-            record["box_source"] = rows[0].get("box_source")
+            steps = sum(int(row.get("decoding_steps", 0)) for row in rows)
+            biased = sum(int(row.get("biased_steps", 0)) for row in rows)
+            hits = [row["mean_boxes_hit"] for row in rows if row.get("mean_boxes_hit") is not None]
+            routing = {
+                "pages": len(rows),
+                "bias": rows[0].get("bias"),
+                "box_source": rows[0].get("box_source"),
+                "line_source": rows[0].get("line_source"),
+                "line_map": rows[0].get("line_map"),
+                "pointer": rows[0].get("pointer"),
+                "predicted_lines": rows[0].get("predicted_lines"),
+                "decoding_steps": steps,
+                "biased_steps": biased,
+                "biased_fraction": biased / max(1, steps),
+                "gated_steps": sum(int(row.get("gated_steps", 0)) for row in rows),
+                "missing_box_steps": sum(int(row.get("missing_box_steps", 0)) for row in rows),
+                "mean_boxes_hit": sum(hits) / len(hits) if hits else None,
+            }
+            payload["pointer"] = routing["pointer"]
+            record["box_source"] = routing["box_source"]
+            record["layout_routing"] = routing
     payload["arms"][arm] = record
 
 print(f"{'arm':9s} {'CER':>10s} {'sub':>6s} {'ins':>6s} {'del':>6s} {'genlim':>7s} "
@@ -300,13 +323,26 @@ for arm in order:
         continue
     routing = row.get("layout_routing") or {}
     fraction = routing.get("biased_fraction", 0.0)
-    if fraction < 0.9:
-        print(f"  {arm:9s} 只有 {fraction:.1%} 的解码步拿到偏置：接线未接通，本臂无效")
+    gated = routing.get("gated_steps", 0)
+    missing = routing.get("missing_box_steps", 0)
+    steps = routing.get("decoding_steps", 0)
+    # Every step has to be accounted for: biased, withheld by the gate, or missing a box it should
+    # have had.  The old rule failed an arm below 0.9 coverage, which is right for the oracle arms
+    # -- a step without a bias there is a wiring fault -- and wrong for a gated one, where
+    # withholding on a low-confidence step is the design.  It called two working arms unwired.
+    unaccounted = steps - routing.get("biased_steps", 0) - gated - missing
+    if missing or unaccounted or routing.get("biased_steps", 0) == 0:
+        print(f"  {arm:11s} 接线有问题：偏置 {routing.get('biased_steps')} + 门控 {gated} + "
+              f"缺框 {missing} != {steps} 步（未记账 {unaccounted}）")
         ok = False
+    elif gated:
+        print(f"  {arm:11s} {fraction:.1%} 的解码步拿到偏置，{gated} 步被门控扣下（设计如此），"
+              f"平均命中 {routing.get('mean_boxes_hit'):.1f} 个 token"
+              f"（框来源 {routing.get('box_source')}，地图 {routing.get('line_map')}）")
     else:
-        print(f"  {arm:9s} {fraction:.1%} 的解码步拿到偏置，"
+        print(f"  {arm:11s} {fraction:.1%} 的解码步拿到偏置，"
               f"平均命中 {routing.get('mean_boxes_hit'):.1f} 个视觉 token"
-              f"（框来源 {routing.get('box_source')}）")
+              f"（框来源 {routing.get('box_source')}，地图 {routing.get('line_map')}）")
 
 print()
 print(f"配对 bootstrap（{ITERATIONS} 次重采样，按页配对），基准 noroute：")
@@ -476,27 +512,18 @@ main() {
     # from this list is silently absent inside -- which is how a pred_static run came to abort on
     # its own missing-file guard while the arms that did not need the file went ahead.  The list
     # below is checked against the sources that read it rather than trusted.
-    local tmux_env
-    tmux_env="export GLMOCR_ORACLE_RUN_ID=$(printf '%q' "${run_id}"); "\
-"export GLMOCR_ORACLE_GPUS=$(printf '%q' "${gpu_slots}"); "\
-"export GLMOCR_ORACLE_ARMS=$(printf '%q' "${arms}"); "\
-"export GLMOCR_ORACLE_POINTER=$(printf '%q' "${pointer}"); "\
-"export GLMOCR_ORACLE_MAX_PIXELS=$(printf '%q' "${max_pixels}"); "\
-"export GLMOCR_ORACLE_CHECKPOINT=$(printf '%q' "${checkpoint}"); "\
-"export GLMOCR_ORACLE_PROTOCOL=$(printf '%q' "${protocol_file}"); "\
-"export GLMOCR_ORACLE_PREDICTED_LINES=$(printf '%q' "${predicted_lines}"); "\
-"export GLMOCR_ORACLE_PROBE_LAYERS=$(printf '%q' "${probe_layers}"); "\
-"export GLMOCR_ORACLE_PROBE_HEADS=$(printf '%q' "${probe_heads}"); "\
-"export GLMOCR_ORACLE_TRACKING_CONFIDENCE=$(printf '%q' "${tracking_confidence}"); "
-    local required name
-    for name in GLMOCR_ORACLE_PREDICTED_LINES GLMOCR_ORACLE_ARMS GLMOCR_ORACLE_POINTER \
-                GLMOCR_ORACLE_MAX_PIXELS GLMOCR_ORACLE_CHECKPOINT GLMOCR_ORACLE_PROTOCOL \
-                GLMOCR_ORACLE_PROBE_LAYERS GLMOCR_ORACLE_PROBE_HEADS \
-                GLMOCR_ORACLE_TRACKING_CONFIDENCE; do
-        case "${tmux_env}" in
-            *"export ${name}="*) ;;
-            *) echo "re-export missing for ${name}: the tmux shell would not see it" >&2; exit 64 ;;
-        esac
+    # One list drives both the exports and the check, because two hand-kept lists is how a new
+    # variable came to be missing from both: the baseline directory was added as a knob, never
+    # re-exported, and the summarize then ran without a control while the check said nothing.
+    local -a tmux_names=(
+        GLMOCR_ORACLE_RUN_ID GLMOCR_ORACLE_GPUS GLMOCR_ORACLE_ARMS GLMOCR_ORACLE_POINTER
+        GLMOCR_ORACLE_MAX_PIXELS GLMOCR_ORACLE_CHECKPOINT GLMOCR_ORACLE_PROTOCOL
+        GLMOCR_ORACLE_PREDICTED_LINES GLMOCR_ORACLE_PROBE_LAYERS GLMOCR_ORACLE_PROBE_HEADS
+        GLMOCR_ORACLE_TRACKING_CONFIDENCE GLMOCR_ORACLE_BASELINE_DIR
+    )
+    local tmux_env="" name
+    for name in "${tmux_names[@]}"; do
+        tmux_env+="export ${name}=$(printf '%q' "${!name}"); "
     done
     tmux new-session -d -s "${session}" \
         "${tmux_env}bash $(printf '%q' "${script_path}") --foreground > ${eval_root}/pipeline.log 2>&1"
