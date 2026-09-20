@@ -63,7 +63,7 @@ baseline_dir="${GLMOCR_ORACLE_BASELINE_DIR:-}"
 foreground="${GLMOCR_ORACLE_FOREGROUND:-0}"
 gpu_slots="${GLMOCR_ORACLE_GPUS:-0,1,2,3}"
 
-# 臂格式：<名字>:<bias|none>:<框来源>[:<行来源>[:<地图来源>[:<门控门槛>[:<预测框文件>[:<偏置校正>]]]]]
+# 臂格式：<名字>:<bias|none>:<框来源>[:<行来源>[:<地图来源>[:<门控门槛>[:<预测框文件>[:<偏置校正>[:<下一行份额>]]]]]]
 #   最后一个字段让每个臂用自己的地图：比较「同一张地图换门槛」与「同一门槛换地图」都需要它。
 #   缺省：行来源 pointer、地图来源 regions、门控门槛由 GLMOCR_ORACLE_TRACKING_CONFIDENCE 给。
 #   门控与地图都要按臂变：同一轮里比较「同一张图换门槛」或「同一门槛换地图」才有意义。
@@ -73,6 +73,10 @@ gpu_slots="${GLMOCR_ORACLE_GPUS:-0,1,2,3}"
 # 第 8 个字段 `<偏置校正>`（0/1）把路由加在读数上的偏置除掉再送进门控：偏置会把被偏置那一行
 # 的权重乘 e^B，而门槛登记的正是这个被抬高过的量（见 docs/LAYOUT_LINE_DETECTOR_AND_PREDMAP_RESULT.md
 # §8）。同一轮里必须同时有 0 和 1，否则「门槛/剂量」与「校正」两个变量分不开。
+# 第 9 个字段 `<下一行份额>` 让读序里的**下一行**也带一份偏置。被偏置的那一行按构造滞后一步，
+# 离线重放把代价量到 8.5% 的字符上，而其中 88–95% 是各自行内的前三个字 —— 正是跟踪器还没跟上的
+# 那一步。覆盖下一行在这些字符上指向正确的列；在其余字符上它以这个份额加进一个错的列，
+# 这份稀释成本离线测不出来，只能在这一轮里看。
 arms="${GLMOCR_ORACLE_ARMS:-noroute:none:none char2:2:char line025:0.25:line line050:0.5:line}"
 
 # 记录值（4M，149 页 validation，见 docs/LAYOUT_ATTENTION_ROUTING_RESULT.md §5）。
@@ -122,7 +126,7 @@ preflight() {
 # pre-create the arm directory: the log lives as a sibling.
 launch() {
     local arm="$1" bias="$2" box_source="$3" line_source="$4" line_map="$5" confidence="$6"
-    local arm_predicted="$7" arm_corrected="$8" gpu="$9"
+    local arm_predicted="$7" arm_corrected="$8" arm_next_scale="$9" gpu="${10}"
     # An arm may carry its own map file.  Comparing two maps at one gate needs both in the same run,
     # and the gate has to be held fixed while the map changes or a difference could be either.
     local arm_lines="${arm_predicted:-${predicted_lines}}"
@@ -153,6 +157,9 @@ launch() {
                           --layout-tracking-confidence "${confidence}")
             if [[ "${arm_corrected}" == "1" ]]; then
                 route_flags+=(--layout-tracking-corrected-confidence)
+            fi
+            if [[ -n "${arm_next_scale}" && "${arm_next_scale}" != "0" ]]; then
+                route_flags+=(--layout-routing-next-line-scale "${arm_next_scale}")
             fi
         fi
     fi
@@ -199,7 +206,7 @@ run_arms() {
     local -a pids=() labels=() failed=0
     local index=0 spec
     for spec in ${arms}; do
-        IFS=':' read -r arm bias box_source line_source line_map confidence arm_predicted arm_corrected <<< "${spec}"
+        IFS=':' read -r arm bias box_source line_source line_map confidence arm_predicted arm_corrected arm_next_scale <<< "${spec}"
         line_source="${line_source:-pointer}"
         line_map="${line_map:-regions}"
         confidence="${confidence:-${tracking_confidence}}"
@@ -358,6 +365,9 @@ def arm_note(row):
     if routing.get("line_source") == "tracked":
         parts.append(f"gate {config.get('confidence', '?')}")
         parts.append("corrected" if str(config.get("corrected")) == "1" else "raw")
+        scale = config.get("next_line_scale")
+        if scale not in (None, 0, "0"):
+            parts.append(f"next+{scale}")
     return "  ".join(parts)
 
 
@@ -623,6 +633,17 @@ main() {
         "GLMOCR_ORACLE_PROBE_HEADS=${probe_heads}"
         "GLMOCR_ORACLE_TRACKING_CONFIDENCE=${tracking_confidence}"
         "GLMOCR_ORACLE_BASELINE_DIR=${baseline_dir}"
+        # The paths, re-exported at their resolved values.  These are read at the top of the
+        # script, so the tmux shell recomputes them from its own environment -- and a caller who
+        # set one to point somewhere else had it silently dropped.  That is how a run aimed at a
+        # 28-page subset came to evaluate all 149: the subset root was set in the launching shell,
+        # absent from this list, and the default came back.
+        "GLMOCR_MTHV2_SPARSE_Q32_ROOT=${sparse_root}"
+        "GLMOCR_A100_ROOT=${remote_root}"
+        "GLMOCR_A100_CODE_ROOT=${code_root}"
+        "GLMOCR_A100_MODEL=${model_dir}"
+        "GLMOCR_A100_ENV=${env_dir}"
+        "GLMOCR_A100_NVIDIA_ENV=${nvidia_env}"
     )
     local tmux_env="" pair
     for pair in "${tmux_pairs[@]}"; do
@@ -633,6 +654,7 @@ main() {
     local -a required=(
         GLMOCR_ORACLE_ARMS GLMOCR_ORACLE_PREDICTED_LINES GLMOCR_ORACLE_PROBE_LAYERS
         GLMOCR_ORACLE_PROBE_HEADS GLMOCR_ORACLE_TRACKING_CONFIDENCE GLMOCR_ORACLE_BASELINE_DIR
+        GLMOCR_MTHV2_SPARSE_Q32_ROOT
     )
     local name
     for name in "${required[@]}"; do

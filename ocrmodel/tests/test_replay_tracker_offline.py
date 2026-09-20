@@ -19,6 +19,7 @@ sys.path.insert(0, str(TOOLS))
 
 from replay_tracker_offline import (  # noqa: E402
     correct_head,
+    merge,
     policy_hold,
     policy_mono,
     policy_mono_hold,
@@ -176,3 +177,55 @@ def test_a_policy_that_never_accepts_reports_no_coverage():
     entry = outcome["policies"]["recorded@99"]
     assert entry["accepted_steps"] == 0
     assert entry["coverage"] == 0.0
+
+
+def test_window_scores_count_a_hit_on_the_next_line():
+    """The lag costs the characters just after a line boundary; the window sizes that cost.
+
+    The applied line at step 2 is step 1's estimate, which is line 0 while the truth there is
+    line 1.  A mask covering line 0 and line 1 would have aimed at the right column, so the
+    window is the localization half of what the plan asks for -- the dose half is not free and
+    is not in this number.
+    """
+
+    report, record = _page_setup()
+    outcome = replay_page(
+        report, record, record["page_text"], layers=(8,), heads=(2,), bias=1.0, bars=[BAR]
+    )
+    entry = outcome["policies"][f"recorded@{BAR:g}"]
+    assert entry["applied_correct"] == 0
+    assert entry["window_next_correct"] == 1
+    assert entry["window_prev_correct"] == 0
+    assert entry["window_both_correct"] == 1
+
+
+def test_window_never_counts_an_unbiased_step():
+    report, record = _page_setup()
+    outcome = replay_page(
+        report, record, record["page_text"], layers=(8,), heads=(2,), bias=1.0, bars=[99.0]
+    )
+    entry = outcome["policies"]["recorded@99"]
+    assert entry["window_next_correct"] == 0
+    assert entry["window_both_correct"] == 0
+
+
+def test_merge_adds_the_window_counters():
+    """The per-page entries and the run totals have to carry the same keys.
+
+    The totals dict is built by ``setdefault`` from a literal, so a field added to the per-page
+    entry but not to that literal fails only when a page is merged -- which the page-level tests
+    never do.
+    """
+
+    report, record = _page_setup()
+    outcome = replay_page(
+        report, record, record["page_text"], layers=(8,), heads=(2,), bias=1.0, bars=[BAR]
+    )
+    totals: dict = {}
+    merge(totals, outcome)
+    key = f"recorded@{BAR:g}"
+    assert totals[key]["window_next_correct"] == 1
+    assert totals[key]["chars"] == 2
+    merge(totals, outcome)  # a second page accumulates rather than replacing
+    assert totals[key]["chars"] == 4
+    assert totals[key]["window_next_correct"] == 2

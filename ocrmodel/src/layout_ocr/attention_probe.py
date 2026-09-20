@@ -254,6 +254,7 @@ class AttentionProbe:
         box_map: str = "regions",
         routing_bias: float = 0.0,
         correct_confidence: bool = False,
+        next_line_scale: float = 0.0,
     ) -> None:
         if box_map not in BOX_MAPS:
             raise ValueError(f"box_map must be one of {BOX_MAPS}, got {box_map!r}")
@@ -266,6 +267,9 @@ class AttentionProbe:
         # divide it back out before estimating the line.  See ``_uncorrected_dist``.
         self.routing_bias = float(routing_bias)
         self.correct_confidence = bool(correct_confidence)
+        # The share of the bias the routing put on the next line, so the correction divides out
+        # both.  Zero is the one-line arm every earlier result used.
+        self.next_line_scale = float(next_line_scale)
         self.bias_corrected_steps = 0
         self.bridge = bridge
         self.image_token_id = image_token_id
@@ -552,23 +556,52 @@ class AttentionProbe:
             mask_vis, mask_text = self._split_mask(mask, layer)
         return self._reduce(layer, query, visual, self._text_keys(layer), mask_vis, mask_text)
 
-    def _tokens_inside_line(self, line: int) -> Tensor | None:
-        """Which visual tokens the routing biased, exactly as the routing decided it.
+    def _bias_added_per_token(self, line: int) -> Tensor | None:
+        """The logit the routing added to each visual token, exactly as the routing decided it.
 
-        The same box test ``attention_routing._mask_for`` applies to the patch grid, rebuilt here
-        rather than reusing the region owners: an owner is resolved by first-in-reading-order
-        among the boxes that contain a token, so two overlapping regions would put a token in one
-        line here and bias it under the other there.  The correction has to subtract the bias that
-        was actually added, so it follows the routing's rule.
+        The box test ``attention_routing`` applies to the patch grid, rebuilt here rather than
+        reusing the region owners: an owner is resolved by first-in-reading-order among the boxes
+        that contain a token, so two overlapping regions would put a token in one line here and
+        bias it under the other there.  The correction has to subtract the bias that was actually
+        added, so it follows the routing's rule -- including the share that lands on the next line
+        when one is configured.
         """
 
-        if line < 0 or line >= len(self._regions) or not self.visual_count:
+        outside = self._blank_bias()
+        if outside is None or line < 0:
+            return None
+        added = torch.zeros_like(outside)
+        covered = torch.zeros_like(outside, dtype=torch.bool)
+        for offset, share in ((0, 1.0), (1, self.next_line_scale)):
+            index = line + offset
+            if share <= 0.0 or index >= len(self._regions):
+                continue
+            inside = self._tokens_inside_box(self._regions[index].get("bbox"))
+            if inside is None:
+                continue
+            # The routing adds the share only where the current line does not already cover the
+            # token, so a token in both boxes must not be divided by more than was added.
+            added = added + (inside & ~covered).to(added.dtype) * (self.routing_bias * share)
+            covered = covered | inside
+        return added if bool(covered.any()) else None
+
+    def _blank_bias(self) -> Tensor | None:
+        """A zero tensor over the visual tokens, or ``None`` when the grid is not available.
+
+        The grid is only read for its device and length: the accumulator's dtype has to be a
+        float, and the patch positions are integers.
+        """
+
+        grid = getattr(self.bridge, "last_patch_positions", None)
+        if not self.visual_count or grid is None or grid.shape[1] != self.visual_count:
+            return None
+        return torch.zeros(self.visual_count, dtype=torch.float32, device=grid.device)
+
+    def _tokens_inside_box(self, box: list[float] | None) -> Tensor | None:
+        if not box or not self.visual_count:
             return None
         grid = getattr(self.bridge, "last_patch_positions", None)
         if grid is None or grid.shape[1] != self.visual_count:
-            return None
-        box = self._regions[line].get("bbox")
-        if not box:
             return None
         points = grid[0].to(device=grid.device, dtype=torch.float32)
         return (
@@ -577,6 +610,13 @@ class AttentionProbe:
             & (points[:, 1] >= float(box[1]))
             & (points[:, 1] <= float(box[3]))
         )
+
+    def _tokens_inside_line(self, line: int) -> Tensor | None:
+        """The routing's box mask for one line, ignoring any next-line share."""
+
+        if line < 0 or line >= len(self._regions):
+            return None
+        return self._tokens_inside_box(self._regions[line].get("bbox"))
 
     def _observe_step(self, layer: int, step: int, query: Tensor, mask: Tensor | None) -> None:
         """Reduce one decode step's attention over the visual keys and record it."""
@@ -610,10 +650,11 @@ class AttentionProbe:
         corrected_from = -1
         if self.correct_confidence and self.tracked is not None:
             biased_line = int(getattr(self.tracked, "line", -1))
-            inside = self._tokens_inside_line(biased_line)
-            if inside is not None and bool(inside.any()):
-                factor = math.exp(-self.routing_bias)
-                dist = dist * torch.where(inside.unsqueeze(0), factor, torch.ones_like(dist))
+            added = self._bias_added_per_token(biased_line)
+            if added is not None and bool(added.any()):
+                # Every visual token's weight was multiplied by e^added, so dividing by exactly
+                # that puts the distribution back where no bias was applied.
+                dist = dist * torch.exp(-added).unsqueeze(0)
                 total = dist.sum(dim=-1, keepdim=True)
                 # A head that put no mass inside the biased line is unchanged by the bias, and
                 # dividing by its own total leaves it that way; clamp only guards a zero row.
@@ -1092,6 +1133,7 @@ def install_attention_probe(
     box_map: str = "regions",
     routing_bias: float = 0.0,
     correct_confidence: bool = False,
+    next_line_scale: float = 0.0,
 ) -> tuple[AttentionProbe, list[Any]]:
     """Register observation hooks on the selected decoder attention modules.
 
@@ -1112,6 +1154,7 @@ def install_attention_probe(
         box_map=box_map,
         routing_bias=routing_bias,
         correct_confidence=correct_confidence,
+        next_line_scale=next_line_scale,
     )
     candidates = _find_attention_modules(model)
     available = {index for index, _ in candidates}

@@ -2284,6 +2284,9 @@ def load_model(args: argparse.Namespace, device: torch.device) -> tuple[Any, Any
             line_source=args.layout_routing_line_source,
             tracked=tracked_state,
             line_map=args.layout_routing_line_map,
+            # The share of the bias the next line in reading order carries, to cover the step the
+            # tracker is behind by.
+            next_line_scale=float(getattr(args, "layout_routing_next_line_scale", 0.0) or 0.0),
         )
         # On the top-level model rather than the bridge: this is a text-decoder
         # route and has nothing to do with the layout adapter, but the eval loop
@@ -2315,8 +2318,13 @@ def load_model(args: argparse.Namespace, device: torch.device) -> tuple[Any, Any
                 # A zero-bias arm has nothing to divide out, so it is left uncorrected rather
                 # than reported as corrected.
                 and bool(routing_strength)
+                # The correction inverts one box's constant, which is exact for the region map.
+                # A predicted box overlapping two regions, or a second line carrying a share,
+                # would need the routing's own per-token arithmetic -- which the probe does
+                # implement, so the restriction is only about which arms have been validated.
                 and args.layout_routing_line_map == "regions"
             ),
+            next_line_scale=float(getattr(args, "layout_routing_next_line_scale", 0.0) or 0.0),
         )
         # On the top-level model, like the routing runtime: the eval loop already
         # holds the model and arms the probe per page.
@@ -4653,6 +4661,17 @@ def parse_args() -> argparse.Namespace:
             "raises the very confidence the gate tests -- it multiplies the biased line's mass by "
             "e^B -- so the bar was calibrated on a quantity the intervention inflates. The "
             "correction is exact for the regions map, where the biased set is one line's keys"
+        ),
+    )
+    parser.add_argument(
+        "--layout-routing-next-line-scale",
+        type=float,
+        default=0.0,
+        help=(
+            "share of the bias the *next* line in reading order also carries. The applied line is "
+            "one decoding step stale, which the offline replay puts at 8.5%% of characters -- and "
+            "88-95%% of those are among the first three of their own line. Covering the next line "
+            "aims at the right column there; on the rest it adds a wrong column at this share"
         ),
     )
     parser.add_argument(

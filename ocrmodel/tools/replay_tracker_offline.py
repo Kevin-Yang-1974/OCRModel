@@ -206,12 +206,20 @@ def replay_page(
     # (an insertion, or a reference position with no box) are not scored -- the same rule the
     # offline localizer uses, so the two reports are on one denominator.
     scored: list[tuple[int, int]] = []
+    # How far into its own line each scored character sits, counted in reference characters.  The
+    # lag can only be the cause of a mismatch on the characters just after a line boundary -- one
+    # decoding step behind is one character -- so this separates "the tracker had not moved yet"
+    # from "the tracker was on the wrong line entirely".  The two want different fixes.
+    position_in_line: list[int] = []
+    seen_per_line: dict[int, int] = {}
     for position, step in enumerate(char_step):
         if position >= len(mapping) or mapping[position] is None:
             continue
         truth = lines[mapping[position]] if mapping[position] < len(lines) else -1
         if truth >= 0:
             scored.append((step, truth))
+            position_in_line.append(seen_per_line.get(truth, 0))
+            seen_per_line[truth] = seen_per_line.get(truth, 0) + 1
 
     per_policy: dict[str, dict[str, Any]] = {}
     for bar in bars:
@@ -240,10 +248,40 @@ def replay_page(
                         accepted += 1
             hit = sum(1 for step, truth in scored if applied.get(step, -1) == truth)
             biased_chars = sum(1 for step, _ in scored if applied.get(step, -1) >= 0)
+            # The lag costs the characters right after a line boundary: the bias is still aimed
+            # at the line the previous step read.  A window says what a mask covering more than
+            # one line would recover -- the localization half of the plan's "current line and the
+            # possible next line", which has never been implemented.  The dose half is not free
+            # and is not in this number.
+            windowed = {
+                str(offset): sum(
+                    1 for step, truth in scored if _in_window(applied.get(step, -1), truth, offset)
+                )
+                for offset in (1, -1)
+            }
+            windowed_both = sum(
+                1 for step, truth in scored if _in_window(applied.get(step, -1), truth, 1, -1)
+            )
+            ahead_by_one = [
+                index
+                for index, (step, truth) in enumerate(scored)
+                if applied.get(step, -1) + 1 == truth
+            ]
+            # The characters the lag alone would explain: the first few of a line, where the
+            # tracker is still aimed at the previous one.
+            ahead_within_three = sum(1 for index in ahead_by_one if position_in_line[index] < 3)
             per_policy[key] = {
                 "chars": len(scored),
                 "applied_correct": hit,
                 "applied_accuracy": hit / len(scored) if scored else None,
+                "window_next_correct": windowed["1"],
+                "window_prev_correct": windowed["-1"],
+                "window_both_correct": windowed_both,
+                # Of the characters where the truth is one line ahead of what was aimed at, how
+                # many are the first three of their line.  A high share says the lag explains
+                # them; a low one says the estimate was simply on the wrong line.
+                "ahead_by_one": len(ahead_by_one),
+                "ahead_by_one_early": ahead_within_three,
                 "biased_chars": biased_chars,
                 "coverage": biased_chars / len(scored) if scored else None,
                 "accepted_steps": accepted,
@@ -258,6 +296,12 @@ def replay_page(
                 ),
             }
     return {"page_id": report.get("page_id"), "policies": per_policy}
+
+
+def _in_window(applied: int, truth: int, *offsets: int) -> bool:
+    """Whether the truth line lies within ``offsets`` of the line that was aimed at."""
+
+    return applied >= 0 and any(applied + offset == truth for offset in offsets)
 
 
 def verify_against_routing_report(
@@ -297,7 +341,19 @@ def merge(totals: dict[str, dict[str, float]], page: dict[str, Any]) -> None:
     for key, entry in page.get("policies", {}).items():
         bucket = totals.setdefault(
             key,
-            {"chars": 0, "correct": 0, "biased": 0, "accepted": 0, "observations": 0, "gated_equivalent": 0},
+            {
+                "chars": 0,
+                "correct": 0,
+                "biased": 0,
+                "accepted": 0,
+                "observations": 0,
+                "gated_equivalent": 0,
+                "ahead_by_one": 0,
+                "ahead_by_one_early": 0,
+                "window_next_correct": 0,
+                "window_prev_correct": 0,
+                "window_both_correct": 0,
+            },
         )
         bucket["chars"] += entry["chars"]
         bucket["correct"] += entry["applied_correct"]
@@ -305,6 +361,11 @@ def merge(totals: dict[str, dict[str, float]], page: dict[str, Any]) -> None:
         bucket["accepted"] += entry["accepted_steps"]
         bucket["observations"] += entry["observations"]
         bucket["gated_equivalent"] += entry["gated_equivalent"]
+        bucket["ahead_by_one"] += entry["ahead_by_one"]
+        bucket["ahead_by_one_early"] += entry["ahead_by_one_early"]
+        bucket["window_next_correct"] += entry["window_next_correct"]
+        bucket["window_prev_correct"] += entry["window_prev_correct"]
+        bucket["window_both_correct"] += entry["window_both_correct"]
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -349,14 +410,17 @@ def main(argv: list[str] | None = None) -> int:
     # Sorted by coverage, not by accuracy. Every policy can buy accuracy by biasing fewer steps,
     # and §9.1 already showed that reading a bar change as a mechanism change is how a dose
     # effect gets mistaken for a better estimate -- so the curve has to be read left to right.
-    header = (f"{'policy':>18} {'coverage':>9} {'acc':>8} {'biased_acc':>11} "
-              f"{'accepted':>9} {'chars':>7}")
+    header = (f"{'policy':>18} {'coverage':>9} {'acc':>8} {'+next':>8} {'+-1':>8} "
+              f"{'ahead1':>8} {'early':>8} {'biased_acc':>11} {'chars':>7}")
     print(header)
     for key in sorted(totals, key=lambda name: (_coverage(totals[name]), name)):
         entry = totals[key]
         print(f"{key:>18} {_coverage(entry):9.4f} {_accuracy(entry):8.4f} "
-              f"{_biased_accuracy(entry):11.4f} "
-              f"{_accepted(entry):9.4f} {entry['chars']:7d}")
+              f"{_ratio(entry, 'window_next_correct'):8.4f} "
+              f"{_ratio(entry, 'window_both_correct'):8.4f} "
+              f"{(entry['ahead_by_one'] / entry['chars'] if entry['chars'] else 0.0):8.4f} "
+              f"{(entry['ahead_by_one_early'] / entry['ahead_by_one'] if entry['ahead_by_one'] else 0.0):8.4f} "
+              f"{_biased_accuracy(entry):11.4f} {entry['chars']:7d}")
 
     check = verify_against_routing_report(args.routing_report, totals, args.bias)
     if check is not None:
@@ -383,6 +447,10 @@ def main(argv: list[str] | None = None) -> int:
         }
         args.output.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     return 0
+
+
+def _ratio(entry: dict[str, float], key: str) -> float:
+    return entry[key] / entry["chars"] if entry["chars"] else 0.0
 
 
 def _accuracy(entry: dict[str, float]) -> float:

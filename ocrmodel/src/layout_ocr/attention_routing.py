@@ -170,9 +170,12 @@ class AttentionRouting:
         line_source: str = "pointer",
         tracked: Any | None = None,
         line_map: str = "regions",
+        next_line_scale: float = 0.0,
     ) -> None:
         if bias < 0:
             raise ValueError("AttentionRouting needs a non-negative bias")
+        if next_line_scale < 0:
+            raise ValueError("the next line's share of the bias cannot be negative")
         if pointer not in POINTER_MODES:
             raise ValueError(f"pointer must be one of {POINTER_MODES}, got {pointer!r}")
         if box_source not in BOX_SOURCES:
@@ -203,9 +206,17 @@ class AttentionRouting:
         self.box_source = box_source
         self.line_source = line_source
         self.line_map = line_map
+        # How much of the bias the *next* line in reading order carries.  The applied line is one
+        # decoding step stale by construction, and the offline replay puts the cost at 8.5% of
+        # characters -- and 88-95% of those are among the first three of their own line, which is
+        # exactly the step where the tracker had not moved yet.  Covering the next line as well
+        # aims at the right column on those characters; on the rest it adds a wrong column at this
+        # share.  The plan asks for it; the dilution it costs is not measurable offline.
+        self.next_line_scale = float(next_line_scale)
         self.tracked = tracked
         self.gated = 0
         self.past_annotation = 0
+        self.next_line_hits = 0.0
         # The line each character sits on, resolved once per page from the character boxes and
         # the region boxes.  Per character index, not per step, so a step only looks it up.
         self.regions: list[dict[str, Any]] = []
@@ -258,6 +269,7 @@ class AttentionRouting:
 
         self.gated = 0
         self.past_annotation = 0
+        self.next_line_hits = 0.0
         if self.tracked is not None:
             # A new page invalidates the estimate: the previous page's line says nothing about
             # this one, and leaving it would aim the first steps at a line that may not exist.
@@ -513,11 +525,43 @@ class AttentionRouting:
         count = int(inside.sum().item())
         self.boxes_hit += count
         self.biased += 1
+        added = inside.to(dtype) * self.bias
+        if self.next_line_scale > 0.0:
+            next_box = self._next_line_box(line, box)
+            if next_box is not None:
+                next_inside = (
+                    (grid[:, 0] >= float(next_box[0]))
+                    & (grid[:, 0] <= float(next_box[2]))
+                    & (grid[:, 1] >= float(next_box[1]))
+                    & (grid[:, 1] <= float(next_box[3]))
+                )
+                # The share lands only where the current line does not already cover it, so a token
+                # in both boxes is not biased twice.
+                share = next_inside & ~inside
+                self.next_line_hits += float(share.sum().item())
+                added = added + share.to(dtype) * (self.bias * self.next_line_scale)
         mask = torch.zeros(1, 1, 1, kv_length, device=device, dtype=dtype)
-        mask[0, 0, 0, self.visual_start : self.visual_start + self.visual_count] = (
-            inside.to(dtype) * self.bias
-        )
+        mask[0, 0, 0, self.visual_start : self.visual_start + self.visual_count] = added
         return mask
+
+    def _next_line_box(self, line: int, current_box: list[float]) -> list[float] | None:
+        """The next line's box in reading order, or ``None`` when this is the last one.
+
+        Only the ``line`` source has a next line: the character source aims at one character's
+        box, and the static source already covers every line it knows about.
+        """
+
+        if self.box_source != "line" or self.next_line_scale <= 0.0:
+            return None
+        boxes = (
+            self.predicted_lines
+            if self.line_map == "predicted"
+            else [region["bbox"] for region in self.regions]
+        )
+        index = line + 1
+        if index < 0 or index >= len(boxes):
+            return None
+        return list(boxes[index])
 
     def hook(self, module: nn.Module, args: Any, kwargs: dict) -> None:
         hidden_states = kwargs.get("hidden_states")
@@ -595,6 +639,10 @@ class AttentionRouting:
             "biased_steps": self.biased,
             "missing_box_steps": self.missing,
             "mean_boxes_hit": (self.boxes_hit / self.biased) if self.biased else None,
+            "next_line_scale": self.next_line_scale or None,
+            "mean_next_line_hits": (
+                (self.next_line_hits / self.biased) if self.biased and self.next_line_scale else None
+            ),
             "visual_tokens": self.visual_count,
             "visual_start": self.visual_start,
         }
@@ -611,6 +659,7 @@ def install_attention_routing(
     line_source: str = "pointer",
     tracked: Any | None = None,
     line_map: str = "regions",
+    next_line_scale: float = 0.0,
 ) -> tuple[AttentionRouting, list[Any]]:
     """Register the bias hook on every text decoder layer.
 
@@ -628,7 +677,16 @@ def install_attention_routing(
     if image_token_id is None:
         image_token_id = getattr(getattr(model.config, "text_config", None), "image_token_id", None)
     runtime = AttentionRouting(
-        bridge, bias, image_token_id, tokenizer, pointer, box_source, line_source, tracked, line_map
+        bridge,
+        bias,
+        image_token_id,
+        tokenizer,
+        pointer,
+        box_source,
+        line_source,
+        tracked,
+        line_map,
+        next_line_scale,
     )
     handles = [
         # The model's own pre-hook first: it runs outside every layer, so the
