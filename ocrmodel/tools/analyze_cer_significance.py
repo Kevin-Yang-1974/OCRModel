@@ -19,8 +19,16 @@ from __future__ import annotations
 import argparse
 import json
 import random
+import re
 from collections import Counter
 from pathlib import Path
+
+# The register's version/document proxy: the ``V...P...`` volume prefix of the source image name,
+# with the unnumbered pages pooled into one group. It is an executable proxy, not a book-hand
+# annotation -- see the register's "当前筛选数据边界".
+# The page number after ``P`` is not always purely numeric (``V001P000D`` and ``V001P000F`` are
+# different pages of one volume), so digits alone would merge two pages into one group.
+VOLUME_PATTERN = re.compile(r"(V\d+P[0-9A-Z]+)")
 
 
 def load_predictions(path: Path) -> list[tuple[str, str, str]]:
@@ -82,16 +90,31 @@ def substitution_pairs(a: str, b: str) -> Counter[tuple[str, str]]:
     return pairs
 
 
+def volume_of(page_id: str) -> str:
+    """The version/document group a page belongs to, for the grouped interval.
+
+    Pages of one volume are not independent replicates: they share a hand, a printing, and often
+    near-duplicate crops. Resampling pages then treats correlated draws as independent and the
+    interval is too narrow on exactly the corpora this project works on.
+    """
+
+    match = VOLUME_PATTERN.search(page_id)
+    return match.group(1) if match else "unnumbered"
+
+
 def paired_bootstrap(
     rows_a: list[tuple[str, str, str]],
     rows_b: list[tuple[str, str, str]],
     iterations: int,
     seed: int,
+    groups: list[list[int]] | None = None,
 ) -> tuple[float, float, float]:
-    """CI for CER(a) - CER(b), resampling pages jointly.
+    """CI for CER(a) - CER(b), resampling units jointly.
 
-    Pages are resampled as units because both runs saw the same page; treating
-    characters as independent would understate the interval.
+    The default unit is the page, because both runs saw the same page and treating characters as
+    independent would understate the interval. Passing ``groups`` (index lists) resamples whole
+    groups instead -- the cluster bootstrap the plan asks for where pages of one book are not
+    independent draws.
     """
     if len(rows_a) != len(rows_b):
         raise ValueError(
@@ -105,20 +128,43 @@ def paired_bootstrap(
     stats_a = [(levenshtein(r, p), len(r)) for _, r, p in rows_a]
     stats_b = [(levenshtein(r, p), len(r)) for _, r, p in rows_b]
     rng = random.Random(seed)
-    page_count = len(rows_a)
+    units = groups if groups is not None else [[index] for index in range(len(rows_a))]
     differences: list[float] = []
+    zero_chars = 0
     for _ in range(iterations):
-        index = [rng.randrange(page_count) for _ in range(page_count)]
+        index: list[int] = []
+        for _ in range(len(units)):
+            index.extend(units[rng.randrange(len(units))])
+        if not index:
+            continue
         errors_a = sum(stats_a[i][0] for i in index)
         chars_a = sum(stats_a[i][1] for i in index)
         errors_b = sum(stats_b[i][0] for i in index)
         chars_b = sum(stats_b[i][1] for i in index)
+        if not chars_a or not chars_b:
+            zero_chars += 1
+            continue
         differences.append(errors_a / chars_a - errors_b / chars_b)
+    if not differences:
+        raise ValueError("every resample was empty; nothing to report")
     differences.sort()
-    low = differences[int(0.025 * iterations)]
-    high = differences[int(0.975 * iterations)]
-    share_at_or_below_zero = sum(1 for value in differences if value <= 0) / iterations
+    low = differences[int(0.025 * len(differences))]
+    high = differences[int(0.975 * len(differences))]
+    share_at_or_below_zero = sum(1 for value in differences if value <= 0) / len(differences)
     return low, high, share_at_or_below_zero
+
+
+def group_indices(page_ids: list[str], key: str) -> list[list[int]] | None:
+    """Index lists for the cluster bootstrap, or ``None`` for the page-level unit."""
+
+    if key == "page":
+        return None
+    if key != "volume":
+        raise ValueError(f"unknown grouping {key!r}")
+    buckets: dict[str, list[int]] = {}
+    for index, page_id in enumerate(page_ids):
+        buckets.setdefault(volume_of(page_id), []).append(index)
+    return list(buckets.values())
 
 
 def cer(rows: list[tuple[str, str, str]]) -> float:
@@ -141,6 +187,23 @@ def parse_args() -> argparse.Namespace:
         help="also report the most frequent substitution pairs of run A",
     )
     parser.add_argument("--top-pairs", type=int, default=30)
+    parser.add_argument(
+        "--grouping",
+        choices=["page", "volume", "both"],
+        default="both",
+        help=(
+            "'page' resamples pages, 'volume' resamples whole V..P.. volume groups, 'both' reports "
+            "the two side by side. They answer different questions: the page interval is the one "
+            "this project's earlier results were quoted under, the volume interval is the one the "
+            "plan asks for where same-book pages are not independent draws."
+        ),
+    )
+    parser.add_argument(
+        "--json",
+        type=Path,
+        default=None,
+        help="write the point estimates and every interval as JSON",
+    )
     return parser.parse_args()
 
 
@@ -148,17 +211,57 @@ def main() -> None:
     args = parse_args()
     rows_a = load_predictions(args.prediction_a)
     rows_b = load_predictions(args.prediction_b)
-    low, high, share = paired_bootstrap(rows_a, rows_b, args.iterations, args.seed)
+    page_ids = [row[0] for row in rows_a]
+    volume_groups = group_indices(page_ids, "volume")
 
-    print(f"pages: {len(rows_a)}")
-    print(f"{args.label_a}: CER {cer(rows_a):.6f}")
-    print(f"{args.label_b}: CER {cer(rows_b):.6f}")
-    print(
-        f"difference ({args.label_a} - {args.label_b}): "
-        f"95% CI [{low:+.6f}, {high:+.6f}], P(<=0) = {share:.3f}"
-    )
-    verdict = "significant" if low > 0 or high < 0 else "not significant"
-    print(f"verdict: {verdict}")
+    keys = ["page", "volume"] if args.grouping == "both" else [args.grouping]
+    intervals = {
+        key: paired_bootstrap(
+            rows_a, rows_b, args.iterations, args.seed, group_indices(page_ids, key)
+        )
+        for key in keys
+    }
+
+    cer_a, cer_b = cer(rows_a), cer(rows_b)
+    print(f"pages: {len(rows_a)}  volumes: {len(volume_groups)}")
+    print(f"{args.label_a}: CER {cer_a:.6f}")
+    print(f"{args.label_b}: CER {cer_b:.6f}")
+    print(f"difference ({args.label_a} - {args.label_b}): {cer_a - cer_b:+.6f}")
+    for key in keys:
+        low, high, share = intervals[key]
+        verdict = "significant" if low > 0 or high < 0 else "not significant"
+        print(
+            f"  {key:>6} bootstrap: 95% CI [{low:+.6f}, {high:+.6f}], "
+            f"P(<=0) = {share:.3f}  {verdict}"
+        )
+    # An interval that crosses zero is not a statement that the two are equal. The lower bound is
+    # the worst case the data still supports, and it is the number a decision should be read
+    # against -- quoted as a bound rather than as a failure to reach significance.
+    pessimistic = min(intervals[key][0] for key in keys)
+    print(f"  worst case still supported by the data: {pessimistic:+.6f} CER")
+
+    payload = {
+        "pages": len(rows_a),
+        "volumes": len(volume_groups),
+        "label_a": args.label_a,
+        "label_b": args.label_b,
+        "cer_a": cer_a,
+        "cer_b": cer_b,
+        "difference_a_minus_b": cer_a - cer_b,
+        "relative": (cer_a - cer_b) / cer_b if cer_b else None,
+        "intervals": {
+            key: {"low": low, "high": high, "share_at_or_below_zero": share, "unit": key}
+            for key, (low, high, share) in intervals.items()
+        },
+        "pessimistic_lower_bound": pessimistic,
+        "iterations": args.iterations,
+        "seed": args.seed,
+    }
+    if args.json:
+        args.json.parent.mkdir(parents=True, exist_ok=True)
+        args.json.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+        )
 
     if args.substitutions:
         total: Counter[tuple[str, str]] = Counter()

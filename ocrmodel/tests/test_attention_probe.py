@@ -1062,3 +1062,150 @@ def test_a_probe_without_an_image_token_id_is_an_error():
     runtime = AttentionProbe(_bridge(), None, layers=(0,))
     with pytest.raises(RuntimeError, match="image token id"):
         runtime.set_page("p0", [], PROMPT_LENGTH, _prompt_ids())
+
+
+# -- bias-corrected confidence -------------------------------------------
+#
+# The gate's confidence is read off a distribution the previous step's bias has already moved, so
+# the probe can divide that bias back out.  These check that the division is exact, that it is
+# driven by the routing's own box rule, and that it leaves the uncorrected reading behind so the
+# offline analysis can price it.
+
+class _TrackedStub:
+    """The probe publishes an estimate through ``observe`` and reads the line back off the same
+    object, so a stub needs both even when the test only cares about the one it sets."""
+
+    def __init__(self, line: int) -> None:
+        self.line = line
+        self.seen: list[tuple[int | None, float]] = []
+
+    def observe(self, line, confidence) -> None:
+        self.seen.append((line, confidence))
+
+
+CORRECTION_REGIONS = [
+    {"bbox": [0.0, 0.0, 1.0, 0.5]},  # the grid's top row: visual tokens 0 and 1
+    {"bbox": [0.0, 0.5, 1.0, 1.0]},  # the bottom row: tokens 2 and 3
+]
+
+
+def _armed_for_correction(*, bias: float, biased_line: int, visual: torch.Tensor, correct: bool):
+    runtime = AttentionProbe(
+        _bridge(),
+        IMAGE_TOKEN_ID,
+        layers=(0,),
+        heads=(0,),
+        tracked=_TrackedStub(biased_line),
+        routing_bias=bias,
+        correct_confidence=correct,
+    )
+    runtime.visual_count = VISUAL_COUNT
+    runtime.visual_start = 1
+    runtime._geometry[0] = (4, 2, 1, 1.0)
+    runtime._visual_keys[0] = visual
+    runtime._prompt_text_keys[0] = torch.zeros(1, 2, 2, 1)
+    runtime._regions = [dict(region) for region in CORRECTION_REGIONS]
+    runtime.owners = _region_owners(runtime._regions, _bridge().last_patch_positions)
+    runtime.num_regions = len(CORRECTION_REGIONS)
+    runtime.steps = 1
+    runtime._observe_step(0, 1, _queries(), None)
+    return runtime.report()["steps"][0]["heads"][0]
+
+
+def test_correction_recovers_the_distribution_the_bias_displaced():
+    """The biased line's mass was multiplied by ``e^B``; dividing it out has to be exact.
+
+    Head 0 reads KV head 0, whose keys are set so the logits over the four visual tokens are
+    ``[1+B, B, 0, 0]``.  Both tokens of region 0 carry the bias, so the unbiased logits are
+    ``[1, 0, 0, 0]`` and the recovered line masses have to be that softmax.
+    """
+
+    bias = 1.0
+    biased_keys = torch.tensor([[[[1.0 + bias], [bias], [0.0], [0.0]], [[0.0], [0.0], [0.0], [1.0]]]])
+    row = _armed_for_correction(bias=bias, biased_line=0, visual=biased_keys, correct=True)
+    unbiased = _softmax([1.0, 0.0, 0.0, 0.0])
+    # Regions are the grid's two rows, so region 0 holds tokens 0-1 and region 1 holds 2-3; both
+    # boxes cover the full patch grid, so nothing is left on the background slot.
+    assert row["line_probs"][0] == pytest.approx(unbiased[0] + unbiased[1], rel=1e-6)
+    assert row["line_probs"][1] == pytest.approx(unbiased[2] + unbiased[3], rel=1e-6)
+    assert row["line_probs"][-1] == pytest.approx(0.0, abs=1e-9)
+
+
+def test_correction_lowers_the_mass_the_bias_inflated():
+    """The measured defect in miniature: the bias makes the line it aimed at look more certain."""
+
+    bias = 1.0
+    biased_keys = torch.tensor([[[[1.0 + bias], [bias], [0.0], [0.0]], [[0.0], [0.0], [0.0], [1.0]]]])
+    corrected = _armed_for_correction(bias=bias, biased_line=0, visual=biased_keys, correct=True)
+    uncorrected = _armed_for_correction(bias=bias, biased_line=0, visual=biased_keys, correct=False)
+    assert corrected["top_line_mass"] < uncorrected["top_line_mass"]
+    # The uncorrected reading is carried along, so the two can be compared offline.
+    assert corrected["top_line_mass_raw"] == pytest.approx(uncorrected["top_line_mass"], rel=1e-6)
+
+
+def test_a_corrected_step_still_reports_the_raw_argmax():
+    """The two readings can disagree about which line it is, and that disagreement is the point."""
+
+    bias = 3.0
+    # Token 3 sits in region 1 and dominates; the bias lifts region 0 above it.
+    biased_keys = torch.tensor([[[[0.0 + bias], [0.0 + bias], [0.0], [1.5]], [[0.0], [0.0], [0.0], [1.0]]]])
+    row = _armed_for_correction(bias=bias, biased_line=0, visual=biased_keys, correct=True)
+    assert row["argmax_line_raw"] == 0  # what the inflated readout said
+    assert row["argmax_line"] == 1  # what it says once the bias is divided out
+
+
+def test_an_unbiased_step_is_left_alone():
+    """With no line carried in there is no bias to invert, and the row keeps the raw fields."""
+
+    visual = torch.tensor([[[[1.0], [0.0], [0.0], [0.0]], [[0.0], [0.0], [0.0], [1.0]]]])
+    row = _armed_for_correction(bias=1.0, biased_line=-1, visual=visual, correct=True)
+    assert "top_line_mass_raw" not in row
+
+
+def test_the_biased_token_mask_follows_the_routings_box_rule():
+    """Ownership and the bias mask can disagree on overlapping boxes, so this uses the box test."""
+
+    runtime = AttentionProbe(_bridge(), IMAGE_TOKEN_ID, layers=(0,), routing_bias=1.0)
+    runtime.visual_count = VISUAL_COUNT
+    # Region 1's box covers the left column: tokens 0 and 2, where ownership would give token 0
+    # to region 0 because it comes first in reading order.
+    runtime._regions = [CORRECTION_REGIONS[0], CORRECTION_REGIONS[1], {"bbox": [0.0, 0.0, 0.5, 1.0]}]
+    mask = runtime._tokens_inside_line(2)
+    assert mask.tolist() == [True, False, True, False]
+    assert runtime._tokens_inside_line(-1) is None
+    assert runtime._tokens_inside_line(9) is None
+
+
+def test_correcting_without_a_bias_is_refused():
+    """A no-op correction would be reported as a correction, which is the wrong kind of silence."""
+
+    with pytest.raises(ValueError, match="needs the routing bias"):
+        AttentionProbe(
+            _bridge(), IMAGE_TOKEN_ID, layers=(0,), routing_bias=0.0, correct_confidence=True
+        )
+
+
+def test_the_corrected_step_count_travels_with_the_page():
+    bias = 1.0
+    biased_keys = torch.tensor([[[[1.0 + bias], [bias], [0.0], [0.0]], [[0.0], [0.0], [0.0], [1.0]]]])
+    runtime = AttentionProbe(
+        _bridge(),
+        IMAGE_TOKEN_ID,
+        layers=(0,),
+        heads=(0,),
+        tracked=_TrackedStub(0),
+        routing_bias=bias,
+        correct_confidence=True,
+    )
+    runtime.visual_count = VISUAL_COUNT
+    runtime.visual_start = 1
+    runtime._geometry[0] = (4, 2, 1, 1.0)
+    runtime._visual_keys[0] = biased_keys
+    runtime._prompt_text_keys[0] = torch.zeros(1, 2, 2, 1)
+    runtime._regions = [dict(region) for region in CORRECTION_REGIONS]
+    runtime.num_regions = len(CORRECTION_REGIONS)
+    runtime.steps = 1
+    runtime._observe_step(0, 1, _queries(), None)
+    report = runtime.report()
+    assert report["bias_corrected_steps"] == 1
+    assert report["routing_bias"] == pytest.approx(bias)

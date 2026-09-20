@@ -252,10 +252,21 @@ class AttentionProbe:
         heads: tuple[int, ...] | None = None,
         tracked: Any | None = None,
         box_map: str = "regions",
+        routing_bias: float = 0.0,
+        correct_confidence: bool = False,
     ) -> None:
         if box_map not in BOX_MAPS:
             raise ValueError(f"box_map must be one of {BOX_MAPS}, got {box_map!r}")
+        if correct_confidence and routing_bias <= 0.0:
+            # With no bias there is nothing to divide out, and a run that asked for the
+            # correction would silently report uncorrected numbers.
+            raise ValueError("bias-corrected confidence needs the routing bias it inverts")
         self.box_map = box_map
+        # The bias the routing applies while this step's attention is being read, and whether to
+        # divide it back out before estimating the line.  See ``_uncorrected_dist``.
+        self.routing_bias = float(routing_bias)
+        self.correct_confidence = bool(correct_confidence)
+        self.bias_corrected_steps = 0
         self.bridge = bridge
         self.image_token_id = image_token_id
         self.layers = tuple(layers)
@@ -310,6 +321,7 @@ class AttentionProbe:
         self.grid_missing = 0
         self.emitted_missing = 0
         self.emitted_join_mismatch = 0
+        self.bias_corrected_steps = 0
         self._records = []
         if self.image_token_id is None:
             raise RuntimeError(
@@ -540,6 +552,32 @@ class AttentionProbe:
             mask_vis, mask_text = self._split_mask(mask, layer)
         return self._reduce(layer, query, visual, self._text_keys(layer), mask_vis, mask_text)
 
+    def _tokens_inside_line(self, line: int) -> Tensor | None:
+        """Which visual tokens the routing biased, exactly as the routing decided it.
+
+        The same box test ``attention_routing._mask_for`` applies to the patch grid, rebuilt here
+        rather than reusing the region owners: an owner is resolved by first-in-reading-order
+        among the boxes that contain a token, so two overlapping regions would put a token in one
+        line here and bias it under the other there.  The correction has to subtract the bias that
+        was actually added, so it follows the routing's rule.
+        """
+
+        if line < 0 or line >= len(self._regions) or not self.visual_count:
+            return None
+        grid = getattr(self.bridge, "last_patch_positions", None)
+        if grid is None or grid.shape[1] != self.visual_count:
+            return None
+        box = self._regions[line].get("bbox")
+        if not box:
+            return None
+        points = grid[0].to(device=grid.device, dtype=torch.float32)
+        return (
+            (points[:, 0] >= float(box[0]))
+            & (points[:, 0] <= float(box[2]))
+            & (points[:, 1] >= float(box[1]))
+            & (points[:, 1] <= float(box[3]))
+        )
+
     def _observe_step(self, layer: int, step: int, query: Tensor, mask: Tensor | None) -> None:
         """Reduce one decode step's attention over the visual keys and record it."""
 
@@ -562,6 +600,26 @@ class AttentionProbe:
         lse_vis = lse_vis[:, 0]
         lse_text = lse_text[:, 0]
         num_heads = dist.shape[0]
+        # Divide the routing bias back out before anything reads this distribution.  Observation
+        # and intervention act on one mechanism, so the estimate is being read off a quantity the
+        # previous step's bias has moved: adding B to one line's keys multiplies that line's mass
+        # by e^B, which inflates exactly the confidence the gate then tests.  The biased line is
+        # ``tracked.line`` as it stands right now -- written by the previous step, and the value
+        # the routing hook carried into this same forward.
+        raw_dist = dist
+        corrected_from = -1
+        if self.correct_confidence and self.tracked is not None:
+            biased_line = int(getattr(self.tracked, "line", -1))
+            inside = self._tokens_inside_line(biased_line)
+            if inside is not None and bool(inside.any()):
+                factor = math.exp(-self.routing_bias)
+                dist = dist * torch.where(inside.unsqueeze(0), factor, torch.ones_like(dist))
+                total = dist.sum(dim=-1, keepdim=True)
+                # A head that put no mass inside the biased line is unchanged by the bias, and
+                # dividing by its own total leaves it that way; clamp only guards a zero row.
+                dist = dist / total.clamp_min(torch.finfo(dist.dtype).tiny)
+                corrected_from = biased_line
+                self.bias_corrected_steps += 1
         entropy = -(dist * dist.clamp_min(1e-12).log()).sum(dim=-1)
         # Normalized by log|V| so the number is comparable across resolutions: the
         # 1M and 4M arms see 630 and 2496 visual tokens.
@@ -582,6 +640,8 @@ class AttentionProbe:
         # steps a page is millions of small torch calls -- the probe's own overhead on top of the
         # generation it is watching, and the one part of it that is mine to remove.
         per_line_by_head: list[list[float]] | None = None
+        raw_top_mass_by_head: list[float] | None = None
+        raw_argmax_by_head: list[int] | None = None
         in_line_by_head: list[float] | None = None
         argmax_by_head: list[int] | None = None
         if owners is not None and self.num_regions:
@@ -597,6 +657,18 @@ class AttentionProbe:
             in_line_by_head = self._in_line_position(dist, owners, int(lines_out.shape[1]))
             per_line_by_head = per_line.tolist()
             argmax_by_head = lines_out.argmax(dim=1).tolist()
+            if corrected_from >= 0:
+                # What the same reduction would have said with the bias still in it.  Carried on
+                # every corrected step so the offline analysis can price the correction instead of
+                # comparing two runs that differ in more than one way.
+                raw_per_line = torch.zeros_like(per_line)
+                raw_per_line.index_add_(1, slots, raw_dist)
+                raw_lines = raw_per_line[:, : self.num_regions]
+                raw_argmax_by_head = raw_lines.argmax(dim=1).tolist()
+                raw_top_mass_by_head = [
+                    float(raw_per_line[head, int(raw_argmax_by_head[head])])
+                    for head in range(raw_per_line.shape[0])
+                ]
 
         for head in heads:
             head = int(head)
@@ -616,12 +688,20 @@ class AttentionProbe:
                 row["top_line_mass"] = line_probs[argmax]
                 row["background_mass"] = line_probs[-1]
                 row["in_line_pos"] = in_line_by_head[head]
+                if raw_top_mass_by_head is not None and head < len(raw_top_mass_by_head):
+                    row["top_line_mass_raw"] = raw_top_mass_by_head[head]
+                    row["argmax_line_raw"] = int(raw_argmax_by_head[head])
             records.append(row)
         # One entry per layer per step: ``heads`` carries the layer, so the offline
         # tool can group by step without the probe having to accumulate a nested
         # structure it would then have to keep in memory for the whole page.
         self._records.append(
-            {"step": step, "text_keys": self._text_key_count(layer), "heads": records}
+            {
+                "step": step,
+                "text_keys": self._text_key_count(layer),
+                "heads": records,
+                "bias_corrected_from": corrected_from,
+            }
         )
         if self.tracked is not None:
             # Publish this step's estimate for an arm that aims its bias by it.  Written here, on a
@@ -913,6 +993,8 @@ class AttentionProbe:
             "grid_missing_steps": self.grid_missing,
             "emitted_missing_steps": self.emitted_missing,
             "emitted_join_mismatch": self.emitted_join_mismatch,
+            "bias_corrected_steps": self.bias_corrected_steps,
+            "routing_bias": self.routing_bias if self.correct_confidence else None,
             "layer_geometry": {
                 str(layer): {
                     "num_heads": geometry[0],
@@ -1008,6 +1090,8 @@ def install_attention_probe(
     heads: tuple[int, ...] | None = None,
     tracked: Any | None = None,
     box_map: str = "regions",
+    routing_bias: float = 0.0,
+    correct_confidence: bool = False,
 ) -> tuple[AttentionProbe, list[Any]]:
     """Register observation hooks on the selected decoder attention modules.
 
@@ -1020,7 +1104,14 @@ def install_attention_probe(
     if image_token_id is None:
         image_token_id = getattr(getattr(model.config, "text_config", None), "image_token_id", None)
     runtime = AttentionProbe(
-        bridge, image_token_id, layers=layers, heads=heads, tracked=tracked, box_map=box_map
+        bridge,
+        image_token_id,
+        layers=layers,
+        heads=heads,
+        tracked=tracked,
+        box_map=box_map,
+        routing_bias=routing_bias,
+        correct_confidence=correct_confidence,
     )
     candidates = _find_attention_modules(model)
     available = {index for index, _ in candidates}

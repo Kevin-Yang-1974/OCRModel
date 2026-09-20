@@ -63,13 +63,16 @@ baseline_dir="${GLMOCR_ORACLE_BASELINE_DIR:-}"
 foreground="${GLMOCR_ORACLE_FOREGROUND:-0}"
 gpu_slots="${GLMOCR_ORACLE_GPUS:-0,1,2,3}"
 
-# 臂格式：<名字>:<bias|none>:<框来源>[:<行来源>[:<地图来源>[:<门控门槛>[:<预测框文件>]]]]
+# 臂格式：<名字>:<bias|none>:<框来源>[:<行来源>[:<地图来源>[:<门控门槛>[:<预测框文件>[:<偏置校正>]]]]]
 #   最后一个字段让每个臂用自己的地图：比较「同一张地图换门槛」与「同一门槛换地图」都需要它。
 #   缺省：行来源 pointer、地图来源 regions、门控门槛由 GLMOCR_ORACLE_TRACKING_CONFIDENCE 给。
 #   门控与地图都要按臂变：同一轮里比较「同一张图换门槛」或「同一门槛换地图」才有意义。
 #   pointer  沿真值文本走，取读到那个字所在的行 —— oracle，就是 26.6% 那个臂
 #   tracked  行来自模型自己的注意力（滞后一步、按登记门槛门控），路径里没有参考文本
 # tracked 必须同时装探针，否则没有估计、每一步都被门控，该臂会以「无路由」的分数收场。
+# 第 8 个字段 `<偏置校正>`（0/1）把路由加在读数上的偏置除掉再送进门控：偏置会把被偏置那一行
+# 的权重乘 e^B，而门槛登记的正是这个被抬高过的量（见 docs/LAYOUT_LINE_DETECTOR_AND_PREDMAP_RESULT.md
+# §8）。同一轮里必须同时有 0 和 1，否则「门槛/剂量」与「校正」两个变量分不开。
 arms="${GLMOCR_ORACLE_ARMS:-noroute:none:none char2:2:char line025:0.25:line line050:0.5:line}"
 
 # 记录值（4M，149 页 validation，见 docs/LAYOUT_ATTENTION_ROUTING_RESULT.md §5）。
@@ -119,7 +122,7 @@ preflight() {
 # pre-create the arm directory: the log lives as a sibling.
 launch() {
     local arm="$1" bias="$2" box_source="$3" line_source="$4" line_map="$5" confidence="$6"
-    local arm_predicted="$7" gpu="$8"
+    local arm_predicted="$7" arm_corrected="$8" gpu="$9"
     # An arm may carry its own map file.  Comparing two maps at one gate needs both in the same run,
     # and the gate has to be held fixed while the map changes or a difference could be either.
     local arm_lines="${arm_predicted:-${predicted_lines}}"
@@ -148,8 +151,17 @@ launch() {
                           --layout-attention-probe-layers "${probe_layers}"
                           --layout-attention-probe-heads "${probe_heads}"
                           --layout-tracking-confidence "${confidence}")
+            if [[ "${arm_corrected}" == "1" ]]; then
+                route_flags+=(--layout-tracking-corrected-confidence)
+            fi
         fi
     fi
+    # What the arm was, written next to its log.  The gate and the correction are two variables
+    # and the verdict has to be able to say which one moved, so the flags are recorded here
+    # rather than reconstructed from the arm's name.
+    printf '{"arm":"%s","bias":"%s","box_source":"%s","line_source":"%s","line_map":"%s","confidence":"%s","predicted_lines":"%s","corrected":%s}\n' \
+        "${arm}" "${bias}" "${box_source}" "${line_source}" "${line_map}" "${confidence}" \
+        "${arm_lines}" "${arm_corrected:-0}" > "${out}.arm.json"
     (
         setup_environment
         export CUDA_VISIBLE_DEVICES="${gpu}"
@@ -187,10 +199,11 @@ run_arms() {
     local -a pids=() labels=() failed=0
     local index=0 spec
     for spec in ${arms}; do
-        IFS=':' read -r arm bias box_source line_source line_map confidence arm_predicted <<< "${spec}"
+        IFS=':' read -r arm bias box_source line_source line_map confidence arm_predicted arm_corrected <<< "${spec}"
         line_source="${line_source:-pointer}"
         line_map="${line_map:-regions}"
         confidence="${confidence:-${tracking_confidence}}"
+        arm_corrected="${arm_corrected:-0}"
         if [[ "${arm}" == "noroute" && -n "${baseline_dir}" ]]; then
             # Reused rather than recomputed; the summarize reads it from there.
             echo "{\"event\":\"glmocr_oracle_baseline_reused\",\"from\":\"${baseline_dir}\"}"
@@ -198,7 +211,7 @@ run_arms() {
         fi
         local gpu="${slots[$(( index % total ))]}"
         launch "${arm}" "${bias}" "${box_source}" "${line_source}" "${line_map}" "${confidence}" \
-            "${arm_predicted}" "${gpu}" &
+            "${arm_predicted}" "${arm_corrected}" "${gpu}" &
         pids+=("$!"); labels+=("${arm}")
         index=$(( index + 1 ))
         if (( index % total == 0 )); then
@@ -290,6 +303,14 @@ for arm in order:
     # the raw evidence, it is written by the routing module itself, and reading it means a verdict
     # can be recomputed from a past run without redoing any inference -- and cannot go blind because
     # an older summary block happened not to carry a field.
+    # The arm's own flags, so a verdict can say which variable moved.  A run from before this
+    # sidecar existed reports None rather than a guess.
+    arm_config_path = arms_dir / (arm + ".arm.json")
+    record["arm_config"] = (
+        json.loads(arm_config_path.read_text(encoding="utf-8"))
+        if arm_config_path.exists()
+        else None
+    )
     probe_path = arms_dir / (arm + ".routing.jsonl")
     if probe_path.exists():
         rows = [json.loads(line) for line in probe_path.read_text(encoding="utf-8").splitlines() if line.strip()]
@@ -323,8 +344,25 @@ for arm in order:
             record["layout_routing"] = routing
     payload["arms"][arm] = record
 
+def arm_note(row):
+    """The two variables that move the tracked arm's result, spelled out per arm.
+
+    A gate value means nothing without the confidence it was compared against, and the correction
+    changes that quantity -- so an arm's line has to carry both or the table invites reading a
+    gate change as a mechanism change.
+    """
+
+    config = row.get("arm_config") or {}
+    routing = row.get("layout_routing") or {}
+    parts = []
+    if routing.get("line_source") == "tracked":
+        parts.append(f"gate {config.get('confidence', '?')}")
+        parts.append("corrected" if str(config.get("corrected")) == "1" else "raw")
+    return "  ".join(parts)
+
+
 print(f"{'arm':9s} {'CER':>10s} {'sub':>6s} {'ins':>6s} {'del':>6s} {'genlim':>7s} "
-      f"{'tokens/step':>11s}")
+      f"{'tokens/step':>11s}  note")
 for arm in order:
     row = payload["arms"][arm]
     if row.get("status") == "missing":
@@ -333,7 +371,7 @@ for arm in order:
     routing = row.get("layout_routing") or {}
     print(f"{arm:9s} {row['cer']:10.6f} {row['substitutions']:6d} {row['insertions']:6d} "
           f"{row['deletions']:6d} {row['generation_limit_hits']:7d} "
-          f"{routing.get('mean_boxes_hit', 0.0):11.2f}")
+          f"{routing.get('mean_boxes_hit', 0.0):11.2f}  {arm_note(row)}")
 
 ok = True
 print()

@@ -2306,6 +2306,17 @@ def load_model(args: argparse.Namespace, device: torch.device) -> tuple[Any, Any
             tracked=tracked_state,
             # And the same box list, so line index i means one box on both sides of the handoff.
             box_map=args.layout_routing_line_map,
+            # Only an arm that applies a bias on one line has anything to correct, and only the
+            # regions map expresses the biased set as a line's keys.
+            routing_bias=float(routing_strength or 0.0),
+            correct_confidence=(
+                bool(getattr(args, "layout_tracking_corrected_confidence", False))
+                and tracked_state is not None
+                # A zero-bias arm has nothing to divide out, so it is left uncorrected rather
+                # than reported as corrected.
+                and bool(routing_strength)
+                and args.layout_routing_line_map == "regions"
+            ),
         )
         # On the top-level model, like the routing runtime: the eval loop already
         # holds the model and arms the probe per page.
@@ -4632,6 +4643,16 @@ def parse_args() -> argparse.Namespace:
             "the gate for the tracked source, in the scale-free unit stage 1 registered: "
             "top_line_mass * num_regions. Below this the estimate is dropped and the step left "
             "unbiased, rather than carrying a stale line forward"
+        ),
+    )
+    parser.add_argument(
+        "--layout-tracking-corrected-confidence",
+        action="store_true",
+        help=(
+            "divide the routing bias back out of the readout before the gate sees it. The bias "
+            "raises the very confidence the gate tests -- it multiplies the biased line's mass by "
+            "e^B -- so the bar was calibrated on a quantity the intervention inflates. The "
+            "correction is exact for the regions map, where the biased set is one line's keys"
         ),
     )
     parser.add_argument(
