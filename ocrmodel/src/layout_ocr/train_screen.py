@@ -3622,6 +3622,11 @@ def _routing_summary(reports: list[dict[str, Any]]) -> dict[str, Any] | None:
     return {
         "pages": len(reports),
         "bias": reports[0]["bias"],
+        # Which box the bias was aimed at.  Without it the summary cannot say whether an arm
+        # biased a character or a whole line, and that distinction is the entire reason the
+        # line arms exist.
+        "box_source": reports[0].get("box_source"),
+        "characters_on_a_line": reports[0].get("characters_on_a_line"),
         "decoding_steps": steps,
         "biased_steps": biased,
         "biased_fraction": biased / max(1, steps),
