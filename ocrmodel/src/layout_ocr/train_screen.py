@@ -3660,6 +3660,7 @@ def _probe_summary(reports: list[dict[str, Any]]) -> dict[str, Any] | None:
         "decoding_steps": sum(report["decoding_steps"] for report in reports),
         "grid_missing_steps": sum(report["grid_missing_steps"] for report in reports),
         "emitted_missing_steps": sum(report["emitted_missing_steps"] for report in reports),
+        "emitted_join_mismatch": sum(report["emitted_join_mismatch"] for report in reports),
         "mean_visual_mass": sum(masses) / len(masses) if masses else None,
         "transform_failed": failed,
         "layer_geometry": reports[0]["layer_geometry"],

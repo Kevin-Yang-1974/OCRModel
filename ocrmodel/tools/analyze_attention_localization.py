@@ -288,6 +288,7 @@ def expected_in_line_pos(region: dict[str, Any], box: list[float]) -> tuple[floa
 def score_page(
     report: dict[str, Any],
     reference: str,
+    prediction: str,
     regions: list[dict[str, Any]],
     characters: list[dict[str, Any]],
     *,
@@ -366,6 +367,15 @@ def score_page(
             per_step.setdefault(step, set()).add(int(mapping[position]))
     ambiguous = sum(1 for indices in per_step.values() if len(indices) > 1)
 
+    # End-to-end check on the step-to-token mapping.  The characters attributed to the
+    # observed steps must be a *suffix* of what the model actually produced: step 1 is
+    # the first decode step, and the token sampled from the prefill contributes a
+    # leading piece that no step ever observes.  If the two do not line up this way,
+    # the mapping is off and every character below is scored against the wrong step --
+    # which produces a complete set of plausible numbers and no error at all.
+    observed = "".join(fragment for fragment in fragments if fragment)
+    emitted_matches = int(prediction.endswith(observed))
+
     return {
         "page_id": report.get("page_id"),
         "steps": len(ordered_steps),
@@ -376,6 +386,8 @@ def score_page(
         "unbounded_chars": unbounded,
         "generated_chars": len(generated),
         "reference_chars": len(reference),
+        "prediction_chars": len(prediction),
+        "emitted_matches_prediction": emitted_matches,
         "rows": scored,
     }
 
@@ -561,6 +573,7 @@ def main(argv: list[str] | None = None) -> int:
         page = score_page(
             reports[page_id],
             predictions[page_id]["reference"],
+            predictions[page_id].get("prediction", ""),
             record.get("regions") or [],
             characters,
             layers=args.layers,
@@ -600,12 +613,17 @@ def main(argv: list[str] | None = None) -> int:
         report[name] = summarise(rows, args.confidence, per_page)
         report[name]["pages"] = [page["page_id"] for page in chosen]
         report[name]["alignment"] = {
-            "scored_steps": sum(page["scored"] for page in chosen),
-            "inserted_steps": sum(page["inserted"] for page in chosen),
+            "scored_chars": sum(page["scored"] for page in chosen),
+            "inserted_chars": sum(page["inserted"] for page in chosen),
             "ambiguous_steps": sum(page["ambiguous_steps"] for page in chosen),
             "unbounded_chars": sum(page["unbounded_chars"] for page in chosen),
             "steps_missing_text": sum(page["steps_missing_text"] for page in chosen),
             "total_steps": sum(page["steps"] for page in chosen),
+            "generated_chars": sum(page["generated_chars"] for page in chosen),
+            "prediction_chars": sum(page["prediction_chars"] for page in chosen),
+            "pages_matching_prediction": sum(
+                page["emitted_matches_prediction"] for page in chosen
+            ),
         }
     if "check" not in report and "select" not in report and pages:
         # No split was given, so score everything -- but only when there is something

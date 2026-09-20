@@ -130,6 +130,53 @@ def probe_heads(default: tuple[int, ...] | None = None) -> tuple[int, ...] | Non
     return _env_ints(HEADS_ENV_VAR) or default
 
 
+def _incremental_text(decoder: Any, tokens: list[int]) -> list[str]:
+    """Per-token text, such that concatenating it reproduces the full decode.
+
+    One token can carry several characters and one character can span several tokens,
+    so the attribution has to come from the cumulative decode rather than from
+    ``decode([token])`` -- which on a byte-level tokenizer returns a replacement
+    character for any token holding half of a multi-byte character.
+
+    The subtlety is what to do when a partial character completes.  Decoding the prefix
+    up to token ``s`` can end in U+FFFD, and decoding up to ``s + 1`` replaces it with
+    the finished character, so the longer decode is *not* an extension of the shorter
+    one.  Diffing on the longest common prefix handles that, but it leaves the fragment
+    attributed to token ``s`` -- which would duplicate it, because the finished
+    character also contains it.  The fragment is therefore retracted from the step that
+    emitted it before the completion is appended to this one.
+
+    An earlier version fell back to appending the whole cumulative string whenever the
+    prefix property failed.  That is not a rare fallback: on a real page roughly one
+    token in ten ends on a partial character, and each one re-appended the entire text
+    so far.  One 245-step page came out as 3485 characters instead of 284, which the
+    alignment then read as seventeen thousand insertions.
+    """
+
+    emitted: list[str] = []
+    previous = ""
+    for index in range(len(tokens)):
+        current = decoder.decode(tokens[: index + 1], skip_special_tokens=True)
+        common = 0
+        limit = min(len(previous), len(current))
+        while common < limit and previous[common] == current[common]:
+            common += 1
+        retract = len(previous) - common
+        while retract > 0 and emitted:
+            # Walk back over the slots that actually hold text; an emptied slot keeps
+            # its position so step indices stay aligned with token indices.
+            for position in range(len(emitted) - 1, -1, -1):
+                if retract <= 0:
+                    break
+                text = emitted[position]
+                take = min(retract, len(text))
+                emitted[position] = text[: len(text) - take]
+                retract -= take
+        emitted.append(current[common:])
+        previous = current
+    return emitted
+
+
 def _region_owners(regions: list[dict[str, Any]], positions: Tensor) -> Tensor:
     """Return the region index owning each visual token, or ``-1`` for background.
 
@@ -219,6 +266,7 @@ class AttentionProbe:
         self.steps = 0
         self._step_key: int | None = None
         self.emitted_missing = 0
+        self.emitted_join_mismatch = 0
         self._records: list[dict[str, Any]] = []
 
     # -- page lifecycle -----------------------------------------------------
@@ -243,6 +291,7 @@ class AttentionProbe:
         self._step_key = None
         self.grid_missing = 0
         self.emitted_missing = 0
+        self.emitted_join_mismatch = 0
         self._records = []
         if self.image_token_id is None:
             raise RuntimeError(
@@ -685,15 +734,16 @@ class AttentionProbe:
         """
 
         tokens = [int(token) for token in ids.reshape(-1).tolist()]
-        emitted: list[str] = []
-        previous = ""
-        for index in range(len(tokens)):
-            current = decoder.decode(tokens[: index + 1], skip_special_tokens=True)
-            # A byte-level tokenizer routinely cuts a multi-byte character in half, so
-            # losing the prefix property is normal; the remainder is then the whole
-            # fragment run rather than one character.
-            emitted.append(current[len(previous) :] if current.startswith(previous) else current)
-            previous = current
+        emitted = _incremental_text(decoder, tokens)
+        # The decomposition reproduces the full decode by construction -- the retraction
+        # above removes exactly the diverged tail before the extension is appended --
+        # so this cannot fire for an honest tokenizer.  What it does catch is a decoder
+        # that returns different text for the same ids across calls, which would make
+        # every character-to-step mapping downstream a fiction.  Cheap, and the failure
+        # it guards against is silent otherwise.
+        self.emitted_join_mismatch = int(
+            "".join(emitted) != decoder.decode(tokens, skip_special_tokens=True)
+        )
         self.emitted_missing = 0
         for record in self._records:
             step = record["step"]
@@ -721,6 +771,7 @@ class AttentionProbe:
             "decoding_steps": self.steps,
             "grid_missing_steps": self.grid_missing,
             "emitted_missing_steps": self.emitted_missing,
+            "emitted_join_mismatch": self.emitted_join_mismatch,
             "layer_geometry": {
                 str(layer): {
                     "num_heads": geometry[0],

@@ -309,6 +309,10 @@ else:
             ok = False
         if probe["emitted_missing_steps"]:
             print(f"  警告：{probe['emitted_missing_steps']} 步没有生成文本，离线对齐会缺")
+        if probe.get("emitted_join_mismatch"):
+            print(f"  **逐步文本拼不回完整解码**（{probe['emitted_join_mismatch']} 页）："
+                  f"字符到步的映射不可信，离线定位结果一律不读")
+            ok = False
         if probe["transform_failed"]:
             print(f"  **探针变换失败**（这些层的数字不可信）：{probe['transform_failed']}")
             ok = False

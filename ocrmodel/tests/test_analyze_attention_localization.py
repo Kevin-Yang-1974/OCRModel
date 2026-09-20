@@ -157,7 +157,8 @@ def test_a_step_is_scored_against_the_line_of_what_it_emitted():
         _char([0.6, 0.25, 0.8, 0.35]),  # 丁, right
     ]
     page = score_page(
-        report, "甲乙丙丁", REGIONS, characters, layers=None, heads=None, aggregate="mean"
+        report, "甲乙丙丁", "甲乙丙丁", REGIONS, characters, layers=None, heads=None,
+        aggregate="mean",
     )
     assert page["scored"] == 4
     assert [row["truth"] for row in page["rows"]] == [0, 0, 1, 1]
@@ -175,7 +176,10 @@ def test_the_emitted_text_decides_the_step_not_the_step_index():
         _char([0.1, 0.25, 0.3, 0.35]),
         _char([0.6, 0.05, 0.8, 0.15]),
     ]
-    page = score_page(report, "甲乙丙", REGIONS, characters, layers=None, heads=None, aggregate="mean")
+    page = score_page(
+        report, "甲乙丙", "甲乙丙", REGIONS, characters, layers=None,
+        heads=None, aggregate="mean",
+    )
     assert [row["truth"] for row in page["rows"]] == [0, 0, 1]
     # The step covering two reference characters has no single line by observation,
     # so it is counted rather than quietly averaged.
@@ -191,7 +195,10 @@ def test_an_inserted_character_is_not_scored_against_a_line():
 
     report = _report("p0", {1: ("甲", 0, 0.9), 2: ("乙", 0, 0.9), 3: ("Z", 1, 0.9)})
     characters = [_char([0.1, 0.05, 0.3, 0.15]), _char([0.1, 0.25, 0.3, 0.35])]
-    page = score_page(report, "甲乙", REGIONS, characters, layers=None, heads=None, aggregate="mean")
+    page = score_page(
+        report, "甲乙", "甲乙", REGIONS, characters, layers=None, heads=None,
+        aggregate="mean",
+    )
     assert page["inserted"] == 1
     assert [row["truth"] for row in page["rows"]] == [0, 0]
 
@@ -200,7 +207,9 @@ def test_a_step_without_emitted_text_is_reported_not_skipped():
     report = _report("p0", {1: ("甲", 0, 0.9)})
     del report["steps"][0]["emitted"]
     characters = [_char([0.1, 0.05, 0.3, 0.15])]
-    page = score_page(report, "甲", REGIONS, characters, layers=None, heads=None, aggregate="mean")
+    page = score_page(
+        report, "甲", "甲", REGIONS, characters, layers=None, heads=None, aggregate="mean"
+    )
     assert page["steps_missing_text"] == 1
     assert page["scored"] == 0
 
@@ -243,7 +252,8 @@ def test_row_breaks_are_marked_and_scored_separately():
         _char([0.6, 0.25, 0.8, 0.35]),
     ]
     page = score_page(
-        report, "甲乙丙丁", REGIONS, characters, layers=None, heads=None, aggregate="mean"
+        report, "甲乙丙丁", "甲乙丙丁", REGIONS, characters, layers=None, heads=None,
+        aggregate="mean",
     )
     from analyze_attention_localization import add_row_breaks
 
@@ -273,7 +283,10 @@ def test_head_selection_is_reported_per_head():
     report["steps"][0]["heads"] = [_row(0, layer=0, head=0), _row(1, layer=0, head=1)]
     report["steps"][1]["heads"] = [_row(0, layer=0, head=0), _row(1, layer=0, head=1)]
     characters = [_char([0.1, 0.05, 0.3, 0.15]), _char([0.1, 0.25, 0.3, 0.35])]
-    page = score_page(report, "甲乙", REGIONS, characters, layers=None, heads=None, aggregate="mean")
+    page = score_page(
+        report, "甲乙", "甲乙", REGIONS, characters, layers=None, heads=None,
+        aggregate="mean",
+    )
     page["raw_by_step"] = steps_for_head_selection(report)
     from analyze_attention_localization import by_selection
 
@@ -354,7 +367,10 @@ def test_the_tool_scores_the_gate_on_the_check_pages_only(tmp_path, capsys):
     report = json.loads(capsys.readouterr().out)
     assert report["check"]["scored"] == 2
     assert report["check"]["accuracy"] == 1.0
-    assert report["check"]["alignment"]["inserted_steps"] == 0
+    assert report["check"]["alignment"]["inserted_chars"] == 0
+    # The step-to-token mapping is checked end to end: the text attributed to observed
+    # steps has to be a suffix of what the model actually produced.
+    assert report["check"]["alignment"]["pages_matching_prediction"] == 1
     assert report["selection"]["per_head"]["0:0"]["accuracy"] == 1.0
     # The gate needs both the accuracy and the coverage, and it has to beat the prior.
     assert report["check"]["gate"]["accuracy_target"] == 0.90

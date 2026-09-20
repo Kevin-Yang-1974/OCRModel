@@ -177,6 +177,7 @@ def _probe_report(**overrides):
         "decoding_steps": 3,
         "grid_missing_steps": 0,
         "emitted_missing_steps": 1,
+        "emitted_join_mismatch": 0,
         "layer_geometry": {"0": {"num_heads": 4, "num_kv_heads": 2, "head_dim": 2, "scaling": 1.0}},
         "transform_failed": {},
         "steps": [
@@ -211,6 +212,7 @@ def test_the_summary_carries_every_key_the_launcher_reads():
         "decoding_steps",
         "grid_missing_steps",
         "emitted_missing_steps",
+        "emitted_join_mismatch",
         "mean_visual_mass",
         "transform_failed",
         "layer_geometry",

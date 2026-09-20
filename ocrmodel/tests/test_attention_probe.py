@@ -27,6 +27,7 @@ from torch import nn
 from layout_ocr import attention_probe as probe_module
 from layout_ocr.attention_probe import (
     AttentionProbe,
+    _incremental_text,
     _logsumexp,
     _region_owners,
     install_attention_probe,
@@ -789,6 +790,113 @@ def test_emitted_text_is_stamped_with_the_one_step_offset(monkeypatch):
     assert [record["emitted"] for record in runtime._records] == ["乙", "丙", "丁"]
     assert runtime.emitted_missing == 0
     assert runtime.report()["emitted_missing_steps"] == 0
+
+
+class _FragmentingDecoder:
+    """A byte-level tokenizer: a split character decodes to U+FFFD until it completes.
+
+    The completion *replaces* the trailing replacement character rather than being
+    appended after it.  That replacement is what makes a longer decode stop being an
+    extension of the shorter one, and it is the only reason the incremental
+    decomposition needs to retract anything.
+    """
+
+    def __init__(self, pieces):
+        # ``pieces[i]`` is what token ``i`` contributes; ``None`` means "half a
+        # character", which the real tokenizer renders as a replacement character.
+        self.pieces = pieces
+
+    def decode(self, ids, skip_special_tokens=True):
+        text = ""
+        pending = False
+        for index in ids:
+            piece = self.pieces[int(index)]
+            if piece is None:
+                text += "�"
+                pending = True
+            elif pending:
+                text = text[:-1] + piece
+                pending = False
+            else:
+                text += piece
+        return text
+
+
+def test_a_character_split_across_tokens_is_not_duplicated(monkeypatch):
+    """The failure that actually happened on the first real run.
+
+    Token 1 holds half of 穎, so the prefix decode ends in U+FFFD and the next decode
+    is not an extension of it.  Appending the whole cumulative string instead of
+    diffing made one 245-step page come out as 3485 characters instead of 284, and the
+    alignment read that as seventeen thousand insertions.
+    """
+
+    decoder = _FragmentingDecoder({0: "有", 1: None, 2: "穎", 3: "拔"})
+    ids = [0, 1, 2, 3]
+    # Token 1 holds only half of 穎, so it contributes no text at all; the character
+    # lands whole on token 2, which completed it.
+    assert _incremental_text(decoder, ids) == ["有", "", "穎", "拔"]
+
+    runtime = AttentionProbe(_bridge(), IMAGE_TOKEN_ID, layers=(0,))
+    runtime.set_page("p0", [], PROMPT_LENGTH, _prompt_ids())
+    for step in (1, 2, 3):
+        runtime._records.append({"step": step, "text_keys": 0, "heads": []})
+    runtime.attach_emitted(torch.tensor(ids), decoder)
+    # 有 came from token 0, which the prefill sampled and no step ever observes.
+    assert [record["emitted"] for record in runtime._records] == ["", "穎", "拔"]
+    assert runtime.emitted_join_mismatch == 0
+    assert runtime.report()["emitted_join_mismatch"] == 0
+    # An empty step is a step that emitted half a character, not a missing reading --
+    # so it is not counted as one.
+    assert runtime.emitted_missing == 0
+
+
+def test_the_decomposition_always_reproduces_the_full_decode():
+    """Whatever the splits, the concatenation has to be the model's own output."""
+
+    for pieces in (
+        {0: "甲", 1: "乙", 2: "丙"},
+        {0: None, 1: None, 2: "甲", 3: "乙"},
+        {0: "甲乙", 1: None, 2: "丙"},
+        {0: None, 1: "甲", 2: "乙丙", 3: None, 4: "丁"},
+    ):
+        decoder = _FragmentingDecoder(pieces)
+        ids = sorted(pieces)
+        # The invariant is over the whole decomposition, including token 0: that is the
+        # string the model produced, and any divergence from it is what would silently
+        # misalign every character downstream.
+        emitted = _incremental_text(decoder, ids)
+        assert "".join(emitted) == decoder.decode(ids), pieces
+
+        runtime = AttentionProbe(_bridge(), IMAGE_TOKEN_ID, layers=(0,))
+        runtime.set_page("p0", [], PROMPT_LENGTH, _prompt_ids())
+        # Step ``s`` is token ``s``; token 0 belongs to the prefill and to no step.
+        for step in range(1, len(ids)):
+            runtime._records.append({"step": step, "text_keys": 0, "heads": []})
+        runtime.attach_emitted(torch.tensor(ids), decoder)
+        assert [record["emitted"] for record in runtime._records] == emitted[1:], pieces
+        assert runtime.emitted_join_mismatch == 0
+
+
+def test_a_non_deterministic_decoder_is_flagged():
+    """The decomposition is faithful by construction, so what this checks is the
+    tokenizer: a decoder that does not return the same string for the same ids would
+    make every character-to-step mapping a fiction."""
+
+    class _Unstable:
+        def __init__(self):
+            self.calls = 0
+
+        def decode(self, ids, skip_special_tokens=True):
+            self.calls += 1
+            return "甲" * self.calls  # each call disagrees with the last
+
+    runtime = AttentionProbe(_bridge(), IMAGE_TOKEN_ID, layers=(0,))
+    runtime.set_page("p0", [], PROMPT_LENGTH, _prompt_ids())
+    runtime._records.append({"step": 1, "text_keys": 0, "heads": []})
+    runtime.attach_emitted(torch.tensor([0, 1]), _Unstable())
+    assert runtime.emitted_join_mismatch == 1
+    assert runtime.report()["emitted_join_mismatch"] == 1
 
 
 def test_a_multi_character_token_lands_whole_on_its_step():
