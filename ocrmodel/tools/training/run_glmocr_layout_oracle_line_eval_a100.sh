@@ -562,15 +562,40 @@ main() {
     # One list drives both the exports and the check, because two hand-kept lists is how a new
     # variable came to be missing from both: the baseline directory was added as a knob, never
     # re-exported, and the summarize then ran without a control while the check said nothing.
-    local -a tmux_names=(
-        GLMOCR_ORACLE_RUN_ID GLMOCR_ORACLE_GPUS GLMOCR_ORACLE_ARMS GLMOCR_ORACLE_POINTER
-        GLMOCR_ORACLE_MAX_PIXELS GLMOCR_ORACLE_CHECKPOINT GLMOCR_ORACLE_PROTOCOL
-        GLMOCR_ORACLE_PREDICTED_LINES GLMOCR_ORACLE_PROBE_LAYERS GLMOCR_ORACLE_PROBE_HEADS
-        GLMOCR_ORACLE_TRACKING_CONFIDENCE GLMOCR_ORACLE_BASELINE_DIR
+    # One list carrying both the names and their values.  Indirect expansion would have been the
+    # tidier way to keep a single list, and this host's bash does not support it -- ``${!name}``
+    # comes back as "!name: unbound variable" -- so the pairs are written out and the check reads
+    # the names back off them.
+    local -a tmux_pairs=(
+        "GLMOCR_ORACLE_RUN_ID=${run_id}"
+        "GLMOCR_ORACLE_GPUS=${gpu_slots}"
+        "GLMOCR_ORACLE_ARMS=${arms}"
+        "GLMOCR_ORACLE_POINTER=${pointer}"
+        "GLMOCR_ORACLE_MAX_PIXELS=${max_pixels}"
+        "GLMOCR_ORACLE_CHECKPOINT=${checkpoint}"
+        "GLMOCR_ORACLE_PROTOCOL=${protocol_file}"
+        "GLMOCR_ORACLE_PREDICTED_LINES=${predicted_lines}"
+        "GLMOCR_ORACLE_PROBE_LAYERS=${probe_layers}"
+        "GLMOCR_ORACLE_PROBE_HEADS=${probe_heads}"
+        "GLMOCR_ORACLE_TRACKING_CONFIDENCE=${tracking_confidence}"
+        "GLMOCR_ORACLE_BASELINE_DIR=${baseline_dir}"
     )
-    local tmux_env="" name
-    for name in "${tmux_names[@]}"; do
-        tmux_env+="export ${name}=$(printf '%q' "${!name}"); "
+    local tmux_env="" pair
+    for pair in "${tmux_pairs[@]}"; do
+        tmux_env+="export ${pair%%=*}=$(printf '%q' "${pair#*=}"); "
+    done
+    # The names that must reach the tmux shell, read back off the pairs.  An array rather than a
+    # backslash-continued list: the tooling here has eaten those continuations twice.
+    local -a required=(
+        GLMOCR_ORACLE_ARMS GLMOCR_ORACLE_PREDICTED_LINES GLMOCR_ORACLE_PROBE_LAYERS
+        GLMOCR_ORACLE_PROBE_HEADS GLMOCR_ORACLE_TRACKING_CONFIDENCE GLMOCR_ORACLE_BASELINE_DIR
+    )
+    local name
+    for name in "${required[@]}"; do
+        case "${tmux_env}" in
+            *"export ${name}="*) ;;
+            *) echo "re-export missing for ${name}: the tmux shell would not see it" >&2; exit 64 ;;
+        esac
     done
     tmux new-session -d -s "${session}" \
         "${tmux_env}bash $(printf '%q' "${script_path}") --foreground > ${eval_root}/pipeline.log 2>&1"
