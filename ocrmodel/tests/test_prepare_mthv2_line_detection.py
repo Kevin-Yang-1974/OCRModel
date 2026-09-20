@@ -101,6 +101,49 @@ def test_a_region_without_a_box_field_is_counted_not_guessed():
     assert stats["no_box_field"] == 1
 
 
+def test_a_relative_image_path_is_resolved_against_the_manifest(tmp_path):
+    """The Dunhuang manifest gives paths relative to its split directory; MTHv2 gives absolute.
+
+    Without the fallback every Dunhuang page is reported as having no image, which would read as
+    a broken dataset rather than a path convention.
+    """
+
+    from prepare_mthv2_line_detection import resolve_image
+
+    images = tmp_path / "train" / "images" / "dunhuang"
+    images.mkdir(parents=True)
+    image = images / "page.jpg"
+    image.write_bytes(b"x")
+    assert resolve_image("images/dunhuang/page.jpg", tmp_path / "train") == str(image)
+    # An absolute path that exists is left alone.
+    assert resolve_image(str(image), tmp_path / "elsewhere") == str(image)
+    # Nothing resolves: hand back what was asked for, so the missing-image report names it.
+    assert resolve_image("images/nope.jpg", tmp_path / "train") == "images/nope.jpg"
+
+
+def test_a_manifest_without_the_char_channel_is_accepted(tmp_path):
+    """The Dunhuang layout has no characters; the index only needs regions and images."""
+
+    directory = tmp_path / "data" / "train"
+    # The image sits beside the manifest, which is how the Dunhuang layout ships its paths.
+    image = directory / "images" / "p0.jpg"
+    image.parent.mkdir(parents=True)
+    image.write_bytes(b"x")
+    record = _record(page_id="p0", image_path="images/p0.jpg")
+    # Deliberately named manifest.jsonl, and with no characters key at all.
+    (directory / "manifest.jsonl").write_text(
+        json.dumps(record, ensure_ascii=False) + "\n", encoding="utf-8"
+    )
+    code = main(["--manifest-dir", str(tmp_path / "data"), "--output-dir", str(tmp_path / "out"),
+                 "--splits", "train"])
+    assert code == 0
+    index = tmp_path / "out" / "lines_train.jsonl"
+    rows = [
+        json.loads(line) for line in index.read_text(encoding="utf-8").splitlines() if line.strip()
+    ]
+    assert [row["page_id"] for row in rows] == ["p0"]
+
+
 def test_the_test_split_is_refused(tmp_path):
     """Rule 10 locks it, and the refusal belongs in the code rather than in a note."""
 

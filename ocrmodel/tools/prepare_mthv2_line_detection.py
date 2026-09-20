@@ -46,7 +46,35 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--output-dir", required=True, type=Path)
     parser.add_argument("--splits", nargs="+", default=["train", "validation"])
     parser.add_argument("--min-side-px", type=float, default=MIN_SIDE_PX)
+    parser.add_argument(
+        "--image-root",
+        type=Path,
+        default=None,
+        help=(
+            "where a relative image_path is resolved from. Defaults to the manifest's own "
+            "directory. MTHv2 carries absolute paths and needs none of this; the Dunhuang "
+            "manifest carries paths relative to its split directory, and without the fallback "
+            "every page would be reported as having no image"
+        ),
+    )
     return parser.parse_args(argv)
+
+
+def resolve_image(raw: str, image_root: Path) -> str:
+    """An absolute path for a manifest entry that may be relative.
+
+    Returns the raw value unchanged when nothing resolves, so the caller's missing-image report
+    still fires and names the path it could not find.
+    """
+
+    candidate = Path(raw)
+    if candidate.is_absolute() or candidate.is_file():
+        return raw
+    for base in (image_root, image_root.parent):
+        joined = base / candidate
+        if joined.is_file():
+            return str(joined)
+    return raw
 
 
 def page_rows(
@@ -118,9 +146,15 @@ def main(argv: list[str] | None = None) -> int:
     report: dict[str, Any] = {"splits": {}, "min_side_px": args.min_side_px}
 
     for split in args.splits:
+        # MTHv2 names its manifest char-by-char; the Dunhuang compatibility layout does not have
+        # the character channel at all.  Both are accepted, and what a split actually carries is
+        # reported rather than assumed.
         manifest = args.manifest_dir / split / "manifest.char.jsonl"
         if not manifest.is_file():
-            raise SystemExit(f"manifest missing: {manifest}")
+            manifest = args.manifest_dir / split / "manifest.jsonl"
+        if not manifest.is_file():
+            raise SystemExit(f"manifest missing: {args.manifest_dir / split}")
+        image_root = args.image_root or manifest.parent
         rows: list[dict[str, Any]] = []
         totals = Counter()
         boxes_per_page: list[int] = []
@@ -136,6 +170,7 @@ def main(argv: list[str] | None = None) -> int:
             totals.update(stats)
             if row is None:
                 continue
+            row["image_path"] = resolve_image(row["image_path"], image_root)
             image = Path(row["image_path"])
             if not image.is_file():
                 # The index is only useful if the images are actually there; a missing one
