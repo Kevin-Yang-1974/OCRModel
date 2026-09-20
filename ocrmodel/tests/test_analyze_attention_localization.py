@@ -291,6 +291,54 @@ def test_a_page_with_no_failures_has_no_marked_characters():
     assert near_repeated == [False] * 3
 
 
+def test_the_scale_free_confidence_unit_removes_the_line_count():
+    """The absolute share is not comparable across pages; the multiple of uniform is.
+
+    With N lines nothing exceeds 1/N under a uniform distribution, so a fixed bar is much
+    harder to clear on a page with more lines -- which is how coverage came to correlate
+    -0.65 with the line count on the stage-1 subset.
+    """
+
+    from analyze_attention_localization import confidence_value
+
+    two_lines = {"confidence": 0.5, "regions": 2}
+    twenty_lines = {"confidence": 0.1, "regions": 20}
+    # Same readout quality: half the mass on a two-line page and a tenth on a twenty-line
+    # page are both 1x uniform.
+    assert confidence_value(two_lines, "uniform_multiple") == pytest.approx(1.0)
+    assert confidence_value(twenty_lines, "uniform_multiple") == pytest.approx(2.0)
+    # Under the absolute unit the two are far apart, which is the confound.
+    assert confidence_value(two_lines, "absolute") == pytest.approx(0.5)
+    assert confidence_value(twenty_lines, "absolute") == pytest.approx(0.1)
+
+
+def test_the_threshold_and_the_curve_use_the_same_unit():
+    """A curve drawn in one unit and a verdict in another would not describe each other."""
+
+    rows = [
+        {"step": 1, "truth": 0, "pred": 0, "confidence": 0.30, "regions": 4,
+         "row_break": False, "in_line_pos": 0.5, "expected_pos": 0.5, "m_t": 0.5,
+         "near_dropped": False, "near_repeated": False},
+        {"step": 2, "truth": 1, "pred": 1, "confidence": 0.05, "regions": 4,
+         "row_break": True, "in_line_pos": 0.5, "expected_pos": 0.5, "m_t": 0.5,
+         "near_dropped": False, "near_repeated": False},
+    ]
+    from analyze_attention_localization import curves
+
+    # In the absolute unit only the 0.30 row clears 0.20.
+    absolute = curves(rows, 0.20, "absolute")
+    assert absolute["confident_steps"] == 1
+    # In the scale-free unit neither does: 0.30 x 4 = 1.2x uniform and 0.05 x 4 = 0.2x.
+    scale_free = curves(rows, 2.0, "uniform_multiple")
+    assert scale_free["confident_steps"] == 0
+    # And the bands follow the same unit.  Fixed 0.0-1.0 edges would drop both rows --
+    # 1.2x and 0.2x -- outside every band, leaving an empty curve that still looked like
+    # one.  Every row must land in exactly one band.
+    assert sum(band["steps"] for band in scale_free["bands"].values()) == 2
+    assert sum(band["steps"] for band in absolute["bands"].values()) == 2
+    assert list(scale_free["bands"])[-1].endswith("+")
+
+
 def test_the_report_splits_the_readout_by_failure_neighbourhood():
     report = _report("p0", {1: ("甲", 0, 0.9), 2: ("丙", 1, 0.9)})
     # Three boxes for three reference characters; the middle one is the dropped 乙.

@@ -55,6 +55,10 @@ gpu_slots="${GLMOCR_PROBE_GPUS:-0,1}"
 # 在 check 页上只用固定选择，不得每页用真值挑头。
 probe_layers="${GLMOCR_PROBE_LAYERS:-0,4,8,12}"
 probe_heads="${GLMOCR_PROBE_HEADS:-}"
+# A previous run's validation_subset_stage.jsonl.  Pages it already measured are left out
+# of this draw, so a re-run is not judged on the pages that produced the result it is
+# re-examining.  Empty means no exclusion (a first run has nothing to exclude).
+subset_exclude="${GLMOCR_PROBE_SUBSET_EXCLUDE:-}"
 
 eval_root="${remote_root}/attention_probe/${run_id}"
 python="${env_dir}/bin/python3"
@@ -92,24 +96,54 @@ subset_manifest() {
     setup_environment
     mkdir -p "${eval_root}"
     "${python}" - "${sparse_root}/validation/manifest.char.jsonl" "${eval_root}" \
-        "${page_count}" "${select_pages}" <<'PY'
+        "${page_count}" "${select_pages}" "${subset_exclude}" <<'PY'
 import json
 import sys
 from pathlib import Path
 
-source, out_dir, count, select_count = Path(sys.argv[1]), Path(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4])
+source, out_dir = Path(sys.argv[1]), Path(sys.argv[2])
+count, select_count = int(sys.argv[3]), int(sys.argv[4])
+exclude_path = sys.argv[5]
 rows = [json.loads(line) for line in source.read_text(encoding="utf-8").splitlines() if line.strip()]
 if len(rows) < count:
     raise SystemExit(f"validation manifest has {len(rows)} pages, need {count}")
+
+# Pages a previous run already measured, so a re-run can be judged on pages that did not
+# produce the result being re-examined.  Excluding them is what makes the evidence
+# independent of that result; it does not make the sample a blind one, and the
+# pre-registration says so.
+excluded = set()
+if exclude_path:
+    prior = Path(exclude_path)
+    if not prior.is_file():
+        raise SystemExit(f"--subset-exclude file not found: {prior}")
+    excluded = {
+        json.loads(line)["page_id"]
+        for line in prior.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    }
 
 # The subset is fixed by a rule, not by an outcome.  Sorting by reference length and
 # taking an even stride across the range covers short pages and long pages without
 # anyone looking at how the model did on them first -- the plan's requirement is that
 # pages are not chosen by experimental gain.
-ordered = sorted(range(len(rows)), key=lambda index: (len(rows[index].get("page_text") or ""), index))
+ordered = [
+    index
+    for index in sorted(
+        range(len(rows)), key=lambda index: (len(rows[index].get("page_text") or ""), index)
+    )
+    if rows[index]["page_id"] not in excluded
+]
+if len(ordered) < count:
+    raise SystemExit(
+        f"{len(ordered)} pages remain after excluding {len(excluded)}, need {count}"
+    )
 stride = len(ordered) / count
 picked = [ordered[int(index * stride)] for index in range(count)]
 chosen = [rows[index] for index in sorted(picked)]
+overlap = excluded & {row["page_id"] for row in chosen}
+if overlap:
+    raise SystemExit(f"subset overlaps the excluded set: {sorted(overlap)[:3]}")
 
 (out_dir / f"validation_subset_stage.jsonl").write_text(
     "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in chosen), encoding="utf-8"
@@ -128,8 +162,12 @@ print(json.dumps({
     "pages": len(chosen),
     "select": len(select_ids),
     "check": len(check_ids),
+    "excluded": len(excluded),
     "length_range": [len(chosen[by_length[0]].get("page_text") or ""),
                      len(chosen[by_length[-1]].get("page_text") or "")],
+    # Printed so disjointness from the excluded set can be checked from the log rather
+    # than taken on trust.
+    "page_ids": sorted(row["page_id"] for row in chosen),
 }, ensure_ascii=False))
 PY
 }
@@ -399,6 +437,7 @@ main() {
 "export GLMOCR_PROBE_GPUS=$(printf '%q' "${gpu_slots}"); "\
 "export GLMOCR_PROBE_LAYERS=$(printf '%q' "${probe_layers}"); "\
 "export GLMOCR_PROBE_HEADS=$(printf '%q' "${probe_heads}"); "\
+"export GLMOCR_PROBE_SUBSET_EXCLUDE=$(printf '%q' "${subset_exclude}"); "\
 "export GLMOCR_PROBE_MAX_PIXELS=$(printf '%q' "${max_pixels}"); "\
 "export GLMOCR_PROBE_CHECKPOINT=$(printf '%q' "${checkpoint}"); "\
 "export GLMOCR_PROBE_PROTOCOL=$(printf '%q' "${protocol_file}"); "\

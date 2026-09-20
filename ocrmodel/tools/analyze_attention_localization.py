@@ -96,6 +96,19 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--heads", type=int, nargs="+", default=None)
     parser.add_argument("--confidence", type=float, default=DEFAULT_CONFIDENCE)
     parser.add_argument(
+        "--confidence-mode",
+        choices=["absolute", "uniform_multiple"],
+        default="absolute",
+        help=(
+            "'absolute' compares top_line_mass to --confidence. 'uniform_multiple' compares "
+            "top_line_mass times the page's line count, i.e. how many times above a uniform "
+            "distribution over its lines the readout concentrates -- the same number means "
+            "the same thing on a ten-line page and a forty-line one, which the absolute "
+            "share does not. The default is 'absolute' so results reported under it stay "
+            "reproducible; the stage-1 pre-registration selects uniform_multiple at 2.0"
+        ),
+    )
+    parser.add_argument(
         "--neighbourhood",
         type=int,
         default=3,
@@ -438,6 +451,9 @@ def score_page(
                 "truth": truth,
                 "pred": int(readout["argmax_line"]),
                 "confidence": float(readout["top_line_mass"]),
+                # The page's line count travels with the row so the scale-free
+                # confidence unit can be computed per character.
+                "regions": max(1, len(ordered)),
                 "background": float(readout.get("background_mass", 0.0)),
                 "m_t": float(readout.get("m_t", 0.0)),
                 "in_line_pos": float(readout.get("in_line_pos", -1.0)),
@@ -493,18 +509,43 @@ def accuracy(rows: list[dict[str, Any]]) -> float | None:
     return sum(1 for row in rows if row["pred"] == row["truth"]) / len(rows) if rows else None
 
 
-def curves(rows: list[dict[str, Any]], confidence: float) -> dict[str, Any]:
+def confidence_value(row: dict[str, Any], mode: str) -> float:
+    """The step's confidence in the unit the mode defines.
+
+    ``uniform_multiple`` multiplies by the page's line count because the absolute share is
+    not comparable across pages: with ``N`` lines nothing exceeds ``1/N`` under a uniform
+    distribution, so a fixed bar is far harder to clear on a page with more lines.  That
+    showed up as coverage correlating -0.65 with the line count on the stage-1 subset.
+    """
+
+    if mode == "uniform_multiple":
+        return float(row["confidence"]) * max(1, int(row.get("regions") or 1))
+    return float(row["confidence"])
+
+
+def curves(rows: list[dict[str, Any]], confidence: float, mode: str = "absolute") -> dict[str, Any]:
     """Overall accuracy, the high-confidence subset, and the accuracy-vs-confidence bands."""
 
-    confident = [row for row in rows if row["confidence"] >= confidence]
+    confident = [row for row in rows if confidence_value(row, mode) >= confidence]
+    # The band edges have to follow the unit.  They used to be fixed at 0.0-1.0 in steps of
+    # 0.2, which is the absolute unit's range and nothing else's: the scale-free unit has a
+    # median near 10, so almost every row fell outside every band and the curve came out
+    # empty while still looking like a curve.
+    edges = (
+        (0.0, 2.0, 4.0, 6.0, 8.0) if mode == "uniform_multiple" else (0.0, 0.2, 0.4, 0.6, 0.8)
+    )
+    step = edges[1] - edges[0]
     bands: dict[str, Any] = {}
-    for low in (0.0, 0.2, 0.4, 0.6, 0.8):
-        high = low + 0.2
-        band = [row for row in rows if low <= row["confidence"] < high]
-        bands[f"{low:.1f}-{high:.1f}"] = {
-            "steps": len(band),
-            "accuracy": accuracy(band),
-        }
+    for index, low in enumerate(edges):
+        high = low + step
+        last = index == len(edges) - 1
+        band = [
+            row
+            for row in rows
+            if low <= confidence_value(row, mode) < (float("inf") if last else high)
+        ]
+        label = f"{low:.1f}+" if last else f"{low:.1f}-{high:.1f}"
+        bands[label] = {"steps": len(band), "accuracy": accuracy(band)}
     line_breaks = [row for row in rows if row["row_break"]]
     within = [row for row in rows if not row["row_break"]]
     dropped = [row for row in rows if row["near_dropped"]]
@@ -604,10 +645,12 @@ def baselines(rows: list[dict[str, Any]], pages: dict[str, list[dict[str, Any]]]
     }
 
 
-def summarise(rows: list[dict[str, Any]], confidence: float, page_rows: dict) -> dict[str, Any]:
+def summarise(
+    rows: list[dict[str, Any]], confidence: float, page_rows: dict, mode: str = "absolute"
+) -> dict[str, Any]:
     add_row_breaks(rows)
     base = baselines(rows, page_rows)
-    result = curves(rows, confidence)
+    result = curves(rows, confidence, mode)
     result["baselines"] = base
     best = base["stay_previous_line"]
     result["beats_stay_previous_line"] = (
@@ -716,6 +759,7 @@ def main(argv: list[str] | None = None) -> int:
         "heads": args.heads,
         "aggregate": args.aggregate,
         "confidence": args.confidence,
+        "confidence_mode": args.confidence_mode,
         "neighbourhood": args.neighbourhood,
         "pages_scored": len(pages),
         "pages_without_char_channel": skipped,
@@ -730,7 +774,7 @@ def main(argv: list[str] | None = None) -> int:
         for page in chosen:
             rows.extend(page["rows"])
         per_page = {page["page_id"]: page["rows"] for page in chosen}
-        report[name] = summarise(rows, args.confidence, per_page)
+        report[name] = summarise(rows, args.confidence, per_page, args.confidence_mode)
         report[name]["pages"] = [page["page_id"] for page in chosen]
         # Per page, because a half-to-half difference can be page composition rather than
         # a property of the readout, and the plan asks for grouped statistics when pages
@@ -764,7 +808,7 @@ def main(argv: list[str] | None = None) -> int:
         # actually means "no truth to compare against".
         rows = [row for page in pages for row in page["rows"]]
         per_page = {page["page_id"]: page["rows"] for page in pages}
-        report["all"] = summarise(rows, args.confidence, per_page)
+        report["all"] = summarise(rows, args.confidence, per_page, args.confidence_mode)
 
     text = json.dumps(report, ensure_ascii=False, indent=2)
     if args.output:
