@@ -39,7 +39,7 @@ class _Tracked:
     def set_page(self):
         self.line = -1
 
-    def observe(self, line, confidence):
+    def observe(self, line, confidence, **_kwargs):
         pass
 
     def report(self):

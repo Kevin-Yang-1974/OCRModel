@@ -1079,7 +1079,7 @@ class _TrackedStub:
         self.line = line
         self.seen: list[tuple[int | None, float]] = []
 
-    def observe(self, line, confidence) -> None:
+    def observe(self, line, confidence, **_kwargs) -> None:
         self.seen.append((line, confidence))
 
 

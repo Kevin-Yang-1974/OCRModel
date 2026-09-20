@@ -2251,7 +2251,10 @@ def load_model(args: argparse.Namespace, device: torch.device) -> tuple[Any, Any
             )
         if routing_strength is None:
             raise RuntimeError("--layout-routing-line-source is meaningless without a routing bias")
-        tracked_state = TrackedLineState(args.layout_tracking_confidence)
+        tracked_state = TrackedLineState(
+            args.layout_tracking_confidence,
+            getattr(args, "layout_tracking_switch_bar", 1.0) or 1.0,
+        )
     if (
         routing_strength is not None
         and getattr(args, "layout_routing_line_map", "regions") == "predicted"
@@ -4651,6 +4654,20 @@ def parse_args() -> argparse.Namespace:
             "the gate for the tracked source, in the scale-free unit stage 1 registered: "
             "top_line_mass * num_regions. Below this the estimate is dropped and the step left "
             "unbiased, rather than carrying a stale line forward"
+        ),
+    )
+    parser.add_argument(
+        "--layout-tracking-switch-bar",
+        type=float,
+        default=1.0,
+        help=(
+            "how much more mass a different line has to hold, relative to what the current line "
+            "still holds, before the tracker moves to it. One is the recorded behaviour. Measured "
+            "against the current line rather than against the bar on purpose: the bar version "
+            "leaves the change rate alone (0.0317 -> 0.0315) because the costly switches are "
+            "high-confidence ones. The bias inflates the mass of the line in use, so it supplies "
+            "hysteresis by accident -- removing it took the change rate from 0.060 to 0.123 and "
+            "deletions from 771 to 1066. This makes the stability deliberate"
         ),
     )
     parser.add_argument(

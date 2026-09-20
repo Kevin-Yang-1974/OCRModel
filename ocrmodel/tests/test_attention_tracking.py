@@ -328,3 +328,73 @@ def test_installation_passes_the_state_through():
     assert runtime.line_source == "tracked"
     for handle in handles:
         handle.remove()
+
+
+# -- the switch margin ---------------------------------------------------
+#
+# The bias inflates the mass of the line already in use, so it supplies hysteresis by accident:
+# dividing it out raised the change rate from 0.060 to 0.123 per accepted step and deletions from
+# 771 to 1066. The margin makes that stability deliberate -- and it is measured against what the
+# *current* line still holds, not against the bar, because a penalty on the bar was tried first
+# and does nothing: the switches that cost are not low-confidence ones.
+
+
+def test_without_a_held_mass_the_margin_is_not_applied():
+    # A caller that cannot supply the distribution gets the recorded behaviour rather than an
+    # invented comparison.
+    state = TrackedLineState(6.0, switch_bar=3.0)
+    state.observe(3, 7.0, num_regions=10)
+    state.observe(4, 7.0, num_regions=10)
+    assert state.line == 4
+    assert state.held == 0
+
+
+def test_a_line_holding_less_than_the_margin_is_overruled():
+    state = TrackedLineState(6.0, switch_bar=2.0)
+    state.observe(3, 7.0, held_mass=0.5, num_regions=10)
+    # Candidate mass 0.8 against the held 0.5 * 2 = 1.0: not enough to move.
+    state.observe(4, 8.0, held_mass=0.5, num_regions=10)
+    assert state.line == 3
+    assert state.held == 1
+
+
+def test_a_line_holding_more_than_the_margin_takes_over():
+    state = TrackedLineState(6.0, switch_bar=2.0)
+    state.observe(3, 7.0, held_mass=0.5, num_regions=10)
+    # Candidate mass 1.2 against 1.0: it moves.
+    state.observe(4, 12.0, held_mass=0.5, num_regions=10)
+    assert state.line == 4
+
+
+def test_the_same_line_never_needs_a_margin():
+    state = TrackedLineState(6.0, switch_bar=3.0)
+    state.observe(3, 7.0, held_mass=0.9, num_regions=10)
+    state.observe(3, 7.0, held_mass=0.9, num_regions=10)
+    assert state.line == 3
+    assert state.held == 0
+
+
+def test_the_first_line_of_a_page_is_never_held_back():
+    state = TrackedLineState(6.0, switch_bar=3.0)
+    state.observe(5, 7.0, held_mass=0.0, num_regions=10)
+    assert state.line == 5
+
+
+def test_a_gated_step_still_clears_the_line():
+    state = TrackedLineState(6.0, switch_bar=3.0)
+    state.observe(3, 7.0, held_mass=0.5, num_regions=10)
+    state.observe(3, 1.0, held_mass=0.5, num_regions=10)
+    assert state.line == -1
+    assert state.gated == 1
+    assert state.held == 0
+
+
+def test_a_switch_bar_below_one_is_refused():
+    with pytest.raises(ValueError, match="at least 1.0"):
+        TrackedLineState(6.0, switch_bar=0.5)
+
+
+def test_the_switch_bar_travels_with_the_report():
+    state = TrackedLineState(6.0, switch_bar=1.5)
+    assert state.report()["switch_bar"] == 1.5
+    assert state.report()["held"] == 0

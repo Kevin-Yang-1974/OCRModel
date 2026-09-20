@@ -73,6 +73,11 @@ gpu_slots="${GLMOCR_ORACLE_GPUS:-0,1,2,3}"
 # 第 8 个字段 `<偏置校正>`（0/1）把路由加在读数上的偏置除掉再送进门控：偏置会把被偏置那一行
 # 的权重乘 e^B，而门槛登记的正是这个被抬高过的量（见 docs/LAYOUT_LINE_DETECTOR_AND_PREDMAP_RESULT.md
 # §8）。同一轮里必须同时有 0 和 1，否则「门槛/剂量」与「校正」两个变量分不开。
+# 第 10 个字段 `<切换门槛倍数>` 要求换到**不同的行**时，候选行持有的权重高于**当前行**的这么多倍才换。
+# 注意是跟当前行的权重比，不是跟门控门槛比：按门槛的版本先试过，对换行率毫无影响
+# （0.0317 → 0.0315），因为真正有害的换行本身置信度很高。按当前行比的那版把换行率从 0.121
+# 压到 0.078（离线筛选），而把偏置从读数里除掉正是让换行率从 0.060 升到 0.123、删除 771→1066
+# 的那件事 —— 偏置抬高「当前行」的权重，本身在提供滞后。1.0 是记录行为。
 # 第 9 个字段 `<下一行份额>` 让读序里的**下一行**也带一份偏置。被偏置的那一行按构造滞后一步，
 # 离线重放把代价量到 8.5% 的字符上，而其中 88–95% 是各自行内的前三个字 —— 正是跟踪器还没跟上的
 # 那一步。覆盖下一行在这些字符上指向正确的列；在其余字符上它以这个份额加进一个错的列，
@@ -126,7 +131,7 @@ preflight() {
 # pre-create the arm directory: the log lives as a sibling.
 launch() {
     local arm="$1" bias="$2" box_source="$3" line_source="$4" line_map="$5" confidence="$6"
-    local arm_predicted="$7" arm_corrected="$8" arm_next_scale="$9" gpu="${10}"
+    local arm_predicted="$7" arm_corrected="$8" arm_next_scale="$9" arm_switch_bar="${10}" gpu="${11}"
     # An arm may carry its own map file.  Comparing two maps at one gate needs both in the same run,
     # and the gate has to be held fixed while the map changes or a difference could be either.
     local arm_lines="${arm_predicted:-${predicted_lines}}"
@@ -161,14 +166,17 @@ launch() {
             if [[ -n "${arm_next_scale}" && "${arm_next_scale}" != "0" ]]; then
                 route_flags+=(--layout-routing-next-line-scale "${arm_next_scale}")
             fi
+            if [[ -n "${arm_switch_bar}" && "${arm_switch_bar}" != "1" ]]; then
+                route_flags+=(--layout-tracking-switch-bar "${arm_switch_bar}")
+            fi
         fi
     fi
     # What the arm was, written next to its log.  The gate and the correction are two variables
     # and the verdict has to be able to say which one moved, so the flags are recorded here
     # rather than reconstructed from the arm's name.
-    printf '{"arm":"%s","bias":"%s","box_source":"%s","line_source":"%s","line_map":"%s","confidence":"%s","predicted_lines":"%s","corrected":%s,"next_line_scale":%s}\n' \
+    printf '{"arm":"%s","bias":"%s","box_source":"%s","line_source":"%s","line_map":"%s","confidence":"%s","predicted_lines":"%s","corrected":%s,"next_line_scale":%s,"switch_bar":%s}\n' \
         "${arm}" "${bias}" "${box_source}" "${line_source}" "${line_map}" "${confidence}" \
-        "${arm_lines}" "${arm_corrected:-0}" "${arm_next_scale:-0}" > "${out}.arm.json"
+        "${arm_lines}" "${arm_corrected:-0}" "${arm_next_scale:-0}" "${arm_switch_bar:-1}" > "${out}.arm.json"
     (
         setup_environment
         export CUDA_VISIBLE_DEVICES="${gpu}"
@@ -206,7 +214,7 @@ run_arms() {
     local -a pids=() labels=() failed=0
     local index=0 spec
     for spec in ${arms}; do
-        IFS=':' read -r arm bias box_source line_source line_map confidence arm_predicted arm_corrected arm_next_scale <<< "${spec}"
+        IFS=':' read -r arm bias box_source line_source line_map confidence arm_predicted arm_corrected arm_next_scale arm_switch_bar <<< "${spec}"
         line_source="${line_source:-pointer}"
         line_map="${line_map:-regions}"
         confidence="${confidence:-${tracking_confidence}}"
@@ -218,7 +226,7 @@ run_arms() {
         fi
         local gpu="${slots[$(( index % total ))]}"
         launch "${arm}" "${bias}" "${box_source}" "${line_source}" "${line_map}" "${confidence}" \
-            "${arm_predicted}" "${arm_corrected}" "${arm_next_scale}" "${gpu}" &
+            "${arm_predicted}" "${arm_corrected}" "${arm_next_scale}" "${arm_switch_bar}" "${gpu}" &
         pids+=("$!"); labels+=("${arm}")
         index=$(( index + 1 ))
         if (( index % total == 0 )); then
@@ -386,6 +394,9 @@ def arm_note(row):
         scale = config.get("next_line_scale")
         if scale not in (None, 0, "0"):
             parts.append(f"next+{scale}")
+        switch = config.get("switch_bar")
+        if switch not in (None, 1, "1"):
+            parts.append(f"switch {switch}")
     return "  ".join(parts)
 
 

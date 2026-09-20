@@ -748,10 +748,20 @@ class AttentionProbe:
             # Publish this step's estimate for an arm that aims its bias by it.  Written here, on a
             # post-hook, so a reader hooked earlier in the next forward sees the previous step's
             # value -- which is the one-step lag the plan asks for, and it needs no extra state.
-            from .attention_tracking import aggregate_line_estimate
+            from .attention_tracking import (
+                aggregate_line_distribution,
+                aggregate_line_estimate,
+            )
 
-            line, confidence = aggregate_line_estimate(records, int(self.num_regions or 0))
-            self.tracked.observe(line, confidence)
+            num_regions = int(self.num_regions or 0)
+            line, confidence = aggregate_line_estimate(records, num_regions)
+            # What the line already in use still holds, so a switch margin can compare like with
+            # like. Absent when no line is in use, in which case there is nothing to hold.
+            probs = aggregate_line_distribution(records, num_regions)
+            held = None
+            if probs is not None and 0 <= self.tracked.line < len(probs):
+                held = float(probs[self.tracked.line])
+            self.tracked.observe(line, confidence, held_mass=held, num_regions=num_regions)
 
     def _in_line_position(self, dist: Tensor, owners: Tensor, num_lines: int) -> list[float]:
         """Attention-weighted position along each line's reading direction, one per head.

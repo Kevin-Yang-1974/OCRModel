@@ -44,6 +44,18 @@ from analyze_attention_localization import (  # noqa: E402
     select,
 )
 
+# How much more mass a different line must hold before the tracker moves to it, by policy name.
+# Screening only: the point is to see whether a value reduces the change rate at all, because the
+# applied-line accuracy this file reports has been measured not to predict CER.
+MARGINS = {
+    "margin15": 1.5,
+    "margin20": 2.0,
+    "margin30": 3.0,
+    "cmargin15": 1.5,
+    "cmargin20": 2.0,
+    "cmargin30": 3.0,
+}
+
 # Stage 1's registered bar, in the scale-free unit the tracker uses.
 DEFAULT_BAR = 6.0
 # The tracked arm's bias.  Only used to invert the contamination, so a wrong value shows up as a
@@ -163,7 +175,18 @@ def policy_mono_hold(state: int, candidate: int, confidence: float, bar: float) 
     return candidate if candidate >= state else state
 
 
+
+
 POLICIES: dict[str, tuple[Callable[[int, int, float, float], int], bool]] = {
+    "margin15": (policy_recorded, False),
+    "margin20": (policy_recorded, False),
+    "margin30": (policy_recorded, False),
+    # The corrected readout is the restless one (0.045 changes per step against 0.032), so the
+    # margin only has something to do when it is paired with the correction that removed the
+    # bias's accidental hysteresis.
+    "cmargin15": (policy_recorded, True),
+    "cmargin20": (policy_recorded, True),
+    "cmargin30": (policy_recorded, True),
     # name -> (policy, whether the confidence has the bias divided out of it)
     "recorded": (policy_recorded, False),
     "corrected": (policy_recorded, True),
@@ -246,7 +269,22 @@ def replay_page(
                     observations += 1
                     confidence = float(row["top_line_mass"]) * len(regions)
                     previous = state
-                    state = policy(state, int(row["argmax_line"]), confidence, bar)
+                    margin = MARGINS.get(name)
+                    if margin is not None and previous >= 0:
+                        # What the *current* line still holds, against what the candidate does.
+                        # A penalty built on the bar cannot express this: the switches that cost
+                        # are not low-confidence ones, they are steps where a second line briefly
+                        # out-peaks the one in use.
+                        probs = row.get("line_probs") or []
+                        held = float(probs[previous]) if previous < len(probs) else 0.0
+                        best = int(row["argmax_line"])
+                        taking = float(probs[best]) if best < len(probs) else 0.0
+                        if best != previous and taking < held * margin:
+                            state = previous if confidence >= bar else -1
+                        else:
+                            state = policy(state, best, confidence, bar)
+                    else:
+                        state = policy(state, int(row["argmax_line"]), confidence, bar)
                     if state >= 0:
                         accepted += 1
                     # How restless the estimate is. §9.1 measured that the gate and the dose are
@@ -428,7 +466,7 @@ def main(argv: list[str] | None = None) -> int:
     # and §9.1 already showed that reading a bar change as a mechanism change is how a dose
     # effect gets mistaken for a better estimate -- so the curve has to be read left to right.
     header = (f"{'policy':>18} {'coverage':>9} {'acc':>8} {'+next':>8} {'+-1':>8} "
-              f"{'ahead1':>8} {'early':>8} {'biased_acc':>11} {'chars':>7}")
+              f"{'ahead1':>8} {'early':>8} {'chg/step':>9} {'biased_acc':>11} {'chars':>7}")
     print(header)
     for key in sorted(totals, key=lambda name: (_coverage(totals[name]), name)):
         entry = totals[key]
@@ -437,6 +475,7 @@ def main(argv: list[str] | None = None) -> int:
               f"{_ratio(entry, 'window_both_correct'):8.4f} "
               f"{(entry['ahead_by_one'] / entry['chars'] if entry['chars'] else 0.0):8.4f} "
               f"{(entry['ahead_by_one_early'] / entry['ahead_by_one'] if entry['ahead_by_one'] else 0.0):8.4f} "
+              f"{_ratio(entry, 'line_changes'):9.4f} "
               f"{_ratio(entry, 'line_changes'):9.4f} "
               f"{_biased_accuracy(entry):11.4f} {entry['chars']:7d}")
 
