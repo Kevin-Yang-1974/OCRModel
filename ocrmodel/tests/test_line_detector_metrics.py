@@ -144,7 +144,8 @@ def test_order_accuracy_uses_the_axis_the_direction_implies():
         ]
     )
     assert order_accuracy(diagonal, diagonal.clone(), "horizontal_ltr")["accuracy"] == 1.0
-    assert order_accuracy(diagonal, diagonal.clone(), "vertical_rtl")["accuracy"] == pytest.approx(0.0)
+    vertical = order_accuracy(diagonal, diagonal.clone(), "vertical_rtl")
+    assert vertical["accuracy"] == pytest.approx(0.0)
 
 
 def test_order_accuracy_needs_two_matches_to_say_anything():

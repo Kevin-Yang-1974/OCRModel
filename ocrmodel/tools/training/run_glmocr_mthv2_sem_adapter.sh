@@ -21,6 +21,22 @@ forward_args=()
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
+        --run-id)
+            [[ $# -ge 2 ]] || {
+                printf '{"event":"glmocr_sem_adapter_failed","error":"missing_run_id_value"}\n' >&2
+                exit 64
+            }
+            run_id="$2"
+            shift 2
+            ;;
+        --seed)
+            [[ $# -ge 2 ]] || {
+                printf '{"event":"glmocr_sem_adapter_failed","error":"missing_seed_value"}\n' >&2
+                exit 64
+            }
+            seed="$2"
+            shift 2
+            ;;
         --init-checkpoint-dir)
             [[ $# -ge 2 ]] || {
                 printf '{"event":"glmocr_sem_adapter_failed","error":"missing_phase1_checkpoint_value"}\n' >&2
