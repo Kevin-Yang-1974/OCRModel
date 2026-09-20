@@ -483,6 +483,82 @@ def test_the_character_source_still_ignores_regions():
     assert runtime.report()["characters_on_a_line"] is None
 
 
+def _static_runtime(predicted, bias=BIAS):
+    """A static-prediction runtime, deliberately given no character boxes at all."""
+
+    runtime = AttentionRouting(
+        _bridge(), bias, IMAGE_TOKEN_ID, _FakeTokenizer({}), "synced", "pred_static"
+    )
+    runtime.set_page(
+        "p0",
+        None,  # no annotation: this arm must not need it
+        PROMPT_LENGTH,
+        torch.tensor([[1, IMAGE_TOKEN_ID, IMAGE_TOKEN_ID, IMAGE_TOKEN_ID,
+                       IMAGE_TOKEN_ID, 2]]),
+        predicted_lines=predicted,
+    )
+    return runtime
+
+
+def test_the_static_source_biases_the_union_of_the_predicted_lines():
+    runtime = _static_runtime([LINE_LEFT["bbox"], LINE_RIGHT["bbox"]])
+    mask = _call(runtime, [PROMPT_LENGTH])["attention_mask"]
+    # Both columns' tokens, and nothing else.
+    assert mask[0, 0, 0, 1:5].tolist() == [BIAS, BIAS, BIAS, BIAS]
+    assert mask[0, 0, 0, 0].item() == 0.0
+
+
+def test_the_static_source_needs_no_pointer_and_no_annotation():
+    """No character boxes, no regions, no reference text: only the predicted lines."""
+
+    runtime = _static_runtime([LINE_LEFT["bbox"]])
+    assert runtime.characters is None
+    assert runtime.regions == []
+    # The pointer hook does nothing, so no generated text is ever consumed and the position
+    # never moves.  The pointer is still "synced" in the report -- it simply has nothing to do.
+    runtime.observe_inputs(
+        None,
+        (),
+        {"input_ids": torch.tensor([[7]]), "cache_position": torch.tensor([PROMPT_LENGTH])},
+    )
+    assert runtime.position == 0
+    assert runtime.report()["box_source"] == "pred_static"
+    mask = _call(runtime, [PROMPT_LENGTH])["attention_mask"]
+    assert mask[0, 0, 0, 1:5].tolist() == [BIAS, 0.0, BIAS, 0.0]
+
+
+def test_the_static_mask_is_the_same_on_every_step():
+    """The page's mask, not the step's -- which is what makes this arm deployable."""
+
+    runtime = _static_runtime([LINE_LEFT["bbox"]])
+    first = _call(runtime, [PROMPT_LENGTH])["attention_mask"]
+    runtime._cache_key = None
+    second = _call(runtime, [PROMPT_LENGTH + 1])["attention_mask"]
+    # Same biased keys, on a longer key span.
+    assert first[0, 0, 0, 1:5].tolist() == second[0, 0, 0, 1:5].tolist()
+    assert second.shape[-1] == KV_LENGTH + 1
+    assert second[0, 0, 0, 5:].tolist() == [0.0, 0.0, 0.0]
+    assert runtime.steps == 2
+    assert runtime.biased == 2
+
+
+def test_a_page_with_no_predicted_lines_is_left_unbiased_and_counted():
+    runtime = _static_runtime([])
+    assert "attention_mask" not in _call(runtime, [PROMPT_LENGTH])
+    assert runtime.missing == 1
+    assert runtime.biased == 0
+
+
+def test_the_static_source_reports_how_many_lines_it_used():
+    runtime = _static_runtime([LINE_LEFT["bbox"], LINE_RIGHT["bbox"]])
+    report = runtime.report()
+    assert report["box_source"] == "pred_static"
+    assert report["predicted_lines"] == 2
+    # The coverage is the reported tokens per step, which is what the dose has to be matched on:
+    # a whole-page union covers far more than one line.
+    assert report["characters_on_a_line"] is None
+
+
 def test_installation_hooks_every_decoder_layer():
     model = _FakeModel()
     runtime, handles = install_attention_routing(

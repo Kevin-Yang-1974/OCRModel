@@ -86,7 +86,19 @@ ROUTING_ATTR = "layout_attention_routing"
 #           deployable page map could plausibly exist.  If a line box carries none of that
 #           gain, then the character-level precision -- which nothing deployable supplies --
 #           was where the gain lived, and the route has no deployable form.
-BOX_SOURCES = ("char", "line")
+# ``pred_static``  the union of the page's *predicted* line boxes, the same mask on every step.
+#               No pointer and no annotation: this is the first arm whose boxes could exist in a
+#               real run at all.  It says "look at text rather than background" without saying
+#               *which* text, which is exactly the weaker claim the plan wants measured before
+#               anything is built on top of it.
+#
+#               The dose has to be matched to the dynamic arms, and that is not a small
+#               correction: the union of ~24 predicted columns covers around 74% of the visual
+#               tokens where the true line box holds about 3%, so the same bias value would add
+#               roughly 24x the logit mass.  The plan asks for the static and dynamic arms to be
+#               matched in total bias weight for exactly this reason -- without it, a static arm
+#               that looks better may only be looking at more of the page.
+BOX_SOURCES = ("char", "line", "pred_static")
 
 # How the box for the current step is chosen.
 #
@@ -158,6 +170,11 @@ class AttentionRouting:
         # the region boxes.  Per character index, not per step, so a step only looks it up.
         self.regions: list[dict[str, Any]] = []
         self._char_lines: list[int] = []
+        # Predicted line boxes, normalized, for the ``pred_static`` source.  The union's inside
+        # flags are computed once per page and reused every step: the mask does not depend on the
+        # step at all, which is what makes this arm deployable.
+        self.predicted_lines: list[list[float]] = []
+        self._static_inside: Tensor | None = None
         self.characters: list[dict[str, Any]] | None = None
         self.prompt_length: int | None = None
         self.visual_start: int | None = None
@@ -186,6 +203,7 @@ class AttentionRouting:
         input_ids: Tensor,
         reference: str | None = None,
         regions: list[dict[str, Any]] | None = None,
+        predicted_lines: list[list[float]] | None = None,
     ) -> None:
         """Point the route at one page's character boxes.
 
@@ -198,6 +216,8 @@ class AttentionRouting:
         in all three.
         """
 
+        self.predicted_lines = [list(box) for box in (predicted_lines or [])]
+        self._static_inside = None
         self.regions = sorted(regions or [], key=lambda item: int(item["reading_order"]))
         # Only the line source needs the character-to-line map; computing it for the character
         # source would put a number in the report that the arm never used.
@@ -263,6 +283,8 @@ class AttentionRouting:
         self.characters = None
         self.regions = []
         self._char_lines = []
+        self.predicted_lines = []
+        self._static_inside = None
         self.prompt_length = None
         self.visual_start = None
         self.visual_count = None
@@ -307,7 +329,14 @@ class AttentionRouting:
         the first run of this arm did: every step biased the first character's box.
         """
 
-        if self.pointer != "synced" or self.characters is None or self.prompt_length is None:
+        if (
+            self.pointer != "synced"
+            or self.characters is None
+            or self.prompt_length is None
+            or self.box_source == "pred_static"
+        ):
+            # The static arm has no pointer to advance: it biases every predicted line, so
+            # tracking which character is being read would be work whose result is discarded.
             return None
         input_ids = kwargs.get("input_ids")
         if input_ids is None and args:
@@ -333,7 +362,46 @@ class AttentionRouting:
         self._advance(self.tokenizer.decode(input_ids[0][generated], skip_special_tokens=True))
         return None
 
+    def _static_mask(self, kv_length: int, device: Any, dtype: torch.dtype) -> Tensor | None:
+        """One mask for the whole page: every predicted line biased, no pointer involved.
+
+        The union of the boxes is computed once and kept, because it does not change from step to
+        step -- which is the whole point of this arm.  Nothing here reads the annotation.
+        """
+
+        if not self.predicted_lines or self.visual_count in (None, 0) or self.visual_start is None:
+            self.missing += 1
+            return None
+        positions = getattr(self.bridge, "last_patch_positions", None)
+        if positions is None or positions.shape[1] != self.visual_count:
+            raise RuntimeError(
+                "attention routing has no patch grid for this page: the visual tower must run "
+                "before the first biased decoding step"
+            )
+        if self._static_inside is None:
+            grid = positions[0].to(device=device, dtype=torch.float32)
+            inside = torch.zeros(grid.shape[0], dtype=torch.bool, device=device)
+            for box in self.predicted_lines:
+                inside |= (
+                    (grid[:, 0] >= float(box[0]))
+                    & (grid[:, 0] <= float(box[2]))
+                    & (grid[:, 1] >= float(box[1]))
+                    & (grid[:, 1] <= float(box[3]))
+                )
+            self._static_inside = inside
+        count = int(self._static_inside.sum().item())
+        self.boxes_hit += count
+        self.biased += 1
+        mask = torch.zeros(1, 1, 1, kv_length, device=device, dtype=dtype)
+        mask[0, 0, 0, self.visual_start : self.visual_start + self.visual_count] = (
+            self._static_inside.to(dtype) * self.bias
+        )
+        return mask
+
     def _mask_for(self, step: int, kv_length: int, device: Any, dtype: torch.dtype) -> Tensor | None:
+        if self.box_source == "pred_static":
+            # No pointer and no annotation: the mask is the page's, not the step's.
+            return self._static_mask(kv_length, device, dtype)
         if self.characters is None or self.visual_count in (None, 0) or self.visual_start is None:
             return None
         if not 0 <= step < len(self.characters):
@@ -436,6 +504,9 @@ class AttentionRouting:
             "box_source": self.box_source,
             "characters_on_a_line": (
                 sum(1 for line in self._char_lines if line >= 0) if self._char_lines else None
+            ),
+            "predicted_lines": (
+                len(self.predicted_lines) if self.box_source == "pred_static" else None
             ),
             "pointer_position": self.position if self.pointer == "synced" else None,
             "reference_characters": len(self.reference) if self.reference else None,

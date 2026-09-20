@@ -43,9 +43,12 @@ import torch
 from PIL import Image
 from torch.utils.data import DataLoader, Dataset
 
-# One class, so torchvision's label-1-is-the-first-class convention means lines are label 1 and
-# 0 stays background.
-LINE_LABEL = 1
+# One class, and **zero**-based: torchvision's FCOS builds its classification targets as a
+# one-hot of width ``num_classes`` and indexes it with the label, so a label of 1 against one
+# class is an out-of-bounds index rather than a background convention.  The two-stage models in
+# the same package do the opposite -- labels from 1 with 0 for background -- and reaching for that
+# habit here fails at the first loss computation.
+LINE_LABEL = 0
 MATCH_IOU = 0.5
 
 
@@ -292,8 +295,11 @@ def main(argv: list[str] | None = None) -> int:
         losses: list[float] = []
         for images, targets in train_loader:
             images = [image.to(device) for image in images]
+            # Only the two keys the loss consumes.  The dataset also carries page_id and
+            # direction for the evaluator, and moving those to the device is what a blanket
+            # comprehension gets wrong: one of them is a string.
             targets = [
-                {key: value.to(device) for key, value in target.items() if key != "page_id"}
+                {"boxes": target["boxes"].to(device), "labels": target["labels"].to(device)}
                 for target in targets
             ]
             loss_dict = model(images, targets)
