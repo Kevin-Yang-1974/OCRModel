@@ -258,6 +258,11 @@ if reused_predictions is not None and reused_predictions.is_file() and "noroute"
     order = ["noroute"] + order
 missing = []
 for arm in order:
+    if payload["arms"].get(arm, {}).get("status") == "reused":
+        # Supplied from an earlier run: there is no summary.json here to read, and overwriting the
+        # registered entry with "missing" is how a reused control came to be reported absent while
+        # the bootstrap was using it.
+        continue
     summary_path = arms_dir / arm / "summary.json"
     if not summary_path.exists():
         missing.append(arm)
