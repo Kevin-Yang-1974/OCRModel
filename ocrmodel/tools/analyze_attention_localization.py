@@ -96,6 +96,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--heads", type=int, nargs="+", default=None)
     parser.add_argument("--confidence", type=float, default=DEFAULT_CONFIDENCE)
     parser.add_argument(
+        "--neighbourhood",
+        type=int,
+        default=3,
+        help=(
+            "how many characters either side count as 'near' a dropped or repeated "
+            "stretch when reporting the readout there"
+        ),
+    )
+    parser.add_argument(
         "--aggregate",
         choices=["mean", "best"],
         default="mean",
@@ -285,6 +294,72 @@ def expected_in_line_pos(region: dict[str, Any], box: list[float]) -> tuple[floa
     return (centre - low) / (high - low), axis
 
 
+def _prefix_counts(flags: list[bool]) -> list[int]:
+    """Prefix sums, so a window query is two lookups instead of a scan."""
+
+    counts = [0]
+    for flag in flags:
+        counts.append(counts[-1] + int(flag))
+    return counts
+
+
+def _in_window(counts: list[int], start: int, end: int) -> bool:
+    start = max(0, start)
+    end = min(len(counts) - 1, end)
+    return start < end and counts[end] - counts[start] > 0
+
+
+def neighbourhood_flags(
+    generated: str, reference: str, mapping: list[int | None], window: int
+) -> tuple[list[bool], list[bool]]:
+    """Which generated positions sit near a dropped reference character or a repeat.
+
+    The plan asks for the readout's behaviour specifically around missed and repeated
+    characters, because those are the two failures a line constraint is supposed to
+    address: drifting off the line shows up as a dropped or duplicated stretch, so if the
+    readout is *also* least reliable exactly there, a tracker built on it inherits the
+    failure rather than fixing it.
+
+    ``dropped[j]``      reference position ``j`` that no generated character was aligned
+                        to -- a character the model skipped.
+    ``repeated[i]``     the trigram starting at generated position ``i`` occurs more than
+                        once in the generated text, which is the same notion of repetition
+                        the training side measures.
+    """
+
+    mapped = {index for index in mapping if index is not None}
+    dropped = [index not in mapped for index in range(len(reference))]
+
+    seen: dict[str, int] = {}
+    starts = max(0, len(generated) - 2)
+    for index in range(starts):
+        trigram = generated[index : index + 3]
+        seen[trigram] = seen.get(trigram, 0) + 1
+    # Mark the whole occurrence, not just the position the repeat starts at: a character
+    # in the middle of a repeated stretch is part of the repetition, and a per-start flag
+    # would leave it unmarked and make the stretch look mostly clean.
+    repeated = [False] * len(generated)
+    for index in range(starts):
+        if seen[generated[index : index + 3]] > 1:
+            for offset in range(3):
+                if index + offset < len(repeated):
+                    repeated[index + offset] = True
+
+    dropped_counts = _prefix_counts(dropped)
+    repeated_counts = _prefix_counts(repeated)
+    near_dropped = [
+        index < len(mapping)
+        and mapping[index] is not None
+        and _in_window(dropped_counts, mapping[index] - window, mapping[index] + window + 1)
+        for index in range(len(generated))
+    ]
+    near_repeated = [
+        _in_window(repeated_counts, index - window, index + window + 1)
+        for index in range(len(generated))
+    ]
+    return near_dropped, near_repeated
+
+
 def score_page(
     report: dict[str, Any],
     reference: str,
@@ -295,6 +370,7 @@ def score_page(
     layers,
     heads,
     aggregate: str,
+    window: int = 3,
 ) -> dict[str, Any]:
     """Score one page's probe report against the reference it was asked to produce."""
 
@@ -318,6 +394,8 @@ def score_page(
     for index, step in enumerate(ordered_steps):
         fragment = fragments[index] or ""
         char_step.extend([step] * len(fragment))
+
+    near_dropped, near_repeated = neighbourhood_flags(generated, reference, mapping, window)
 
     scored: list[dict[str, Any]] = []
     inserted = 0
@@ -355,6 +433,10 @@ def score_page(
                     else -1.0
                 ),
                 "reference_index": reference_index,
+                # Which failure neighbourhood this character sits in, so the readout can
+                # be reported where a line constraint would actually have to work.
+                "near_dropped": near_dropped[position],
+                "near_repeated": near_repeated[position],
             }
         )
 
@@ -410,6 +492,9 @@ def curves(rows: list[dict[str, Any]], confidence: float) -> dict[str, Any]:
         }
     line_breaks = [row for row in rows if row["row_break"]]
     within = [row for row in rows if not row["row_break"]]
+    dropped = [row for row in rows if row["near_dropped"]]
+    repeated = [row for row in rows if row["near_repeated"]]
+    clean = [row for row in rows if not row["near_dropped"] and not row["near_repeated"]]
     errors = [
         abs(row["in_line_pos"] - row["expected_pos"])
         for row in rows
@@ -422,8 +507,26 @@ def curves(rows: list[dict[str, Any]], confidence: float) -> dict[str, Any]:
         "confident_share": len(confident) / len(rows) if rows else None,
         "confident_accuracy": accuracy(confident),
         "bands": bands,
-        "at_row_break": {"steps": len(line_breaks), "accuracy": accuracy(line_breaks)},
-        "within_row": {"steps": len(within), "accuracy": accuracy(within)},
+        "at_row_break": {"chars": len(line_breaks), "accuracy": accuracy(line_breaks)},
+        "within_row": {"chars": len(within), "accuracy": accuracy(within)},
+        # The readout where a line constraint would have to earn its keep.  If the
+        # attention is least reliable near a dropped or repeated stretch, a tracker
+        # built on it inherits the failure it was meant to fix.
+        "near_dropped": {
+            "chars": len(dropped),
+            "accuracy": accuracy(dropped),
+            "mean_confidence": (
+                sum(row["confidence"] for row in dropped) / len(dropped) if dropped else None
+            ),
+        },
+        "near_repeated": {
+            "chars": len(repeated),
+            "accuracy": accuracy(repeated),
+            "mean_confidence": (
+                sum(row["confidence"] for row in repeated) / len(repeated) if repeated else None
+            ),
+        },
+        "clean": {"chars": len(clean), "accuracy": accuracy(clean)},
         "in_line_error": sum(errors) / len(errors) if errors else None,
         "mean_visual_mass": (
             sum(row["m_t"] for row in rows) / len(rows) if rows else None
@@ -579,6 +682,7 @@ def main(argv: list[str] | None = None) -> int:
             layers=args.layers,
             heads=args.heads,
             aggregate=args.aggregate,
+            window=args.neighbourhood,
         )
         page["raw_by_step"] = steps_for_head_selection(reports[page_id])
         pages.append(page)
@@ -597,6 +701,7 @@ def main(argv: list[str] | None = None) -> int:
         "heads": args.heads,
         "aggregate": args.aggregate,
         "confidence": args.confidence,
+        "neighbourhood": args.neighbourhood,
         "pages_scored": len(pages),
         "pages_without_char_channel": skipped,
     }

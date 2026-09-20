@@ -214,6 +214,83 @@ def test_a_step_without_emitted_text_is_reported_not_skipped():
     assert page["scored"] == 0
 
 
+def test_a_dropped_character_marks_its_neighbours():
+    """The readout has to be reported where a line constraint would have to work.
+
+    A dropped reference character is what drifting off the line looks like, so if the
+    attention is least reliable right there, a tracker built on it inherits the failure.
+    """
+
+    from analyze_attention_localization import neighbourhood_flags
+
+    # 乙 was dropped by the model: reference 1 has nothing aligned to it.
+    mapping = align("甲丙", "甲乙丙")
+    near_dropped, near_repeated = neighbourhood_flags("甲丙", "甲乙丙", mapping, window=3)
+    # Both generated characters sit within three of the dropped position, and neither is
+    # itself an insertion, so both are marked.
+    assert near_dropped == [True, True]
+    assert near_repeated == [False, False]
+
+    # A window of zero leaves only exact adjacency, which no character here has.
+    near_dropped, _ = neighbourhood_flags("甲丙", "甲乙丙", mapping, window=0)
+    assert near_dropped == [False, False]
+
+
+def test_an_insertion_is_not_itself_near_a_drop():
+    """An inserted character has no reference position, so it has nothing to be near."""
+
+    from analyze_attention_localization import neighbourhood_flags
+
+    mapping = align("甲丁丙", "甲乙丙")  # 丁 is inserted
+    near_dropped, _ = neighbourhood_flags("甲丁丙", "甲乙丙", mapping, window=3)
+    assert len(near_dropped) == 3
+    assert near_dropped[1] is False
+
+
+def test_a_repeated_trigram_marks_its_neighbourhood():
+    from analyze_attention_localization import neighbourhood_flags
+
+    generated = "甲乙丙甲乙丙丁"
+    mapping = align(generated, generated)
+    _, near_repeated = neighbourhood_flags(generated, generated, mapping, window=0)
+    # 甲乙丙 occurs twice, so all six characters inside those two occurrences are marked
+    # -- including the middle of each stretch, which a per-start-position flag would miss.
+    assert near_repeated == [True] * 6 + [False]
+
+
+def test_a_page_with_no_failures_has_no_marked_characters():
+    from analyze_attention_localization import neighbourhood_flags
+
+    near_dropped, near_repeated = neighbourhood_flags("甲乙丙", "甲乙丙", [0, 1, 2], window=3)
+    assert near_dropped == [False] * 3
+    assert near_repeated == [False] * 3
+
+
+def test_the_report_splits_the_readout_by_failure_neighbourhood():
+    report = _report("p0", {1: ("甲", 0, 0.9), 2: ("丙", 1, 0.9)})
+    # Three boxes for three reference characters; the middle one is the dropped 乙.
+    characters = [
+        _char([0.1, 0.05, 0.3, 0.15]),
+        _char([0.1, 0.25, 0.3, 0.35]),
+        _char([0.1, 0.45, 0.3, 0.55]),
+    ]
+    # 乙 is dropped between 甲 and 丙.
+    page = score_page(
+        report, "甲乙丙", "甲丙", REGIONS, characters, layers=None, heads=None,
+        aggregate="mean", window=3,
+    )
+    rows = page["rows"]
+    assert [row["near_dropped"] for row in rows] == [True, True]
+    assert [row["near_repeated"] for row in rows] == [False, False]
+
+    from analyze_attention_localization import summarise
+
+    summary = summarise(rows, 0.5, {"p0": rows})
+    assert summary["near_dropped"]["chars"] == 2
+    assert summary["clean"]["chars"] == 0
+    assert summary["near_repeated"]["chars"] == 0
+
+
 def test_combine_averages_the_distributions_not_the_argmax():
     """Averaging ``argmax_line`` would throw away the confidence the stage turns on."""
 
