@@ -113,6 +113,71 @@ def order_accuracy(
     }
 
 
+def missed_line_diagnosis(
+    predictions: list[dict[str, torch.Tensor]],
+    targets: list[dict[str, Any]],
+    iou_threshold: float = 0.5,
+) -> dict[str, Any]:
+    """What the lines the detector misses have in common.
+
+    Recall is the number that matters for a union bias -- a missed line is a stretch of page the
+    bias can never reach -- so the useful next question is whether the misses are small, faint, or
+    concentrated on a few pages. Each answer points somewhere different: size means resolution,
+    page concentration means a page-level failure the aggregate hides.
+    """
+
+    matched_sizes: list[tuple[float, float]] = []
+    missed_sizes: list[tuple[float, float]] = []
+    missed_per_page: list[tuple[str, int, int]] = []
+    for prediction, target in zip(predictions, targets):
+        gt = target["boxes"]
+        pred = prediction["boxes"]
+        iou = iou_matrix(gt, pred)
+        taken: set[int] = set()
+        page_missed = 0
+        for gt_index in range(gt.shape[0]):
+            best, best_pred = 0.0, -1
+            for pred_index in range(pred.shape[0]):
+                if pred_index in taken:
+                    continue
+                if float(iou[gt_index, pred_index]) > best:
+                    best, best_pred = float(iou[gt_index, pred_index]), pred_index
+            box = gt[gt_index]
+            size = (float(box[2] - box[0]), float(box[3] - box[1]))
+            if best >= iou_threshold:
+                taken.add(best_pred)
+                matched_sizes.append(size)
+            else:
+                missed_sizes.append(size)
+                page_missed += 1
+        missed_per_page.append((target.get("page_id", "?"), page_missed, int(gt.shape[0])))
+
+    def quantiles(sizes: list[tuple[float, float]]) -> dict[str, float]:
+        if not sizes:
+            return {}
+        widths = sorted(pair[0] for pair in sizes)
+        heights = sorted(pair[1] for pair in sizes)
+        pick = lambda values, q: values[min(len(values) - 1, int(q * len(values)))]
+        return {
+            "count": len(sizes),
+            "width_p10": pick(widths, 0.10),
+            "width_p50": pick(widths, 0.50),
+            "height_p50": pick(heights, 0.50),
+        }
+
+    worst = sorted(missed_per_page, key=lambda item: -item[1])[:5]
+    return {
+        "matched": quantiles(matched_sizes),
+        "missed": quantiles(missed_sizes),
+        "pages_with_any_miss": sum(1 for _, missed, _ in missed_per_page if missed),
+        "pages": len(missed_per_page),
+        "worst_pages": [
+            {"page_id": page_id, "missed": missed, "gt": gt}
+            for page_id, missed, gt in worst
+        ],
+    }
+
+
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     from torchvision.models.detection import fcos_resnet50_fpn
@@ -177,6 +242,28 @@ def main(argv: list[str] | None = None) -> int:
         1 for prediction in predictions if int(prediction["boxes"].shape[0]) == 0
     )
 
+    # A union bias cares about recall more than precision: a missed line is a stretch of page the
+    # bias can never reach, while a spurious box only biases tokens that were mostly going to be
+    # biased anyway. Which score threshold to export at therefore matters, and the curve used to
+    # choose it did not exist -- the sweep above varies the *matching* IoU, not the score.
+    score_points = (0.05, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7)
+    report["by_score"] = {}
+    for score in score_points:
+        filtered = []
+        for prediction in predictions:
+            # Every entry in a prediction shares the score axis, so one mask filters all of them.
+            keep = prediction["scores"] >= score
+            filtered.append({key: value[keep] for key, value in prediction.items()})
+        stats = match_detections(filtered, targets, 0.5)
+        stats["f1"] = (
+            2 * stats["precision"] * stats["recall"] / (stats["precision"] + stats["recall"])
+            if stats["precision"] + stats["recall"]
+            else 0.0
+        )
+        stats["boxes_per_page"] = stats["pred"] / max(1, len(dataset))
+        report["by_score"][f"{score:.2f}"] = stats
+    report["missed_lines"] = missed_line_diagnosis(predictions, targets, 0.5)
+
     print(f"{'IoU':>5} {'gt':>6} {'pred':>6} {'recall':>8} {'prec':>8} {'F1':>8} "
           f"{'meanIoU':>8} {'missed':>7} {'merged':>7}")
     for threshold in THRESHOLDS:
@@ -184,6 +271,21 @@ def main(argv: list[str] | None = None) -> int:
         print(f"{threshold:5.1f} {stats['gt']:6d} {stats['pred']:6d} {stats['recall']:8.4f} "
               f"{stats['precision']:8.4f} {stats['f1']:8.4f} {stats['mean_iou']:8.4f} "
               f"{stats['missed_gt']:7d} {stats['merged_gt']:7d}")
+    print()
+    print("score sweep at IoU 0.5（并集偏置要的是召回，不是精度）:")
+    print(f"{'score':>6} {'recall':>8} {'prec':>8} {'F1':>8} {'boxes/page':>11}")
+    for score in score_points:
+        stats = report["by_score"][f"{score:.2f}"]
+        print(f"{score:6.2f} {stats['recall']:8.4f} {stats['precision']:8.4f} "
+              f"{stats['f1']:8.4f} {stats['boxes_per_page']:11.1f}")
+    missed = report["missed_lines"]
+    print()
+    print("漏行归因（IoU 0.5）:")
+    print(f"  匹配上的框: {missed['matched']}")
+    print(f"  漏掉的框:   {missed['missed']}")
+    print(f"  有漏行的页: {missed['pages_with_any_miss']}/{missed['pages']}")
+    for entry in missed["worst_pages"]:
+        print(f"    {entry['page_id']}  漏 {entry['missed']}/{entry['gt']}")
     print()
     print(f"reading order: {report['reading_order']}")
     print(f"pages with no detection at all: {report['pages_with_no_detection']}/{len(dataset)}")
