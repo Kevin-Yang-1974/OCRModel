@@ -46,6 +46,10 @@ max_pixels="${GLMOCR_ORACLE_MAX_PIXELS:-4000000}"
 max_eval_new_tokens=1536
 layout_loss_profile="history_box_equalized_v2"
 pointer="${GLMOCR_ORACLE_POINTER:-synced}"
+# The detector's boxes, for the pred_static box source.  Written by
+# tools/predict_lines_for_routing.py after the detector is trained; required by, and only by,
+# the arms whose boxes come from an image rather than the annotation.
+predicted_lines="${GLMOCR_ORACLE_PREDICTED_LINES:-}"
 foreground="${GLMOCR_ORACLE_FOREGROUND:-0}"
 gpu_slots="${GLMOCR_ORACLE_GPUS:-0,1,2,3}"
 
@@ -105,6 +109,11 @@ launch() {
         route_flags=(--layout-routing-bias "${bias}"
                      --layout-routing-pointer "${pointer}"
                      --layout-routing-box-source "${box_source}")
+        if [[ "${box_source}" == "pred_static" ]]; then
+            [[ -n "${predicted_lines}" ]] \
+                || { echo "pred_static needs GLMOCR_ORACLE_PREDICTED_LINES" >&2; exit 64; }
+            route_flags+=(--layout-routing-predicted-lines "${predicted_lines}")
+        fi
     fi
     (
         setup_environment
