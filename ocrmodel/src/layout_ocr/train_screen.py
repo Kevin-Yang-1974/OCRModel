@@ -42,6 +42,12 @@ from .distributed import (
     wrap_adapter,
     wrap_model,
 )
+from .attention_probe import (
+    PROBE_ATTR,
+    install_attention_probe,
+    probe_heads,
+    probe_layers,
+)
 from .attention_routing import ROUTING_ATTR, install_attention_routing
 from .glm_bridge import LayoutAwarePatchMerger, install_layout_adapter
 from .prefix_injection import enable_prefix_injection
@@ -1555,6 +1561,15 @@ def optional_positive_int(value: str) -> int | None:
     return parsed
 
 
+def index_list(value: str) -> tuple[int, ...]:
+    """A comma-separated list of non-negative indices, for layers and heads."""
+
+    parsed = tuple(int(part) for part in value.replace(" ", "").split(",") if part)
+    if not parsed or min(parsed) < 0:
+        raise argparse.ArgumentTypeError("expected a non-empty list of non-negative ints")
+    return parsed
+
+
 def learning_rate_at_step(
     step: int,
     *,
@@ -2236,6 +2251,23 @@ def load_model(args: argparse.Namespace, device: torch.device) -> tuple[Any, Any
         # route and has nothing to do with the layout adapter, but the eval loop
         # already holds the model and needs to arm it per page.
         setattr(model, ROUTING_ATTR, routing_runtime)
+    # Observation only.  The probe reproduces the decoder's own attention logits and
+    # reduces them per step; it never writes into the forward, so the run it rides
+    # along with stays bit-identical to one without it.  That is the point of the
+    # Stage 0 ``probe_only`` vs ``noroute`` arm: it measures the instrument's cost
+    # and proves it is an instrument, before any of its numbers are believed.
+    if getattr(args, "layout_attention_probe", False):
+        probe_runtime, _ = install_attention_probe(
+            model,
+            bridge,
+            # The flags win if given, then the environment, then the development
+            # default; both readers are only consulted on a run that asked for a probe.
+            layers=args.layout_attention_probe_layers or probe_layers(),
+            heads=args.layout_attention_probe_heads or probe_heads(),
+        )
+        # On the top-level model, like the routing runtime: the eval loop already
+        # holds the model and arms the probe per page.
+        setattr(model, PROBE_ATTR, probe_runtime)
     prefix_tokens = int(getattr(args, "prefix_tokens", 0) or 0)
     if prefix_tokens > 0:
         # Installed after the adapter so the reserved ids are added once, to a
@@ -3598,6 +3630,41 @@ def _routing_summary(reports: list[dict[str, Any]]) -> dict[str, Any] | None:
     }
 
 
+def _probe_summary(reports: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """Aggregate the per-page attention reports; ``None`` when the probe is off.
+
+    The three fields that decide whether the probe is trustworthy at all are kept
+    here, next to the score, rather than only in the probe file: how many pages
+    actually produced steps, whether any layer's transform failed (those numbers
+    would be wrong rather than missing), and the mean visual total mass, which is the
+    reading the whole stage turns on.
+    """
+
+    if not reports:
+        return None
+    masses: list[float] = []
+    for report in reports:
+        for step in report["steps"]:
+            masses.extend(head["m_t"] for head in step["heads"])
+    failed = {
+        report["page_id"]: report["transform_failed"]
+        for report in reports
+        if report["transform_failed"]
+    }
+    return {
+        "pages": len(reports),
+        "pages_with_steps": sum(1 for report in reports if report["steps"]),
+        "layers": reports[0]["layers"],
+        "heads": reports[0]["heads"],
+        "visual_tokens": reports[0]["visual_tokens"],
+        "decoding_steps": sum(report["decoding_steps"] for report in reports),
+        "grid_missing_steps": sum(report["grid_missing_steps"] for report in reports),
+        "mean_visual_mass": sum(masses) / len(masses) if masses else None,
+        "transform_failed": failed,
+        "layer_geometry": reports[0]["layer_geometry"],
+    }
+
+
 @torch.inference_mode()
 def evaluate(
     args: argparse.Namespace,
@@ -3702,6 +3769,13 @@ def evaluate(
         "dense": [],
     }
     started = time.time()
+    if torch.cuda.is_available():
+        # Reset the high-water mark so the number reported below describes this
+        # evaluation rather than the whole process.  The probe's memory cost is the
+        # difference between two arms that differ only in whether it is installed,
+        # so a peak that included the training phase would hide exactly what is
+        # being measured.
+        torch.cuda.reset_peak_memory_stats()
     prefix_runtime = getattr(bridge, "prefix_runtime", None)
     # Installed by ``load_model`` when ``--layout-routing-bias`` is set; absent on
     # every other run, in which case the eval loop below is unchanged.
@@ -3709,6 +3783,12 @@ def evaluate(
     if routing_runtime is None:
         routing_runtime = getattr(model, ROUTING_ATTR, None)
     routing_reports: list[dict[str, Any]] = []
+    # Installed by ``load_model`` when ``--layout-attention-probe`` is set.  It only
+    # observes: the generation below runs the same whether or not it is armed.
+    probe_runtime = getattr(model_module, PROBE_ATTR, None)
+    if probe_runtime is None:
+        probe_runtime = getattr(model, PROBE_ATTR, None)
+    probe_reports: list[dict[str, Any]] = []
     # Oracle arm: substitute ground-truth region boxes for the predicted ones, so
     # the run differs from the normal one in the accuracy of the layout and nothing
     # else.  Eval-only; the branch's own output cannot separate "the decoder
@@ -3802,6 +3882,17 @@ def evaluate(
                 inputs["input_ids"],
                 reference=record["page_text"],
             )
+        if probe_runtime is not None:
+            # Armed after the site that may run a teacher-forcing forward above: its
+            # prefill would otherwise populate the probe's captured keys and then be
+            # thrown away, and the visual grid it needs is the one the generation
+            # prefill writes.
+            probe_runtime.set_page(
+                record["page_id"],
+                list(record.get("regions") or []),
+                prompt_length,
+                inputs["input_ids"],
+            )
         generated = generate_with_loop_recovery(
             model_module,
             inputs,
@@ -3823,6 +3914,18 @@ def evaluate(
             routing_runtime.write_probe()
             routing_reports.append(routing_runtime.report())
             routing_runtime.clear_page()
+        if probe_runtime is not None:
+            # The probe cannot read the sampled token -- sampling happens after the
+            # forward it hooks -- so the generated span is handed over here, where the
+            # tokenizer is, and stamped onto the steps it belongs to.  Written after
+            # generation so the report describes a complete page, and before
+            # ``clear_page``, which would otherwise erase the evidence.
+            probe_runtime.attach_emitted(
+                generated[0, prompt_length:], getattr(processor, "tokenizer", None) or processor
+            )
+            probe_runtime.write_probe()
+            probe_reports.append(probe_runtime.report())
+            probe_runtime.clear_page()
         generated_tokens = generated[0, prompt_length:]
         generation_length = int(generated_tokens.shape[0])
         generation_lengths.append(generation_length)
@@ -4046,10 +4149,15 @@ def evaluate(
             "mean_unannotated_queries": args.num_queries
             - sum(annotated_query_counts) / max(1, len(annotated_query_counts)),
             "seconds": time.time() - started,
+            "seconds_per_page": (time.time() - started) / max(1, len(validation_records)),
+            "cuda_peak_memory_bytes": (
+                torch.cuda.max_memory_allocated() if torch.cuda.is_available() else None
+            ),
             "generation_max_new_tokens": args.max_eval_new_tokens,
             "generation_limit_hits": generation_limit_hits,
             "generation_limit_hit_rate": generation_limit_hits / max(1, len(validation_records)),
             "layout_routing": _routing_summary(routing_reports),
+            "layout_attention_probe": _probe_summary(probe_reports),
             "generation_lengths": generation_lengths,
             "generation_mean_new_tokens": sum(generation_lengths) / max(1, len(generation_lengths)),
             "generation_max_new_tokens_observed": max(generation_lengths, default=0),
@@ -4411,6 +4519,36 @@ def parse_args() -> argparse.Namespace:
             "walking the truth text alongside the generated one; 'step' points at "
             "the t-th character, which is what a detector could supply but drifts "
             "by a median of 6 and up to 1271 characters on this checkpoint"
+        ),
+    )
+    parser.add_argument(
+        "--layout-attention-probe",
+        action="store_true",
+        help=(
+            "observe where the decoder's attention falls, per step and per layer/head, "
+            "without changing the forward. The run stays bit-identical to one without "
+            "the probe, which is what the probe_only vs noroute arm checks before any "
+            "of its numbers are believed. Writes one JSON report per page to "
+            "$GLMOCR_ATTENTION_PROBE"
+        ),
+    )
+    parser.add_argument(
+        "--layout-attention-probe-layers",
+        type=index_list,
+        default=None,
+        help=(
+            "decoder layers to observe, e.g. 0,4,8,12. Defaults to "
+            "$GLMOCR_ATTENTION_PROBE_LAYERS, then to 0,4,8,12. Probing every layer "
+            "costs a q/k projection per layer per step, so the sample is deliberate"
+        ),
+    )
+    parser.add_argument(
+        "--layout-attention-probe-heads",
+        type=index_list,
+        default=None,
+        help=(
+            "query heads to record, e.g. 0,1,2. Defaults to every head, which is what "
+            "the cross-head consistency readout needs"
         ),
     )
     parser.add_argument(
