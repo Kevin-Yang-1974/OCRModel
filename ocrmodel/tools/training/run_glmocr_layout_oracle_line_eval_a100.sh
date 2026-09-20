@@ -318,6 +318,18 @@ for arm in order:
         if arm_config_path.exists()
         else None
     )
+    attention_path = arms_dir / (arm + ".attention.jsonl")
+    if attention_path.exists():
+        corrected_steps = None
+        with attention_path.open(encoding="utf-8") as handle:
+            for line in handle:
+                if not line.strip():
+                    continue
+                page = json.loads(line)
+                value = page.get("bias_corrected_steps")
+                if value is not None:
+                    corrected_steps = int(value) if corrected_steps is None else corrected_steps + int(value)
+        record["probe_corrected_steps"] = corrected_steps
     probe_path = arms_dir / (arm + ".routing.jsonl")
     if probe_path.exists():
         rows = [json.loads(line) for line in probe_path.read_text(encoding="utf-8").splitlines() if line.strip()]
@@ -345,6 +357,12 @@ for arm in order:
                 "accounting_complete": "past_annotation_steps" in rows[0],
                 "missing_box_steps": sum(int(row.get("missing_box_steps", 0)) for row in rows),
                 "mean_boxes_hit": sum(hits) / len(hits) if hits else None,
+                "next_line_scale": rows[0].get("next_line_scale"),
+                "mean_next_line_hits": (
+                    sum(row["mean_next_line_hits"] for row in rows
+                        if row.get("mean_next_line_hits") is not None)
+                    / max(1, sum(1 for row in rows if row.get("mean_next_line_hits") is not None))
+                ),
             }
             payload["pointer"] = routing["pointer"]
             record["box_source"] = routing["box_source"]
@@ -415,6 +433,20 @@ for arm in order:
     if row.get("status") == "missing" or arm == "noroute":
         continue
     routing = row.get("layout_routing") or {}
+    config = row.get("arm_config") or {}
+    # The correction is a flag on the probe, so an arm whose flag never reached it scores as
+    # "the correction changes nothing" -- which is the one conclusion it must not reach by
+    # accident.  The probe counts the steps it corrected; the flag says how many there should be.
+    if routing.get("line_source") == "tracked" and row.get("probe_corrected_steps") is not None:
+        corrected_steps = int(row["probe_corrected_steps"])
+        wants = str(config.get("corrected")) == "1"
+        biased = int(routing.get("biased_steps", 0))
+        if wants and corrected_steps == 0:
+            print(f"  {arm:11s} 臂声称已校正，但探针一步都没有校正 <- 接线有问题，不要读结果")
+            ok = False
+        elif not wants and corrected_steps > 0:
+            print(f"  {arm:11s} 臂未开校正，但探针校正了 {corrected_steps} 步 <- 接线有问题")
+            ok = False
     fraction = routing.get("biased_fraction", 0.0)
     gated = routing.get("gated_steps", 0)
     missing = routing.get("missing_box_steps", 0)
