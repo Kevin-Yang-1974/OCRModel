@@ -364,15 +364,30 @@ main() {
     fi
     mkdir -p "${eval_root}"
     tmux kill-session -t "${session}" 2>/dev/null || true
-    tmux new-session -d -s "${session}" \
-        "export GLMOCR_ORACLE_RUN_ID=$(printf '%q' "${run_id}"); "\
+    # Every override the foreground stage reads has to be re-exported here.  tmux starts a fresh
+    # shell and inherits only what is named, so a variable that is set in this shell but missing
+    # from this list is silently absent inside -- which is how a pred_static run came to abort on
+    # its own missing-file guard while the arms that did not need the file went ahead.  The list
+    # below is checked against the sources that read it rather than trusted.
+    local tmux_env
+    tmux_env="export GLMOCR_ORACLE_RUN_ID=$(printf '%q' "${run_id}"); "\
 "export GLMOCR_ORACLE_GPUS=$(printf '%q' "${gpu_slots}"); "\
 "export GLMOCR_ORACLE_ARMS=$(printf '%q' "${arms}"); "\
 "export GLMOCR_ORACLE_POINTER=$(printf '%q' "${pointer}"); "\
 "export GLMOCR_ORACLE_MAX_PIXELS=$(printf '%q' "${max_pixels}"); "\
 "export GLMOCR_ORACLE_CHECKPOINT=$(printf '%q' "${checkpoint}"); "\
 "export GLMOCR_ORACLE_PROTOCOL=$(printf '%q' "${protocol_file}"); "\
-"bash $(printf '%q' "${script_path}") --foreground > ${eval_root}/pipeline.log 2>&1"
+"export GLMOCR_ORACLE_PREDICTED_LINES=$(printf '%q' "${predicted_lines}"); "
+    local required name
+    for name in GLMOCR_ORACLE_PREDICTED_LINES GLMOCR_ORACLE_ARMS GLMOCR_ORACLE_POINTER \
+                GLMOCR_ORACLE_MAX_PIXELS GLMOCR_ORACLE_CHECKPOINT GLMOCR_ORACLE_PROTOCOL; do
+        case "${tmux_env}" in
+            *"export ${name}="*) ;;
+            *) echo "re-export missing for ${name}: the tmux shell would not see it" >&2; exit 64 ;;
+        esac
+    done
+    tmux new-session -d -s "${session}" \
+        "${tmux_env}bash $(printf '%q' "${script_path}") --foreground > ${eval_root}/pipeline.log 2>&1"
     echo "{\"event\":\"glmocr_oracle_line_eval_armed\",\"session\":\"${session}\",\"root\":\"${eval_root}\",\"arms\":\"${arms}\"}"
 }
 
