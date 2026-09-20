@@ -63,7 +63,9 @@ baseline_dir="${GLMOCR_ORACLE_BASELINE_DIR:-}"
 foreground="${GLMOCR_ORACLE_FOREGROUND:-0}"
 gpu_slots="${GLMOCR_ORACLE_GPUS:-0,1,2,3}"
 
-# 臂格式：<名字>:<bias|none>:<框来源>[:<行来源>]，行来源缺省 pointer。
+# 臂格式：<名字>:<bias|none>:<框来源>[:<行来源>[:<地图来源>[:<门控门槛>]]]
+#   缺省：行来源 pointer、地图来源 regions、门控门槛由 GLMOCR_ORACLE_TRACKING_CONFIDENCE 给。
+#   门控与地图都要按臂变：同一轮里比较「同一张图换门槛」或「同一门槛换地图」才有意义。
 #   pointer  沿真值文本走，取读到那个字所在的行 —— oracle，就是 26.6% 那个臂
 #   tracked  行来自模型自己的注意力（滞后一步、按登记门槛门控），路径里没有参考文本
 # tracked 必须同时装探针，否则没有估计、每一步都被门控，该臂会以「无路由」的分数收场。
@@ -115,7 +117,7 @@ preflight() {
 # train_screen.py refuses to start when --output-dir already exists, so nothing may
 # pre-create the arm directory: the log lives as a sibling.
 launch() {
-    local arm="$1" bias="$2" box_source="$3" line_source="$4" gpu="$5"
+    local arm="$1" bias="$2" box_source="$3" line_source="$4" line_map="$5" confidence="$6" gpu="$7"
     local out="${eval_root}/arms/${arm}"
     local -a route_flags=()
     if [[ "${bias}" != "none" ]]; then
@@ -128,11 +130,16 @@ launch() {
                 || { echo "pred_static needs GLMOCR_ORACLE_PREDICTED_LINES" >&2; exit 64; }
             route_flags+=(--layout-routing-predicted-lines "${predicted_lines}")
         fi
+        route_flags+=(--layout-routing-line-map "${line_map}")
+        if [[ "${line_map}" == "predicted" ]]; then
+            [[ -n "${predicted_lines}" ]]                 || { echo "line_map predicted needs GLMOCR_ORACLE_PREDICTED_LINES" >&2; exit 64; }
+            route_flags+=(--layout-routing-predicted-lines "${predicted_lines}")
+        fi
         if [[ "${line_source}" == "tracked" ]]; then
             route_flags+=(--layout-attention-probe
                           --layout-attention-probe-layers "${probe_layers}"
                           --layout-attention-probe-heads "${probe_heads}"
-                          --layout-tracking-confidence "${tracking_confidence}")
+                          --layout-tracking-confidence "${confidence}")
         fi
     fi
     (
@@ -172,15 +179,17 @@ run_arms() {
     local -a pids=() labels=() failed=0
     local index=0 spec
     for spec in ${arms}; do
-        IFS=':' read -r arm bias box_source line_source <<< "${spec}"
+        IFS=':' read -r arm bias box_source line_source line_map confidence <<< "${spec}"
         line_source="${line_source:-pointer}"
+        line_map="${line_map:-regions}"
+        confidence="${confidence:-${tracking_confidence}}"
         if [[ "${arm}" == "noroute" && -n "${baseline_dir}" ]]; then
             # Reused rather than recomputed; the summarize reads it from there.
             echo "{\"event\":\"glmocr_oracle_baseline_reused\",\"from\":\"${baseline_dir}\"}"
             continue
         fi
         local gpu="${slots[$(( index % total ))]}"
-        launch "${arm}" "${bias}" "${box_source}" "${line_source}" "${gpu}" &
+        launch "${arm}" "${bias}" "${box_source}" "${line_source}" "${line_map}" "${confidence}" "${gpu}" &
         pids+=("$!"); labels+=("${arm}")
         index=$(( index + 1 ))
         if (( index % total == 0 )); then
