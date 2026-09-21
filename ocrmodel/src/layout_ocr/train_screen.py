@@ -4502,6 +4502,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model-path", type=Path, required=True)
     parser.add_argument("--train-manifest", type=Path, required=True)
     parser.add_argument("--validation-manifest", type=Path, required=True)
+    parser.add_argument(
+        "--test-manifest",
+        type=Path,
+        default=None,
+        help="held-out test manifest; read only when --eval-split test, never by training or selection",
+    )
+    parser.add_argument(
+        "--eval-split",
+        choices=["validation", "test"],
+        default="validation",
+        help="which split --eval-only scores; test is the selection-locked confirmation",
+    )
     parser.add_argument("--protocol-file", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument(
@@ -5377,6 +5389,12 @@ def main() -> None:
         validation_records = load_records(args.validation_manifest)
         validate_records(train_records, split="train", num_queries=args.num_queries)
         validate_records(validation_records, split="validation", num_queries=args.num_queries)
+        test_records = None
+        if args.eval_split == "test":
+            if args.test_manifest is None:
+                raise ValueError("--eval-split test requires --test-manifest")
+            test_records = load_records(args.test_manifest)
+            validate_records(test_records, split="test", num_queries=args.num_queries)
         model, processor, bridge = load_model(args, device)
         continuation_head = (
             ContinuationStopHead(hidden_size=args.continuation_head_hidden_size).to(device)
@@ -5478,6 +5496,8 @@ def main() -> None:
         if distributed.is_main:
             write_json(args.output_dir / "metadata.json", metadata)
         if args.eval_only:
+            eval_records = test_records if args.eval_split == "test" else validation_records
+            eval_split_name = args.eval_split
             state_before = clone_module_state(bridge.adapter)
             validation = evaluate(
                 args,
@@ -5485,9 +5505,10 @@ def main() -> None:
                 processor,
                 bridge,
                 continuation_head,
-                validation_records,
+                eval_records,
                 train_records,
                 device,
+                split_name=eval_split_name,
             )
             unchanged = module_state_matches(bridge.adapter, state_before)
             if not unchanged:
@@ -5518,7 +5539,7 @@ def main() -> None:
                 "free_generation_loss": free_generation_loss_config(args),
                 "natural_loop_config": natural_loop_config(args),
                 "max_eval_new_tokens": args.max_eval_new_tokens,
-                "validation": validation,
+                eval_split_name: validation,
                 "test_manifest_read": metadata["test_manifest_read"],
                 "test_used_for_selection": False,
             }
