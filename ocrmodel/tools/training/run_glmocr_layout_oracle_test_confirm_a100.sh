@@ -44,6 +44,7 @@ probe_layers="8"
 probe_heads="2,3,8,10,11,12,14,15"
 tracking_confidence="6.0"
 foreground="${GLMOCR_ORACLE_TEST_FOREGROUND:-0}"
+summarize_only=0
 gpu_slots="${GLMOCR_ORACLE_TEST_GPUS:-0,1,2}"
 
 # 三个臂，字段见 run_glmocr_layout_oracle_line_eval_a100.sh 的臂格式说明。
@@ -327,7 +328,8 @@ for label_a, label_b, tag in pairs:
           f"Δ {stats['difference_control_minus_arm']:+.6f}"
           + ("" if stats["relative"] is None else f"  ({stats['relative']:+.1%})"))
     for key in ("page", "volume"):
-        low, high, share = stats["intervals"][key]
+        interval = stats["intervals"][key]
+        low, high, share = interval["low"], interval["high"], interval["share_at_or_below_zero"]
         verdict = "显著" if (low > 0 or high < 0) else "不显著"
         print(f"    {key:>6} 95% CI [{low:+.6f}, {high:+.6f}]  P(<=0)={share:.3f}  {verdict}")
 
@@ -344,6 +346,10 @@ PY
 }
 
 main() {
+    if (( summarize_only == 1 )); then
+        summarize
+        return
+    fi
     preflight
     local session="${session_override:-glmocr_oracle_test_$(printf '%s' "${run_id}" | tr '.' '_')}"
     if (( foreground == 1 )); then
@@ -393,6 +399,7 @@ main() {
 while (( $# > 0 )); do
     case "$1" in
         --foreground) foreground=1; shift ;;
+        --summarize-only) summarize_only=1; shift ;;
         --run-id) run_id="$2"; eval_root="${remote_root}/oracle_line_eval/${run_id}"; shift 2 ;;
         *) echo "unknown argument: $1" >&2; exit 64 ;;
     esac
