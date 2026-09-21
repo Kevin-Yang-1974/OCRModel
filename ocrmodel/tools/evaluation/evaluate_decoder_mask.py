@@ -181,13 +181,21 @@ def main() -> None:
     image_token_id = _image_token_id(model)
     spatial_merge_size = int(model.model.visual.spatial_merge_size)
 
-    lora_rank = int(fingerprint.get("lora_rank", args.lora_rank))
-    lora_alpha = float(fingerprint.get("lora_alpha", args.lora_alpha))
-    inject_decoder_lora(model, rank=lora_rank, alpha=lora_alpha)
-    lora_state = load_lora_state(checkpoint_dir)
-    if lora_state is None:
-        raise FileNotFoundError(checkpoint_dir / "lora.safetensors")
-    load_lora_state_dict(model, lora_state)
+    head_only = bool(fingerprint.get("head_only", False))
+    if head_only:
+        # The backbone was never adapted, so there is no LoRA to restore: the
+        # scored model is the frozen base plus the trained head, and injecting an
+        # untrained LoRA would silently change the thing being measured.
+        lora_rank = int(fingerprint.get("lora_rank", args.lora_rank))
+        lora_alpha = float(fingerprint.get("lora_alpha", args.lora_alpha))
+    else:
+        lora_rank = int(fingerprint.get("lora_rank", args.lora_rank))
+        lora_alpha = float(fingerprint.get("lora_alpha", args.lora_alpha))
+        inject_decoder_lora(model, rank=lora_rank, alpha=lora_alpha)
+        lora_state = load_lora_state(checkpoint_dir)
+        if lora_state is None:
+            raise FileNotFoundError(checkpoint_dir / "lora.safetensors")
+        load_lora_state_dict(model, lora_state)
 
     runtime = None
     bias_max = None

@@ -98,6 +98,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--router-vae-kl-free-bits", type=float, default=0.05)
     parser.add_argument("--router-vae-inference", choices=("mean", "sample"), default="mean")
     parser.add_argument("--probe", action="store_true", help="print the seam/grid probe and exit")
+    # Head-only regime: freeze everything except the mask head and train it on
+    # mask supervision alone.  No LoRA is injected (nothing would train it), the
+    # backbone builds no autograd graph, and the language-model CE is skipped --
+    # which is what lets a 4M-resolution run fit on one 40GB card.
+    parser.add_argument("--head-only", action="store_true")
+    # Page sharding: run N processes over disjoint page shards, one per card, and
+    # average the resulting heads afterwards.
+    parser.add_argument("--shard-index", type=int, default=0)
+    parser.add_argument("--shard-count", type=int, default=1)
     # optimization
     # The LoRA rate is the corrected project value: 1e-4 is 10x the established
     # lr1e5 recipe and produced severe over-generation in the first screen.
@@ -286,7 +295,11 @@ def run_training(args: argparse.Namespace) -> dict[str, Any]:
     spatial_merge_size = int(model.model.visual.spatial_merge_size)
     image_token_id = _image_token_id(model)
 
-    inject_decoder_lora(model, rank=args.lora_rank, alpha=args.lora_alpha)
+    # Head-only: inject no LoRA at all.  A frozen LoRA that never receives a
+    # gradient would only add parameters to the checkpoint and a backward pass
+    # nothing needs; leaving the backbone untouched keeps it graph-free.
+    if not args.head_only:
+        inject_decoder_lora(model, rank=args.lora_rank, alpha=args.lora_alpha)
 
     runtime = None
     config = None
@@ -326,6 +339,19 @@ def run_training(args: argparse.Namespace) -> dict[str, Any]:
 
     train_records = load_records(Path(args.train_manifest))
     validation_records = load_records(Path(args.validation_manifest))
+    if args.shard_count > 1:
+        if not 0 <= args.shard_index < args.shard_count:
+            raise ValueError("shard_index must be in [0, shard_count)")
+        # Deterministic contiguous shards in the manifest's own order, so the
+        # five processes together cover exactly the full page set with no
+        # overlap and no dependence on which one starts first.
+        shard = train_records[args.shard_index :: args.shard_count]
+        if not shard:
+            raise ValueError(
+                f"shard {args.shard_index}/{args.shard_count} is empty for "
+                f"{len(train_records)} pages; reduce the shard count"
+            )
+        train_records = shard
     train_counts = _train_character_counts(train_records)
 
     # Optimizer over LoRA + (if installed) router parameters.
@@ -334,9 +360,13 @@ def run_training(args: argparse.Namespace) -> dict[str, Any]:
     # the head trains from scratch and needs a rate it can actually move at.  One
     # shared rate cannot serve both, so they are separate parameter groups.
     head_lr = args.router_learning_rate if args.router_learning_rate is not None else args.learning_rate
-    parameter_groups = [{"params": list(iter_lora_parameters(model)), "lr": args.learning_rate}]
+    parameter_groups = []
+    if not args.head_only:
+        parameter_groups.append({"params": list(iter_lora_parameters(model)), "lr": args.learning_rate})
     if runtime is not None:
         parameter_groups.append({"params": list(runtime.router.parameters()), "lr": head_lr})
+    if not parameter_groups:
+        raise RuntimeError("nothing to optimize: head-only mode needs --routing-mode learned")
     optimizer = torch.optim.AdamW(parameter_groups, lr=args.learning_rate, weight_decay=args.weight_decay)
 
     trainable_report = {
@@ -379,8 +409,14 @@ def run_training(args: argparse.Namespace) -> dict[str, Any]:
                 _noise_at(step, config.mask_feedback_noise, args),
                 _noise_at(step, config.input_noise, args),
             )
-        outputs = model(**inputs)
-        loss = outputs.loss
+        # Head-only skips the language-model CE entirely: the head is trained by
+        # mask supervision, and the CE would only add a [1, L, vocab] logit tensor
+        # (hundreds of MB at 4M resolution) that no gradient needs.
+        model_inputs = dict(inputs)
+        if args.head_only:
+            model_inputs.pop("labels", None)
+        outputs = model(**model_inputs)
+        loss = outputs.loss if outputs.loss is not None else torch.zeros((), device=device)
         parts: dict[str, Any] = {}
         if runtime is not None and mask_targets is not None:
             mask_loss, parts = mask_and_dice_loss(
@@ -393,7 +429,13 @@ def run_training(args: argparse.Namespace) -> dict[str, Any]:
             stop_loss = balanced_stop_bce(
                 runtime.last_stop.squeeze(-1), mask_targets.stop_target
             )
-            loss = loss + args.router_mask_loss_weight * mask_loss + args.router_stop_loss_weight * stop_loss
+            supervision = (
+                args.router_mask_loss_weight * mask_loss
+                + args.router_stop_loss_weight * stop_loss
+            )
+            # Head-only trains on supervision alone; otherwise the CE comes along
+            # and the head also sees the language-model signal through the bias.
+            loss = supervision if args.head_only else loss + supervision
             if args.router_head == "vae":
                 kl_weight = _kl_weight_at(step, args)
                 kl = runtime.router.kl_loss()
@@ -435,11 +477,17 @@ def run_training(args: argparse.Namespace) -> dict[str, Any]:
                 output_dir / f"step-{step}",
                 config=runtime.config if runtime is not None else config,
                 router_state=runtime.router.state_dict() if runtime is not None else None,
-                lora_state=lora_state_dict(model),
+                # No LoRA was injected in head-only mode, so there is nothing to
+                # save -- an empty file would make the scorer try to load a LoRA
+                # into a model that has none.
+                lora_state=None if args.head_only else lora_state_dict(model),
                 training_state={"optimizer": optimizer.state_dict(), "step": step},
                 fingerprint={
                     "seed": args.seed,
                     "routing_mode": args.routing_mode,
+                    "head_only": args.head_only,
+                    "shard_index": args.shard_index,
+                    "shard_count": args.shard_count,
                     "lora_rank": args.lora_rank,
                     "lora_alpha": args.lora_alpha,
                     # The architecture knobs are recorded so an arm can be
