@@ -24,6 +24,12 @@ The output is index-aligned with ``page_text``: entry ``i`` is the box of the
 character the decoder emits at generation step ``i``.  A character with no box gets
 ``null`` rather than an interpolated guess -- 0.2% of characters, and fabricating
 one would put a made-up location under an arm whose whole point is spatial truth.
+
+Each entry also carries ``alignment_status`` (``exact``, ``placeholder`` for an
+unidentified ``#`` glyph, ``mismatch`` for an identity drift, or ``missing`` for no
+box) and ``source_index`` (the character's index in the annotation's ``characters``
+list).  The mask head reads ``alignment_status`` to distinguish a placeholder box --
+which is still the right *location* -- from a box that belongs to a different glyph.
 """
 
 from __future__ import annotations
@@ -190,11 +196,26 @@ def page_characters(record: dict[str, Any], annotation: dict[str, Any]) -> tuple
     mismatches = 0
     for index, pair in enumerate(pairs):
         if pair is None:
-            entries.append({"bbox": None, "line_index": line_of[index] if index < len(line_of) else None})
+            entries.append(
+                {
+                    "bbox": None,
+                    "line_index": line_of[index] if index < len(line_of) else None,
+                    "source_index": None,
+                    "alignment_status": "missing",
+                }
+            )
             continue
         matched += 1
-        mismatches += int(source[pair] != page_text[index])
-        box = characters[ordered[pair]]["bbox_xyxy_px"]
+        source_index = ordered[pair]
+        source_char = source[pair]
+        mismatches += int(source_char != page_text[index])
+        if source_char == page_text[index]:
+            status = "exact"
+        elif source_char == "#":
+            status = "placeholder"
+        else:
+            status = "mismatch"
+        box = characters[source_index]["bbox_xyxy_px"]
         entries.append(
             {
                 "bbox": [
@@ -204,6 +225,8 @@ def page_characters(record: dict[str, Any], annotation: dict[str, Any]) -> tuple
                     round(float(box[3]) / height, 8),
                 ],
                 "line_index": line_of[index] if index < len(line_of) else None,
+                "source_index": source_index,
+                "alignment_status": status,
             }
         )
     stats = {

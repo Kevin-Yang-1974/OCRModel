@@ -41,7 +41,7 @@ foreach ($commandName in $requiredCommands) {
 
 $relativeFiles = @(
     & git.exe -C $gitRoot ls-files --cached --others --exclude-standard -- `
-        ocrmodel/src ocrmodel/tools ocrmodel/config
+        ocrmodel/src ocrmodel/tools ocrmodel/tests ocrmodel/config
 )
 if ($LASTEXITCODE -ne 0) {
     throw 'git ls-files failed.'
@@ -88,7 +88,7 @@ try {
     if ($LASTEXITCODE -ne 0) {
         throw 'Remote directory creation failed.'
     }
-    $uploadRoots = @('src', 'tools', 'config') |
+    $uploadRoots = @('src', 'tools', 'tests', 'config') |
         ForEach-Object { Join-Path $temporaryRoot $_ } |
         Where-Object { Test-Path -LiteralPath $_ }
     & scp.exe -r @uploadRoots "${RemoteHost}:${RemoteRoot}/"
