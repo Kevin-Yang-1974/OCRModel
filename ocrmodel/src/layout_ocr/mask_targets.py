@@ -20,7 +20,7 @@ Two alignments happen here, and both are explicit and reported:
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Iterable, Sequence
 
 import torch
@@ -41,6 +41,9 @@ class MaskTargets:
     char_spans: list[tuple[int, int] | None]  # per token, span into page_text
     alignment_status: list[str]  # per token: exact/placeholder/missing/blank/unmapped
     alignment_report: dict[str, Any]  # token-char coverage counters for Gate A
+    # Present only in window mode; carried so line grouping (which poisons every
+    # target on a page when it is wrong) is logged rather than inferred.
+    window_report: dict[str, Any] = field(default_factory=dict)
 
 
 def char_boxes(record: dict[str, Any]) -> tuple[list[list[float] | None], list[str]]:
@@ -67,6 +70,37 @@ def char_boxes(record: dict[str, Any]) -> tuple[list[list[float] | None], list[s
         boxes.append([float(value) for value in box])
         statuses.append(entry.get("alignment_status", "exact"))
     return boxes, statuses
+
+
+def char_lines(record: dict[str, Any]) -> tuple[list[int | None], bool]:
+    """Per-page_text-position line id, index-aligned with ``page_text``.
+
+    ``prepare_mthv2_char_manifest`` already emits an authoritative ``line_index``
+    per character, derived from the page's own ``textlines`` annotation and
+    verified by concatenating the lines in reading order back to ``page_text``.
+    That is better than any geometric rule: it is exact, it needs no thresholds,
+    and it works for vertical as well as horizontal writing (a rule based on y
+    overlap would merge two columns on a vertical page).
+
+    Returns ``(line_ids, annotated)`` where ``annotated`` reports whether the
+    manifest actually carried the field -- a stale cache built before it existed
+    must not silently degrade into a one-line-per-page grouping.
+    """
+
+    characters = record.get("characters") or []
+    ids: list[int | None] = []
+    annotated = False
+    for entry in characters:
+        if isinstance(entry, dict) and "line_index" in entry:
+            value = entry.get("line_index")
+            ids.append(None if value is None else int(value))
+            annotated = True
+        else:
+            ids.append(None)
+    width = len(record.get("page_text", ""))
+    if len(ids) < width:
+        ids.extend([None] * (width - len(ids)))
+    return ids[:width], annotated
 
 
 def _align(target: str, source: str) -> list[int | None]:
@@ -200,12 +234,89 @@ def rasterize_box(box: Sequence[float], xywh: Tensor) -> Tensor:
     return share / peak
 
 
+def convex_hull(points: Tensor) -> Tensor:
+    """Monotone-chain hull of ``[P, 2]`` points, returned counter-clockwise.
+
+    Degenerate inputs (fewer than three distinct points, or all collinear) return
+    the input points unchanged, so the caller gets a zero-area polygon rather
+    than an exception.
+    """
+
+    unique = sorted({(float(x), float(y)) for x, y in points.tolist()})
+    if len(unique) < 3:
+        return torch.tensor(unique, dtype=points.dtype, device=points.device) if unique else points.new_zeros((0, 2))
+
+    def cross(o: tuple[float, float], a: tuple[float, float], b: tuple[float, float]) -> float:
+        return (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0])
+
+    lower: list[tuple[float, float]] = []
+    for point in unique:
+        while len(lower) >= 2 and cross(lower[-2], lower[-1], point) <= 0:
+            lower.pop()
+        lower.append(point)
+    upper: list[tuple[float, float]] = []
+    for point in reversed(unique):
+        while len(upper) >= 2 and cross(upper[-2], upper[-1], point) <= 0:
+            upper.pop()
+        upper.append(point)
+    hull = lower[:-1] + upper[:-1]
+    return torch.tensor(hull, dtype=points.dtype, device=points.device)
+
+
+def rasterize_polygon(points: Tensor, xywh: Tensor, samples: int = 4) -> Tensor:
+    """Supersampled cell-coverage share of a convex polygon, peak-normalised to 1.
+
+    ``points`` is ``[P, 2]`` in the same normalised page coordinates as ``xywh``
+    (``[N, 4]`` cell centres and sizes).  Each cell is probed on an ``S x S``
+    sub-grid and its share is the fraction of probes inside the hull, so a cell
+    the polygon fully covers scores 1 and one it misses scores 0.
+
+    Supersampling rather than exact polygon clipping is deliberate: the target is
+    soft supervision normalised to a peak of 1, so what matters is where the peak
+    lands and how the blob is shaped, not the sub-cell area to five decimals --
+    and it avoids the degenerate-polygon failure modes of a clipper.
+    """
+
+    if points.numel() == 0:
+        return torch.zeros(xywh.shape[0], device=xywh.device, dtype=xywh.dtype)
+    hull = convex_hull(points.to(torch.float64))
+    if hull.shape[0] < 3:
+        return torch.zeros(xywh.shape[0], device=xywh.device, dtype=xywh.dtype)
+    offset = (torch.arange(samples, device=xywh.device, dtype=xywh.dtype) + 0.5) / samples - 0.5
+    dy, dx = torch.meshgrid(offset, offset, indexing="ij")
+    probe_x = xywh[:, 0].unsqueeze(1) + dx.reshape(1, -1) * xywh[:, 2].unsqueeze(1)  # [N, S*S]
+    probe_y = xywh[:, 1].unsqueeze(1) + dy.reshape(1, -1) * xywh[:, 3].unsqueeze(1)
+    # Cross product of every probe against every hull edge; inside iff all agree.
+    edge_a = hull
+    edge_b = torch.roll(hull, shifts=-1, dims=0)
+    ex = (edge_b[:, 0] - edge_a[:, 0]).to(xywh.dtype)  # [K]
+    ey = (edge_b[:, 1] - edge_a[:, 1]).to(xywh.dtype)
+    ax = edge_a[:, 0].to(xywh.dtype)
+    ay = edge_a[:, 1].to(xywh.dtype)
+    # [N, S*S, K]
+    cross = ex.view(1, 1, -1) * (probe_y.unsqueeze(-1) - ay.view(1, 1, -1)) - ey.view(
+        1, 1, -1
+    ) * (probe_x.unsqueeze(-1) - ax.view(1, 1, -1))
+    sign = torch.sign(cross)
+    inside = (sign.abs().sum(dim=-1) == cross.shape[-1]).to(xywh.dtype)
+    share = inside.mean(dim=-1)
+    peak = share.max()
+    if float(peak) <= 0.0:
+        return torch.zeros_like(share)
+    return share / peak
+
+
 def build_mask_targets(
     tokenizer: Any,
     record: dict[str, Any],
     target_ids: Sequence[int],
     eos_ids: Iterable[int],
     xywh: Tensor,
+    *,
+    target_mode: str = "token",
+    window_min: int = 3,
+    window_max: int = 5,
+    line_source: str = "auto",
 ) -> MaskTargets:
     """Assemble the per-token mask targets for one page.
 
@@ -217,6 +328,35 @@ def build_mask_targets(
     page_text = record["page_text"]
     boxes, char_statuses = char_boxes(record)
     spans, statuses, report = token_char_spans(tokenizer, page_text, target_ids, char_statuses)
+
+    # --- window mode: the target is the convex hull of an in-line run of chars.
+    # Line membership comes from the manifest's authoritative ``line_index``; a
+    # geometric rule would merge columns on a vertical page, so it is only a
+    # reported fallback, never a silent substitute.
+    line_ids, annotated = char_lines(record)
+    line_source = line_source if target_mode == "window" else "token"
+    if target_mode == "window" and line_source == "annotation" and not annotated:
+        raise ValueError(
+            "target_mode='window' with line_source='annotation' needs a 'line_index' in the "
+            "manifest; regenerate the char manifest or use line_source='auto'"
+        )
+    use_lines = target_mode == "window" and annotated
+    line_members: dict[int, list[int]] = {}
+    if use_lines:
+        for char_index, line_id in enumerate(line_ids):
+            if line_id is None or char_index >= len(boxes) or boxes[char_index] is None:
+                continue
+            line_members.setdefault(int(line_id), []).append(char_index)
+    window_report: dict[str, Any] = {
+        "mode": target_mode,
+        "line_source": "annotation" if use_lines else ("geometry_unavailable" if target_mode == "window" else "token"),
+        "lines": len(line_members),
+        "singleton_lines": sum(1 for members in line_members.values() if len(members) == 1),
+        "max_line_length": max((len(m) for m in line_members.values()), default=0),
+        "window_fallbacks": 0,
+        "span_over_window": 0,
+        "short_windows_at_line_end": 0,
+    }
 
     eos = set(int(t) for t in eos_ids)
     n_tokens = len(target_ids)
@@ -242,8 +382,40 @@ def build_mask_targets(
         if not boxes_present:
             spatial_valid[0, index] = False  # missing boxes: ignore, never train as background
             continue
-        for box in boxes_present:
-            mask[0, index] = torch.maximum(mask[0, index], rasterize_box(box, xywh[0]))
+
+        window_boxes: list[list[float]] | None = None
+        if use_lines:
+            line_id = line_ids[span[0]] if span[0] < len(line_ids) else None
+            members = line_members.get(int(line_id)) if line_id is not None else None
+            if members:
+                start = next((k for k, char_index in enumerate(members) if char_index >= span[0]), None)
+                if start is not None:
+                    want = max(window_min, min(window_max, span[1] - span[0]))
+                    if span[1] - span[0] > window_max:
+                        window_report["span_over_window"] += 1
+                    end = min(len(members), start + want)
+                    if end - start < window_min:  # line tail: top up to the left
+                        start = max(0, end - window_min)
+                        window_report["short_windows_at_line_end"] += 1
+                    if end > start:
+                        window_boxes = [boxes[members[k]] for k in range(start, end)]
+
+        if window_boxes:
+            # Convex hull of the window's box corners: adjacent characters on one
+            # line are near-collinear, so the hull is close to their union's
+            # rectangle while still filling the gaps between glyphs -- one
+            # connected blob for the bias instead of a row of separate dots.
+            corners = torch.tensor(
+                [[box[0], box[1]] for box in window_boxes] + [[box[2], box[3]] for box in window_boxes],
+                device=xywh.device,
+                dtype=xywh.dtype,
+            )
+            mask[0, index] = torch.maximum(mask[0, index], rasterize_polygon(corners, xywh[0]))
+        else:
+            if target_mode == "window":
+                window_report["window_fallbacks"] += 1
+            for box in boxes_present:
+                mask[0, index] = torch.maximum(mask[0, index], rasterize_box(box, xywh[0]))
         spatial_valid[0, index] = True
 
     return MaskTargets(
@@ -253,4 +425,5 @@ def build_mask_targets(
         char_spans=spans,
         alignment_status=statuses,
         alignment_report=report,
+        window_report=window_report,
     )

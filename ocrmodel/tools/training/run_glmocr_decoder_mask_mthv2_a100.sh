@@ -37,7 +37,7 @@ mode="screen"
 gpu_ids="0,1,2,3"
 gpu_utilization_limit=50
 seed=42
-screen_id="glmocr_decoder_mask_screen_v1"
+screen_id="glmocr_decoder_mask_finegrid_v1"
 session=""
 foreground=0
 max_steps=1024
@@ -47,7 +47,9 @@ smoke_train_pages=4
 smoke_validation_pages=4
 smoke_max_steps=8
 max_pixels=1003520
-max_eval_new_tokens=512
+# 15.6% of MTHv2 pages have more than 512 reference tokens (max 1349), so a 512
+# cap silently truncates them; 1536 covers every page in both splits.
+max_eval_new_tokens=1536
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -293,15 +295,20 @@ PY
 
 arm_training_args() {
     # Echoes the flag composition for one arm; the caller appends the subset
-    # manifests and output dir.  B0 is the native LoRA baseline, B1 keeps the mask
-    # loss but never applies bias, B2 drops the previous-mask recurrence, B3 is
-    # the full proposal (plan section 8, Gate C).
+    # manifests and output dir.  Everything the three learned arms share (fine
+    # grid, max pooling, BCE+Dice, both learning rates, beta) lives in
+    # ``run_training``'s fixed list, so each arm below changes exactly ONE
+    # variable.  That is what makes the comparisons interpretable:
+    #   G1 vs G2 : window target vs single-token target
+    #   G2 vs G3 : deterministic MLP head vs conditional VAE head
+    #   each vs B0 : does a head help at all
+    # G1 vs G3 differs in two factors and must not be read as a single contrast.
     local arm="$1"
     case "${arm}" in
         B0) printf '%s' "--routing-mode none" ;;
-        B1) printf '%s' "--routing-mode learned --router-bias-max 0" ;;
-        B2) printf '%s' "--routing-mode learned --router-no-prev-mask" ;;
-        B3) printf '%s' "--routing-mode learned" ;;
+        G2) printf '%s' "--routing-mode learned --router-target-mode token" ;;
+        G1) printf '%s' "--routing-mode learned --router-target-mode window" ;;
+        G3) printf '%s' "--routing-mode learned --router-head vae" ;;
         *) printf '{"event":"decoder_mask_failed","error":"invalid_arm","arm":"%s"}\n' "${arm}" >&2; exit 64 ;;
     esac
 }
@@ -321,7 +328,16 @@ run_training() {
         --max-pixels "${max_pixels}" \
         --processor-mode slow \
         --lora-rank 8 --lora-alpha 8 \
-        --learning-rate 1e-4 \
+        --learning-rate 1e-6 \
+        --router-learning-rate 1e-4 \
+        --router-visual-source fine \
+        --router-pool-mode max \
+        --router-dice-weight 1.0 \
+        --router-mask-bce balanced \
+        --router-window-size 3 5 \
+        --router-vae-latent-channels 4 --router-vae-latent-size 16 \
+        --router-vae-kl-weight 1.0 --router-vae-kl-warmup-steps 200 \
+        --router-vae-kl-free-bits 0.05 \
         --checkpoint-every 256 \
         --validation-every 256 \
         --validation-steps ${validation_steps} \
@@ -346,9 +362,35 @@ run_smoke() {
     if [[ ! -f "${train_manifest}" ]]; then
         prepare_split "${smoke_train_pages}" "${smoke_validation_pages}" "smoke" > "${split_root}/split_smoke.log"
     fi
-    run_training "B3" "${train_manifest}" "${validation_manifest}" "${smoke_dir}" "${smoke_max_steps}" "${smoke_max_steps}"
-    # Checkpoint reload: score the last smoke checkpoint on one page prompt-only.
-    local checkpoint_dir="${smoke_dir}/step-${smoke_max_steps}"
+    # Both new code paths in one wall clock: G3 exercises the conditional VAE,
+    # the pre-merge capture and the fine->merged pooling; G1 exercises the window
+    # target and the annotation-driven line grouping.  One arm per card, parallel.
+    local pids=()
+    local smoke_arm
+    for slot in 0 1; do
+        smoke_arm="G3"
+        [[ "${slot}" -eq 1 ]] && smoke_arm="G1"
+        local smoke_card="${gpu_array[${slot}]}"
+        local smoke_arm_dir="${smoke_dir}/${smoke_arm}"
+        mkdir -p "${smoke_arm_dir}"
+        (
+            export CUDA_VISIBLE_DEVICES="${smoke_card}"
+            export TMPDIR="${screen_root}/tmp/${mode}/${smoke_arm}"
+            export HF_HOME="${TMPDIR}/huggingface"
+            mkdir -p "${TMPDIR}" "${HF_HOME}"
+            run_training "${smoke_arm}" "${train_manifest}" "${validation_manifest}" \
+                "${smoke_arm_dir}" "${smoke_max_steps}" "${smoke_max_steps}"
+        ) > "${smoke_arm_dir}/train.log" 2>&1 &
+        pids+=("$!")
+    done
+    local smoke_failed=0
+    for pid in "${pids[@]}"; do wait "${pid}" || smoke_failed=$((smoke_failed + 1)); done
+    if (( smoke_failed > 0 )); then
+        printf '{"event":"decoder_mask_failed","error":"smoke_train_failed","count":%s}\n' "${smoke_failed}" >&2
+        return 1
+    fi
+    # Checkpoint reload: score the last G3 checkpoint on the smoke validation pages.
+    local checkpoint_dir="${smoke_dir}/G3/step-${smoke_max_steps}"
     [[ -d "${checkpoint_dir}" ]] || {
         printf '{"event":"decoder_mask_failed","error":"smoke_checkpoint_missing","dir":"%s"}\n' "${checkpoint_dir}" >&2; return 1
     }
@@ -373,7 +415,7 @@ run_screen() {
     # same code stays correct if the allowlist is later narrowed to fewer cards
     # than arms (a narrow allowlist must not silently co-schedule two arms on one
     # card, which would oversubscribe its memory instead of queueing).
-    local arms=(B0 B1 B2 B3)
+    local arms=(G1 G2 G3 B0)
     local n_cards=${#gpu_array[@]}
     local total=${#arms[@]}
     local index=0

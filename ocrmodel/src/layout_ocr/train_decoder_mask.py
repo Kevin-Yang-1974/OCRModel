@@ -37,8 +37,14 @@ from .decoder_mask_checkpoint import (
     save_decoder_mask_checkpoint,
 )
 from .decoder_mask_model import enable_eager_backend, install_decoder_mask_router
-from .decoder_mask_router import DecoderMaskConfig, _normalized_grid_xywh
+from .decoder_mask_router import (
+    DecoderMaskConfig,
+    _normalized_grid_xywh,
+    fine_grid_xywh,
+    pool_to_merged,
+)
 from .lora import inject_decoder_lora, iter_lora_parameters, lora_state_dict
+from .mask_losses import balanced_stop_bce, mask_and_dice_loss
 from .mask_targets import build_mask_targets
 from .metrics import aggregate_ocr_metrics
 
@@ -71,8 +77,38 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--router-scheduled-sampling", type=float, default=0.0)
     parser.add_argument("--router-use-prev-mask", action="store_true", default=True)
     parser.add_argument("--router-no-prev-mask", action="store_true")
+    # visual source / grid
+    parser.add_argument("--router-visual-source", choices=("merged", "fine"), default="merged")
+    parser.add_argument(
+        "--router-pool-mode",
+        choices=("max", "mean"),
+        default="max",
+        help="how the fine mask is reduced onto the merged grid the bias lives on",
+    )
+    parser.add_argument("--router-head", choices=("mlp", "vae"), default="mlp")
+    parser.add_argument("--router-target-mode", choices=("token", "window"), default="token")
+    parser.add_argument("--router-window-size", nargs=2, type=int, default=[3, 5], metavar=("MIN", "MAX"))
+    parser.add_argument("--router-window-line-source", choices=("annotation", "geometry", "auto"), default="auto")
+    parser.add_argument("--router-dice-weight", type=float, default=0.0)
+    parser.add_argument("--router-mask-bce", choices=("balanced", "plain"), default="balanced")
+    parser.add_argument("--router-vae-latent-channels", type=int, default=4)
+    parser.add_argument("--router-vae-latent-size", type=int, default=16)
+    parser.add_argument("--router-vae-kl-weight", type=float, default=1.0)
+    parser.add_argument("--router-vae-kl-warmup-steps", type=int, default=200)
+    parser.add_argument("--router-vae-kl-free-bits", type=float, default=0.05)
+    parser.add_argument("--router-vae-inference", choices=("mean", "sample"), default="mean")
+    parser.add_argument("--probe", action="store_true", help="print the seam/grid probe and exit")
     # optimization
-    parser.add_argument("--learning-rate", type=float, default=1e-4)
+    # The LoRA rate is the corrected project value: 1e-4 is 10x the established
+    # lr1e5 recipe and produced severe over-generation in the first screen.
+    parser.add_argument("--learning-rate", type=float, default=1e-6)
+    parser.add_argument(
+        "--router-learning-rate",
+        type=float,
+        default=None,
+        help="head LR; defaults to --learning-rate. The head trains from scratch, so "
+        "it usually needs its own (higher) rate than a LoRA that must stay near its base.",
+    )
     parser.add_argument("--weight-decay", type=float, default=0.0)
     parser.add_argument("--max-steps", type=int, default=1024)
     parser.add_argument("--checkpoint-every", type=int, default=256)
@@ -124,39 +160,6 @@ def _image_token_id(model: Any) -> int:
     return int(value)
 
 
-def _balanced_mask_bce(mask: torch.Tensor, target: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
-    """Balanced BCE on the soft mask (plan 5): non-empty and empty groups averaged apart."""
-
-    eps = 1e-7
-    has_content = target.sum(dim=-1) > 0
-    non_empty = valid & has_content
-    empty = valid & ~has_content
-    log_m = torch.log(mask.clamp_min(eps))
-    log_1m = torch.log1p(-mask.clamp_max(1.0 - eps))
-    ne_loss = mask.new_zeros(())
-    if non_empty.any():
-        m = mask[non_empty]
-        g = target[non_empty]
-        pos = -(g * log_m[non_empty]).sum() / g.sum().clamp_min(eps)
-        neg = -((1.0 - g) * log_1m[non_empty]).sum() / (1.0 - g).sum().clamp_min(eps)
-        ne_loss = 0.5 * pos + 0.5 * neg
-    empty_loss = mask.new_zeros(())
-    if empty.any():
-        empty_loss = -log_1m[empty].mean()
-    return ne_loss + empty_loss
-
-
-def _balanced_stop_bce(stop_prob: torch.Tensor, stop_target: torch.Tensor) -> torch.Tensor:
-    eps = 1e-7
-    stop_prob = stop_prob.clamp(eps, 1.0 - eps)
-    log_e = torch.log(stop_prob)
-    log_1e = torch.log1p(-stop_prob)
-    pos = stop_target > 0.5
-    pos_loss = -log_e[pos].mean() if pos.any() else stop_prob.new_zeros(())
-    neg_loss = -log_1e[~pos].mean() if (~pos).any() else stop_prob.new_zeros(())
-    return pos_loss + neg_loss
-
-
 def _beta_at(step: int, args: argparse.Namespace) -> float:
     if args.routing_mode != "learned":
         return 0.0
@@ -164,6 +167,34 @@ def _beta_at(step: int, args: argparse.Namespace) -> float:
         return float(args.router_bias_max)
     frac = min(1.0, step / args.router_bias_warmup_steps)
     return float(args.router_bias_max) * frac
+
+
+def _kl_weight_at(step: int, args: argparse.Namespace) -> float:
+    """Linear KL warmup; the anti-collapse pair with the decoder's small init."""
+
+    if args.router_head != "vae":
+        return 0.0
+    if args.router_vae_kl_warmup_steps <= 0:
+        return float(args.router_vae_kl_weight)
+    return float(args.router_vae_kl_weight) * min(1.0, step / args.router_vae_kl_warmup_steps)
+
+
+def _pooled_peak(runtime: Any) -> float:
+    """Mean per-token peak of the mask *after* it is pooled onto the merged grid.
+
+    The bias the decoder actually receives is ``beta * pooled(M)``, so this is the
+    number that says whether ``beta`` still means what it did on the merged grid.
+    """
+
+    mask = runtime.last_mask
+    if mask is None:
+        return 0.0
+    pooled = mask
+    if runtime.config.visual_source == "fine":
+        pooled = pool_to_merged(
+            mask, runtime.merged_shape, runtime.spatial_merge_size, runtime.config.pool_mode
+        )
+    return float(pooled.detach().amax(dim=-1).mean().item())
 
 
 def _noise_at(step: int, initial: float, args: argparse.Namespace) -> float:
@@ -181,11 +212,36 @@ def _prompt_length(inputs: dict[str, Any]) -> int:
     return int((labels == -100).to(torch.int32).cumprod(dim=1).sum().item())
 
 
-def _build_targets(processor: Any, record: dict[str, Any], inputs: dict[str, Any], spatial_merge_size: int, eos_ids: set[int]):
+def _router_xywh(grid_thw: torch.Tensor, spatial_merge_size: int, visual_source: str):
+    """The head's own grid: one cell per patch in fine mode, else the merged grid."""
+
+    if visual_source == "fine":
+        return fine_grid_xywh(grid_thw, 1)
+    return _normalized_grid_xywh(grid_thw, spatial_merge_size)
+
+
+def _build_targets(
+    processor: Any,
+    record: dict[str, Any],
+    inputs: dict[str, Any],
+    spatial_merge_size: int,
+    eos_ids: set[int],
+    args: argparse.Namespace,
+):
     prompt_length = _prompt_length(inputs)
     target_ids = inputs["input_ids"][0, prompt_length:]
-    xywh, _ = _normalized_grid_xywh(inputs["image_grid_thw"], spatial_merge_size)
-    return build_mask_targets(processor.tokenizer, record, target_ids, eos_ids, xywh)
+    xywh, _ = _router_xywh(inputs["image_grid_thw"], spatial_merge_size, args.router_visual_source)
+    return build_mask_targets(
+        processor.tokenizer,
+        record,
+        target_ids,
+        eos_ids,
+        xywh,
+        target_mode=args.router_target_mode,
+        window_min=args.router_window_size[0],
+        window_max=args.router_window_size[1],
+        line_source=args.router_window_line_source,
+    )
 
 
 def _decode_tokens(tokenizer: Any, tokens: torch.Tensor, eos_ids: set[int]) -> str:
@@ -248,6 +304,21 @@ def run_training(args: argparse.Namespace) -> dict[str, Any]:
             input_noise=args.router_input_noise,
             detach_every=args.router_detach_every,
             use_prev_mask=use_prev_mask,
+            visual_source=args.router_visual_source,
+            pool_mode=args.router_pool_mode,
+            head=args.router_head,
+            target_mode=args.router_target_mode,
+            window_min=args.router_window_size[0],
+            window_max=args.router_window_size[1],
+            line_source=args.router_window_line_source,
+            dice_weight=args.router_dice_weight,
+            bce_mode=args.router_mask_bce,
+            vae_latent_channels=args.router_vae_latent_channels,
+            vae_latent_size=args.router_vae_latent_size,
+            vae_kl_weight=args.router_vae_kl_weight,
+            vae_kl_warmup_steps=args.router_vae_kl_warmup_steps,
+            vae_kl_free_bits=args.router_vae_kl_free_bits,
+            vae_inference=args.router_vae_inference,
         )
         enable_eager_backend(model)
         runtime = install_decoder_mask_router(model, config, image_token_id, spatial_merge_size)
@@ -258,14 +329,29 @@ def run_training(args: argparse.Namespace) -> dict[str, Any]:
     train_counts = _train_character_counts(train_records)
 
     # Optimizer over LoRA + (if installed) router parameters.
-    parameter_groups = [{"params": list(iter_lora_parameters(model))}]
+    # The LoRA must stay near its base (a high rate causes over-generation, since
+    # teacher forcing never teaches recovery from the model's own errors), while
+    # the head trains from scratch and needs a rate it can actually move at.  One
+    # shared rate cannot serve both, so they are separate parameter groups.
+    head_lr = args.router_learning_rate if args.router_learning_rate is not None else args.learning_rate
+    parameter_groups = [{"params": list(iter_lora_parameters(model)), "lr": args.learning_rate}]
     if runtime is not None:
-        parameter_groups.append({"params": list(runtime.router.parameters())})
+        parameter_groups.append({"params": list(runtime.router.parameters()), "lr": head_lr})
     optimizer = torch.optim.AdamW(parameter_groups, lr=args.learning_rate, weight_decay=args.weight_decay)
 
     trainable_report = {
         "decoder_lora_parameters": sum(p.numel() for p in iter_lora_parameters(model)),
         "router_parameters": runtime.router.trainable_parameter_count() if runtime is not None else 0,
+        "lora_learning_rate": args.learning_rate,
+        "router_learning_rate": head_lr if runtime is not None else None,
+        "visual_source": args.router_visual_source,
+        # Read the *installed* config: the installer re-derives the model-dependent
+        # widths, so the local one still carries the placeholder zeros.
+        "visual_hidden_size": int(getattr(runtime.config, "visual_hidden_size", 0)) if runtime else None,
+        "head": args.router_head,
+        "target_mode": args.router_target_mode,
+        "pool_mode": args.router_pool_mode,
+        "dice_weight": args.router_dice_weight,
     }
     with open(output_dir / "trainable_report.json", "w", encoding="utf-8") as handle:
         json.dump(trainable_report, handle, indent=2)
@@ -286,7 +372,7 @@ def run_training(args: argparse.Namespace) -> dict[str, Any]:
         beta = _beta_at(step, args)
         mask_targets = None
         if runtime is not None:
-            mask_targets = _build_targets(processor, record, inputs, spatial_merge_size, eos_ids)
+            mask_targets = _build_targets(processor, record, inputs, spatial_merge_size, eos_ids, args)
             runtime.set_page(inputs["image_grid_thw"], inputs["input_ids"], prompt_length, mask_targets)
             runtime.set_bias_strength(beta)
             runtime.set_noise(
@@ -295,14 +381,33 @@ def run_training(args: argparse.Namespace) -> dict[str, Any]:
             )
         outputs = model(**inputs)
         loss = outputs.loss
+        parts: dict[str, Any] = {}
         if runtime is not None and mask_targets is not None:
-            mask_loss = _balanced_mask_bce(
-                runtime.last_mask, mask_targets.mask, mask_targets.spatial_valid
+            mask_loss, parts = mask_and_dice_loss(
+                runtime.last_mask,
+                mask_targets.mask,
+                mask_targets.spatial_valid,
+                dice_weight=args.router_dice_weight,
+                bce_mode=args.router_mask_bce,
             )
-            stop_loss = _balanced_stop_bce(
+            stop_loss = balanced_stop_bce(
                 runtime.last_stop.squeeze(-1), mask_targets.stop_target
             )
             loss = loss + args.router_mask_loss_weight * mask_loss + args.router_stop_loss_weight * stop_loss
+            if args.router_head == "vae":
+                kl_weight = _kl_weight_at(step, args)
+                kl = runtime.router.kl_loss()
+                loss = loss + kl_weight * kl
+                parts.update(runtime.router.kl_diagnostics())
+                parts["kl_term"] = float(kl.detach().item())
+                parts["kl_weight"] = kl_weight
+            # The pooled peak is the empirical answer to "does beta stay anchored":
+            # the bias is beta * pooled(M), so a peak well below 1 means the fine
+            # grid weakened the intervention instead of sharpening it.
+            parts["pooled_peak"] = _pooled_peak(runtime)
+            if mask_targets.window_report:
+                parts["window"] = mask_targets.window_report
+            parts["stop_loss"] = float(stop_loss.detach().item())
         else:
             mask_loss = torch.zeros((), device=device)
             stop_loss = torch.zeros((), device=device)
@@ -320,6 +425,7 @@ def run_training(args: argparse.Namespace) -> dict[str, Any]:
                 "mask_loss": float(mask_loss.detach().item()),
                 "stop_loss": float(stop_loss.detach().item()),
                 "beta": beta,
+                **parts,
             }
         )
         if step % args.checkpoint_every == 0 or step in args.validation_steps or step == args.max_steps:
@@ -327,7 +433,7 @@ def run_training(args: argparse.Namespace) -> dict[str, Any]:
             # checkpoint so the locked test can score it symmetrically.
             save_decoder_mask_checkpoint(
                 output_dir / f"step-{step}",
-                config=config,
+                config=runtime.config if runtime is not None else config,
                 router_state=runtime.router.state_dict() if runtime is not None else None,
                 lora_state=lora_state_dict(model),
                 training_state={"optimizer": optimizer.state_dict(), "step": step},
@@ -336,6 +442,18 @@ def run_training(args: argparse.Namespace) -> dict[str, Any]:
                     "routing_mode": args.routing_mode,
                     "lora_rank": args.lora_rank,
                     "lora_alpha": args.lora_alpha,
+                    # The architecture knobs are recorded so an arm can be
+                    # identified without loading the config, and so a mismatched
+                    # scorer can be caught rather than silently scoring a
+                    # different head.
+                    "head": args.router_head,
+                    "visual_source": args.router_visual_source,
+                    "target_mode": args.router_target_mode,
+                    "pool_mode": args.router_pool_mode,
+                    "bias_max": args.router_bias_max,
+                    "dice_weight": args.router_dice_weight,
+                    "learning_rate": args.learning_rate,
+                    "router_learning_rate": head_lr,
                 },
             )
         if step in args.validation_steps or step == args.max_steps:
@@ -416,8 +534,88 @@ def run_validation(
     return metrics
 
 
+def run_probe(args: argparse.Namespace) -> int:
+    """Print the vision seam and both grids, then exit.
+
+    The fine-grid experiment rests entirely on the pre-merge features being four
+    times the merged token count and wider than the text hidden size.  If that is
+    false, four cards would be spent rediscovering it, so this is a pre-flight
+    rather than a convenience.
+    """
+
+    from transformers import AutoModelForImageTextToText, AutoProcessor
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    processor = AutoProcessor.from_pretrained(
+        args.model_path, use_fast=args.processor_mode == "fast", local_files_only=True
+    )
+    size = dict(processor.image_processor.size)
+    size["longest_edge"] = args.max_pixels
+    processor.image_processor.size = size
+    model = AutoModelForImageTextToText.from_pretrained(
+        args.model_path, dtype=torch.bfloat16, attn_implementation="sdpa", local_files_only=True
+    )
+    for parameter in model.parameters():
+        parameter.requires_grad_(False)
+    model.to(device)
+    model.eval()
+
+    vision = getattr(getattr(model, "model", None), "visual", None)
+    captured: dict[str, Any] = {}
+    handles: list[Any] = []
+    post_layernorm = getattr(vision, "post_layernorm", None)
+    if post_layernorm is not None:
+        def capture_output(module: Any, call_args: Any, output: Any) -> None:
+            tensor = output[0] if isinstance(output, (tuple, list)) else output
+            if torch.is_tensor(tensor):
+                captured["post_layernorm_out"] = list(tensor.shape)
+
+        handles.append(post_layernorm.register_forward_hook(capture_output))
+    for name, module in (("downsample_in", getattr(vision, "downsample", None)), ("merger_in", getattr(vision, "merger", None))):
+        if module is None:
+            continue
+
+        def capture_input(module_: Any, call_args: Any, _name: str = name) -> None:
+            tensor = call_args[0] if call_args else None
+            if torch.is_tensor(tensor):
+                captured[_name] = list(tensor.shape)
+
+        handles.append(module.register_forward_pre_hook(capture_input))
+
+    records = load_records(Path(args.train_manifest))
+    eos_ids = _eos_ids(model, processor)
+    inputs = prepare_training_inputs(processor, records[0], device, eos_ids)
+    with torch.no_grad():
+        model(**inputs)
+    for handle in handles:
+        handle.remove()
+
+    grid = [int(value) for value in inputs["image_grid_thw"][0].tolist()]
+    _, height, width = grid
+    merge = int(getattr(vision, "spatial_merge_size", 0) or 0)
+    vision_config = getattr(vision, "config", None)
+    payload = {
+        "event": "visual_probe",
+        "grid_thw": grid,
+        "N_fine": height * width,
+        "N_merged": ((height // merge) * (width // merge)) if merge else None,
+        "image_tokens_in_sequence": int((inputs["input_ids"][0] == _image_token_id(model)).sum()),
+        "vision_hidden_size": int(getattr(vision_config, "hidden_size", 0) or 0),
+        "vision_out_hidden_size": int(getattr(vision_config, "out_hidden_size", 0) or 0),
+        "spatial_merge_size": merge,
+        "captured": captured,
+    }
+    payload["fine_grid_available"] = bool(payload["N_merged"]) and payload["N_fine"] != payload["N_merged"]
+    print(json.dumps(payload, ensure_ascii=False))
+    if args.router_visual_source == "fine" and not payload["fine_grid_available"]:
+        raise SystemExit("fine grid requested but N_fine == N_merged; the premise does not hold")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
+    if args.probe:
+        return run_probe(args)
     run_training(args)
     return 0
 

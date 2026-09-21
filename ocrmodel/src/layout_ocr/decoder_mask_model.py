@@ -38,7 +38,13 @@ from typing import Any
 import torch
 from torch import Tensor, nn
 
-from .decoder_mask_router import DecoderMaskConfig, DecoderMaskRouter, _normalized_grid_xywh
+from .decoder_mask_router import (
+    DecoderMaskConfig,
+    DecoderMaskRouter,
+    _normalized_grid_xywh,
+    fine_grid_xywh,
+    pool_to_merged,
+)
 from .prefix_injection import _find_text_model
 
 ROUTER_MODULE_NAME = "decoder_mask_router"
@@ -54,8 +60,13 @@ class DecoderMaskRuntime:
     spatial_merge_size: int
 
     # --- per-page state (cleared on ``clear_page``) ---
+    # ``xywh``/``spatial_shape`` describe the *head's* grid, which is finer than
+    # the model's in ``visual_source="fine"``; ``merged_shape`` is the grid the
+    # language model actually attends over, and is what the bias is built on.
     xywh: Tensor | None = None
     spatial_shape: tuple[int, int] | None = None
+    merged_shape: tuple[int, int] | None = None
+    premerge_features: Tensor | None = None  # [N_fine, visual_hidden]
     grid_thw: Tensor | None = None
     keys: Tensor | None = None
     image_positions: Tensor | None = None  # [N] absolute sequence positions
@@ -63,6 +74,12 @@ class DecoderMaskRuntime:
     mask_targets: Any | None = None
     prompt_length: int | None = None
     bias_strength: float = 0.0  # beta, ramped by the trainer from 0 to bias_max
+    # Oracle diagnostic only: when set, this mask drives the attention bias
+    # instead of the head's prediction.  It is what makes the "is the *idea* of
+    # routing useful, separately from whether the head predicts well" question
+    # answerable.  It reads evaluation ground truth, so it must never be used for
+    # selection or reported as a deployable result.
+    oracle_mask: Tensor | None = None
     last_mask: Tensor | None = None  # [B, T, N] clean predicted mask
     last_stop: Tensor | None = None  # [B, T, 1] stop probability
     last_logits: Tensor | None = None  # [B, T, N] pre-sigmoid z
@@ -98,13 +115,25 @@ class DecoderMaskRuntime:
 
         if input_ids.ndim != 2 or input_ids.shape[0] != 1:
             raise ValueError("the mask runtime expects a single-page [1, L] input_ids")
-        self.xywh, self.spatial_shape = _normalized_grid_xywh(grid_thw, self.spatial_merge_size)
         self.grid_thw = grid_thw
+        # The head's own stride: 1 patch per cell in fine mode, otherwise the
+        # tower's merge size.  The model's merged grid is fixed either way.
+        router_stride = 1 if self.config.visual_source == "fine" else self.spatial_merge_size
+        self.xywh, self.spatial_shape = (
+            fine_grid_xywh(grid_thw, router_stride)
+            if self.config.visual_source == "fine"
+            else _normalized_grid_xywh(grid_thw, router_stride)
+        )
+        height = int(grid_thw[0, 1])
+        width = int(grid_thw[0, 2])
+        self.merged_shape = (height // self.spatial_merge_size, width // self.spatial_merge_size)
         positions = (input_ids[0] == int(self.image_token_id)).nonzero().flatten()
-        if positions.numel() != self.xywh.shape[1]:
+        merged_cells = self.merged_shape[0] * self.merged_shape[1]
+        if positions.numel() != merged_cells:
             raise RuntimeError(
                 "image token count does not match the merged grid: "
-                f"{positions.numel()} image tokens for {self.xywh.shape[1]} grid cells"
+                f"{positions.numel()} image tokens for {merged_cells} merged cells "
+                f"(head grid {self.spatial_shape})"
             )
         self.image_positions = positions.to(device=input_ids.device)
         total = int(input_ids.shape[1])
@@ -135,12 +164,15 @@ class DecoderMaskRuntime:
     def clear_page(self) -> None:
         self.xywh = None
         self.spatial_shape = None
+        self.merged_shape = None
+        self.premerge_features = None
         self.grid_thw = None
         self.keys = None
         self.image_positions = None
         self.query_positions = None
         self.mask_targets = None
         self.prompt_length = None
+        self.oracle_mask = None
         self.last_mask = None
         self.last_stop = None
         self.last_logits = None
@@ -149,12 +181,42 @@ class DecoderMaskRuntime:
 
     # --- hooks ---
 
+    def capture_premerge(self, module: nn.Module, args: Any, output: Any) -> None:
+        """Vision ``post_layernorm`` hook: stash the one-cell-per-patch features.
+
+        GLM-OCR's tower runs ``downsample`` (a strided 2x2 conv) *before*
+        ``merger``, so the last seam that still has one cell per patch is the
+        vision ``post_layernorm`` output.  Hooked once per page on the prefill;
+        the tower is frozen, so detaching here is free and keeps its graph (and
+        its eager attention) out of the backward pass.
+        """
+
+        if self.image_positions is None or self.keys is not None:
+            return None
+        if self.grid_thw is None:
+            return None
+        tensor = output[0] if isinstance(output, (tuple, list)) else output
+        if not torch.is_tensor(tensor) or tensor.ndim != 2:
+            shape = tuple(tensor.shape) if torch.is_tensor(tensor) else type(tensor).__name__
+            raise RuntimeError(f"pre-merge features should be a 2-D tensor, got {shape}")
+        height = int(self.grid_thw[0, 1])
+        width = int(self.grid_thw[0, 2])
+        if tensor.shape[0] != height * width:
+            raise RuntimeError(
+                f"pre-merge capture got {tuple(tensor.shape)} for a {height}x{width} patch grid: "
+                f"expected {height * width} patches, so the hook is on the wrong seam"
+            )
+        self.premerge_features = tensor.detach().float()
+        return None
+
     def capture_visual(self, module: nn.Module, args: Any, kwargs: dict) -> None:
-        """Text-model pre-hook: project the image embeddings once per page.
+        """Text-model pre-hook: project the visual features once per page.
 
         The text model is reached with ``input_ids=None`` and assembled
-        ``inputs_embeds`` (see :mod:`prefix_injection`), so the visual tokens are
-        read off the embeddings at the image positions resolved in ``set_page``.
+        ``inputs_embeds`` (see :mod:`prefix_injection`), so in merged mode the
+        visual tokens are read off the embeddings at the image positions resolved
+        in ``set_page``.  In fine mode they come from the pre-merge capture
+        instead, because the merged tokens have already lost the sub-cell detail.
         """
 
         if self.image_positions is None:
@@ -163,13 +225,24 @@ class DecoderMaskRuntime:
             # A decode step re-embeds only the new token; the image tokens live in
             # the KV cache and were already projected on the prefill.
             return None
+        if self.xywh is None or self.grid_thw is None:
+            return None
+        if self.config.visual_source == "fine":
+            if self.premerge_features is None:
+                raise RuntimeError(
+                    "visual_source='fine' but no pre-merge features were captured; the "
+                    "visual.post_layernorm hook is missing or the vision tower did not run"
+                )
+            # Router stride 1: one cell per patch, block-major.
+            self.keys, self.xywh, self.spatial_shape = self.router.project_visual(
+                self.premerge_features.unsqueeze(0), self.grid_thw, 1
+            )
+            return None
         inputs_embeds = kwargs.get("inputs_embeds")
         if inputs_embeds is None and args:
             inputs_embeds = args[0]
         if inputs_embeds is None:
             raise RuntimeError("mask routing expected inputs_embeds at the text-model seam")
-        if self.xywh is None or self.grid_thw is None:
-            return None
         visual = inputs_embeds[:, self.image_positions, :]  # [B, N, hidden]
         self.keys, self.xywh, self.spatial_shape = self.router.project_visual(
             visual, self.grid_thw, self.spatial_merge_size
@@ -198,8 +271,17 @@ class DecoderMaskRuntime:
             self.prev_mask = mask
             return mask.unsqueeze(1), stop.unsqueeze(1), z.unsqueeze(1)
         h = hidden_states[:, self.query_positions, :]  # [B, T, hidden]
+        # The ground-truth mask is handed to the head only on a training forward
+        # (``set_page`` receives it there and ``None`` for prompt-only generation),
+        # so the VAE posterior can never leak into inference.
+        targets = None if self.mask_targets is None else self.mask_targets.mask
         mask, stop, z = router.scan(
-            h, self.keys, self.xywh, self.spatial_shape, detach_every=router.config.detach_every
+            h,
+            self.keys,
+            self.xywh,
+            self.spatial_shape,
+            detach_every=router.config.detach_every,
+            targets=targets,
         )
         self.prev_mask = mask[:, -1]
         return mask, stop, z
@@ -235,6 +317,13 @@ class DecoderMaskRuntime:
         beta = self.bias_strength
         if beta == 0.0:
             return bias
+        if self.config.visual_source == "fine":
+            # The head predicts on the fine grid; attention only has the merged
+            # image keys, so the mask is reduced here -- the single place where
+            # the two grids meet.  ``last_mask`` stays fine for the loss.
+            mask = pool_to_merged(
+                mask, self.merged_shape, self.spatial_merge_size, self.config.pool_mode
+            )
         ip = self.image_positions  # [N] absolute, all present in the key range
         if q_len == 1:
             bias[0, 0, 0, ip] = (beta * mask[0, 0]).to(hidden_states.dtype)
@@ -283,7 +372,10 @@ class DecoderMaskRuntime:
             self.last_mask = mask
             self.last_stop = stop
             self.last_logits = z
-            self._bias = self._build_bias(mask, hidden_states, kwargs)
+            # ``last_mask`` always stays the head's own prediction (the loss and
+            # the diagnostics read it); only the bias can be overridden.
+            bias_mask = mask if self.oracle_mask is None else self.oracle_mask
+            self._bias = self._build_bias(bias_mask, hidden_states, kwargs)
         bias = self._bias
         if bias is None:
             return None
@@ -323,6 +415,8 @@ def install_decoder_mask_router(
     config: DecoderMaskConfig,
     image_token_id: int,
     spatial_merge_size: int,
+    *,
+    visual_hidden_size: int | None = None,
 ) -> DecoderMaskRuntime:
     """Register the mask head on the decoder and wire its hooks.
 
@@ -337,10 +431,30 @@ def install_decoder_mask_router(
     hidden = int(getattr(text_model, "hidden_size", 0)) or int(
         model.get_input_embeddings().weight.shape[1]
     )
-    config = DecoderMaskConfig(**{**config.__dict__, "hidden_size": hidden})
-    router = DecoderMaskRouter(config).to(
-        device=next(model.parameters()).device, dtype=torch.float32
+    vision = getattr(getattr(model, "model", None), "visual", None)
+    if visual_hidden_size is None:
+        visual_config = getattr(vision, "config", None)
+        visual_hidden_size = int(getattr(visual_config, "hidden_size", 0) or 0)
+    if config.visual_source == "fine":
+        if int(visual_hidden_size) <= 0:
+            raise RuntimeError(
+                "visual_source='fine' needs the vision tower's hidden size; pass "
+                "visual_hidden_size explicitly when the tower is not reachable"
+            )
+    else:
+        # Merged mode reads the LM's own image embeddings, so the width is the text
+        # hidden size.  Forcing it keeps every existing checkpoint bit-identical.
+        visual_hidden_size = hidden
+    config = DecoderMaskConfig(
+        **{**config.__dict__, "hidden_size": hidden, "visual_hidden_size": int(visual_hidden_size)}
     )
+    if config.head == "vae":
+        from .decoder_mask_vae import DecoderMaskVaeRouter  # local: avoids a cycle
+
+        router: nn.Module = DecoderMaskVaeRouter(config)
+    else:
+        router = DecoderMaskRouter(config)
+    router = router.to(device=next(model.parameters()).device, dtype=torch.float32)
     text_model.add_module(ROUTER_MODULE_NAME, router)
     runtime = DecoderMaskRuntime(router, config, int(image_token_id), int(spatial_merge_size))
 
@@ -361,6 +475,14 @@ def install_decoder_mask_router(
             for layer in layers[config.split_layer :]
         ],
     ]
+    if config.visual_source == "fine":
+        post_layernorm = getattr(vision, "post_layernorm", None)
+        if post_layernorm is None:
+            raise RuntimeError(
+                "visual_source='fine' needs the vision tower's post_layernorm -- the last "
+                "seam with one cell per patch, before downsample/merger; its layout changed"
+            )
+        handles.append(post_layernorm.register_forward_hook(runtime.capture_premerge))
     runtime.handles = handles  # type: ignore[attr-defined]
     return runtime
 

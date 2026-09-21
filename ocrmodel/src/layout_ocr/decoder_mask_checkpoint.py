@@ -87,8 +87,15 @@ def save_decoder_mask_checkpoint(
     return manifest
 
 
+# Both widths are resolved from the live model at install time.  Trusting a
+# stored value would build a projection with the wrong ``in_features`` and either
+# fail cryptically in ``restore_router`` or, worse, load a mismatched head.
+MODEL_DERIVED_FIELDS = ("hidden_size", "visual_hidden_size")
+
+
 def load_config(output_dir: str | Path) -> DecoderMaskConfig:
-    return DecoderMaskConfig(**{k: v for k, v in _read_json(Path(output_dir) / CONFIG_FILE).items() if k != "hidden_size"})
+    stored = _read_json(Path(output_dir) / CONFIG_FILE)
+    return DecoderMaskConfig(**{k: v for k, v in stored.items() if k not in MODEL_DERIVED_FIELDS})
 
 
 def load_router_state(output_dir: str | Path) -> dict[str, torch.Tensor]:
@@ -130,8 +137,19 @@ def restore_router(model: Any, runtime: Any, output_dir: str | Path) -> None:
     missing, unexpected = _check_keys(router, state)
     if missing or unexpected:
         raise ValueError(
-            f"router checkpoint keys do not match: missing={missing[:3]}, unexpected={unexpected[:3]}"
+            f"checkpoint was written by a different head (head={getattr(router.config, 'head', '?')}, "
+            f"visual_source={getattr(router.config, 'visual_source', '?')}); "
+            f"missing={missing[:3]}, unexpected={unexpected[:3]}. "
+            "Group-2 and group-3 checkpoints are not interchangeable."
         )
+    for name, parameter in router.named_parameters():
+        expected = parameter.shape
+        found = state[name].shape
+        if tuple(found) != tuple(expected):
+            raise ValueError(
+                f"checkpoint tensor {name!r} has shape {tuple(found)} but this head expects "
+                f"{tuple(expected)}; the checkpoint and the model disagree on the architecture"
+            )
     for name, parameter in router.named_parameters():
         parameter.data.copy_(state[name].to(device=parameter.device, dtype=parameter.dtype))
     for name, buffer in router.named_buffers():

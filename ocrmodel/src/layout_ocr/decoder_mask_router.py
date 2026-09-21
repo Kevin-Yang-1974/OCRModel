@@ -34,8 +34,37 @@ class DecoderMaskConfig:
     explicitly marked as to-be-validated rather than tuned."""
 
     hidden_size: int = 1536  # text hidden size, read from the real checkpoint
+    # Dimension of the visual features the head reads.  ``merged`` (legacy) feeds
+    # the head the merged image tokens the LM sees, so it equals ``hidden_size``;
+    # ``fine`` feeds it the pre-merge vision features, whose width is the vision
+    # tower's own hidden size (1024 for GLM-OCR) and is resolved at install time.
+    # Both dims are model-derived and are stripped when a config is reloaded.
+    visual_hidden_size: int = 0
     router_dim: int = 256  # internal width ``d``
     split_layer: int = 8  # layers 0..split-1 feed the head; split.. get the bias
+    # Which visual features the head reads, and how its mask is mapped back to the
+    # merged grid the attention bias lives on:
+    #   "merged" -> read the LM's image tokens, no pooling (the original design)
+    #   "fine"   -> read pre-merge features on the 4x finer grid, then pool
+    visual_source: str = "merged"
+    pool_mode: str = "max"
+    head: str = "mlp"  # "mlp" (deterministic) | "vae" (conditional latent)
+    target_mode: str = "token"  # "token" (per-token span) | "window" (in-line k-char)
+    window_min: int = 3
+    window_max: int = 5
+    line_source: str = "auto"  # annotation | geometry | auto (window mode only)
+    dice_weight: float = 0.0  # 0.0 keeps the previous loss bit-identical
+    bce_mode: str = "balanced"  # balanced | plain
+    vae_latent_channels: int = 4
+    # The latent is a fixed-size spatial map, adaptively pooled from the router
+    # grid and interpolated back in the decoder.  A stride would not divide the
+    # patch grid on every page (e.g. W=38), and an adaptive resize keeps one
+    # latent shape across pages and checkpoints.
+    vae_latent_size: int = 16
+    vae_kl_weight: float = 1.0
+    vae_kl_warmup_steps: int = 200
+    vae_kl_free_bits: float = 0.05
+    vae_inference: str = "mean"  # mean | sample
     # beta upper bound during warmup.  Anchored to the attention-routing sweep:
     # a +2.0-logit bias on a binary box gave the best CER (-20%) while +4.0 went
     # catastrophic (repetition / 114 length-cap hits).  The learned mask is soft
@@ -61,6 +90,28 @@ class DecoderMaskConfig:
             raise ValueError("input_noise must be non-negative")
         if self.detach_every <= 0:
             raise ValueError("detach_every must be positive")
+        if self.visual_source not in ("merged", "fine"):
+            raise ValueError(f"unknown visual_source {self.visual_source!r}")
+        if self.pool_mode not in ("mean", "max"):
+            raise ValueError(f"unknown pool_mode {self.pool_mode!r}")
+        if self.head not in ("mlp", "vae"):
+            raise ValueError(f"unknown head {self.head!r}")
+        if self.target_mode not in ("token", "window"):
+            raise ValueError(f"unknown target_mode {self.target_mode!r}")
+        if self.bce_mode not in ("balanced", "plain"):
+            raise ValueError(f"unknown bce_mode {self.bce_mode!r}")
+        if self.line_source not in ("annotation", "geometry", "auto"):
+            raise ValueError(f"unknown line_source {self.line_source!r}")
+        if self.vae_inference not in ("mean", "sample"):
+            raise ValueError(f"unknown vae_inference {self.vae_inference!r}")
+        if self.window_min < 1 or self.window_max < self.window_min:
+            raise ValueError("window_min/window_max must satisfy 1 <= min <= max")
+        if self.dice_weight < 0.0:
+            raise ValueError("dice_weight must be non-negative")
+        if self.vae_kl_weight < 0.0 or self.vae_kl_free_bits < 0.0:
+            raise ValueError("VAE KL weight and free bits must be non-negative")
+        if self.vae_latent_channels <= 0 or self.vae_latent_size <= 0:
+            raise ValueError("VAE latent channels and size must be positive")
 
 
 def _normalized_grid_xywh(grid_thw: Tensor, spatial_merge_size: int) -> tuple[Tensor, tuple[int, int]]:
@@ -97,6 +148,81 @@ def _normalized_grid_xywh(grid_thw: Tensor, spatial_merge_size: int) -> tuple[Te
     return xyw.unsqueeze(0), (merged_height, merged_width)
 
 
+def fine_grid_xywh(grid_thw: Tensor, spatial_merge_size: int) -> tuple[Tensor, tuple[int, int]]:
+    """Per-patch centres ``[x, y, w, h]`` on the **pre-merge** grid, block-major.
+
+    GLM-OCR's vision tower does not order patches row-major.  ``rot_pos_emb``
+    reshapes ``(H, W)`` to ``(H//ms, ms, W//ms, ms)`` and permutes to
+    ``(H//ms, W//ms, ms, ms)`` before flattening, and the merge itself is
+    ``hidden.view(-1, ms, ms, C)`` -- both only make sense if the flattened order
+    is block-major.  So fine index ``p = m * ms*ms + q``, where ``m`` is the
+    merged cell (row-major) and ``q = i*ms + j`` is the offset inside its block.
+
+    Reusing ``_normalized_grid_xywh`` here would silently transpose the target
+    against the features; that is why this is a separate function.
+    """
+
+    if grid_thw.shape != (1, 3):
+        raise ValueError("the mask head expects exactly one whole-page image per step")
+    temporal, height, width = (int(value) for value in grid_thw[0].tolist())
+    if temporal != 1:
+        raise ValueError("the mask head does not accept video/multi-frame input")
+    ms = int(spatial_merge_size)
+    if ms < 1 or height % ms or width % ms:
+        raise ValueError(f"grid {(height, width)} is not a multiple of merge size {ms}")
+    device = grid_thw.device
+    block_rows, block_cols = height // ms, width // ms
+    coarse_r = torch.arange(block_rows, device=device, dtype=torch.float32)
+    coarse_c = torch.arange(block_cols, device=device, dtype=torch.float32)
+    inner = torch.arange(ms, device=device, dtype=torch.float32)
+    by, bx = torch.meshgrid(coarse_r, coarse_c, indexing="ij")
+    fine_r = (by.unsqueeze(-1).unsqueeze(-1) * ms + inner.view(1, 1, ms, 1)).expand(block_rows, block_cols, ms, ms)
+    fine_c = (bx.unsqueeze(-1).unsqueeze(-1) * ms + inner.view(1, 1, 1, ms)).expand(block_rows, block_cols, ms, ms)
+    x = (fine_c.reshape(-1) + 0.5) / width
+    y = (fine_r.reshape(-1) + 0.5) / height
+    count = height * width
+    xyw = torch.stack(
+        (
+            x,
+            y,
+            torch.full((count,), 1.0 / width, device=device, dtype=torch.float32),
+            torch.full((count,), 1.0 / height, device=device, dtype=torch.float32),
+        ),
+        dim=-1,
+    )
+    return xyw.unsqueeze(0), (height, width)
+
+
+def pool_to_merged(
+    mask: Tensor,
+    merged_shape: tuple[int, int],
+    block: int,
+    mode: str = "max",
+) -> Tensor:
+    """``[B, T, N_fine]`` -> ``[B, T, N_merged]`` by reducing each ``block x block`` run.
+
+    A plain reshape, not a spatial pooling: because ``fine_grid_xywh`` is
+    block-major, the ``block*block`` fine cells of merged cell ``m`` are exactly
+    ``mask[..., m*block*block : (m+1)*block*block]``, in the same row-major order
+    as the merged grid the language model sees.
+
+    ``max`` is the default because it preserves a peak: a sharp fine mask that
+    fires one cell at 1.0 still reaches 1.0 on the merged grid, so ``beta`` keeps
+    its anchored meaning (``mean`` would cut it to ``1/block**2`` and make the
+    intervention *weaker* the better the mask gets).
+    """
+
+    b, t, n = mask.shape
+    merged_cells = merged_shape[0] * merged_shape[1]
+    if n != merged_cells * block * block:
+        raise ValueError(
+            f"mask has {n} cells but the merged grid {merged_shape} with block {block} "
+            f"expects {merged_cells * block * block}"
+        )
+    grouped = mask.reshape(b, t, merged_cells, block * block)
+    return grouped.max(dim=-1).values if mode == "max" else grouped.mean(dim=-1)
+
+
 class DecoderMaskRouter(nn.Module):
     """The spatial mask head.  All internal arithmetic runs in float32."""
 
@@ -105,9 +231,12 @@ class DecoderMaskRouter(nn.Module):
         self.config = config
         d = config.router_dim
         hidden = config.hidden_size
-        # Project the whole-page visual tokens once per page.
-        self.visual_norm = nn.LayerNorm(hidden, eps=1e-5)
-        self.visual_proj = nn.Linear(hidden, d, bias=False)
+        visual_hidden = config.visual_hidden_size or hidden
+        # Project the whole-page visual features once per page.  In fine mode the
+        # input is the pre-merge tower output, whose width is the vision hidden
+        # size (1024 for GLM-OCR), not the text hidden size.
+        self.visual_norm = nn.LayerNorm(visual_hidden, eps=1e-5)
+        self.visual_proj = nn.Linear(visual_hidden, d, bias=False)
         self.pos_proj = nn.Linear(4, d, bias=False)
         # Project the query hidden state.
         self.query_proj = nn.Linear(hidden, d, bias=False)
@@ -169,12 +298,22 @@ class DecoderMaskRouter(nn.Module):
         noise = torch.randn_like(query_proj) * (self.input_noise * rms)
         return query_proj + noise
 
-    def project_visual(self, visual: Tensor, grid_thw: Tensor, spatial_merge_size: int) -> tuple[Tensor, Tensor, tuple[int, int]]:
-        """Project the merged visual tokens ``visual`` (``[B, N, hidden]``) into
+    def project_visual(self, visual: Tensor, grid_thw: Tensor, router_stride: int) -> tuple[Tensor, Tensor, tuple[int, int]]:
+        """Project the visual features ``visual`` (``[B, N, visual_hidden]``) into
         per-key features ``K`` (``[B, N, d]``), returning ``K``, the grid and the
-        spatial shape.  Called once per page."""
+        spatial shape.  Called once per page.
 
-        xywh, spatial_shape = _normalized_grid_xywh(grid_thw, spatial_merge_size)
+        ``router_stride`` is the **head's own** stride over the patch grid, not the
+        LM's merge size: ``1`` in fine mode (one cell per patch, block-major) and
+        the tower's merge size in merged mode.  Only the bias path reduces the
+        head's grid back to the merged grid the language model actually attends
+        over, so the two are deliberately decoupled here.
+        """
+
+        if self.config.visual_source == "fine":
+            xywh, spatial_shape = fine_grid_xywh(grid_thw, router_stride)
+        else:
+            xywh, spatial_shape = _normalized_grid_xywh(grid_thw, router_stride)
         visual = visual.float()
         keys = self.visual_proj(self.visual_norm(visual)) + self.pos_proj(xywh.to(visual.dtype))
         return keys, xywh, spatial_shape
@@ -217,6 +356,7 @@ class DecoderMaskRouter(nn.Module):
         xywh: Tensor,
         spatial_shape: tuple[int, int],
         detach_every: int = 64,
+        targets: Tensor | None = None,
     ) -> tuple[Tensor, Tensor, Tensor]:
         """Run the head over ``hidden_states`` (``[B, T, hidden]``) in order.
 

@@ -18,7 +18,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-DEFAULT_ARMS = ("B0", "B1", "B2", "B3")
+DEFAULT_ARMS = ("G1", "G2", "G3", "B0")
 
 METRIC_KEYS = (
     "cer",
