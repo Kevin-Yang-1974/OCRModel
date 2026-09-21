@@ -298,7 +298,12 @@ def rasterize_polygon(points: Tensor, xywh: Tensor, samples: int = 4) -> Tensor:
         1, 1, -1
     ) * (probe_x.unsqueeze(-1) - ax.view(1, 1, -1))
     sign = torch.sign(cross)
-    inside = (sign.abs().sum(dim=-1) == cross.shape[-1]).to(xywh.dtype)
+    # Inside a convex polygon a point lies on the SAME side of every edge, so the
+    # signed crossings must all agree in sign.  Testing ``|sign|.sum() == K``
+    # instead only asks "did no probe land exactly on an edge" -- true almost
+    # everywhere -- which marks the entire grid as inside and yields an all-ones
+    # target.
+    inside = (sign.sum(dim=-1).abs() == cross.shape[-1]).to(xywh.dtype)
     share = inside.mean(dim=-1)
     peak = share.max()
     if float(peak) <= 0.0:

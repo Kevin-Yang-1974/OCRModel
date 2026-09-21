@@ -92,6 +92,52 @@ def test_dice_weight_zero_reproduces_the_previous_loss():
     assert parts["dice"] == 0.0
 
 
+def _uniform_grid(rows: int, cols: int) -> torch.Tensor:
+    ys = (torch.arange(rows, dtype=torch.float32) + 0.5) / rows
+    xs = (torch.arange(cols, dtype=torch.float32) + 0.5) / cols
+    yy, xx = torch.meshgrid(ys, xs, indexing="ij")
+    n = rows * cols
+    return torch.stack(
+        [xx.reshape(-1), yy.reshape(-1), torch.full((n,), 1.0 / cols), torch.full((n,), 1.0 / rows)],
+        dim=-1,
+    )
+
+
+def test_rasterize_polygon_lights_only_the_polygon():
+    """Regression: the inside test must be 'same side of every edge'.
+
+    Summing |sign| instead of |sum of signs| passes whenever no probe lands
+    exactly on an edge, which is almost always -- so the whole grid was marked
+    inside and the window target came out all ones.  The head then learned to
+    predict 1.0 everywhere, with a *rising* Dice score that hid the fault.
+    """
+
+    from layout_ocr.mask_targets import rasterize_polygon
+
+    xywh = _uniform_grid(8, 8)
+    # An axis-aligned box covering the top-left quarter of the page.
+    box = torch.tensor([[0.0, 0.0], [0.0, 0.5], [0.5, 0.0], [0.5, 0.5]])
+    target = rasterize_polygon(box, xywh)
+    coverage = float((target > 0.5).float().mean())
+    assert coverage == pytest.approx(0.25, abs=0.06), f"covered {coverage:.3f} of the grid"
+    assert coverage < 0.9, "the polygon must not cover the page"
+    assert float(target.max()) == pytest.approx(1.0)
+
+
+def test_rasterize_polygon_matches_rasterize_box_for_a_single_box():
+    from layout_ocr.mask_targets import rasterize_box, rasterize_polygon
+
+    xywh = _uniform_grid(10, 10)
+    box_xyxy = [0.2, 0.3, 0.5, 0.45]
+    corners = torch.tensor(
+        [[box_xyxy[0], box_xyxy[1]], [box_xyxy[2], box_xyxy[1]],
+         [box_xyxy[0], box_xyxy[3]], [box_xyxy[2], box_xyxy[3]]]
+    )
+    polygon = rasterize_polygon(corners, xywh)
+    rectangle = rasterize_box(box_xyxy, xywh)
+    assert torch.allclose(polygon, rectangle, atol=0.08)
+
+
 def test_dice_weight_penalises_a_spread_mask_more_than_a_sharp_one():
     """The loophole the whole change exists to close."""
 

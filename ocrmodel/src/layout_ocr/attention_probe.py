@@ -80,6 +80,7 @@ from __future__ import annotations
 import json
 import math
 import os
+from pathlib import Path
 from typing import Any
 
 import torch
@@ -90,6 +91,9 @@ from .prefix_injection import _find_text_model
 PROBE_ENV_VAR = "GLMOCR_ATTENTION_PROBE"
 LAYERS_ENV_VAR = "GLMOCR_ATTENTION_PROBE_LAYERS"
 HEADS_ENV_VAR = "GLMOCR_ATTENTION_PROBE_HEADS"
+HEATMAP_DIR_ENV = "GLMOCR_ATTENTION_HEATMAP_DIR"
+HEATMAP_PAGES_ENV = "GLMOCR_ATTENTION_HEATMAP_PAGES"
+HEATMAP_MAX_STEPS_ENV = "GLMOCR_ATTENTION_HEATMAP_MAX_STEPS"
 PROBE_ATTR = "layout_attention_probe"
 
 # The plan asks to probe layers 0/4/8/12 first and keep per-head statistics.  This
@@ -137,6 +141,34 @@ def probe_heads(default: tuple[int, ...] | None = None) -> tuple[int, ...] | Non
     """Query-head indices to observe; ``None`` means every head."""
 
     return _env_ints(HEADS_ENV_VAR) or default
+
+
+def _heatmap_pages() -> frozenset[str]:
+    """Pages for which patch-level attention is retained for offline rendering.
+
+    The full validation run always keeps the scalar/per-head probe statistics.  Patch
+    maps are opt-in and page-limited so an attention diagnostic cannot accidentally
+    turn a normal evaluation into a multi-gigabyte JSON dump.
+    """
+
+    raw = os.environ.get(HEATMAP_PAGES_ENV, "").strip()
+    if not raw:
+        return frozenset()
+    path = Path(raw)
+    if path.is_file():
+        return frozenset(line.strip() for line in path.read_text(encoding="utf-8").splitlines() if line.strip())
+    return frozenset(part.strip() for part in raw.split(",") if part.strip())
+
+
+def _heatmap_max_steps() -> int:
+    raw = os.environ.get(HEATMAP_MAX_STEPS_ENV, "8").strip()
+    try:
+        value = int(raw)
+    except ValueError as error:
+        raise ValueError(f"{HEATMAP_MAX_STEPS_ENV} must be a positive integer") from error
+    if value <= 0:
+        raise ValueError(f"{HEATMAP_MAX_STEPS_ENV} must be a positive integer")
+    return value
 
 
 def _incremental_text(decoder: Any, tokens: list[int]) -> list[str]:
@@ -300,6 +332,17 @@ class AttentionProbe:
         self.emitted_missing = 0
         self.emitted_join_mismatch = 0
         self._records: list[dict[str, Any]] = []
+        # Patch-level maps are a deliberately separate, opt-in artifact.  The ordinary
+        # probe remains a scalar/per-head JSONL instrument, while a small, pre-registered
+        # page set can retain enough visual weights for heatmap rendering.
+        heatmap_raw = os.environ.get(HEATMAP_DIR_ENV, "").strip()
+        self._heatmap_dir = Path(heatmap_raw) if heatmap_raw else None
+        self._heatmap_pages = _heatmap_pages()
+        self._heatmap_max_steps = _heatmap_max_steps() if self._heatmap_dir else 0
+        self._heatmap_records: list[tuple[int, int, Tensor]] = []
+        self._heatmap_positions: Tensor | None = None
+        self._heatmap_file: str | None = None
+        self._heatmap_enabled = False
 
     # -- page lifecycle -----------------------------------------------------
 
@@ -327,6 +370,10 @@ class AttentionProbe:
         self.emitted_join_mismatch = 0
         self.bias_corrected_steps = 0
         self._records = []
+        self._heatmap_records = []
+        self._heatmap_positions = None
+        self._heatmap_file = None
+        self._heatmap_enabled = page_id in self._heatmap_pages
         if self.image_token_id is None:
             raise RuntimeError(
                 "attention probe needs the model's image token id; "
@@ -384,6 +431,10 @@ class AttentionProbe:
         self._visual_keys = {}
         self._prompt_text_keys = {}
         self._gen_keys = {}
+        self._heatmap_records = []
+        self._heatmap_positions = None
+        self._heatmap_file = None
+        self._heatmap_enabled = False
 
     # -- capture ------------------------------------------------------------
 
@@ -665,6 +716,23 @@ class AttentionProbe:
         # Normalized by log|V| so the number is comparable across resolutions: the
         # 1M and 4M arms see 630 and 2496 visual tokens.
         entropy_norm = entropy / math.log(self.visual_count) if self.visual_count > 1 else entropy
+
+        if self._heatmap_enabled:
+            grid = getattr(self.bridge, "last_patch_positions", None)
+            if grid is None or grid.shape[1] != self.visual_count:
+                raise RuntimeError(
+                    "attention heatmap requested but the visual patch grid is missing or "
+                    "does not match the visual keys"
+                )
+            self._heatmap_positions = grid[0].detach().float().cpu()
+            selected_heads = (
+                tuple(int(head) for head in self.heads)
+                if self.heads is not None
+                else tuple(range(num_heads))
+            )
+            self._heatmap_records.append(
+                (step, layer, dist[list(selected_heads)].detach().float().cpu())
+            )
 
         # ``_observe_step`` only runs after the prefill, so the grid exists by now; if it
         # still does not, the per-line fields are absent -- counted, because a report of
@@ -1024,12 +1092,89 @@ class AttentionProbe:
                 self.emitted_missing += 1
         return self.emitted_missing
 
+    def _write_heatmaps(self) -> dict[str, Any] | None:
+        """Write a small binary sample of visual attention for selected pages.
+
+        The JSONL report intentionally keeps only reductions.  For a pre-registered
+        visualization page, this method keeps a few evenly spaced decode steps and
+        stores the visual-conditional distribution in compressed ``npz`` form.  The
+        stored distribution is the same ``dist`` used by the scalar entropy and line
+        readouts; it is not an SDPA side channel or a second attention computation.
+        """
+
+        if not self._heatmap_enabled:
+            return None
+        if self._heatmap_dir is None:
+            raise RuntimeError("heatmap page selected but no heatmap output directory was set")
+        if not self._heatmap_records or self._heatmap_positions is None:
+            return {
+                "enabled": True,
+                "status": "no_records",
+                "records": 0,
+                "file": None,
+            }
+
+        import numpy as np
+
+        steps = sorted({step for step, _, _ in self._heatmap_records})
+        if len(steps) > self._heatmap_max_steps:
+            selected_indices = np.linspace(
+                0, len(steps) - 1, self._heatmap_max_steps, dtype=np.int64
+            ).tolist()
+            selected_steps = {steps[index] for index in selected_indices}
+        else:
+            selected_steps = set(steps)
+        selected = [
+            (step, layer, values)
+            for step, layer, values in self._heatmap_records
+            if step in selected_steps
+        ]
+        if not selected:
+            return {
+                "enabled": True,
+                "status": "no_selected_records",
+                "records": 0,
+                "file": None,
+            }
+
+        self._heatmap_dir.mkdir(parents=True, exist_ok=True)
+        safe_page = str(self.page_id or "page").replace("/", "_").replace("\\", "_")
+        path = self._heatmap_dir / f"{safe_page}.npz"
+        attention = np.stack([values.numpy() for _, _, values in selected], axis=0)
+        np.savez_compressed(
+            path,
+            page_id=np.asarray([str(self.page_id or "")]),
+            steps=np.asarray([step for step, _, _ in selected], dtype=np.int64),
+            layers=np.asarray([layer for _, layer, _ in selected], dtype=np.int64),
+            heads=np.asarray(
+                list(self.heads)
+                if self.heads is not None
+                else list(range(attention.shape[1])),
+                dtype=np.int64,
+            ),
+            attention=attention,
+            positions=self._heatmap_positions.numpy(),
+            visual_tokens=np.asarray([int(self.visual_count or 0)], dtype=np.int64),
+        )
+        self._heatmap_file = str(path)
+        return {
+            "enabled": True,
+            "status": "complete",
+            "records": len(selected),
+            "steps": sorted(selected_steps),
+            "file": str(path),
+        }
+
     def write_probe(self) -> None:
         """Append this page's report, so a run's artifacts show what was observed."""
 
         path = probe_path()
         if path:
-            _probe(path, self.report())
+            heatmap = self._write_heatmaps()
+            report = self.report()
+            if heatmap is not None:
+                report["heatmap"] = heatmap
+            _probe(path, report)
 
     def report(self) -> dict[str, Any]:
         return {

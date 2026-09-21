@@ -14,3 +14,11 @@
 10. 正式训练前必须锁定 train/validation/test 协议；只用 validation 选 checkpoint，然后执行 selection-locked test。test 不参与训练、选点、阈值或后处理调整。
 11. A100/BSCC 任务监控：`PENDING`/排队阶段每 30 分钟查看一次；首次进入 `RUNNING` 后只做最多两次、间隔 5 分钟的健康检查。健康检查必须确认会话仍在、结构化状态为运行态、metrics/日志/输出有实际进展，且无 NaN/Inf、CUDA/OOM、Traceback、异常退出或资源异常。连续两次健康后必须立即降频：256-step 诊断、短任务或单次验证为每 30 分钟一次；正式全量训练、长任务或大规模 array 为每 1 小时一次。不得继续按 5 分钟频率检查。
 12. 定时监控实现：桌面 Codex 使用绑定当前线程的 automation/heartbeat；初始可设 5 分钟，但两次健康检查后必须通过 `automation_update` 更新同一个 automation 的完整字段和 `rrule`，切换到 30 分钟或 1 小时，保留正确的线程、job/run ID、只读约束和 test 隔离规则，不得创建重复 automation。阶段切换时立即检查并重新设置阶段频率；用户要求每次触发可见回报时，降频后仍须简短回报。任务完成、失败、异常退出、NaN/Inf、CUDA/OOM、Traceback 或需要决策时立即回报；任务完成并完成结果核验后删除或停用旧监控，避免 stale automation。
+13. 实验记录：每个 run（含机制探针、离线诊断、消融、按用户要求中止或失败的 run）都必须在 `ocrmodel/docs/EXPERIMENT_REGISTER.md` 登记，需要展开的写入 `ocrmodel/docs/实验日志/`。记录详细程度以「可直接用于论文」为准，缺少下列任一项即视为不完整，不得据此下结论或写入文档：
+    - 标识与产物：run ID、日期、分支/commit、入口脚本或 config 路径、远端产物根目录、Slurm job/array ID。
+    - 数据协议：manifest 指纹、隔离单元、页数与 train/validation/test 划分、seed。
+    - 训练配置：学习率（主 adapter 与 decoder LoRA 分别写）、warmup 与 schedule、总步数、per-device batch size、梯度累积、GPU 数与 DDP 方式、effective global batch、精度、可训练参数范围与秩、loss 权重（`auxiliary_weight`、gate 初值、各项 layout 权重）。
+    - 组别设置：每条对照臂的 run ID、唯一改动变量、共享起点 checkpoint，并说明各臂预算是否一致。
+    - 结果：validation 选点 step 与全部被比较指标、locked test 指标（IoU/MAE/CER、I/D/S）、EOS/触顶/循环率、loss 曲线关键点、checkpoint 是否 finite、有无 NaN/Inf/OOM/Traceback。
+    - 协议字段：`test_manifest_read`、`test_used_for_selection`；未跑 test 也要显式写「未读取」，不得留空。
+    - 失败与中止 run 同样登记，注明原因、产物是否保留和可否复用；不删除、不覆盖既有记录，修正以追加说明的方式写入。

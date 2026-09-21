@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import random
 import time
 from collections import Counter
@@ -138,6 +139,45 @@ def _set_seed(seed: int) -> None:
         np.random.seed(seed)
     except ImportError:
         pass
+
+
+def _init_distributed() -> tuple[int, int, bool, int]:
+    """Join the process group when launched under ``torchrun``; else one rank.
+
+    The five cards train **one** head.  Every rank holds the same parameters and
+    a different page, and the head's gradients are averaged after every backward,
+    so the weights stay identical by construction -- this is data parallelism, not
+    five runs whose results get averaged at the end.
+
+    Returns ``(rank, world_size, distributed, local_rank)``.
+    """
+
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    if world_size <= 1:
+        return 0, 1, False, local_rank
+    import torch.distributed as dist
+
+    torch.cuda.set_device(local_rank)
+    dist.init_process_group(backend="nccl")
+    return dist.get_rank(), dist.get_world_size(), True, local_rank
+
+
+def _average_gradients(parameters: Any, world_size: int) -> None:
+    """All-reduce the head's gradients so every rank steps identically.
+
+    Summed then divided by the world size, i.e. the mean gradient over the pages
+    the ranks processed together -- the same quantity a single card would use for
+    a batch of ``world_size`` pages.
+    """
+
+    import torch.distributed as dist
+
+    for parameter in parameters:
+        if parameter.grad is None:
+            continue
+        dist.all_reduce(parameter.grad, op=dist.ReduceOp.SUM)
+        parameter.grad.div_(world_size)
 
 
 def _eos_ids(model: Any, processor: Any) -> set[int]:
@@ -272,7 +312,15 @@ def run_training(args: argparse.Namespace) -> dict[str, Any]:
     from transformers import AutoModelForImageTextToText, AutoProcessor
 
     _set_seed(args.seed)
-    device = torch.device(args.device) if args.device else torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    rank, world_size, distributed, local_rank = _init_distributed()
+    is_main = rank == 0
+    if distributed:
+        # Every rank owns one card; the rank index is its device.
+        device = torch.device("cuda", local_rank)
+    else:
+        device = torch.device(args.device) if args.device else torch.device(
+            "cuda" if torch.cuda.is_available() else "cpu"
+        )
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -339,19 +387,17 @@ def run_training(args: argparse.Namespace) -> dict[str, Any]:
 
     train_records = load_records(Path(args.train_manifest))
     validation_records = load_records(Path(args.validation_manifest))
-    if args.shard_count > 1:
+    # Data parallelism: every rank takes a different slice of the pages and the
+    # gradients are averaged, so the ranks see the whole set between them while
+    # training one shared set of weights.
+    if world_size > 1:
+        if world_size > len(train_records):
+            raise ValueError(f"world size {world_size} exceeds {len(train_records)} training pages")
+        train_records = train_records[rank::world_size]
+    elif args.shard_count > 1:
         if not 0 <= args.shard_index < args.shard_count:
             raise ValueError("shard_index must be in [0, shard_count)")
-        # Deterministic contiguous shards in the manifest's own order, so the
-        # five processes together cover exactly the full page set with no
-        # overlap and no dependence on which one starts first.
-        shard = train_records[args.shard_index :: args.shard_count]
-        if not shard:
-            raise ValueError(
-                f"shard {args.shard_index}/{args.shard_count} is empty for "
-                f"{len(train_records)} pages; reduce the shard count"
-            )
-        train_records = shard
+        train_records = train_records[args.shard_index :: args.shard_count]
     train_counts = _train_character_counts(train_records)
 
     # Optimizer over LoRA + (if installed) router parameters.
@@ -383,8 +429,10 @@ def run_training(args: argparse.Namespace) -> dict[str, Any]:
         "pool_mode": args.router_pool_mode,
         "dice_weight": args.router_dice_weight,
     }
-    with open(output_dir / "trainable_report.json", "w", encoding="utf-8") as handle:
-        json.dump(trainable_report, handle, indent=2)
+    trainable_report["world_size"] = world_size
+    if is_main:
+        with open(output_dir / "trainable_report.json", "w", encoding="utf-8") as handle:
+            json.dump(trainable_report, handle, indent=2)
 
     model.train()
     step = 0
@@ -456,6 +504,10 @@ def run_training(args: argparse.Namespace) -> dict[str, Any]:
         if not torch.isfinite(loss):
             raise RuntimeError(f"non-finite total loss at step {step}")
         loss.backward()
+        if distributed:
+            # The head's gradients are averaged across ranks before the step, so
+            # all five replicas remain byte-identical weights.
+            _average_gradients(runtime.router.parameters(), world_size)
         optimizer.step()
         optimizer.zero_grad(set_to_none=True)
         step += 1
@@ -470,7 +522,20 @@ def run_training(args: argparse.Namespace) -> dict[str, Any]:
                 **parts,
             }
         )
-        if step % args.checkpoint_every == 0 or step in args.validation_steps or step == args.max_steps:
+        # Only rank 0 writes and validates: five ranks would race on the same
+        # paths, and the generation-based validation is expensive enough that
+        # repeating it on every card would dominate the run.  The other ranks
+        # wait at a barrier for the validation window, because a rank that ran
+        # ahead would desynchronise the next all-reduce and hang the group.
+        if step in args.validation_steps or step == args.max_steps:
+            if distributed:
+                import torch.distributed as dist
+
+                dist.barrier()
+
+        if is_main and (
+            step % args.checkpoint_every == 0 or step in args.validation_steps or step == args.max_steps
+        ):
             # The B0 baseline (routing-mode none) still writes a LoRA-only
             # checkpoint so the locked test can score it symmetrically.
             save_decoder_mask_checkpoint(
@@ -504,7 +569,7 @@ def run_training(args: argparse.Namespace) -> dict[str, Any]:
                     "router_learning_rate": head_lr,
                 },
             )
-        if step in args.validation_steps or step == args.max_steps:
+        if is_main and (step in args.validation_steps or step == args.max_steps):
             val = run_validation(args, model, processor, runtime, validation_records, device, eos_ids, spatial_merge_size, image_token_id, train_counts, step)
             summary[f"step-{step}"] = val
             with open(output_dir / "validation.json", "w", encoding="utf-8") as handle:
@@ -513,6 +578,16 @@ def run_training(args: argparse.Namespace) -> dict[str, Any]:
                 "\n".join(json.dumps(line, ensure_ascii=False) for line in log_lines) + "\n",
                 encoding="utf-8",
             )
+        if step in args.validation_steps or step == args.max_steps:
+            if distributed:
+                import torch.distributed as dist
+
+                dist.barrier()
+                # Validation switches the model to eval and back; the replicas
+                # were only ever reading the same frozen backbone, but the head's
+                # mode flag is per-process, so re-sync it explicitly.
+                runtime.router.train()
+                model.train()
 
     elapsed = time.time() - start
     final = {
@@ -521,8 +596,14 @@ def run_training(args: argparse.Namespace) -> dict[str, Any]:
         "trainable_report": trainable_report,
         "validation": summary,
     }
-    with open(output_dir / "summary.json", "w", encoding="utf-8") as handle:
-        json.dump(final, handle, ensure_ascii=False, indent=2)
+    if is_main:
+        with open(output_dir / "summary.json", "w", encoding="utf-8") as handle:
+            json.dump(final, handle, ensure_ascii=False, indent=2)
+    if distributed:
+        import torch.distributed as dist
+
+        dist.barrier()
+        dist.destroy_process_group()
     return final
 
 

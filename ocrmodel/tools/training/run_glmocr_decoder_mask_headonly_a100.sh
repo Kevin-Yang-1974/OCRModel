@@ -74,7 +74,8 @@ case "${mode}" in smoke|screen) ;; *) printf '{"event":"headonly_failed","error"
 IFS=',' read -r -a gpu_array <<< "${gpu_ids}"
 python="${env_dir}/bin/python"
 train_cli="${code_root}/src/layout_ocr/train_decoder_mask.py"
-merge_cli="${code_root}/tools/merge_decoder_mask_shards.py"
+# torchrun rendezvous port; distinct per mode so a smoke can overlap a screen.
+master_port="${GLMOCR_MASTER_PORT:-29541}"
 char_tool="${code_root}/tools/prepare_mthv2_char_manifest.py"
 train_char_manifest="${dataset_root}/train/manifest.char.jsonl"
 validation_char_manifest="${dataset_root}/validation/manifest.char.jsonl"
@@ -152,94 +153,67 @@ arm_training_args() {
 }
 
 run_arm() {
-    # One arm across one card per shard, then merge the shards into one head.
+    # ONE head trained on all five cards: torchrun starts one process per card,
+    # each rank takes a different slice of the pages, and the head's gradients
+    # are averaged every step -- so there is a single set of weights, not five
+    # that get combined afterwards.
     local arm="$1" train_manifest="$2" validation_manifest="$3" steps="$4" validation_steps="$5"
     local arm_dir="${arm_root}/${arm}"
     mkdir -p "${arm_dir}"
     local routing_args
     routing_args="$(arm_training_args "${arm}")"
-    local shard_count=${#gpu_array[@]}
-    local pids=() shard_dirs=()
-    for slot in "${!gpu_array[@]}"; do
-        local card="${gpu_array[${slot}]}"
-        local shard_dir="${arm_dir}/shard${slot}"
-        mkdir -p "${shard_dir}"
-        shard_dirs+=("${shard_dir}")
-        (
-            export CUDA_VISIBLE_DEVICES="${card}"
-            export TMPDIR="${screen_root}/tmp/${mode}/${arm}_shard${slot}"
-            export HF_HOME="${TMPDIR}/huggingface"
-            mkdir -p "${TMPDIR}" "${HF_HOME}"
-            "${python}" -m layout_ocr.train_decoder_mask \
-                --model-path "${model_dir}" \
-                --train-manifest "${train_manifest}" \
-                --validation-manifest "${validation_manifest}" \
-                --output-dir "${shard_dir}" \
-                --seed "${seed}" \
-                --max-steps "${steps}" \
-                --max-pixels "${max_pixels}" \
-                --processor-mode slow \
-                --head-only \
-                --shard-index "${slot}" --shard-count "${shard_count}" \
-                --routing-mode learned \
-                --router-split-layer 8 --router-dim 256 \
-                --router-bias-max 2.0 \
-                --router-bias-warmup-steps 100 \
-                --router-mask-loss-weight 0.2 \
-                --router-stop-loss-weight 0.05 \
-                --router-detach-every 64 \
-                --router-mask-feedback-noise 0.15 --router-input-noise 0.05 \
-                --router-noise-warmup-steps 200 \
-                --router-visual-source merged \
-                --router-pool-mode max \
-                --router-dice-weight 1.0 \
-                --router-mask-bce balanced \
-                --router-window-size 3 5 \
-                --router-vae-latent-channels 4 --router-vae-latent-size 16 \
-                --router-vae-kl-weight 1.0 --router-vae-kl-warmup-steps 200 \
-                --router-vae-kl-free-bits 0.05 \
-                --learning-rate 1e-6 \
-                --router-learning-rate 1e-4 \
-                --checkpoint-every "${checkpoint_every}" \
-                --validation-every "${checkpoint_every}" \
-                --validation-steps ${validation_steps} \
-                --max-eval-new-tokens "${max_eval_new_tokens}" \
-                ${routing_args}
-        ) > "${shard_dir}/train.log" 2>&1 &
-        pids+=("$!")
-        printf '{"event":"headonly_shard_launched","screen_id":"%s","arm":"%s","shard":%s,"gpu":"%s"}\n' \
-            "${screen_id}" "${arm}" "${slot}" "${card}"
-    done
-    local failures=0
-    for index in "${!pids[@]}"; do
-        if wait "${pids[${index}]}"; then
-            printf '{"event":"headonly_shard_complete","screen_id":"%s","arm":"%s","shard":%s}\n' "${screen_id}" "${arm}" "${index}"
-        else
-            failures=$((failures + 1))
-            printf '{"event":"headonly_shard_failed","screen_id":"%s","arm":"%s","shard":%s}\n' "${screen_id}" "${arm}" "${index}" >&2
-        fi
-    done
-    (( failures == 0 )) || return 1
-    # Merge the last checkpoint of every shard; all shards share the step grid,
-    # so step-N exists in each.
-    local merged_dir="${arm_dir}/merged"
-    mkdir -p "${merged_dir}"
-    local merge_args=()
-    for index in "${!shard_dirs[@]}"; do
-        local source="${shard_dirs[${index}]}/step-${steps}"
-        [[ -d "${source}" ]] || {
-            printf '{"event":"headonly_failed","error":"missing_shard_checkpoint","arm":"%s","dir":"%s"}\n' "${arm}" "${source}" >&2
-            return 1
-        }
-        merge_args+=(--shard-dir "${source}")
-    done
-    "${python}" "${merge_cli}" "${merge_args[@]}" --output-dir "${merged_dir}" > "${arm_dir}/merge.log" 2>&1
-    printf '{"event":"headonly_arm_complete","screen_id":"%s","arm":"%s","merged":"%s"}\n' "${screen_id}" "${arm}" "${merged_dir}"
+    export TMPDIR="${screen_root}/tmp/${mode}/${arm}"
+    export HF_HOME="${TMPDIR}/huggingface"
+    mkdir -p "${TMPDIR}" "${HF_HOME}"
+    printf '{"event":"headonly_arm_launched","screen_id":"%s","arm":"%s","gpus":"%s","world_size":%s}\n' \
+        "${screen_id}" "${arm}" "${gpu_ids}" "${#gpu_array[@]}"
+    # CUDA_VISIBLE_DEVICES is deliberately NOT set: torchrun assigns LOCAL_RANK
+    # and each process selects its own device, so all five cards stay visible to
+    # the launcher's own bookkeeping.
+    "${env_dir}/bin/torchrun" \
+        --nproc_per_node="${#gpu_array[@]}" \
+        --master_port="${master_port}" \
+        --module layout_ocr.train_decoder_mask \
+        --model-path "${model_dir}" \
+        --train-manifest "${train_manifest}" \
+        --validation-manifest "${validation_manifest}" \
+        --output-dir "${arm_dir}" \
+        --seed "${seed}" \
+        --max-steps "${steps}" \
+        --max-pixels "${max_pixels}" \
+        --processor-mode slow \
+        --head-only \
+        --routing-mode learned \
+        --router-split-layer 8 --router-dim 256 \
+        --router-bias-max 2.0 \
+        --router-bias-warmup-steps 100 \
+        --router-mask-loss-weight 0.2 \
+        --router-stop-loss-weight 0.05 \
+        --router-detach-every 64 \
+        --router-mask-feedback-noise 0.15 --router-input-noise 0.05 \
+        --router-noise-warmup-steps 200 \
+        --router-visual-source merged \
+        --router-pool-mode max \
+        --router-dice-weight 1.0 \
+        --router-mask-bce balanced \
+        --router-window-size 3 5 \
+        --router-vae-latent-channels 4 --router-vae-latent-size 16 \
+        --router-vae-kl-weight 1.0 --router-vae-kl-warmup-steps 200 \
+        --router-vae-kl-free-bits 0.05 \
+        --learning-rate 1e-6 \
+        --router-learning-rate 1e-4 \
+        --checkpoint-every "${checkpoint_every}" \
+        --validation-every "${checkpoint_every}" \
+        --validation-steps ${validation_steps} \
+        --max-eval-new-tokens "${max_eval_new_tokens}" \
+        ${routing_args} > "${arm_dir}/train.log" 2>&1
+    printf '{"event":"headonly_arm_complete","screen_id":"%s","arm":"%s","output_dir":"%s"}\n' \
+        "${screen_id}" "${arm}" "${arm_dir}"
 }
 
 run_inner() {
     trap 'rc=$?; write_status failed; exit "$rc"' ERR
-    [[ -x "${python}" && -f "${train_cli}" && -f "${merge_cli}" ]] || {
+    [[ -x "${python}" && -f "${train_cli}" && -x "${env_dir}/bin/torchrun" ]] || {
         printf '{"event":"headonly_failed","error":"missing_source"}\n' >&2; exit 66
     }
     declare -A observed=()
@@ -265,6 +239,14 @@ run_inner() {
     # fragmentation rather than live memory; this keeps the carve-up from
     # stranding blocks a page-boundary allocation then cannot use.
     export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+    # This node's five A100-PCIE cards are a fragmented topology (0-1 NV12,
+    # 3-4 NV12, 2 only PIX/SYS, every cross-NUMA link SYS).  Default NCCL hangs
+    # on the first all-reduce here -- measured: five ranks enqueued twelve
+    # collectives and completed none, until the watchdog fired at ten minutes.
+    # Disabling P2P makes the same all-reduce return in milliseconds over shared
+    # memory, which is plenty for a ~1M-parameter head.
+    export NCCL_P2P_DISABLE=1
+    export NCCL_IB_DISABLE=1
     export TMPDIR="${screen_root}/tmp/${mode}"
     mkdir -p "${screen_root}/logs" "${screen_root}/status" "${split_root}" "${remote_root}/runs" "${TMPDIR}"
     write_status running
