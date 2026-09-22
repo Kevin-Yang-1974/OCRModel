@@ -465,3 +465,26 @@ MTHv2 原官方 split 是随机页级划分，没有书籍/版本元数据，不
 1. `legacy-line` 复现 `0.124694`（或落在其误差内）→ 装置可比，后续差值可归因；不复现 → 先修装置，不读其余结论。**已复现，装置可比。**
 2. `gt + --legacy-layout-control` 与验收 `0.13693763` 的差 = **小分支移除**单独贡献多少；该臂与 `0.124694` 的差 = **整行换 3–5 字窗口**单独贡献多少。**前者为精确 0；后者为全部 `0.012244`。**
 3. 两个诊断臂都不作验收、不作选点，也不用于调整 bias 或窗口。**已遵守。**
+
+## 2026-09-22 line100 3–5 字窗口 beta 强度扫描（五档，一卡一档，已完成）
+
+| 字段 | 口径 |
+| --- | --- |
+| 扫描根 | `/data3/yky/yangky_ocr_models/glm_ocr_layout_mask_routing/beta_sweep_20260922` |
+| 分支 / commit | `glm-ocr-layout-mask-routing` / `63ef1aa` |
+| 源码指纹 | `git archive` SHA256 `8cebdc8df337093304c11822c75b24c0323edee6efec3ce8d2940b4fa7314e54`，远端核验一致 |
+| 入口 | `tools/evaluation/evaluate_window_mask_routing.py --mode gt --target-mode window --bias <b>` |
+| 动机 | 窗口臂的 `B=1.0` 继承自整行臂，从未针对窗口扫过。剂量测量显示窗口每步命中 `7.39` token、整行 `69.27`，同一 `B=1.0` 在窗口上只有整行十分之一的每步加性总量；而整行的崩坏悬崖是在每步 69 个格子的剂量下测出的，窗口的可用区间不可能相同 |
+| 组别 | `bias` = `1 / 1.5 / 2 / 2.5 / 3`，各占物理 GPU `0/1/2/3/4`；每卡**一个** worker，149 页串行、`--shard-count 1`；非 DDP、非重复 run |
+| 数据协议 | sparse24 validation 全 149 页，SHA256 `36ec845875e1ea18a48d4a523b6c5a3f007b46e2a07de0cafd2c26139929a348`；train 未读取，test 未读取 |
+| checkpoint | `glmocr_mthv2_sparse24_q32_layout_boxeq820_3000_from_boxeq58_a100_260916_v1/seed42/checkpoint-3000` |
+| 推理协议 | window 3–5 字 hard mask、synced 指针、全 decoder 层、prefill 不注入、fast processor、`max_pixels=4000000`、`max_new_tokens=1536`、BF16、math-SDPA、seed 42；小版面分支移除 | 
+| 唯一变量 | `--bias` |
+| 结果 | `B=1.0` CER `0.136938`（替换/插入/删除 `3987/948/769`，触顶 `0`）；`B=1.5` **`0.131944`**（`4018/826/652`，触顶 `0`）；`B=2.0` `0.174341`（`4043/2575/644`，触顶 `2`）；`B=2.5` `0.151438`（`4004/1651/653`，触顶 `1`）；`B=3.0` `0.214481`（`4555/3753/626`，触顶 `3`）。五档均 149 页、reference characters `41654` |
+| 装置可比性 | `B=1.0` 档的 `validation_predictions.jsonl` 与验收 run 的 SHA256 **完全相同**（`846acbede98c2c96c00e40408c529bb7c9334f669d8d622eaf24289d5baff37a`），逐字节复现 `0.13693762903922793` |
+| 判读一 | 窗口峰在 `[1.0, 2.0)`、靠近 `1.5`。`B=2.0` 起崩坏，崩坏量在**插入**（`826→2575`，×3.1），替换基本不动（`4018→4043`），与整行 `B=2.0` 崩坏形态同类（整行插入 `1948→7972`、5 页触顶）。**两臂崩坏点同为每 key `B=2.0`，而每步覆盖差近十倍 → 独立复现 `LAYOUT_ORACLE_LINE_RESULT.md` §7.1「决定崩坏的是每 key 强度、不是加性总量」** |
+| 判读二 | `B=1.5` 相对 `B=1.0` 的优势**不稳健**：按页配对 bootstrap CI `[−0.010909, −0.000494]` 显著（P=0.989），**按卷号分组（33 卷）CI `[−0.005977, +0.003045]` 不显著**（P=0.771）。逐页为「更好 39 / 更差 35 / 打平 75」，改善高度集中（单页最大 `+90/+36/+25/+17`，退步最大仅 `−15`）。`B=2.0` 对 `B=1.5`、`B=3.0` 对 `B=1.5` 按卷也不显著 |
+| 工程结论 | 记录配置 `B=1.0` **不是**窗口最优值，但 1.5 的量级不足以改记录配置；`B≥2.0` 不可用（插入翻倍至三倍、出现触顶页）。记录配置的验收结论不受影响（本就 `passed=false`），本轮未使任何档通过，也未替记录配置改参数 |
+| 资格门禁 | 只有 `B=1.0` 档 `acceptance.eligible=true`，其余四档 `eligible=false`、`passed=null`；未见 eligible 的档不得读成记录配置通过 |
+| protocol 字段 | `test_manifest_read=false`；`test_used_for_selection=false`；`usable_for_selection=false`；`reads_ground_truth_for_routing=true`；不训练、不选点 |
+| 产物 | 远端 `beta_sweep_20260922/beta_<b>/`（`summary.json`/`protocol.json`/`validation_predictions.jsonl`）；本地归档 `D:/yangky/glm-ocr-assets/beta-sweep-20260922/`（2.2 MB，五档齐全） |
