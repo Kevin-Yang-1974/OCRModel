@@ -431,3 +431,31 @@ MTHv2 原官方 split 是随机页级划分，没有书籍/版本元数据，不
 **五卡提交确认**：执行commit `21afa4a` 已推送远端分支；独立git archive SHA256 `819450ecebdeae89a51a4e3784f457784ca037727d7152bf2c3cabfe3b4c4469`，新run已派发，同一heartbeat已切换。
 
 **五卡验收完成**：`glmocr_line100_window_gt_accept_5gpu_20260922_150507` complete；五片 `30/30/30/30/29` 合并完整149页，无重无漏；manifest SHA256=`36ec845875e1ea18a48d4a523b6c5a3f007b46e2a07de0cafd2c26139929a348`。GT 3–5字 hard window、synced、beta1、全层、prefill不注入、4M/1536/fast/math-SDPA/BF16、小版面分支移除；固定checkpoint-3000，不训练、不选点、不读test。完整 micro CER=`0.13693762903922793`，I/D/S=`948/769/3987`，reference characters=`41654`，generation tokens=`50321`，EOS=`149/149`，触顶=`0/149`，循环页=`0/149`、循环率=`0.0`；JSON 结果无非有限数值，日志无 CUDA/OOM/NaN/Inf/Traceback/异常退出。`acceptance.eligible=true`、`passed=false`（严格 CER<0.13 未通过）。产物已下载至 `D:/yangky/glm-ocr-assets/line100-window-acceptance/glmocr_line100_window_gt_accept_5gpu_20260922_150507/`；详情见实验日志。
+
+**生成上限核对（2026-09-22，补登）**：验收 run 的 `results/summary.json` 与五片 `protocol.json` 均记录 `max_new_tokens=1536`，`validation.generation_limit_hits=0`，因此 `0.13693763` 不是生成预算截断的产物。历史整行 `line100`（`0.124694`）走 `tools/training/run_glmocr_layout_oracle_line_eval_a100.sh`，其 `max_eval_new_tokens` 同为 `1536`、触顶 `0`、分辨率同为 4M。两轮生成预算同口径，`0.13693763` 与 `0.124694` 的差可直接比较。
+
+## 2026-09-22 line100-window 失败归因诊断（两臂，五卡并行，运行中）
+
+验收未过线时，`LINE100_WINDOW_MASK_ROUTING.md` 规定先拆开「移除小版面分支」与「整行换 3–5 字窗口」两项同时变化，不得直接调 bias、指针、分辨率或评价子集。
+
+| 字段 | 口径 |
+| --- | --- |
+| run ID | `glmocr_line100_legacy_line_diag_20260922_160451`（`--mode legacy-line`）、`glmocr_line100_layout_control_diag_20260922_160451`（`--mode gt --legacy-layout-control`） |
+| 分支 / commit | `glm-ocr-layout-mask-routing` / `a980c4e` |
+| 入口 | `ocrmodel/tools/evaluation/run_window_mask_acceptance_a100.sh <run_root> <mode> [--legacy-layout-control]` → `evaluate_window_mask_routing.py` |
+| 源码指纹 | `git archive` 独立压缩包 SHA256 `a8224cef505a16f1792393564471a5ac8dff27fa277f877b568b120b249bd222`，已远端核验 |
+| 远端产物根 | `/data3/yky/yangky_ocr_models/glm_ocr_layout_mask_routing/acceptance_runs/<run ID>` |
+| 数据协议 | 同一 sparse24 validation 149 页 manifest，SHA256 `36ec845875e1ea18a48d4a523b6c5a3f007b46e2a07de0cafd2c26139929a348`；train 未读取，test 未读取 |
+| 模型 / checkpoint | base `ca5d8b3e287e52589e37c28385d9655ee4372f9d`；`glmocr_mthv2_sparse24_q32_layout_boxeq820_3000_from_boxeq58_a100_260916_v1/seed42/checkpoint-3000`（decoder LoRA SHA256 `ada4cdd3bb1f2f417d1c0a68054dc61e70ab59f215b3bc2018074b4f2fdcd5d5`） |
+| 固定推理协议 | `bias=1.0`、`synced` 指针、hard raster、prefill 不注入、fast processor、`max_pixels=4000000`、`max_new_tokens=1536`、BF16、math-SDPA、seed 42；全部 decoder 层 |
+| 五卡语义 | 物理 GPU `0–4` 各一个单卡 worker，149 页 round-robin `30/30/30/30/29`；两臂各五个 worker 同时在跑（每卡两个进程），**不是 DDP、不是重复 run** |
+| 组别设置 | 两臂与验收 run 共用同一起点 checkpoint、同一 manifest、同一生成协议，预算一致；唯一变量见下 |
+| 唯一变量 | `legacy-line`：保留原 geometry 小分支、GT 整行框（复核 `0.124694` 与装置可比性）；`gt + --legacy-layout-control`：新路径但把小分支放回，隔离「小分支移除」与「整行换窗口」 |
+| 产出边界 | 两臂均为诊断；`acceptance_eligible=false`，merge 只写 `results/merged.json`，**不写 `results/summary.json`**，不得读成验收结论 |
+| protocol 字段 | `test_manifest_read=false`；`test_used_for_selection=false`；不训练、不选点、无优化器/学习率/梯度累积 |
+| 状态 | 运行中（派发 2026-09-22 16:04 Asia/Shanghai）；preflight 通过，Torch `2.8.0+cu128`、Transformers `5.3.0`，五卡 admission 利用率 0%，`status/run.json=running`。完整 CER/I-D-S 待完成后追加 |
+
+**判读口径（写在跑之前）**：
+1. `legacy-line` 复现 `0.124694`（或落在其误差内）→ 装置可比，后续差值可归因；不复现 → 先修装置，不读其余结论。
+2. `gt + --legacy-layout-control` 与验收 `0.13693763` 的差 = **小分支移除**单独贡献多少；该臂与 `0.124694` 的差 = **整行换 3–5 字窗口**单独贡献多少。
+3. 两个诊断臂都不作验收、不作选点，也不用于调整 bias 或窗口。
