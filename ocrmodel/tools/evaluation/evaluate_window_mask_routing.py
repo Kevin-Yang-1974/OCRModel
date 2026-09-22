@@ -8,7 +8,7 @@ import random
 import sys
 import time
 from collections import Counter
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
@@ -91,10 +91,28 @@ def targets_for(processor, record, device, eos, merge, target_mode="window"):
     return targets, target_ids
 
 
-def acceptance(metrics, manifest_hash, mode, *, limited=False, legacy_layout=False, target_mode="window"):
+def acceptance(
+    metrics,
+    manifest_hash,
+    mode,
+    *,
+    limited=False,
+    legacy_layout=False,
+    target_mode="window",
+    bias=None,
+):
+    """Eligibility for the one pre-registered configuration.
+
+    The recorded criterion -- window target, B=1.0, all 149 pages -- was fixed
+    before the run.  Any other target shape or bias is a diagnostic and returns
+    eligible=False, so a swept or stronger configuration can never be read as
+    the recorded configuration having passed.
+    """
+
     eligible = (
         mode == "gt"
         and target_mode == "window"
+        and (bias is None or float(bias) == float(PROFILE.bias))
         and not limited
         and not legacy_layout
         and metrics["pages"] == PROFILE.validation_pages
@@ -133,6 +151,14 @@ def parse_args(argv=None):
         help="GT spatial target shape; only 'window' is acceptance-eligible. "
         "'anchored' is the in-line window union the rest of its line",
     )
+    parser.add_argument(
+        "--bias",
+        type=float,
+        default=None,
+        help="per-key additive logit bias; defaults to the profile's recorded 1.0. "
+        "The recorded window value was inherited from the whole-line arm and has "
+        "never been swept for this target",
+    )
     parser.add_argument("--pages", type=int, default=0, help="smoke subset, never acceptance")
     parser.add_argument("--shard-count", type=int, default=1)
     parser.add_argument("--shard-index", type=int, default=0)
@@ -167,6 +193,7 @@ def main():
         "profile": asdict(PROFILE),
         "mode": args.mode,
         "target_mode": args.target_mode,
+        "bias": float(PROFILE.bias if args.bias is None else args.bias),
         "model_path": str(args.model_path),
         "backbone_checkpoint": str(args.backbone_checkpoint),
         "backbone_lora_sha256": sha256(args.backbone_checkpoint / "decoder_lora.safetensors"),
@@ -215,7 +242,12 @@ def main():
         )
     else:
         config = load_config(args.mask_checkpoint) if args.mask_checkpoint else None
-        fusion = FirstLayerWindowRuntime(model, processor.tokenizer, config)
+        profile = (
+            PROFILE
+            if args.bias is None
+            else replace(PROFILE, bias=float(args.bias))
+        )
+        fusion = FirstLayerWindowRuntime(model, processor.tokenizer, config, profile)
         if args.mode == "predicted":
             fingerprint = load_fingerprint(args.mask_checkpoint)
             if (
@@ -308,6 +340,7 @@ def main():
             limited=bool(args.pages) or args.shard_count > 1,
             legacy_layout=args.legacy_layout_control,
             target_mode=args.target_mode,
+            bias=metadata["bias"],
         ),
     }
     (args.output_dir / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")

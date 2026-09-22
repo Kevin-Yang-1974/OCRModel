@@ -16,14 +16,18 @@ run_root="$1"
 mode="${2:-gt}"
 control_flag=0
 target_mode="window"
+bias=""
 shift 2 || true
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --legacy-layout-control) control_flag=1; shift ;;
         --target-mode) target_mode="$2"; shift 2 ;;
+        --bias) bias="$2"; shift 2 ;;
         *) printf '{"event":"window_acceptance_failed","error":"unknown_argument","argument":"%s"}\n' "$1" >&2; exit 64 ;;
     esac
 done
+bias_args=()
+[[ -z "${bias}" ]] || bias_args=(--bias "${bias}")
 case "${mode}" in
     gt|legacy-line) ;;
     *) printf '{"event":"window_acceptance_failed","error":"invalid_mode","value":"%s"}\n' "${mode}" >&2; exit 64 ;;
@@ -37,7 +41,8 @@ esac
 # The spatial target is part of that configuration: mode=gt with an anchored or
 # line target is still a diagnostic, and must not inherit the acceptance result.
 acceptance_eligible=0
-if [[ "${mode}" == "gt" && "${control_flag}" == "0" && "${target_mode}" == "window" ]]; then
+if [[ "${mode}" == "gt" && "${control_flag}" == "0" && "${target_mode}" == "window" ]] \
+    && { [[ -z "${bias}" ]] || [[ "${bias}" == "1.0" || "${bias}" == "1" ]]; }; then
     acceptance_eligible=1
 fi
 code_root="${run_root}/code/ocrmodel"
@@ -88,8 +93,8 @@ for util in "${values[@]}"; do
     (( util < 50 ))
 done
 printf '%s\n' "${utils}" > "${run_root}/status/admission_utilization.txt"
-printf '{"status":"running","phase":"validation_gt_window_5shards","mode":"%s","target_mode":"%s","legacy_layout_control":%s,"acceptance_eligible":%s,"physical_gpus":[0,1,2,3,4],"test_manifest_read":false}\n' \
-    "${mode}" "${target_mode}" "${control_flag}" "${acceptance_eligible}" > "${run_root}/status/run.json"
+printf '{"status":"running","phase":"validation_gt_window_5shards","mode":"%s","target_mode":"%s","bias":"%s","legacy_layout_control":%s,"acceptance_eligible":%s,"physical_gpus":[0,1,2,3,4],"test_manifest_read":false}\n' \
+    "${mode}" "${target_mode}" "${bias:-profile}" "${control_flag}" "${acceptance_eligible}" > "${run_root}/status/run.json"
 cd "${code_root}"
 mkdir -p "${run_root}/shards"
 control_args=()
@@ -99,7 +104,7 @@ for gpu in 0 1 2 3 4; do
     CUDA_VISIBLE_DEVICES="${gpu}" "${python}" tools/evaluation/evaluate_window_mask_routing.py \
         --model-path "${model}" --backbone-checkpoint "${checkpoint}" \
         --validation-manifest "${manifest}" --output-dir "${run_root}/shards/${gpu}" \
-        --mode "${mode}" "${control_args[@]}" --target-mode "${target_mode}" \
+        --mode "${mode}" "${control_args[@]}" --target-mode "${target_mode}" "${bias_args[@]}" \
         --device cuda:0 --shard-count 5 --shard-index "${gpu}" \
         > "${run_root}/shards/${gpu}.log" 2>&1 &
     pids+=("$!")
@@ -125,6 +130,7 @@ if eligible:
               'validation': summary['validation'], 'test_manifest_read': False}
 else:
     status = {'status': 'complete', 'mode': mode, 'target_mode': merged['target_mode'],
+              'bias': merged['bias'],
               'acceptance': None, 'acceptance_eligible': False,
               'validation': merged['validation'], 'test_manifest_read': False}
 (root / 'status' / 'run.json').write_text(json.dumps(status))

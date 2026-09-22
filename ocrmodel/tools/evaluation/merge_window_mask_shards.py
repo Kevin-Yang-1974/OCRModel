@@ -17,6 +17,7 @@ def merge_shards(root, count=5, expected_mode=None):
         "profile",
         "mode",
         "target_mode",
+        "bias",
         "model_path",
         "backbone_checkpoint",
         "backbone_lora_sha256",
@@ -77,6 +78,7 @@ def merge_shards(root, count=5, expected_mode=None):
             limited=base["limited"],
             legacy_layout=base["layout_branch_present"],
             target_mode=base["target_mode"],
+            bias=base["bias"],
         ),
     )
     if base["mode"] == "gt" and not base["limited"] and len(rows) != PROFILE.validation_pages:
@@ -108,6 +110,7 @@ def main():
                 "validation": summary["validation"],
                 "mode": summary["mode"],
                 "target_mode": summary["target_mode"],
+                "bias": summary["bias"],
             },
             indent=2,
         ),

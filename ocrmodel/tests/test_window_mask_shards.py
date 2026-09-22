@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 
 
-def prepare(root, monkeypatch, mode="gt", target_mode="window"):
+def prepare(root, monkeypatch, mode="gt", target_mode="window", bias=1.0):
     monkeypatch.syspath_prepend(str(Path(__file__).parents[1] / "tools/evaluation"))
     evaluate = importlib.import_module("evaluate_window_mask_routing")
     merge = importlib.import_module("merge_window_mask_shards")
@@ -22,6 +22,7 @@ def prepare(root, monkeypatch, mode="gt", target_mode="window"):
             "profile": asdict(evaluate.PROFILE),
             "mode": mode,
             "target_mode": target_mode,
+            "bias": bias,
             "model_path": "model",
             "backbone_checkpoint": "checkpoint",
             "backbone_lora_sha256": "weights",
@@ -118,5 +119,26 @@ def test_acceptance_is_not_inherited_by_a_non_window_target(tmp_path, monkeypatc
     other = tmp_path / "window"
     other.mkdir()
     merge2, _ = prepare(other, monkeypatch, mode="gt", target_mode="window")
+    summary2, _ = merge2.merge_shards(other)
+    assert summary2["acceptance"]["eligible"] is True
+
+
+def test_acceptance_is_not_inherited_by_a_swept_bias(tmp_path, monkeypatch):
+    """A beta sweep is a diagnostic; only the recorded B=1.0 can pass.
+
+    The window arm inherited B=1.0 from the whole-line arm and it was never
+    swept for this target, so the sweep has to be free to find a better value
+    without any of its points coming back as the recorded configuration passing.
+    """
+
+    merge, _ = prepare(tmp_path, monkeypatch, mode="gt", target_mode="window", bias=2.0)
+    summary, _ = merge.merge_shards(tmp_path)
+    assert summary["acceptance"]["eligible"] is False
+    assert summary["acceptance"]["passed"] is None
+    assert summary["bias"] == 2.0
+
+    other = tmp_path / "recorded"
+    other.mkdir()
+    merge2, _ = prepare(other, monkeypatch, mode="gt", target_mode="window", bias=1.0)
     summary2, _ = merge2.merge_shards(other)
     assert summary2["acceptance"]["eligible"] is True
