@@ -159,6 +159,24 @@ python tools/summarize_architecture_comparison.py \
 
 正式训练入口还必须自动执行 validation-only checkpoint selection 和 selection-locked test，且不允许 test 参与任何调参。
 
+### 显存并发上限（2026-09-22 实测确定）
+
+单页 4M 的 GT 评测在每个 worker 上约 **29 GB** 常驻。A100-PCIE 的 40 GB 因此允许的并发是**每卡最多 2 个 worker**：
+
+| 每卡 worker 数 | 峰值显存 | 结果 |
+| ---: | ---: | --- |
+| 1 | 29 GB | 安全（beta 扫描五档全量 149 页，全部完成） |
+| 2 | 34–37 GB | 可用（line100-window 验收与归因诊断，共完成三次） |
+| **3** | **40 GB** | **OOM**（三臂阶梯派发时 5 个 shard 被杀，`torch.OutOfMemoryError`，需重投） |
+
+因此**三个及以上并行的评测臂必须错开派发**（例如先跑两臂再跑第三臂），不得同时压在五张卡上。每臂 5 shard 的旋转分片入口 `run_window_mask_acceptance_a100.sh` 固定用 5 个 worker，一次只能跑一个臂；要同时跑多个臂，改用每卡单 worker 的全量串行形式。
+
+### `/tmp` 不可写（2026-09-22 发现）
+
+远端 `/` 已 100% 占满，`/tmp` 与 `$HOME` 均不可写。后果是静默的：`scp` 到 `/tmp` 会在中途截断而不报错（实测把 787 KB 的压缩包传成 261 KB）、`cat >` 报 `No space left on device`、`tempfile` 抛 `No usable temporary directory`。
+
+**所有远端临时文件与 `TMPDIR` 必须放在 `/data3/yky/yangky_ocr_models/...` 下**，并在启动脚本里显式 `export TMPDIR=<data3 路径>`。压缩包与派发脚本也一律传到 `/data3`，不要用 `/tmp`。
+
 ## 参数优选后的统一默认超参数
 
 图片所示参数优选结果作为后续 A100-yky 与 BSCC 新 run 的统一默认值：
