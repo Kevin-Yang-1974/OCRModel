@@ -300,3 +300,11 @@ MTHv2 原官方 split 是随机页级划分，没有书籍/版本元数据，不
 | 对照 | plain baseline 800 页 CER=`0.874635`、循环页率=`0.195000`、长度上限率=`0.207500`；warm-start A1 CER 恶化 `+0.308902` |
 
 该 run 证明自然循环惩罚有非零训练梯度，但没有改善自由生成，反而增加插入和触顶。由于采用 `256+768` warm-start 且接续阶段重置 optimizer/scheduler，不能把它当成与从基础权重单次连续 1024 步的严格等价对照；详细证据见 `docs/实验日志/GLMOCR/训练退化诊断/GLMOCR-B-260912-001.md`。
+
+## 2026-09-22 line100-window GT acceptance
+
+`glmocr_line100_window_gt_accept_20260922_145532`：已登记待启动，a100-yky GPU0，完整 sparse24 validation149，GT 3–5 字 hard window + synced + beta1，移除小版面分支；固定 checkpoint-3000，不训练、不读取 test、不做 selection。验收 CER <0.13，成绩待完成；详细配置、源码指纹与产物位置见 [实验日志](实验日志/GLMOCR/架构收益对照/GLMOCR-line100-window-gt-acceptance-20260922.md)。
+
+**启动确认**：`glmocr_line100_window_gt_accept_20260922_145532` preflight通过，GPU0 admission=0%，tmux存在，status=running；Torch2.8.0+cu128/Transformers5.3.0。heartbeat `line100-window-gt` 初始5分钟，两次健康后30分钟。完整CER待完成。
+
+**五卡替换**：用户要求中止旧单卡run（15页保留，TERM143，非完整验收），新run `glmocr_line100_window_gt_accept_5gpu_20260922_150507` 待启动；GPU0–4，30/30/30/30/29页，原数据/模型/生成协议不变，单卡batch1，非DDP、不训练、不读test；合并完整149页后按micro CER<0.13判定。详情追加在同一实验日志。

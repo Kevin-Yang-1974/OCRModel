@@ -1,5 +1,15 @@
 # 本地检查与后续运行
 
+## 2026-09-22：line100 + 第一层窗口 mask 新入口
+
+本次融合使用历史 CER 0.124694 的 `line100` 配置，将空间目标替换为已有 3–5 字窗口，
+移除小版面分支，在 decoder 第 0 层输出接预测 head。训练入口为
+`tools/training/train_window_mask_routing.py`，GT 验收/预测评测入口为
+`tools/evaluation/evaluate_window_mask_routing.py`。协议与时序详见
+[LINE100_WINDOW_MASK_ROUTING.md](LINE100_WINDOW_MASK_ROUTING.md)。
+本地 80 项测试及 Ruff 检查通过；真实完整 validation 的 GT CER < 0.13 尚未验收。
+旧 decoder-mask 与 attention-tracking 脚本保留用于历史 run 复现。
+
 ## 当前可执行内容
 
 建立隔离环境并运行单元测试：

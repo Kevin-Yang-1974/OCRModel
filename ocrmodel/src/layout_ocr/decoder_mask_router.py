@@ -41,7 +41,7 @@ class DecoderMaskConfig:
     # Both dims are model-derived and are stripped when a config is reloaded.
     visual_hidden_size: int = 0
     router_dim: int = 256  # internal width ``d``
-    split_layer: int = 8  # layers 0..split-1 feed the head; split.. get the bias
+    split_layer: int = 8  # layers 0..split-1 feed the head; split.. get the bias; 0 means all
     # Which visual features the head reads, and how its mask is mapped back to the
     # merged grid the attention bias lives on:
     #   "merged" -> read the LM's image tokens, no pooling (the original design)
@@ -82,8 +82,8 @@ class DecoderMaskConfig:
     def __post_init__(self) -> None:
         if self.router_dim <= 0:
             raise ValueError("router_dim must be positive")
-        if self.split_layer <= 0:
-            raise ValueError("split_layer must be positive")
+        if self.split_layer < 0:
+            raise ValueError("split_layer must be non-negative")
         if not 0.0 <= self.mask_feedback_noise < 1.0:
             raise ValueError("mask_feedback_noise must be in [0, 1)")
         if self.input_noise < 0.0:

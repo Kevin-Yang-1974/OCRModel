@@ -34,7 +34,7 @@ def test_config_rejects_invalid_values():
     with pytest.raises(ValueError):
         DecoderMaskConfig(router_dim=0)
     with pytest.raises(ValueError):
-        DecoderMaskConfig(split_layer=0)
+        DecoderMaskConfig(split_layer=-1)
     with pytest.raises(ValueError):
         DecoderMaskConfig(mask_feedback_noise=1.0)
     with pytest.raises(ValueError):

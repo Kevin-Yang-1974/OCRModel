@@ -44,6 +44,7 @@ class MaskTargets:
     # Present only in window mode; carried so line grouping (which poisons every
     # target on a page when it is wrong) is logged rather than inferred.
     window_report: dict[str, Any] = field(default_factory=dict)
+    xywh: Tensor | None = None  # [1, N, 4]; optional for older tensor-only callers
 
 
 def char_boxes(record: dict[str, Any]) -> tuple[list[list[float] | None], list[str]]:
@@ -234,6 +235,25 @@ def rasterize_box(box: Sequence[float], xywh: Tensor) -> Tensor:
     return share / peak
 
 
+def rasterize_box_hard(box: Sequence[float], xywh: Tensor) -> Tensor:
+    """Return the binary patch-centre mask used by attention routing.
+
+    A cell is selected exactly when its normalised centre lies inside the box.
+    This deliberately does not use overlap area or peak normalisation: one
+    selected visual key receives the full decoder bias, matching
+    ``attention_routing.AttentionRouting._mask_for``.
+    """
+
+    centres = xywh[..., :2]
+    inside = (
+        (centres[:, 0] >= float(box[0]))
+        & (centres[:, 0] <= float(box[2]))
+        & (centres[:, 1] >= float(box[1]))
+        & (centres[:, 1] <= float(box[3]))
+    )
+    return inside.to(dtype=xywh.dtype)
+
+
 def convex_hull(points: Tensor) -> Tensor:
     """Monotone-chain hull of ``[P, 2]`` points, returned counter-clockwise.
 
@@ -311,6 +331,29 @@ def rasterize_polygon(points: Tensor, xywh: Tensor, samples: int = 4) -> Tensor:
     return share / peak
 
 
+def rasterize_polygon_hard(points: Tensor, xywh: Tensor) -> Tensor:
+    """Return a binary patch-centre mask for a convex polygon."""
+
+    if points.numel() == 0:
+        return torch.zeros(xywh.shape[0], device=xywh.device, dtype=xywh.dtype)
+    hull = convex_hull(points.to(torch.float64))
+    if hull.shape[0] < 3:
+        return torch.zeros(xywh.shape[0], device=xywh.device, dtype=xywh.dtype)
+    edge_a = hull
+    edge_b = torch.roll(hull, shifts=-1, dims=0)
+    ex = (edge_b[:, 0] - edge_a[:, 0]).to(xywh.dtype)
+    ey = (edge_b[:, 1] - edge_a[:, 1]).to(xywh.dtype)
+    ax = edge_a[:, 0].to(xywh.dtype)
+    ay = edge_a[:, 1].to(xywh.dtype)
+    centres = xywh[:, :2]
+    cross = ex.view(1, -1) * (centres[:, 1].unsqueeze(-1) - ay.view(1, -1)) - ey.view(
+        1, -1
+    ) * (centres[:, 0].unsqueeze(-1) - ax.view(1, -1))
+    eps = torch.finfo(xywh.dtype).eps * 8
+    inside = (cross >= -eps).all(dim=-1) | (cross <= eps).all(dim=-1)
+    return inside.to(dtype=xywh.dtype)
+
+
 def build_mask_targets(
     tokenizer: Any,
     record: dict[str, Any],
@@ -322,6 +365,7 @@ def build_mask_targets(
     window_min: int = 3,
     window_max: int = 5,
     line_source: str = "auto",
+    raster_mode: str = "soft",
 ) -> MaskTargets:
     """Assemble the per-token mask targets for one page.
 
@@ -329,6 +373,9 @@ def build_mask_targets(
     EOS) taken from the actual ``input_ids``, and ``xywh`` is the grid returned
     by ``DecoderMaskRouter.project_visual`` (shape ``[1, N, 4]``).
     """
+
+    if raster_mode not in ("soft", "hard"):
+        raise ValueError(f"unknown raster_mode {raster_mode!r}")
 
     page_text = record["page_text"]
     boxes, char_statuses = char_boxes(record)
@@ -339,13 +386,13 @@ def build_mask_targets(
     # geometric rule would merge columns on a vertical page, so it is only a
     # reported fallback, never a silent substitute.
     line_ids, annotated = char_lines(record)
-    line_source = line_source if target_mode == "window" else "token"
-    if target_mode == "window" and line_source == "annotation" and not annotated:
+    line_source = line_source if target_mode in ("window", "line") else "token"
+    if target_mode in ("window", "line") and line_source == "annotation" and not annotated:
         raise ValueError(
-            "target_mode='window' with line_source='annotation' needs a 'line_index' in the "
+            f"target_mode='{target_mode}' with line_source='annotation' needs a 'line_index' in the "
             "manifest; regenerate the char manifest or use line_source='auto'"
         )
-    use_lines = target_mode == "window" and annotated
+    use_lines = target_mode in ("window", "line") and annotated
     line_members: dict[int, list[int]] = {}
     if use_lines:
         for char_index, line_id in enumerate(line_ids):
@@ -354,13 +401,14 @@ def build_mask_targets(
             line_members.setdefault(int(line_id), []).append(char_index)
     window_report: dict[str, Any] = {
         "mode": target_mode,
-        "line_source": "annotation" if use_lines else ("geometry_unavailable" if target_mode == "window" else "token"),
+        "line_source": "annotation" if use_lines else ("geometry_unavailable" if target_mode in ("window", "line") else "token"),
         "lines": len(line_members),
         "singleton_lines": sum(1 for members in line_members.values() if len(members) == 1),
         "max_line_length": max((len(m) for m in line_members.values()), default=0),
         "window_fallbacks": 0,
         "span_over_window": 0,
         "short_windows_at_line_end": 0,
+        "raster_mode": raster_mode,
     }
 
     eos = set(int(t) for t in eos_ids)
@@ -393,17 +441,22 @@ def build_mask_targets(
             line_id = line_ids[span[0]] if span[0] < len(line_ids) else None
             members = line_members.get(int(line_id)) if line_id is not None else None
             if members:
-                start = next((k for k, char_index in enumerate(members) if char_index >= span[0]), None)
-                if start is not None:
-                    want = max(window_min, min(window_max, span[1] - span[0]))
-                    if span[1] - span[0] > window_max:
-                        window_report["span_over_window"] += 1
-                    end = min(len(members), start + want)
-                    if end - start < window_min:  # line tail: top up to the left
-                        start = max(0, end - window_min)
-                        window_report["short_windows_at_line_end"] += 1
-                    if end > start:
-                        window_boxes = [boxes[members[k]] for k in range(start, end)]
+                if target_mode == "line":
+                    # Line-level target: the full hull of the token's own text line,
+                    # so every token on a line attends to the whole line's region.
+                    window_boxes = [boxes[k] for k in members]
+                else:
+                    start = next((k for k, char_index in enumerate(members) if char_index >= span[0]), None)
+                    if start is not None:
+                        want = max(window_min, min(window_max, span[1] - span[0]))
+                        if span[1] - span[0] > window_max:
+                            window_report["span_over_window"] += 1
+                        end = min(len(members), start + want)
+                        if end - start < window_min:  # line tail: top up to the left
+                            start = max(0, end - window_min)
+                            window_report["short_windows_at_line_end"] += 1
+                        if end > start:
+                            window_boxes = [boxes[members[k]] for k in range(start, end)]
 
         if window_boxes:
             # Convex hull of the window's box corners: adjacent characters on one
@@ -415,16 +468,27 @@ def build_mask_targets(
                 device=xywh.device,
                 dtype=xywh.dtype,
             )
-            mask[0, index] = torch.maximum(mask[0, index], rasterize_polygon(corners, xywh[0]))
+            polygon_mask = (
+                rasterize_polygon_hard(corners, xywh[0])
+                if raster_mode == "hard"
+                else rasterize_polygon(corners, xywh[0])
+            )
+            mask[0, index] = torch.maximum(mask[0, index], polygon_mask)
         else:
             if target_mode == "window":
                 window_report["window_fallbacks"] += 1
             for box in boxes_present:
-                mask[0, index] = torch.maximum(mask[0, index], rasterize_box(box, xywh[0]))
+                box_mask = (
+                    rasterize_box_hard(box, xywh[0])
+                    if raster_mode == "hard"
+                    else rasterize_box(box, xywh[0])
+                )
+                mask[0, index] = torch.maximum(mask[0, index], box_mask)
         spatial_valid[0, index] = True
 
     return MaskTargets(
         mask=mask,
+        xywh=xywh,
         spatial_valid=spatial_valid,
         stop_target=stop_target,
         char_spans=spans,
