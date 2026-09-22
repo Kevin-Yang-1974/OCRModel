@@ -15,12 +15,25 @@ acceptance or selection.
 
 The rasters are built on the real merged visual grid, so the numbers are
 comparable with the routing diagnostics recorded in validation_predictions.jsonl.
-Note the one difference and why it is safe: routing counts cells whose centre
-falls inside the rasterised polygon, while build_mask_targets assigns a cell to
-a polygon if any of its corners does. On a grid this coarse the two agree to a
-cell or two per step, which is far inside the spread this measurement is used
-to separate. ``--reported`` compares against the recorded numbers so the gap is
-visible rather than assumed.
+
+Two traps this tool exists to avoid, both of which produced wrong numbers before
+they were caught:
+
+* The grid.  ``prepare_training_inputs`` does not take ``max_pixels``; it has to
+  be set on the processor exactly as the evaluator does, or every dose is
+  measured on the processor default grid.  The placeholder count cannot catch
+  this, because a smaller grid is still self-consistent.
+* The reference.  The routing arms report ``mean_boxes_hit`` as a mean over
+  pages, but the quantity that belongs next to a per-step dose is the aggregate
+  ``sum(hits) / sum(biased_steps)``: on the window arm those are 8.3788 and
+  7.5023, a 12% gap.  Compare like with like.
+
+Like shapes only.  ``--reported`` exists for that: the routing ``line`` arm
+biases ``regions[line]['bbox']`` (the whole annotated region) while
+``build_mask_targets(target_mode='line')`` takes the convex hull of the
+character boxes, so those two must not be set against each other.  Passing a
+value this tool cannot reproduce fails the run rather than emitting a figure
+that looks comparable and is not.
 """
 
 from __future__ import annotations
