@@ -64,6 +64,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         metavar="MODE=TOKENS,...",
         help="recorded per-step hit tokens to compare against, e.g. 'line=77.62,window=8.38'",
     )
+    parser.add_argument(
+        "--reported-tolerance",
+        type=float,
+        default=1.0,
+        help="absolute token tolerance for the reported check; exceeding it fails the run",
+    )
+    parser.add_argument(
+        "--allow-mismatch",
+        action="store_true",
+        help="report the mismatch instead of failing; only for diagnosing the tool itself",
+    )
     parser.add_argument("--device", default="cpu")
     return parser.parse_args(argv)
 
@@ -98,6 +109,14 @@ def main() -> None:
     processor = AutoProcessor.from_pretrained(
         str(args.model_path), trust_remote_code=True, use_fast=args.processor_mode == "fast"
     )
+    # The evaluator sets longest_edge to max_pixels; leaving it at the processor
+    # default silently lands on a different visual grid and rescales every dose.
+    # This is not cosmetic: the default grid for this model is roughly half the
+    # merged cells of the 4M grid the routing arms ran on.
+    processor.image_processor.size = {
+        **processor.image_processor.size,
+        "longest_edge": args.max_pixels,
+    }
     device = torch.device(args.device)
     records = [
         json.loads(line)
@@ -114,6 +133,7 @@ def main() -> None:
     fallbacks: Counter[str] = Counter()
     lines_per_page: list[int] = []
     grid_checks: list[dict[str, int]] = []
+    grid_sizes: list[int] = []
     for index, record in enumerate(records):
         inputs = prepare_training_inputs(processor, record, device, eos)
         # The assistant span of the chat template is exactly what the decoder
@@ -122,13 +142,16 @@ def main() -> None:
         target_ids = inputs["input_ids"][0, prompt_length:]
         grid_thw = inputs["image_grid_thw"]
         xywh, merged_shape = _normalized_grid_xywh(grid_thw, merge_size)
-        # Verify the merge size against the prompt: the placeholder count must be
-        # the merged grid size.  A wrong grid would silently rescale every dose.
+        # Verify against the prompt: the placeholder count must equal the merged
+        # grid size.  This catches a wrong merge size, but it does NOT catch a
+        # wrong max_pixels -- a smaller grid is still self-consistent.  Only the
+        # reported-value comparison below can catch that, which is why it exists.
         placeholder = int((inputs["input_ids"] == image_token_id).sum()) if image_token_id else 0
         if placeholder:
             grid_checks.append(
                 {"merged_cells": merged_shape[0] * merged_shape[1], "image_tokens": placeholder}
             )
+        grid_sizes.append(merged_shape[0] * merged_shape[1])
         for mode in args.modes:
             targets = build_mask_targets(
                 processor.tokenizer,
@@ -168,6 +191,9 @@ def main() -> None:
         "processor_mode": args.processor_mode,
         "merge_size": merge_size,
         "grid_verified_pages": len(grid_checks),
+        "merged_cells_mean": statistics.fmean(grid_sizes) if grid_sizes else None,
+        "merged_cells_min": min(grid_sizes) if grid_sizes else None,
+        "merged_cells_max": max(grid_sizes) if grid_sizes else None,
         "modes": {mode: summarise(values) for mode, values in per_mode.items() if values},
         "window_fallbacks": fallbacks["window_fallbacks"],
         "mean_lines_per_page": statistics.fmean(lines_per_page) if lines_per_page else None,
@@ -175,20 +201,29 @@ def main() -> None:
         "usable_for_selection": False,
         "test_manifest_read": False,
     }
-    if args.reported:
-        recorded = {}
-        for item in args.reported.split(","):
-            name, _, value = item.partition("=")
-            recorded[name.strip()] = float(value)
+    recorded: dict[str, float] = {}
+    for item in args.reported.split(","):
+        if not item.strip():
+            continue
+        name, _, value = item.partition("=")
+        recorded[name.strip()] = float(value)
+    if recorded:
         report["reported"] = {
             mode: {
                 "recorded": value,
                 "measured": report["modes"][mode]["mean"],
                 "difference": report["modes"][mode]["mean"] - value,
+                "relative": report["modes"][mode]["mean"] / value - 1.0,
             }
             for mode, value in recorded.items()
             if mode in report["modes"]
         }
+        off = {
+            mode: stats["relative"]
+            for mode, stats in report["reported"].items()
+            if abs(stats["difference"]) > args.reported_tolerance
+        }
+        report["reported_check"] = {"passed": not off, "tolerance": args.reported_tolerance, "off": off}
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(report, indent=2), encoding="utf-8")
     for mode, stats in report["modes"].items():
@@ -196,7 +231,25 @@ def main() -> None:
             f"{mode:10s} mean {stats['mean']:8.2f}  median {stats['median']:8.2f}  "
             f"p05 {stats['p05']:7.2f}  p95 {stats['p95']:8.2f}  zero {stats['zero_share']:.3f}"
         )
+    print(
+        "merged cells per page: mean {:.0f} min {} max {}".format(
+            report["merged_cells_mean"] or 0,
+            report["merged_cells_min"],
+            report["merged_cells_max"],
+        )
+    )
     print(json.dumps({k: v for k, v in report.items() if k not in ("modes",)}, ensure_ascii=False))
+    check = report.get("reported_check")
+    if check and not check["passed"] and not args.allow_mismatch:
+        # The whole value of this tool is that its third number can be trusted.
+        # If it cannot reproduce the two recorded arms, it is measuring something
+        # else -- a wrong grid, a wrong denominator -- and its anchored figure
+        # would be just as wrong.  Fail rather than report it.
+        raise SystemExit(
+            "reported-value self-check failed: "
+            + json.dumps(report["reported"], ensure_ascii=False)
+            + "; the measured doses are not comparable with the recorded arms"
+        )
 
 
 if __name__ == "__main__":
