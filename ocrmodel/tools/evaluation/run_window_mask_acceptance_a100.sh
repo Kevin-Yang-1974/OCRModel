@@ -1,7 +1,29 @@
 #!/usr/bin/env bash
 # One immutable line100-window GT acceptance run on physical GPUs 0,1,2,3,4.
+#
+# usage: run_window_mask_acceptance_a100.sh <run_root> [mode] [--legacy-layout-control]
+#
+# mode is one of the evaluator's three, and only ``gt`` can pass acceptance:
+#   gt        new path: no layout branch, 3-5 character windows    (the acceptance run)
+#   legacy-line        original geometry branch, whole GT line     (reproduces 0.124694)
+#   gt + control       new path but WITH the geometry branch reintroduced
+#
+# The last two exist to split the two variables this fusion changed at once.  The
+# acceptance number alone cannot say whether the 0.13 miss came from dropping the
+# small layout branch or from coarsening the whole line to a 3-5 character window.
 set -Eeuo pipefail
 run_root="$1"
+mode="${2:-gt}"
+control_flag=0
+[[ "${3:-}" != "--legacy-layout-control" ]] || control_flag=1
+case "${mode}" in
+    gt|legacy-line) ;;
+    *) printf '{"event":"window_acceptance_failed","error":"invalid_mode","value":"%s"}\n' "${mode}" >&2; exit 64 ;;
+esac
+# Acceptance is defined for exactly one configuration.  Anything else is a
+# diagnostic and must not write results/summary.json that looks like a verdict.
+acceptance_eligible=0
+if [[ "${mode}" == "gt" && "${control_flag}" == "0" ]]; then acceptance_eligible=1; fi
 code_root="${run_root}/code/ocrmodel"
 env_dir=/data3/yky/yangky_ocr_models/glm_ocr_layout_ot/envs/glmocr_a100_py311_cu128
 nvidia_env=/data3/yky/yangky_ocr_models/envs/anandasky
@@ -50,15 +72,19 @@ for util in "${values[@]}"; do
     (( util < 50 ))
 done
 printf '%s\n' "${utils}" > "${run_root}/status/admission_utilization.txt"
-printf '{"status":"running","phase":"validation_gt_window_5shards","physical_gpus":[0,1,2,3,4],"test_manifest_read":false}\n' > "${run_root}/status/run.json"
+printf '{"status":"running","phase":"validation_gt_window_5shards","mode":"%s","legacy_layout_control":%s,"acceptance_eligible":%s,"physical_gpus":[0,1,2,3,4],"test_manifest_read":false}\n' \
+    "${mode}" "${control_flag}" "${acceptance_eligible}" > "${run_root}/status/run.json"
 cd "${code_root}"
 mkdir -p "${run_root}/shards"
+control_args=()
+(( control_flag == 0 )) || control_args=(--legacy-layout-control)
 pids=()
 for gpu in 0 1 2 3 4; do
     CUDA_VISIBLE_DEVICES="${gpu}" "${python}" tools/evaluation/evaluate_window_mask_routing.py \
         --model-path "${model}" --backbone-checkpoint "${checkpoint}" \
         --validation-manifest "${manifest}" --output-dir "${run_root}/shards/${gpu}" \
-        --mode gt --device cuda:0 --shard-count 5 --shard-index "${gpu}" \
+        --mode "${mode}" "${control_args[@]}" \
+        --device cuda:0 --shard-count 5 --shard-index "${gpu}" \
         > "${run_root}/shards/${gpu}.log" 2>&1 &
     pids+=("$!")
     printf '%s %s\n' "${gpu}" "$!" >> "${run_root}/status/worker_pids.txt"
@@ -68,12 +94,22 @@ for pid in "${pids[@]}"; do
     wait "${pid}" || failed=1
 done
 (( failed == 0 ))
-"${python}" tools/evaluation/merge_window_mask_shards.py --run-root "${run_root}"
-"${python}" - "${run_root}" <<'PY'
+"${python}" tools/evaluation/merge_window_mask_shards.py --run-root "${run_root}" --mode "${mode}"
+"${python}" - "${run_root}" "${mode}" "${acceptance_eligible}" <<'PY'
 import json, sys
 from pathlib import Path
-root = Path(sys.argv[1])
-summary = json.loads((root/'results/summary.json').read_text())
-(root/'status/run.json').write_text(json.dumps({'status': 'complete', 'acceptance': summary['acceptance'],
-                                             'validation': summary['validation'], 'test_manifest_read': False}))
+root, mode, eligible = Path(sys.argv[1]), sys.argv[2], int(sys.argv[3])
+merged = json.loads((root / 'results' / 'merged.json').read_text())
+if eligible:
+    # Acceptance is recomputed from the merged statistics by the evaluator itself;
+    # it is never asserted here on the strength of the merge.
+    summary = json.loads((root / 'results' / 'summary.json').read_text())
+    assert summary['acceptance']['eligible'], "eligible run produced a non-eligible summary"
+    status = {'status': 'complete', 'mode': mode, 'acceptance': summary['acceptance'],
+              'validation': summary['validation'], 'test_manifest_read': False}
+else:
+    status = {'status': 'complete', 'mode': mode, 'acceptance': None,
+              'acceptance_eligible': False, 'validation': merged['validation'],
+              'test_manifest_read': False}
+(root / 'status' / 'run.json').write_text(json.dumps(status))
 PY

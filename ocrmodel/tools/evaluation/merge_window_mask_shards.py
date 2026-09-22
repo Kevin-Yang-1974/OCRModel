@@ -11,7 +11,7 @@ from evaluate_window_mask_routing import PROFILE, acceptance
 from layout_ocr.metrics import aggregate_ocr_metrics
 
 
-def merge_shards(root, count=5):
+def merge_shards(root, count=5, expected_mode=None):
     summaries, predictions = [], {}
     keys = (
         "profile",
@@ -56,6 +56,10 @@ def merge_shards(root, count=5):
             predictions[row["page_id"]] = row
         summaries.append(summary)
     base = summaries[0]
+    # The caller names the mode it launched; shards can only agree with each other,
+    # so without this a diagnostic merge could be mistaken for the acceptance one.
+    if expected_mode is not None and base["mode"] != expected_mode:
+        raise ValueError(f"shards are {base['mode']}, caller launched {expected_mode}")
     rows = [predictions[page] for page in base["full_page_ids"]]
     metrics = aggregate_ocr_metrics(((r["reference"], r["prediction"]) for r in rows), Counter())
     metrics["generation_limit_hits"] = sum(r["generation_limit_hit"] for r in rows)
@@ -81,14 +85,25 @@ def merge_shards(root, count=5):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--run-root", type=Path, required=True)
+    parser.add_argument("--mode", default=None, help="the mode the caller launched")
     args = parser.parse_args()
-    summary, rows = merge_shards(args.run_root)
+    summary, rows = merge_shards(args.run_root, expected_mode=args.mode)
     out = args.run_root / "results"
     out.mkdir(exist_ok=False)
-    (out / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    # A verdict is only ever produced for the one acceptance configuration.  The
+    # diagnostic runs get their numbers from merged.json instead, so a legacy or
+    # layout-control CER can never be read as this fusion's acceptance result.
+    if summary["acceptance"]["eligible"]:
+        (out / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
     with (out / "validation_predictions.jsonl").open("w", encoding="utf-8") as handle:
         for row in rows:
             handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+    # Success signal for the launcher: summary.json cannot be written twice, so a
+    # diagnostic run that must not expose a summary still needs a merge artifact.
+    (out / "merged.json").write_text(
+        json.dumps({"validation": summary["validation"], "mode": summary["mode"]}, indent=2),
+        encoding="utf-8",
+    )
     print(json.dumps(summary), flush=True)
 
 

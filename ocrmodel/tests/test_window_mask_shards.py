@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 
 
-def prepare(root, monkeypatch):
+def prepare(root, monkeypatch, mode="gt"):
     monkeypatch.syspath_prepend(str(Path(__file__).parents[1] / "tools/evaluation"))
     evaluate = importlib.import_module("evaluate_window_mask_routing")
     merge = importlib.import_module("merge_window_mask_shards")
@@ -20,7 +20,7 @@ def prepare(root, monkeypatch):
         summary = {
             "status": "complete",
             "profile": asdict(evaluate.PROFILE),
-            "mode": "gt",
+            "mode": mode,
             "model_path": "model",
             "backbone_checkpoint": "checkpoint",
             "backbone_lora_sha256": "weights",
@@ -31,7 +31,7 @@ def prepare(root, monkeypatch):
             "processor": "fast",
             "attention_backend": "math-sdpa",
             "precision": "bfloat16",
-            "layout_branch_present": False,
+            "layout_branch_present": mode == "legacy-line",
             "shard_count": 5,
             "shard_index": index,
             "full_page_ids": ids,
@@ -62,6 +62,25 @@ def test_five_shards_cover_149_once_and_merge_by_edit_counts(tmp_path, monkeypat
     assert summary["validation"]["deletions"] == 149
     assert summary["validation"]["cer"] == 149 / sum(range(1, 150))
     assert summary["acceptance"]["passed"] is True
+
+
+def test_merge_refuses_a_mode_other_than_the_one_the_caller_launched(tmp_path, monkeypatch):
+    merge, _ = prepare(tmp_path, monkeypatch, mode="legacy-line")
+    with pytest.raises(ValueError, match="legacy-line"):
+        merge.merge_shards(tmp_path, expected_mode="gt")
+
+
+def test_main_writes_a_verdict_only_for_the_acceptance_configuration(tmp_path, monkeypatch):
+    # The diagnostic modes must produce numbers without producing anything that
+    # reads as this fusion's acceptance result.
+    merge, _ = prepare(tmp_path, monkeypatch, mode="legacy-line")
+    monkeypatch.setattr(
+        "sys.argv", ["merge_window_mask_shards.py", "--run-root", str(tmp_path), "--mode", "legacy-line"]
+    )
+    merge.main()
+    out = tmp_path / "results"
+    assert not (out / "summary.json").exists()
+    assert json.loads((out / "merged.json").read_text())["validation"]["deletions"] == 149
 
 
 @pytest.mark.parametrize("fault", ["missing", "duplicate", "protocol"])
