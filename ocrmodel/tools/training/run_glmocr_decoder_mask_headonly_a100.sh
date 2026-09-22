@@ -35,6 +35,7 @@ gpu_utilization_limit=50
 max_pixels=4000000
 max_steps=1024
 checkpoint_every=256
+ddp_timeout_seconds=3600
 # One validation point, not three.  Every shard validates the *whole* validation
 # set on its own, so three points would cost fifteen full generations at 4M --
 # and the artifact that matters is the merged head, which is scored separately
@@ -49,6 +50,7 @@ validation_pages=64
 smoke_pages=10
 smoke_max_steps=4
 foreground=0
+start_arm="G1"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -58,9 +60,11 @@ while [[ $# -gt 0 ]]; do
         --gpu-ids) gpu_ids="$2"; shift 2 ;;
         --max-pixels) max_pixels="$2"; shift 2 ;;
         --max-steps) max_steps="$2"; shift 2 ;;
+        --ddp-timeout-seconds) ddp_timeout_seconds="$2"; shift 2 ;;
         --train-pages) train_pages="$2"; shift 2 ;;
         --validation-pages) validation_pages="$2"; shift 2 ;;
         --foreground) foreground=1; shift ;;
+        --start-arm) start_arm="$2"; shift 2 ;;
         --remote-root) remote_root="$2"; shift 2 ;;
         --code-root) code_root="$2"; shift 2 ;;
         --env-dir) env_dir="$2"; shift 2 ;;
@@ -70,6 +74,7 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 case "${mode}" in smoke|screen) ;; *) printf '{"event":"headonly_failed","error":"invalid_mode","value":"%s"}\n' "${mode}" >&2; exit 64 ;; esac
+case "${start_arm}" in G1|G2|G3) ;; *) printf '{"event":"headonly_failed","error":"invalid_start_arm","value":"%s"}\n' "${start_arm}" >&2; exit 64 ;; esac
 
 IFS=',' read -r -a gpu_array <<< "${gpu_ids}"
 python="${env_dir}/bin/python"
@@ -205,6 +210,7 @@ run_arm() {
         --checkpoint-every "${checkpoint_every}" \
         --validation-every "${checkpoint_every}" \
         --validation-steps ${validation_steps} \
+        --ddp-timeout-seconds "${ddp_timeout_seconds}" \
         --max-eval-new-tokens "${max_eval_new_tokens}" \
         ${routing_args} > "${arm_dir}/train.log" 2>&1
     printf '{"event":"headonly_arm_complete","screen_id":"%s","arm":"%s","output_dir":"%s"}\n' \
@@ -269,7 +275,12 @@ run_inner() {
         [[ -f "${train_manifest}" ]] || prepare_split "${train_pages}" "${validation_pages}" "screen" > "${split_root}/split_screen.log"
         # Series, not parallel: all five cards work on one arm at a time, so each
         # arm gets the full page set rather than a fifth of it.
-        for arm in G1 G2 G3; do
+        case "${start_arm}" in
+            G1) arms=(G1 G2 G3) ;;
+            G2) arms=(G2 G3) ;;
+            G3) arms=(G3) ;;
+        esac
+        for arm in "${arms[@]}"; do
             run_arm "${arm}" "${train_manifest}" "${validation_manifest}" "${max_steps}" "${validation_steps}"
         done
     fi
@@ -286,7 +297,7 @@ if (( foreground == 1 )); then
 else
     mkdir -p "${remote_root}/runs"
     script_path="$(realpath -- "${BASH_SOURCE[0]}")"
-    command_line="$(printf '%q ' bash "${script_path}" --foreground --mode "${mode}" --screen-id "${screen_id}" --seed "${seed}" --gpu-ids "${gpu_ids}" --max-pixels "${max_pixels}" --max-steps "${max_steps}" --train-pages "${train_pages}" --validation-pages "${validation_pages}" --remote-root "${remote_root}" --code-root "${code_root}" --env-dir "${env_dir}" --model-dir "${model_dir}" --dataset-root "${dataset_root}")"
+    command_line="$(printf '%q ' bash "${script_path}" --foreground --mode "${mode}" --screen-id "${screen_id}" --seed "${seed}" --gpu-ids "${gpu_ids}" --max-pixels "${max_pixels}" --max-steps "${max_steps}" --ddp-timeout-seconds "${ddp_timeout_seconds}" --start-arm "${start_arm}" --train-pages "${train_pages}" --validation-pages "${validation_pages}" --remote-root "${remote_root}" --code-root "${code_root}" --env-dir "${env_dir}" --model-dir "${model_dir}" --dataset-root "${dataset_root}")"
     setsid nohup bash -c "exec ${command_line}" > "${launcher_log}" 2>&1 < /dev/null &
     disown 2>/dev/null || true
     printf '{"event":"headonly_armed","screen_id":"%s","mode":"%s","seed":%s,"gpu_ids":"%s","log":"%s","test_used_for_selection":false}\n' \

@@ -29,6 +29,7 @@ nvidia_env="${BSCC_GLM_NVIDIA_ENV:-${workspace}/envs/anandasky}"
 
 run_id="${GLMOCR_BSCC_RUN_ID:-glmocr_mthv2_baseline_attention_64val_bscc_260921_v1}"
 source_branch="${GLMOCR_SOURCE_BRANCH:-glm-ocr-layout-mask-routing}"
+resume_existing="${GLMOCR_BSCC_RESUME_EXISTING:-0}"
 seed=42
 page_count=64
 shard_count=4
@@ -53,6 +54,10 @@ python="${env_dir}/bin/python"
 gpu_ids="${GLMOCR_BSCC_GPU_IDS:-${CUDA_VISIBLE_DEVICES:-${SLURM_JOB_GPUS:-0,1,2,3}}}"
 [[ "${run_id}" =~ ^[A-Za-z0-9_.-]+$ ]] || {
     printf '{"event":"glmocr_bscc_attention_failed","error":"invalid_run_id"}\n' >&2
+    exit 64
+}
+[[ "${resume_existing}" == "0" || "${resume_existing}" == "1" ]] || {
+    printf '{"event":"glmocr_bscc_attention_failed","error":"invalid_resume_existing"}\n' >&2
     exit 64
 }
 [[ "${gpu_ids}" =~ ^[0-9]+(,[0-9]+){3}$ ]] || {
@@ -83,10 +88,22 @@ for required in \
         exit 66
     }
 done
-[[ ! -e "${run_root}" ]] || {
-    printf '{"event":"glmocr_bscc_attention_failed","error":"run_already_exists","run_root":"%s"}\n' "${run_root}" >&2
-    exit 74
-}
+reuse_existing=0
+if [[ -e "${run_root}" ]]; then
+    [[ "${resume_existing}" == "1" ]] || {
+        printf '{"event":"glmocr_bscc_attention_failed","error":"run_already_exists","run_root":"%s"}\n' "${run_root}" >&2
+        exit 74
+    }
+    [[ -f "${subset_manifest}" && -f "${protocol_file}" ]] || {
+        printf '{"event":"glmocr_bscc_attention_failed","error":"resume_artifacts_missing","run_root":"%s"}\n' "${run_root}" >&2
+        exit 74
+    }
+    [[ ! -e "${run_root}/summary.json" && ! -e "${run_root}/DECODER_ATTENTION_COMPLETE" ]] || {
+        printf '{"event":"glmocr_bscc_attention_failed","error":"run_already_complete","run_root":"%s"}\n' "${run_root}" >&2
+        exit 74
+    }
+    reuse_existing=1
+fi
 
 IFS=',' read -r -a gpu_array <<< "${gpu_ids}"
 declare -A seen_gpu=()
@@ -162,23 +179,28 @@ export LD_LIBRARY_PATH="${cuda_libraries}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}
 
 query_gpus
 mkdir -p "${run_root}" "${subset_dir}" "${workers_root}" "${heatmap_root}" "${experiment_root}/tmp"
-printf '{"event":"glmocr_bscc_attention_started","run_id":"%s","source_branch":"%s","pages":%s,"gpu_ids":"%s","layers":"%s","heads":"%s","test_manifest_read":false}\n' \
-    "${run_id}" "${source_branch}" "${page_count}" "${gpu_ids}" "${probe_layers}" "${probe_heads}"
+printf '{"event":"glmocr_bscc_attention_started","run_id":"%s","source_branch":"%s","pages":%s,"gpu_ids":"%s","layers":"%s","heads":"%s","resumed_existing":%s,"test_manifest_read":false}\n' \
+    "${run_id}" "${source_branch}" "${page_count}" "${gpu_ids}" "${probe_layers}" "${probe_heads}" "${reuse_existing}"
 
-"${python}" "${code_root}/tools/subset_mthv2_manifest.py" \
-    --input "${dataset_root}/validation/manifest.jsonl" \
-    --output "${subset_manifest}" \
-    --count "${page_count}" --seed "${seed}" --stratify-regions \
-    > "${run_root}/subset_selection.json"
+if (( reuse_existing == 0 )); then
+    "${python}" "${code_root}/tools/subset_mthv2_manifest.py" \
+        --input "${dataset_root}/validation/manifest.jsonl" \
+        --output "${subset_manifest}" \
+        --count "${page_count}" --seed "${seed}" --stratify-regions \
+        > "${run_root}/subset_selection.json"
 
-"${python}" "${code_root}/tools/audit_mthv2_manifest.py" \
-    --train-manifest "${dataset_root}/train/manifest.jsonl" \
-    --validation-manifest "${subset_manifest}" \
-    --without-test --allow-count-mismatch --num-queries "${num_queries}" \
-    --dataset-label "MTHv2_validation64_attention" \
-    --protocol-label "glm_ocr_mthv2_baseline_attention_64val_v1" \
-    --output "${protocol_file}" \
-    > "${run_root}/protocol_audit.json"
+    "${python}" "${code_root}/tools/audit_mthv2_manifest.py" \
+        --train-manifest "${dataset_root}/train/manifest.jsonl" \
+        --validation-manifest "${subset_manifest}" \
+        --without-test --allow-count-mismatch --num-queries "${num_queries}" \
+        --dataset-label "MTHv2_validation64_attention" \
+        --protocol-label "glm_ocr_mthv2_baseline_attention_64val_v1" \
+        --output "${protocol_file}" \
+        > "${run_root}/protocol_audit.json"
+else
+    printf '{"event":"glmocr_bscc_attention_reusing_subset_and_protocol","run_root":"%s","test_manifest_read":false}\n' \
+        "${run_root}"
+fi
 
 heatmap_pages="${run_root}/heatmap_pages.txt"
 "${python}" - "${subset_manifest}" "${workers_root}" "${heatmap_pages}" "${shard_count}" <<'PY'
@@ -186,7 +208,7 @@ import json
 import sys
 from pathlib import Path
 
-manifest, workers_root, heatmap_pages, shard_count = map(Path, sys.argv[1:4])
+manifest, workers_root, heatmap_pages = map(Path, sys.argv[1:4])
 shard_count = int(sys.argv[4])
 rows = [json.loads(line) for line in manifest.read_text(encoding="utf-8").splitlines() if line.strip()]
 if len(rows) != 64:

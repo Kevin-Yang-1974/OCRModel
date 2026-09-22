@@ -22,7 +22,9 @@ over ``--router-noise-warmup-steps`` updates.
 from __future__ import annotations
 
 import argparse
+import datetime
 import json
+import math
 import os
 import random
 import time
@@ -92,6 +94,20 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--router-window-line-source", choices=("annotation", "geometry", "auto"), default="auto")
     parser.add_argument("--router-dice-weight", type=float, default=0.0)
     parser.add_argument("--router-mask-bce", choices=("balanced", "plain"), default="balanced")
+    parser.add_argument(
+        "--router-centroid-weight",
+        type=float,
+        default=0.0,
+        help="weight on the centre-of-mass localization term; breaks the zero-overlap "
+        "dead zone that soft Dice cannot escape. Requires the head grid xywh (built in).",
+    )
+    parser.add_argument(
+        "--router-sparsity-weight",
+        type=float,
+        default=0.0,
+        help="weight on the mean-mask-mass term; counters the dense background floor "
+        "that balanced BCE rewards.",
+    )
     parser.add_argument("--router-vae-latent-channels", type=int, default=4)
     parser.add_argument("--router-vae-latent-size", type=int, default=16)
     parser.add_argument("--router-vae-kl-weight", type=float, default=1.0)
@@ -124,6 +140,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--checkpoint-every", type=int, default=256)
     parser.add_argument("--validation-every", type=int, default=256)
     parser.add_argument("--validation-steps", nargs="*", type=int, default=[256, 512, 1024])
+    # Router LR schedule: linear warmup then cosine anneal.  The head trains from
+    # scratch with a feedback recurrence, so an untempered 1e-4 rate can overshoot
+    # into the dense regime before the mask ever localizes; warmup holds the early
+    # steps steady and the anneal lets the mask settle into a sharp peak.
+    parser.add_argument("--router-lr-warmup-steps", type=int, default=0)
+    parser.add_argument("--router-lr-min-ratio", type=float, default=1.0)
+    parser.add_argument(
+        "--ddp-timeout-seconds",
+        type=int,
+        default=3600,
+        help="process-group collective timeout; rank 0 validation can be long at 4M resolution",
+    )
     # generation / eval
     parser.add_argument("--max-eval-new-tokens", type=int, default=512)
     parser.add_argument("--device", default=None)
@@ -141,7 +169,7 @@ def _set_seed(seed: int) -> None:
         pass
 
 
-def _init_distributed() -> tuple[int, int, bool, int]:
+def _init_distributed(timeout_seconds: int = 600) -> tuple[int, int, bool, int]:
     """Join the process group when launched under ``torchrun``; else one rank.
 
     The five cards train **one** head.  Every rank holds the same parameters and
@@ -159,7 +187,9 @@ def _init_distributed() -> tuple[int, int, bool, int]:
     import torch.distributed as dist
 
     torch.cuda.set_device(local_rank)
-    dist.init_process_group(backend="nccl")
+    dist.init_process_group(
+        backend="nccl", timeout=datetime.timedelta(seconds=timeout_seconds)
+    )
     return dist.get_rank(), dist.get_world_size(), True, local_rank
 
 
@@ -252,6 +282,22 @@ def _noise_at(step: int, initial: float, args: argparse.Namespace) -> float:
     return initial * max(0.0, 1.0 - step / args.router_noise_warmup_steps)
 
 
+def _router_lr_multiplier(step: int, warmup_steps: int, total_steps: int, min_ratio: float) -> float:
+    """Linear warmup then cosine anneal to ``min_ratio`` of the base LR.
+
+    Applied uniformly to every parameter group, so in head-only mode (the only
+    regime that uses it) it scales the single router group from 0 to its base LR
+    and back down to ``min_ratio * base`` over the run.
+    """
+
+    if warmup_steps > 0 and step < warmup_steps:
+        return float(step + 1) / float(warmup_steps)
+    if total_steps <= warmup_steps:
+        return 1.0
+    progress = min(1.0, (step - warmup_steps) / max(1, total_steps - warmup_steps))
+    return min_ratio + 0.5 * (1.0 - min_ratio) * (1.0 + math.cos(math.pi * progress))
+
+
 def _load(processor: Any, record: dict[str, Any], device: torch.device, eos_ids: set[int]) -> dict[str, Any]:
     return prepare_training_inputs(processor, record, device, eos_ids)
 
@@ -312,7 +358,7 @@ def run_training(args: argparse.Namespace) -> dict[str, Any]:
     from transformers import AutoModelForImageTextToText, AutoProcessor
 
     _set_seed(args.seed)
-    rank, world_size, distributed, local_rank = _init_distributed()
+    rank, world_size, distributed, local_rank = _init_distributed(args.ddp_timeout_seconds)
     is_main = rank == 0
     if distributed:
         # Every rank owns one card; the rank index is its device.
@@ -414,6 +460,12 @@ def run_training(args: argparse.Namespace) -> dict[str, Any]:
     if not parameter_groups:
         raise RuntimeError("nothing to optimize: head-only mode needs --routing-mode learned")
     optimizer = torch.optim.AdamW(parameter_groups, lr=args.learning_rate, weight_decay=args.weight_decay)
+    scheduler = torch.optim.lr_scheduler.LambdaLR(
+        optimizer,
+        lr_lambda=lambda step: _router_lr_multiplier(
+            step, args.router_lr_warmup_steps, args.max_steps, args.router_lr_min_ratio
+        ),
+    )
 
     trainable_report = {
         "decoder_lora_parameters": sum(p.numel() for p in iter_lora_parameters(model)),
@@ -428,6 +480,10 @@ def run_training(args: argparse.Namespace) -> dict[str, Any]:
         "target_mode": args.router_target_mode,
         "pool_mode": args.router_pool_mode,
         "dice_weight": args.router_dice_weight,
+        "centroid_weight": args.router_centroid_weight,
+        "sparsity_weight": args.router_sparsity_weight,
+        "router_lr_warmup_steps": args.router_lr_warmup_steps,
+        "router_lr_min_ratio": args.router_lr_min_ratio,
     }
     trainable_report["world_size"] = world_size
     if is_main:
@@ -473,6 +529,9 @@ def run_training(args: argparse.Namespace) -> dict[str, Any]:
                 mask_targets.spatial_valid,
                 dice_weight=args.router_dice_weight,
                 bce_mode=args.router_mask_bce,
+                xywh=mask_targets.xywh,
+                centroid_weight=args.router_centroid_weight,
+                sparsity_weight=args.router_sparsity_weight,
             )
             stop_loss = balanced_stop_bce(
                 runtime.last_stop.squeeze(-1), mask_targets.stop_target
@@ -509,6 +568,7 @@ def run_training(args: argparse.Namespace) -> dict[str, Any]:
             # all five replicas remain byte-identical weights.
             _average_gradients(runtime.router.parameters(), world_size)
         optimizer.step()
+        scheduler.step()
         optimizer.zero_grad(set_to_none=True)
         step += 1
 
@@ -519,6 +579,7 @@ def run_training(args: argparse.Namespace) -> dict[str, Any]:
                 "mask_loss": float(mask_loss.detach().item()),
                 "stop_loss": float(stop_loss.detach().item()),
                 "beta": beta,
+                "router_lr": float(scheduler.get_last_lr()[0]),
                 **parts,
             }
         )
@@ -565,6 +626,10 @@ def run_training(args: argparse.Namespace) -> dict[str, Any]:
                     "pool_mode": args.router_pool_mode,
                     "bias_max": args.router_bias_max,
                     "dice_weight": args.router_dice_weight,
+                    "centroid_weight": args.router_centroid_weight,
+                    "sparsity_weight": args.router_sparsity_weight,
+                    "router_lr_warmup_steps": args.router_lr_warmup_steps,
+                    "router_lr_min_ratio": args.router_lr_min_ratio,
                     "learning_rate": args.learning_rate,
                     "router_learning_rate": head_lr,
                 },

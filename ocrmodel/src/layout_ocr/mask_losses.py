@@ -85,6 +85,61 @@ def plain_mask_bce(mask: Tensor, target: Tensor, valid: Tensor) -> Tensor:
     return loss.mean()
 
 
+def centroid_loss(mask: Tensor, target: Tensor, xywh: Tensor, valid: Tensor) -> Tensor:
+    """Mean squared centre-of-mass distance, predicted vs target, over box tokens.
+
+    The failure mode this targets is a mask that fires at the right column but
+    smears vertically (a "column-level" strip): soft Dice is nearly flat when the
+    prediction is disjoint from the target, and balanced BCE is satisfied by a
+    broad background floor, so neither gives a useful localization gradient at
+    zero overlap.  The centre of mass is differentiable in the mask for any
+    non-zero mass, so this term pulls the predicted blob toward the target centre
+    from the first step, and collapses to zero once the peak is on the box.
+
+    ``xywh`` is the head's grid ``[1, N, 4]`` (or ``[N, 4]``) of normalised cell
+    centres; only the ``x``/``y`` columns are used.  Tokens without a box are
+    excluded (their centre is undefined), matching :func:`soft_dice`.
+    """
+
+    has_content = target.sum(dim=-1) > 0
+    keep = valid & has_content
+    if not bool(keep.any()):
+        return mask.new_zeros(())
+    x = xywh[..., 0]
+    y = xywh[..., 1]
+    if x.dim() == 2:
+        x, y = x[0], y[0]
+    prediction = mask[keep]  # [K, N]
+    truth = target[keep]  # [K, N]
+
+    def centre_of_mass(weights: Tensor) -> tuple[Tensor, Tensor]:
+        mass = weights.sum(dim=-1) + EPS
+        cx = (weights * x).sum(dim=-1) / mass
+        cy = (weights * y).sum(dim=-1) / mass
+        return cx, cy
+
+    px, py = centre_of_mass(prediction)
+    tx, ty = centre_of_mass(truth)
+    return ((px - tx).square() + (py - ty).square()).mean()
+
+
+def sparsity_loss(mask: Tensor, target: Tensor, valid: Tensor) -> Tensor:
+    """Mean mask mass over box tokens: a direct pressure to concentrate.
+
+    The measured failure is a mask 10-30x denser than the peak-normalised target
+    (~6-10% of cells above 0.5 where the target has ~0.6%).  This L1 term lowers
+    the total predicted mass, so the head must spend its budget on the box rather
+    than on a background floor; it is a blunt complement to Dice's shape term.
+    Tokens without a box are excluded, same as the other region terms.
+    """
+
+    has_content = target.sum(dim=-1) > 0
+    keep = valid & has_content
+    if not bool(keep.any()):
+        return mask.new_zeros(())
+    return mask[keep].mean()
+
+
 def balanced_stop_bce(stop_prob: Tensor, stop_target: Tensor) -> Tensor:
     stop_prob = stop_prob.clamp(EPS, 1.0 - EPS)
     log_e = torch.log(stop_prob)
@@ -102,11 +157,17 @@ def mask_and_dice_loss(
     *,
     dice_weight: float = 0.0,
     bce_mode: str = "balanced",
+    xywh: Tensor | None = None,
+    centroid_weight: float = 0.0,
+    sparsity_weight: float = 0.0,
 ) -> tuple[Tensor, dict[str, float]]:
     """Total mask loss plus its parts, for logging.
 
-    ``dice_weight=0`` and ``bce_mode='balanced'`` reproduce the previous
-    behaviour exactly, so existing runs and tests stay comparable.
+    ``dice_weight=0``, ``centroid_weight=0``, ``sparsity_weight=0`` and
+    ``bce_mode='balanced'`` reproduce the previous behaviour exactly, so existing
+    runs and tests stay comparable.  The centroid and sparsity terms are opt-in
+    precisely because they change the loss surface; they address the measured
+    failure (a dense, confident, mislocated mask under balanced BCE + Dice).
     """
 
     if bce_mode == "balanced":
@@ -119,13 +180,25 @@ def mask_and_dice_loss(
         dice = soft_dice(mask, target, valid)
     else:
         dice = mask.new_zeros(())
-    total = bce + dice_weight * dice
+    if centroid_weight > 0.0:
+        if xywh is None:
+            raise ValueError("centroid_weight > 0 requires xywh to compute the centre of mass")
+        centroid = centroid_loss(mask, target, xywh, valid)
+    else:
+        centroid = mask.new_zeros(())
+    if sparsity_weight > 0.0:
+        sparsity = sparsity_loss(mask, target, valid)
+    else:
+        sparsity = mask.new_zeros(())
+    total = bce + dice_weight * dice + centroid_weight * centroid + sparsity_weight * sparsity
     has_content = target.sum(dim=-1) > 0
     keep = valid & has_content
     with torch.no_grad():
         parts = {
             "bce": float(bce.detach().item()),
             "dice": float(dice.detach().item()),
+            "centroid": float(centroid.detach().item()),
+            "sparsity": float(sparsity.detach().item()),
             "mask_mean": float(mask.detach().mean().item()),
             "mask_max": float(mask.detach().max().item()),
             "mask_p95": float(mask.detach().flatten().quantile(0.95).item()),

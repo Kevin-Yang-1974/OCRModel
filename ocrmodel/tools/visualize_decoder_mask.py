@@ -25,6 +25,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from types import SimpleNamespace
 from pathlib import Path
 from typing import Any
 
@@ -200,7 +201,18 @@ def main() -> None:
     target_ids = inputs["input_ids"][0, prompt_length:]
     xywh, _ = _normalized_grid_xywh(inputs["image_grid_thw"], spatial_merge_size)
     targets = build_mask_targets(processor.tokenizer, record, target_ids, eos_ids, xywh)
-    runtime.set_page(inputs["image_grid_thw"], inputs["input_ids"], prompt_length, targets)
+    # Keep the runtime on the inference path.  G1/G2 ignore ``targets`` in the
+    # deterministic router, but G3's VAE router would otherwise build its
+    # ground-truth posterior and leak the target into the rendered mask.  A
+    # non-None sentinel makes the runtime scan the whole teacher-forced target
+    # span, while ``mask=None`` makes every router use its inference prior.  The
+    # actual target below is only for drawing and diagnostics, never prediction.
+    runtime.set_page(
+        inputs["image_grid_thw"],
+        inputs["input_ids"],
+        prompt_length,
+        SimpleNamespace(mask=None),
+    )
     with torch.no_grad():
         model(**inputs)
     predicted = runtime.last_mask[0].detach().float().cpu()  # [T, N]

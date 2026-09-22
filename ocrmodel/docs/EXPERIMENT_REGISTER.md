@@ -23,6 +23,70 @@
 
 ## 运行记录
 
+### 2026-09-22：decoder-mask head-only 4M 五卡串行筛选（已完成）
+
+| 字段 | 当前记录 |
+| --- | --- |
+| bundle / arm | 主 run `glmocr_decoder_mask_headonly4m_v1`（G1 已完成）＋恢复 run `glmocr_decoder_mask_headonly4m_v1_retry_ddp3600`（从 G2 起点续跑 G2/G3）；`B0` 为同协议独立 zero-shot 评测，不训练 |
+| 分支 / commit | `glm-ocr-layout-mask-routing` / `e1667b2` |
+| 入口 | `ocrmodel/tools/training/run_glmocr_decoder_mask_headonly_a100.sh`；G1→G2→G3 串行，每臂一次 `torchrun` |
+| 远端产物根 | 主 run：`/data3/yky/yangky_ocr_models/glm_ocr_layout_mask_routing/training_runs/glmocr_decoder_mask_headonly4m_v1`；恢复 run：同目录下 `glmocr_decoder_mask_headonly4m_v1_retry_ddp3600` |
+| 模型 / 数据 | GLM-OCR revision `ca5d8b3e287e52589e37c28385d9655ee4372f9d`；MTHv2 whole-page character manifest；train `128` 页、validation `64` 页、seed `42`；train manifest SHA256 `d1193dca63e10cd46003f12afceff906e9ebca19817f04c70450a98c90d6dae1`；validation manifest SHA256 `fbe971e01c0bb2dee03903be75bf57655cd18d14bab3b4c1b5c7068a2785434c` |
+| 训练配置 | `max_pixels=4000000`；processor `slow`；`max_steps=1024`；checkpoint / validation step `256/512/768/1024`（本轮 validation 选点实际配置为 `1024`）；head-only；主干冻结；不注入 LoRA；CE 跳过 |
+| 五卡语义 | A100 `0,1,2,3,4`；`torchrun --nproc_per_node=5`；每步对 router 参数执行 all-reduce 梯度平均；`NCCL_P2P_DISABLE=1`、`NCCL_IB_DISABLE=1` |
+| 可训练参数 / 损失 | 仅 mask router；router LR `1e-4`，主 LR 参数保留为 `1e-6`；balanced BCE＋Dice（Dice weight `1.0`、mask loss weight `0.2`）；当前入口同时配置 stop BCE weight `0.05`，G3 另含 VAE KL weight `1.0`，后续结果记录按实际 fingerprint 展开 |
+| 当前状态 | 主 run 已 `failed` 但完整保留；恢复 run 的 G2/G3 已 `complete`，G1 由主 run checkpoint 只读复用；12 组四步波形 validation 与 B0 frozen-base zero-shot 均已完成；未读取 test，`test_manifest_read=false`、`test_used_for_selection=false` |
+| B0 状态 | `b0_zero_shot_v2_frozen_base` 已完成：同一 64 页 validation、4M、1536 tokens；CER `0.2870459219`，I/D/S `2312/1630/2340`，K1/K3/K5 recall `0.645161/0.644995/0.674716`；`routing_mode=none`、`head_only=true`、`training_updates=0`、`lora_injected=false`、`mask_pages=0`；不读取 test、不参与 selection |
+| 健康判据 | `mask_mean` 约 `0.02–0.1`；`pooled_peak` 随训练上升并接近 `1`；`dice` 为 `1−Dice` 且越低越好；显存 `29–40 GB` 为压线区，OOM 立即处理 |
+| 已修复契约 | 五卡拓扑必须保留 `NCCL_P2P_DISABLE=1`；`rasterize_polygon` 使用 `sign.sum(dim=-1).abs() == K`，不得改回 `sign.abs().sum() == K` |
+| 后处理 | 训练完成后用合并前单份 checkpoint 做 `evaluate_decoder_mask_waves.sh`，`arms=G1,G2,G3`、`steps=256,512,768,1024`、`max_pixels=4000000`、`max_new_tokens=1536`；随后补 B0 zero-shot |
+| 结果 | G1/G2/G3 训练、12 组波形 validation、B0 zero-shot 和文档核验均已完成；本表不包含 test 结果 |
+
+**健康检查 1（2026-09-22 00:43，Asia/Shanghai）**：G1 仍在运行，已生成 `step-256`；rank-0 checkpoint 含 13 个 tensor、989451 个参数，远端 finite 检查通过（`all_finite=true`）。`trainable_report` 确认 `world_size=5`、`decoder_lora_parameters=0`、`router_parameters=989449`。G2/G3 尚未启动；未发现 CUDA/OOM/NaN/Inf/Traceback。
+
+**健康检查 2（2026-09-22 01:06，Asia/Shanghai）**：G1 已生成 `step-512`；checkpoint 含 13 个 tensor、989451 个参数，远端 finite 检查通过。五个 rank 仍在运行，G2/G3 尚未启动，错误扫描为空。连续两次健康检查完成，监控已按长程训练切换为每 1 小时一次；阶段切换、异常和指标就绪仍立即检查。
+
+**故障与恢复（2026-09-22 02:07，Asia/Shanghai）**：主 run 在 G1 step-1024 checkpoint 已写完后失败。`train.log` 报告 `WorkNCCL(SeqNum=11266, OpType=ALLREDUCE, NumelIn=1, Timeout(ms)=600000)`，随后 `SIGABRT`；对应尾部同步是 rank-0 单独执行 64 页、4M、`max_new_tokens=1536` validation 时，其余 rank 在验证后的 `dist.barrier()` 等待超过默认 600 秒。该 `NumelIn=1` 集合与梯度 all-reduce 不同，故诊断为 rank-0 validation 超时而非 `NCCL_P2P_DISABLE=1` 修复失效。原失败产物保留，不覆盖。
+
+**恢复启动（2026-09-22 02:07，Asia/Shanghai）**：已将 DDP `init_process_group` 的 timeout 显式设为 `3600s`，launcher 增加 `--start-arm`，并以新 run ID `glmocr_decoder_mask_headonly4m_v1_retry_ddp3600` 从 G2 启动；G1 复用主 run 的四个 finite checkpoint，不重训。恢复 run 初始状态为 `running`，launcher 已报告五卡 `world_size=5` 的 G2 启动；当前等待新的 checkpoint/log 进展后进行两次恢复期健康检查，再降回每小时监控。
+
+**恢复期健康检查 1（2026-09-22 02:21，Asia/Shanghai）**：恢复 run `status/screen.json=running`，G2 训练相关进程仍在，G2 日志更新时间推进到 02:12，处于权重加载／首批 forward 阶段，尚未形成 step checkpoint。五卡显存约 `35–39 GB`，采样时部分 GPU 利用率达到 `100%`；错误扫描未发现 CUDA/OOM/NaN/Inf/Traceback。当前未把“尚无 checkpoint”判为失败，继续按 5 分钟频率等待实际 step 产物。
+
+**恢复期健康检查 2（2026-09-22 02:33，Asia/Shanghai）**：恢复 run 仍为 `running`；五个训练 rank 均在持续计算（进程状态 `Rsl`、CPU 约 `99%`），五卡 `pmon` 均有实际 GPU 工作，显存约 `29–40 GB`。G2 仍处于 4M 首步计算，尚未形成 step checkpoint 或 train summary；错误扫描为空。两次恢复期健康检查均未见异常，监控已切换为每 1 小时一次；阶段切换、checkpoint/指标就绪和故障仍立即处理。
+
+**恢复进展（2026-09-22 03:35，Asia/Shanghai）**：G2 已形成 `step-256`（02:34:43）、`step-512`（02:57:15）和 `step-768`（03:19:31）；每个目录均包含 `decoder_mask.safetensors`、`training_state.pt`、配置和 fingerprint。远端 finite 检查均通过，均为 13 个 tensor、989451 个参数；fingerprint 确认 `head_only=true`、`target_mode=token`、router LR `1e-4`。恢复 run 仍为 `running`，G3 尚未启动；step-1024 前按约定尚无 `train_log.jsonl`／validation summary，错误扫描为空。
+
+**G2 完成、G3 启动（2026-09-22 04:35，Asia/Shanghai）**：G2 已完成 step-1024；`step-256/512/768/1024` 四个 checkpoint 均 finite（13 个 tensor、989451 个参数），无 CUDA/OOM/NaN/Inf/Traceback。G2 step-1024 最后训练记录为 `loss=0.234630`、`bce=0.193758`、`dice=0.978062`、`mask_mean=0.125300`、`pooled_peak=0.972569`；step-1 对照为 `mask_mean=0.020167`、`pooled_peak=0.043633`，说明 pooled peak 已升高且 mask_mean 仅略超预设低位，未接近 0.9 退化区。64 页 validation：CER `0.4772675348`，I/D/S `5285/1364/3796`，reference characters `21885`，exact-page rate `0`，K1/K3/K5 recall `0.579793/0.659191/0.666466`。G3 已启动并形成 `step-256`，checkpoint finite（29 个 tensor、5299228 个参数）；恢复 run 仍为 `running`，等待 G3 的 512/768/1024 与 validation 指标。
+
+**G3 中段进展（2026-09-22 05:36，Asia/Shanghai）**：G3 已形成 `step-256`、`step-512`、`step-768`，对应 checkpoint 均 finite（29 个 tensor、5299228 个参数）；fingerprint 为 `head=vae`、`target_mode=token`、`head_only=true`。恢复 run 仍为 `running`，G3 尚未形成 step-1024 的 train log／validation summary，错误扫描为空。
+
+**G3 完成与波形评测启动（2026-09-22 06:37，Asia/Shanghai）**：G3 已完成 step-1024，恢复 run `status/screen.json=complete`，五卡已释放；四个 G3 checkpoint 均 finite（29 个 tensor、5299228 个参数）。G3 step-1024 最后训练记录为 `loss=0.288307`、`bce=0.210395`、`dice=0.975277`、`mask_mean=0.105160`、`pooled_peak=0.963335`、`kl_raw=0.016403`、`kl_term=0.050000`。64 页 validation：CER `0.4642449166`，I/D/S `5920/1700/2540`，reference characters `21885`，exact-page rate `0`，K1/K3/K5 recall `0.685419/0.744063/0.747816`。随后已把主 run G1 checkpoint 复制到恢复 bundle 的 `arms/G1`（原目录保留），启动 `evaluate_decoder_mask_waves.sh` 共 12 个 job，输出目录为 `eval_mask_waves_v1`，配置为 4M、`max_new_tokens=1536`、validation64，首波任务正在加载模型且无错误。
+
+**波形评测进展（2026-09-22 07:11，Asia/Shanghai）**：12 个 job 中首波 5 个已完成并生成 `summary.json`／`predictions.jsonl`：G1@256 CER `0.371990`、G2@256 `0.485767`、G3@256 `0.459630`、G1@512 `0.582317`、G2@512 `0.400183`；均为 64 页、4M、`max_new_tokens=1536`、`test_used_for_selection=false`。第二波任务已启动，当前 GPU 资源正常，未发现真实 CUDA/OOM/NaN/Inf/Traceback 错误。
+
+**波形评测完成（2026-09-22，Asia/Shanghai）**：12/12 job 均返回 `status=complete`；每行均为 64 页、reference characters `21885`、`exact_page_rate=0`、4M、`max_new_tokens=1536`、`test_used_for_selection=false`。完整关键指标如下（I/D/S 为插入/删除/替换）：
+
+| arm / step | CER | I/D/S | K1 / K3 / K5 recall | generation-limit hit | elapsed (s) | tok/s |
+| --- | ---: | --- | --- | ---: | ---: | ---: |
+| G1 / 256 | 0.371990 | 4297 / 1344 / 2500 | 0.688172 / 0.682147 / 0.708097 | 0.0625 | 793.6 | 38.14 |
+| G1 / 512 | 0.582317 | 7928 / 786 / 4030 | 0.559140 / 0.575851 / 0.614347 | 0.1406 | 887.0 | 39.18 |
+| G1 / 768 | 0.480146 | 5688 / 1156 / 3664 | 0.505376 / 0.519092 / 0.557528 | 0.1094 | 842.7 | 38.84 |
+| G1 / 1024 | 0.478821 | 5644 / 1533 / 3302 | 0.508065 / 0.514964 / 0.556818 | 0.0938 | 858.4 | 37.22 |
+| G2 / 256 | 0.485767 | 6211 / 1140 / 3280 | 0.623656 / 0.633643 / 0.660511 | 0.1094 | 1107.8 | 30.05 |
+| G2 / 512 | 0.400183 | 4740 / 1358 / 2660 | 0.650538 / 0.641899 / 0.664063 | 0.0625 | 787.2 | 38.99 |
+| G2 / 768 | 0.560612 | 7363 / 1144 / 3762 | 0.500000 / 0.510836 / 0.542614 | 0.1250 | 886.9 | 38.63 |
+| G2 / 1024 | 0.477268 | 5285 / 1364 / 3796 | 0.473118 / 0.485036 / 0.522017 | 0.0938 | 816.5 | 38.49 |
+| G3 / 256 | 0.459630 | 5183 / 1809 / 3067 | 0.591398 / 0.573787 / 0.605824 | 0.0781 | 810.7 | 37.81 |
+| G3 / 512 | 0.483345 | 5757 / 1161 / 3660 | 0.508065 / 0.507740 / 0.545455 | 0.0938 | 861.7 | 37.83 |
+| G3 / 768 | 0.537857 | 6700 / 804 / 4267 | 0.489247 / 0.518060 / 0.555398 | 0.1250 | 885.9 | 38.19 |
+| G3 / 1024 | 0.464245 | 5920 / 1700 / 2540 | 0.607527 / 0.616099 / 0.644886 | 0.0781 | 852.4 | 37.06 |
+
+**B0 启动与恢复（2026-09-22，Asia/Shanghai）**：波形评测 12/12 完成后，B0 首次尝试因手工启动遗漏系统 CUDA/CUPTI 路径失败，第二次尝试因旧 evaluator 的 `routing_mode=none` 分支默认要求 `lora.safetensors` 失败；两次产物和日志均保留。第三次以 `b0_zero_shot_v2_frozen_base` 启动，fingerprint 明确为 `routing_mode=none`、`head_only=true`、`zero_shot=true`、`training_updates=0`，不注入 LoRA、不加载 mask head；当前运行中，使用 GPU0、同一 64 页 validation、4M、`max_new_tokens=1536`，test 不读取。
+
+**B0 完成（2026-09-22 08:06，Asia/Shanghai）**：B0 `status=complete`，64 页 frozen-base zero-shot 已生成 `summary.json`／`predictions.jsonl`，GPU0 已释放。指标为 reference characters `21885`、character errors `6282`、I/D/S `2312/1630/2340`、CER `0.2870459219`、exact-page rate `0`、K1/K3/K5 recall `0.645161/0.644995/0.674716`、generation-limit hit rate `0.03125`、elapsed `641.3s`、`42.88 tok/s`、`mask_pages=0`；协议字段为 `max_pixels=4000000`、`max_new_tokens=1536`、`routing_mode=none`、`head_only=true`、`zero_shot=true`、`training_updates=0`、`lora_injected=false`、`test_used_for_selection=false`。
+
+**最终核验（2026-09-22，Asia/Shanghai）**：主失败 run 和两次失败 B0 尝试均保留；恢复训练 run `complete`；G1/G2/G3 四步 checkpoint 均 finite；波形 validation `12/12` complete；B0 summary complete；所有评测均使用同一 64 页 validation、4M 和 `max_new_tokens=1536`，未读取 test。`NCCL_P2P_DISABLE=1` 和 `rasterize_polygon` 的 `sign.sum(dim=-1).abs() == K` 契约均保留。
+
 | ID | 配置 | 数据指纹 | checkpoint 起点 | 状态 | validation | test | 备注 |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | `glmocr_mthv2_sparse24_q32_layout_boxeq820_3000_from_boxeq58_a100_260916_v1` | Q32 layout-only；`history_box_equalized_v2`（box `820`、assignment `1`、order/direction `0.5`）；seed42；五卡；3000-step continuation | MTHv2 sparse24 train/validation/test manifest | `glmocr_mthv2_sparse24_q32_layout_boxeq58_3000_a100_260916_v1/seed42/checkpoint-3000` | complete；checkpoint finite | step `3000`；IoU `0.456072`；MAE `0.029717` | step `3000`；IoU `0.446998`；MAE `0.030560`；CER `0.393093` | box 权重按训练历史调至与 assignment 同量级；作为后续敦煌／地方志 Q32 微调的共同起点；`test_used_for_selection=false` |
@@ -301,6 +365,61 @@ MTHv2 原官方 split 是随机页级划分，没有书籍/版本元数据，不
 
 该 run 证明自然循环惩罚有非零训练梯度，但没有改善自由生成，反而增加插入和触顶。由于采用 `256+768` warm-start 且接续阶段重置 optimizer/scheduler，不能把它当成与从基础权重单次连续 1024 步的严格等价对照；详细证据见 `docs/实验日志/GLMOCR/训练退化诊断/GLMOCR-B-260912-001.md`。
 
+## 2026-09-22 decoder-mask oracle 对照 + 128 步修复重训（五卡单进程，已完成）
+
+| 字段 | 口径 |
+| --- | --- |
+| screen ID | `glmocr_decoder_mask_oracle_128step_v1` |
+| 分支/commit | `glm-ocr-layout-mask-routing`；HEAD `e1667b2`；叠加未提交改动（mask-loss 增 centroid+sparsity、LR warmup/cosine、`target_mode="line"`、oracle 生成工具、五卡 launcher） |
+| 入口 | `tools/training/run_glmocr_decoder_mask_128step_oracle_a100.sh`；远端产物根 `/data3/yky/yangky_ocr_models/glm_ocr_layout_mask_routing/training_runs/glmocr_decoder_mask_oracle_128step_v1` |
+| 数据协议 | 128 训练页 / 64 validation 页，seed 42；`manifest.char.jsonl`；隔离单元与近重复检查沿用上一轮 128 页筛选代理；`test` 未读取 |
+| 组别 | GPU0=G1(window)、GPU1=G2(token)、GPU2=G3(vae) 三训练臂；GPU3=oracle line、GPU4=oracle window(3-5) 两上限；每臂单进程（非 DDP）、per-device batch 1、无梯度累积；effective batch 1 |
+| 训练配置 | max-steps `128`、head-only、routing learned、split-layer `8`、dim `256`、bias-max `2.0`、bias-warmup `100`；FP32 adapter；base LR `1e-6`、router LR `1e-4`、router warmup `32` 步、cosine 退火到 `0.1×`（`router-lr-min-ratio 0.1`）；checkpoint/validation every `64`、validation-steps `128`；可训练参数仅 mask head（G1/G2 MLP ≈989K、G3 VAE ≈5.3M） |
+| 损失改动（本轮唯一变量） | 相对上一轮 head-only 屏（密集列级失败），唯一变量 = 损失函数与 LR schedule：`mask_and_dice_loss` 增 `centroid_weight 1.0`（质心定位，零重叠可导）与 `sparsity_weight 1.0`（L1 质量，反密集），保留 balanced BCE + Dice(1.0)；mask-loss-weight `0.2`、stop-loss-weight `0.05`；gate 初值未覆写（默认） |
+| oracle | 自由生成期按位置注入 GT mask（line / 3-5 window），`bias-max 2.0`；`reads_ground_truth=true`、`usable_for_selection=false`、`test_used_for_selection=false` |
+| 状态 | **已完成**。三训练臂 step-128 validation CER：G1(window)=`0.4445`、G2(token)=`0.3867`、G3(vae)=`0.2963`，**均劣于 B0 `0.287`**；oracle line=`0.356`、window=`0.297`，也劣于 B0。失败模式为插入/过度生成（I/D/S 全线偏高，G1 I=5251、oracle line I=3623）。**mask 仍未定位**：mask_mean `0.20–0.24`（目标仅 ~0.005）、dice `~0.99`、centroid `~0.10`、G3 `kl_active_dims=0.0`——centroid+sparsity 损失未能把密集 mask 压下去。结论见下方 bias 扫描 |
+| protocol 字段 | `test_manifest_read=false`；`test_used_for_selection=false`（机制筛选/诊断，不进入 selection） |
+
+## 2026-09-22 decoder-mask bias 强度扫描（window oracle 五档，运行中）
+
+| 字段 | 口径 |
+| --- | --- |
+| screen ID | `glmocr_decoder_mask_bias_sweep_v1` |
+| 分支/commit | `glm-ocr-layout-mask-routing`；HEAD `e1667b2`；叠加未提交改动（新增 `tools/training/run_glmocr_decoder_mask_bias_sweep_a100.sh`） |
+| 入口 | `tools/training/run_glmocr_decoder_mask_bias_sweep_a100.sh`；远端产物根 `/data3/yky/yangky_ocr_models/glm_ocr_layout_mask_routing/training_runs/glmocr_decoder_mask_bias_sweep_v1` |
+| 动机 | beta=2.0 的 window oracle（0.297）与 line oracle（0.356）均劣于 B0 `0.287`，失败模式为插入/过度生成；判定「加法偏置」在 2.0 下无法把 routing 信息转正，需扫 `bias_max` 找强度拐点（是否存在任一强度使 GT 注入持平或优于 B0） |
+| 数据协议 | 复用上一屏同一 64 页 validation manifest（`split/validation64_screen_seed42.jsonl`）与 128 页 train manifest（仅 K1/K3/K5 指标用）；隔离单元与近重复检查沿用；`test` 不读取 |
+| 组别 | 五档 `bias_max` = `0.1 / 0.25 / 0.5 / 1.0 / 1.5`，各占一张卡（GPU0–4），`window(3-5)` 模式 GT 注入；每臂单进程（非 DDP）、per-device batch 1 |
+| 唯一变量 | `--bias-max`；其余与上一屏 oracle 完全相同（同 model `ca5d8b3e…`、同 manifest、同 `max_pixels=4M`、同 `max-new-tokens=1536`、同 `processor-mode slow`） |
+| oracle 语义 | `reads_ground_truth=true`、`usable_for_selection=false`、`test_used_for_selection=false`；纯诊断，不进入 checkpoint selection |
+| 状态 | **已完成**。五档 window oracle CER：β=0.1 `0.287`、β=0.25 `0.2852`、β=0.5 `0.2883`、β=1.0 `0.2865`、β=1.5 `0.2924`（对照 B0 `0.287`、β=2.0 `0.297`）；**整条曲线平、无剂量效应**，最好点 β=0.25 仅比 B0 好 `0.0018`（64 页噪声量级）。GT mask 注入在该机制下中性——与 attention-routing 的 −20% 陡崖矛盾，混淆变量待隔离（模型 trained vs zero-shot / 框大小单字 vs 窗行 / 指针 synced vs positional / 打分 hard vs soft 峰值归一） |
+| protocol 字段 | `test_manifest_read=false`；`test_used_for_selection=false` |
+
+## 2026-09-22 decoder-mask hardsync window beta=1（149 页五卡快速分片，已完成）
+
+| 字段 | 口径 |
+| --- | --- |
+| run ID | `glmocr_decoder_mask_window_beta1_5gpu_quick_20260922_045950` |
+| 分支/commit | `glm-ocr-layout-mask-routing`；HEAD `e1667b2`；叠加未提交改动 |
+| 远端产物根 | `/data3/yky/yangky_ocr_models/glm_ocr_layout_mask_routing/training_runs/glmocr_decoder_mask_window_beta1_5gpu_quick_20260922_045950` |
+| 模型 / checkpoint | base revision `ca5d8b3e287e52589e37c28385d9655ee4372f9d`；trained layout+decoder checkpoint `glmocr_mthv2_sparse24_q32_layout_boxeq820_3000_from_boxeq58_a100_260916_v1/seed42/checkpoint-3000` |
+| 数据协议 | 同一 149 页 validation `manifest.char.jsonl`，SHA256 `36ec845875e1ea18a48d4a523b6c5a3f007b46e2a07de0cafd2c26139929a348`；train manifest 仅用于字符统计；`test` 未读取 |
+| 固定推理协议 | window `3–5` 字；`bias_max=1.0`；processor `fast`；`max_pixels=4000000`；`max_new_tokens=1536`；math-SDPA 确定性执行；hard mask；synced pointer；`split_layer=0`（全部层注入）；seed `42` |
+| 五卡语义 | GPU `0,1,2,3,4` 各运行一个单卡 worker；149 页按原 manifest round-robin 分为 `30/30/30/30/29` 页五个 shard，按 I/D/S 与 reference characters 聚合；**不是 DDP，也不是五次重复 run** |
+| 状态 | **已完成**。五个 shard 均 `status=complete`，无 CUDA/OOM/NaN/Inf/Traceback；五卡已释放 |
+| 汇总结果 | reference characters `41654`；character errors `5704`；CER `0.1369376290`；I/D/S `948/769/3987`；generation tokens `50321`；generation-limit hits `0/149`（`0.0`） |
+| oracle 语义 | 五个 summary 均为 `reads_ground_truth=true`、`usable_for_selection=false`、`test_used_for_selection=false`；纯机制诊断，不进入 selection |
+| 结论 | 相对同 checkpoint、同 149 页协议的 B0 `CER=0.1699236568`，window beta=1 降至 `0.1369376290`，绝对下降 `0.0329860278`、相对约 `19.4%`。这说明 trained checkpoint 下 3–5 字 window 的 GT routing oracle 已出现明显收益；但它仍是 GT-mask 上限，不能直接证明 decoder 预测 mask 已经有效，也不能与 attention-tracking 的单字符框结果作严格同口径归因。 |
+
+| shard | pages | CER | I/D/S | generation tokens | limit hits |
+| ---: | ---: | ---: | --- | ---: | ---: |
+| 0 | 30 | `0.1741883491` | `385/354/774` | `10514` | `0` |
+| 1 | 30 | `0.1437110834` | `103/132/919` | `9575` | `0` |
+| 2 | 30 | `0.1197111587` | `145/102/814` | `10853` | `0` |
+| 3 | 30 | `0.1101161665` | `127/100/683` | `9801` | `0` |
+| 4 | 29 | `0.1364742030` | `188/81/797` | `9578` | `0` |
+
+
 ## 2026-09-22 line100-window GT acceptance
 
 `glmocr_line100_window_gt_accept_20260922_145532`：已登记待启动，a100-yky GPU0，完整 sparse24 validation149，GT 3–5 字 hard window + synced + beta1，移除小版面分支；固定 checkpoint-3000，不训练、不读取 test、不做 selection。验收 CER <0.13，成绩待完成；详细配置、源码指纹与产物位置见 [实验日志](实验日志/GLMOCR/架构收益对照/GLMOCR-line100-window-gt-acceptance-20260922.md)。
@@ -308,3 +427,7 @@ MTHv2 原官方 split 是随机页级划分，没有书籍/版本元数据，不
 **启动确认**：`glmocr_line100_window_gt_accept_20260922_145532` preflight通过，GPU0 admission=0%，tmux存在，status=running；Torch2.8.0+cu128/Transformers5.3.0。heartbeat `line100-window-gt` 初始5分钟，两次健康后30分钟。完整CER待完成。
 
 **五卡替换**：用户要求中止旧单卡run（15页保留，TERM143，非完整验收），新run `glmocr_line100_window_gt_accept_5gpu_20260922_150507` 待启动；GPU0–4，30/30/30/30/29页，原数据/模型/生成协议不变，单卡batch1，非DDP、不训练、不读test；合并完整149页后按micro CER<0.13判定。详情追加在同一实验日志。
+
+**五卡提交确认**：执行commit `21afa4a` 已推送远端分支；独立git archive SHA256 `819450ecebdeae89a51a4e3784f457784ca037727d7152bf2c3cabfe3b4c4469`，新run已派发，同一heartbeat已切换。
+
+**五卡验收完成**：`glmocr_line100_window_gt_accept_5gpu_20260922_150507` complete；五片 `30/30/30/30/29` 合并完整149页，无重无漏；manifest SHA256=`36ec845875e1ea18a48d4a523b6c5a3f007b46e2a07de0cafd2c26139929a348`。GT 3–5字 hard window、synced、beta1、全层、prefill不注入、4M/1536/fast/math-SDPA/BF16、小版面分支移除；固定checkpoint-3000，不训练、不选点、不读test。完整 micro CER=`0.13693762903922793`，I/D/S=`948/769/3987`，reference characters=`41654`，generation tokens=`50321`，EOS=`149/149`，触顶=`0/149`，循环页=`0/149`、循环率=`0.0`；JSON 结果无非有限数值，日志无 CUDA/OOM/NaN/Inf/Traceback/异常退出。`acceptance.eligible=true`、`passed=false`（严格 CER<0.13 未通过）。产物已下载至 `D:/yangky/glm-ocr-assets/line100-window-acceptance/glmocr_line100_window_gt_accept_5gpu_20260922_150507/`；详情见实验日志。

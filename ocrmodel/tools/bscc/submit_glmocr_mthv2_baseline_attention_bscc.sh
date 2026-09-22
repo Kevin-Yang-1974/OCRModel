@@ -6,10 +6,15 @@ workspace="${BSCC_OCR_WORKSPACE:-${HOME}/yangky_ocr_models_bscc_proto}"
 experiment_root="${BSCC_GLM_EXPERIMENT_ROOT:-${workspace}/glm_ocr_layout_mask_routing}"
 code_root="${BSCC_GLM_CODE_ROOT:-${experiment_root}/code/ocrmodel}"
 run_id="${GLMOCR_BSCC_RUN_ID:-glmocr_mthv2_baseline_attention_64val_bscc_260921_v1}"
+resume_existing="${GLMOCR_BSCC_RESUME_EXISTING:-0}"
 script="${code_root}/tools/bscc/run_glmocr_mthv2_baseline_attention_4gpu.sbatch"
 
 [[ "${run_id}" =~ ^[A-Za-z0-9_.-]+$ ]] || {
     printf '{"event":"glmocr_bscc_attention_submit_failed","error":"invalid_run_id"}\n' >&2
+    exit 64
+}
+[[ "${resume_existing}" == "0" || "${resume_existing}" == "1" ]] || {
+    printf '{"event":"glmocr_bscc_attention_submit_failed","error":"invalid_resume_existing"}\n' >&2
     exit 64
 }
 [[ -f "${script}" ]] || {
@@ -17,6 +22,6 @@ script="${code_root}/tools/bscc/run_glmocr_mthv2_baseline_attention_4gpu.sbatch"
     exit 66
 }
 mkdir -p "${workspace}/runs"
-job_id="$(sbatch --parsable --job-name=glmattn64 --export="ALL,GLMOCR_BSCC_RUN_ID=${run_id},GLMOCR_SOURCE_BRANCH=glm-ocr-layout-mask-routing" "${script}")"
-printf '{"event":"glmocr_bscc_attention_submitted","job_id":"%s","run_id":"%s","pages":64,"world_size":4,"mode":"content_only","test_manifest_read":false,"script":"%s"}\n' \
-    "${job_id}" "${run_id}" "${script}"
+job_id="$(sbatch --parsable --job-name=glmattn64 --export="ALL,GLMOCR_BSCC_RUN_ID=${run_id},GLMOCR_SOURCE_BRANCH=glm-ocr-layout-mask-routing,GLMOCR_BSCC_RESUME_EXISTING=${resume_existing}" "${script}")"
+printf '{"event":"glmocr_bscc_attention_submitted","job_id":"%s","run_id":"%s","resume_existing":%s,"pages":64,"world_size":4,"mode":"content_only","test_manifest_read":false,"script":"%s"}\n' \
+    "${job_id}" "${run_id}" "${resume_existing}" "${script}"

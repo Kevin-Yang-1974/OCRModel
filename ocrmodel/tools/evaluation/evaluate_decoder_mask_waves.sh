@@ -34,6 +34,7 @@ while [[ $# -gt 0 ]]; do
         --gpu-ids) gpu_ids="$2"; shift 2 ;;
         --output-root) output_root="$2"; shift 2 ;;
         --max-new-tokens) max_new_tokens="$2"; shift 2 ;;
+        --max-pixels) max_pixels="$2"; shift 2 ;;
         *) printf '{"event":"eval_failed","error":"unknown_argument","argument":"%s"}\n' "$1" >&2; exit 64 ;;
     esac
 done

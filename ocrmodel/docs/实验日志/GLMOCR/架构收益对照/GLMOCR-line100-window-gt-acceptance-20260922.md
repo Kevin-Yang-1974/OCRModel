@@ -52,3 +52,17 @@
 数据、checkpoint、mask/window、synced指针、seed42、4M、1536、BF16/math-SDPA与前述协议一致；唯一执行变更为GPU0–4五个独立worker，按manifest轮转分片30/30/30/30/29页，每卡batch1、非DDP、不训练、无梯度累积/学习率/优化器。总页数和每页生成预算不变，旧15页不复用。test_manifest_read=false，test_used_for_selection=false。
 
 入口仍run_window_mask_acceptance_a100.sh，worker结果在shards/0..4与对应.log；merge_window_mask_shards.py校验覆盖和协议并按完整I/D/S聚合，最终写results/summary.json。validation/locked-test/EOS/触顶/循环/finite/错误检查：完整成绩待运行，locked test未读取。所有旧、新产物保留。
+
+
+**五卡源码提交与启动**：执行commit `21afa4ac8afa4537cc22bdc7e33bf590ccded2a9`，已push到ocr-shared/glm-ocr-layout-mask-routing；使用git archive导出纯提交代码，未混入剩余工作区修改。压缩包SHA256 `819450ecebdeae89a51a4e3784f457784ca037727d7152bf2c3cabfe3b4c4469` 已在A100核验。五卡tmux已派发，沿用同一heartbeat `line100-window-gt` 监控新run，初始5分钟、两次健康后30分钟。待完成后追加完整结果。
+
+## 最终结果：五卡 GT-window 验收完成
+
+- 远端 run：`glmocr_line100_window_gt_accept_5gpu_20260922_150507`；commit `21afa4ac8afa4537cc22bdc7e33bf590ccded2a9`；tmux 已正常退出，五个 worker 均以 complete 结束。
+- 五片页数：`30/30/30/30/29`，合计 `149`；汇总脚本确认页 ID 无重复、无遗漏且恢复为 manifest 顺序。五片 manifest SHA256 均为 `36ec845875e1ea18a48d4a523b6c5a3f007b46e2a07de0cafd2c26139929a348`。
+- 配置核验：GT 3–5 字 hard window、synced 指针、bias `1.0`、所有 decoder 层、prefill 不注入、fast processor、`max_pixels=4000000`、`max_new_tokens=1536`、BF16、math-SDPA、小版面分支移除；test 未读取。
+- 完整 micro 指标：149 页、reference characters `41654`、编辑错误 `5704`，I/D/S=`948/769/3987`，CER=`0.13693762903922793`，exact-page rate=`0`，generation tokens=`50321`。
+- 生成终止：EOS `149/149`，触顶 `0/149`；按 `repetition_diagnostics`（recent window 96、cycle length 8–32、3 repeats）检测循环页 `0/149`、循环率 `0.0`、最大重复次数 `1`。
+- 结果 JSON 共 11 个（总汇总、5 个 shard summary、5 个 shard protocol）均无非有限数值；日志中没有独立词边界意义上的 NaN/Inf/CUDA OOM/Traceback/Exception/failed/ERROR。
+- 验收：`acceptance.eligible=true`，阈值严格 `<0.13`，`acceptance.passed=false`。相对历史整行 `line100` 的 `0.124694`，当前 3–5 字窗口 GT 结果高 `0.0122436290`；因此本次验收未通过。该结果是完整协议结果，不读取 test、不选点、不调参。
+- 本地归档：`D:/yangky/glm-ocr-assets/line100-window-acceptance/glmocr_line100_window_gt_accept_5gpu_20260922_150507/`，包含 `results/summary.json`、`results/validation_predictions.jsonl` 及每片 `summary.json`/`protocol.json`。
