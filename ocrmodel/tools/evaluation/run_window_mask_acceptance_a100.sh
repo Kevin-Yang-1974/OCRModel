@@ -15,15 +15,31 @@ set -Eeuo pipefail
 run_root="$1"
 mode="${2:-gt}"
 control_flag=0
-[[ "${3:-}" != "--legacy-layout-control" ]] || control_flag=1
+target_mode="window"
+shift 2 || true
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --legacy-layout-control) control_flag=1; shift ;;
+        --target-mode) target_mode="$2"; shift 2 ;;
+        *) printf '{"event":"window_acceptance_failed","error":"unknown_argument","argument":"%s"}\n' "$1" >&2; exit 64 ;;
+    esac
+done
 case "${mode}" in
     gt|legacy-line) ;;
     *) printf '{"event":"window_acceptance_failed","error":"invalid_mode","value":"%s"}\n' "${mode}" >&2; exit 64 ;;
 esac
+case "${target_mode}" in
+    window|anchored|line|token) ;;
+    *) printf '{"event":"window_acceptance_failed","error":"invalid_target_mode","value":"%s"}\n' "${target_mode}" >&2; exit 64 ;;
+esac
 # Acceptance is defined for exactly one configuration.  Anything else is a
 # diagnostic and must not write results/summary.json that looks like a verdict.
+# The spatial target is part of that configuration: mode=gt with an anchored or
+# line target is still a diagnostic, and must not inherit the acceptance result.
 acceptance_eligible=0
-if [[ "${mode}" == "gt" && "${control_flag}" == "0" ]]; then acceptance_eligible=1; fi
+if [[ "${mode}" == "gt" && "${control_flag}" == "0" && "${target_mode}" == "window" ]]; then
+    acceptance_eligible=1
+fi
 code_root="${run_root}/code/ocrmodel"
 env_dir=/data3/yky/yangky_ocr_models/glm_ocr_layout_ot/envs/glmocr_a100_py311_cu128
 nvidia_env=/data3/yky/yangky_ocr_models/envs/anandasky
@@ -72,8 +88,8 @@ for util in "${values[@]}"; do
     (( util < 50 ))
 done
 printf '%s\n' "${utils}" > "${run_root}/status/admission_utilization.txt"
-printf '{"status":"running","phase":"validation_gt_window_5shards","mode":"%s","legacy_layout_control":%s,"acceptance_eligible":%s,"physical_gpus":[0,1,2,3,4],"test_manifest_read":false}\n' \
-    "${mode}" "${control_flag}" "${acceptance_eligible}" > "${run_root}/status/run.json"
+printf '{"status":"running","phase":"validation_gt_window_5shards","mode":"%s","target_mode":"%s","legacy_layout_control":%s,"acceptance_eligible":%s,"physical_gpus":[0,1,2,3,4],"test_manifest_read":false}\n' \
+    "${mode}" "${target_mode}" "${control_flag}" "${acceptance_eligible}" > "${run_root}/status/run.json"
 cd "${code_root}"
 mkdir -p "${run_root}/shards"
 control_args=()
@@ -83,7 +99,7 @@ for gpu in 0 1 2 3 4; do
     CUDA_VISIBLE_DEVICES="${gpu}" "${python}" tools/evaluation/evaluate_window_mask_routing.py \
         --model-path "${model}" --backbone-checkpoint "${checkpoint}" \
         --validation-manifest "${manifest}" --output-dir "${run_root}/shards/${gpu}" \
-        --mode "${mode}" "${control_args[@]}" \
+        --mode "${mode}" "${control_args[@]}" --target-mode "${target_mode}" \
         --device cuda:0 --shard-count 5 --shard-index "${gpu}" \
         > "${run_root}/shards/${gpu}.log" 2>&1 &
     pids+=("$!")
@@ -108,8 +124,8 @@ if eligible:
     status = {'status': 'complete', 'mode': mode, 'acceptance': summary['acceptance'],
               'validation': summary['validation'], 'test_manifest_read': False}
 else:
-    status = {'status': 'complete', 'mode': mode, 'acceptance': None,
-              'acceptance_eligible': False, 'validation': merged['validation'],
-              'test_manifest_read': False}
+    status = {'status': 'complete', 'mode': mode, 'target_mode': merged['target_mode'],
+              'acceptance': None, 'acceptance_eligible': False,
+              'validation': merged['validation'], 'test_manifest_read': False}
 (root / 'status' / 'run.json').write_text(json.dumps(status))
 PY

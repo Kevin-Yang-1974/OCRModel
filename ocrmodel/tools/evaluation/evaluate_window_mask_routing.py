@@ -71,7 +71,7 @@ def eos_ids(model, processor):
     return sorted(ids)
 
 
-def targets_for(processor, record, device, eos, merge):
+def targets_for(processor, record, device, eos, merge, target_mode="window"):
     inputs = prepare_training_inputs(processor, record, device, set(eos))
     length = int((inputs["labels"] == -100).int().cumprod(1).sum())
     target_ids = inputs["input_ids"][0, length:]
@@ -82,7 +82,7 @@ def targets_for(processor, record, device, eos, merge):
         target_ids,
         eos,
         xywh,
-        target_mode="window",
+        target_mode=target_mode,
         window_min=3,
         window_max=5,
         line_source="annotation",
@@ -91,9 +91,10 @@ def targets_for(processor, record, device, eos, merge):
     return targets, target_ids
 
 
-def acceptance(metrics, manifest_hash, mode, *, limited=False, legacy_layout=False):
+def acceptance(metrics, manifest_hash, mode, *, limited=False, legacy_layout=False, target_mode="window"):
     eligible = (
         mode == "gt"
+        and target_mode == "window"
         and not limited
         and not legacy_layout
         and metrics["pages"] == PROFILE.validation_pages
@@ -124,6 +125,13 @@ def parse_args(argv=None):
         "--legacy-layout-control",
         action="store_true",
         help="GT diagnostic only: keep old geometry branch to isolate its removal",
+    )
+    parser.add_argument(
+        "--target-mode",
+        choices=("window", "anchored", "line", "token"),
+        default="window",
+        help="GT spatial target shape; only 'window' is acceptance-eligible. "
+        "'anchored' is the in-line window union the rest of its line",
     )
     parser.add_argument("--pages", type=int, default=0, help="smoke subset, never acceptance")
     parser.add_argument("--shard-count", type=int, default=1)
@@ -158,6 +166,7 @@ def main():
     metadata = {
         "profile": asdict(PROFILE),
         "mode": args.mode,
+        "target_mode": args.target_mode,
         "model_path": str(args.model_path),
         "backbone_checkpoint": str(args.backbone_checkpoint),
         "backbone_lora_sha256": sha256(args.backbone_checkpoint / "decoder_lora.safetensors"),
@@ -249,6 +258,7 @@ def main():
                     torch.device(args.device),
                     eos,
                     fusion.runtime.spatial_merge_size,
+                    args.target_mode,
                 )
                 fusion.set_page(
                     inputs, record["page_id"], gt_targets=targets, reference=record["page_text"]
@@ -297,6 +307,7 @@ def main():
             args.mode,
             limited=bool(args.pages) or args.shard_count > 1,
             legacy_layout=args.legacy_layout_control,
+            target_mode=args.target_mode,
         ),
     }
     (args.output_dir / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")

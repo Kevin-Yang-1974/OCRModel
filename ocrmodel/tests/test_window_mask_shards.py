@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 
 
-def prepare(root, monkeypatch, mode="gt"):
+def prepare(root, monkeypatch, mode="gt", target_mode="window"):
     monkeypatch.syspath_prepend(str(Path(__file__).parents[1] / "tools/evaluation"))
     evaluate = importlib.import_module("evaluate_window_mask_routing")
     merge = importlib.import_module("merge_window_mask_shards")
@@ -21,6 +21,7 @@ def prepare(root, monkeypatch, mode="gt"):
             "status": "complete",
             "profile": asdict(evaluate.PROFILE),
             "mode": mode,
+            "target_mode": target_mode,
             "model_path": "model",
             "backbone_checkpoint": "checkpoint",
             "backbone_lora_sha256": "weights",
@@ -99,3 +100,23 @@ def test_merge_rejects_incomplete_or_mixed_results(tmp_path, monkeypatch, fault)
         path.write_text("\n".join(rows))
     with pytest.raises(ValueError):
         merge.merge_shards(tmp_path)
+
+
+def test_acceptance_is_not_inherited_by_a_non_window_target(tmp_path, monkeypatch):
+    """mode=gt with an anchored target is a diagnostic, not the acceptance run.
+
+    The acceptance criterion was fixed for the 3-5 character window.  A different
+    spatial target measured under the same mode must not come back as a verdict,
+    or a stronger target could be reported as the recorded configuration passing.
+    """
+
+    merge, _ = prepare(tmp_path, monkeypatch, mode="gt", target_mode="anchored")
+    summary, _ = merge.merge_shards(tmp_path)
+    assert summary["acceptance"]["eligible"] is False
+    assert summary["acceptance"]["passed"] is None
+    # The window target under the same mode still scores.
+    other = tmp_path / "window"
+    other.mkdir()
+    merge2, _ = prepare(other, monkeypatch, mode="gt", target_mode="window")
+    summary2, _ = merge2.merge_shards(other)
+    assert summary2["acceptance"]["eligible"] is True

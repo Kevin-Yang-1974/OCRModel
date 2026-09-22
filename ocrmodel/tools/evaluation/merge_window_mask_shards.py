@@ -16,6 +16,7 @@ def merge_shards(root, count=5, expected_mode=None):
     keys = (
         "profile",
         "mode",
+        "target_mode",
         "model_path",
         "backbone_checkpoint",
         "backbone_lora_sha256",
@@ -75,6 +76,7 @@ def merge_shards(root, count=5, expected_mode=None):
             base["mode"],
             limited=base["limited"],
             legacy_layout=base["layout_branch_present"],
+            target_mode=base["target_mode"],
         ),
     )
     if base["mode"] == "gt" and not base["limited"] and len(rows) != PROFILE.validation_pages:
@@ -101,7 +103,14 @@ def main():
     # Success signal for the launcher: summary.json cannot be written twice, so a
     # diagnostic run that must not expose a summary still needs a merge artifact.
     (out / "merged.json").write_text(
-        json.dumps({"validation": summary["validation"], "mode": summary["mode"]}, indent=2),
+        json.dumps(
+            {
+                "validation": summary["validation"],
+                "mode": summary["mode"],
+                "target_mode": summary["target_mode"],
+            },
+            indent=2,
+        ),
         encoding="utf-8",
     )
     print(json.dumps(summary), flush=True)
