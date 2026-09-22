@@ -386,13 +386,14 @@ def build_mask_targets(
     # geometric rule would merge columns on a vertical page, so it is only a
     # reported fallback, never a silent substitute.
     line_ids, annotated = char_lines(record)
-    line_source = line_source if target_mode in ("window", "line") else "token"
-    if target_mode in ("window", "line") and line_source == "annotation" and not annotated:
+    line_modes = ("window", "line", "anchored")
+    line_source = line_source if target_mode in line_modes else "token"
+    if target_mode in line_modes and line_source == "annotation" and not annotated:
         raise ValueError(
             f"target_mode='{target_mode}' with line_source='annotation' needs a 'line_index' in the "
             "manifest; regenerate the char manifest or use line_source='auto'"
         )
-    use_lines = target_mode in ("window", "line") and annotated
+    use_lines = target_mode in line_modes and annotated
     line_members: dict[int, list[int]] = {}
     if use_lines:
         for char_index, line_id in enumerate(line_ids):
@@ -401,7 +402,7 @@ def build_mask_targets(
             line_members.setdefault(int(line_id), []).append(char_index)
     window_report: dict[str, Any] = {
         "mode": target_mode,
-        "line_source": "annotation" if use_lines else ("geometry_unavailable" if target_mode in ("window", "line") else "token"),
+        "line_source": "annotation" if use_lines else ("geometry_unavailable" if target_mode in line_modes else "token"),
         "lines": len(line_members),
         "singleton_lines": sum(1 for members in line_members.values() if len(members) == 1),
         "max_line_length": max((len(m) for m in line_members.values()), default=0),
@@ -445,6 +446,26 @@ def build_mask_targets(
                     # Line-level target: the full hull of the token's own text line,
                     # so every token on a line attends to the whole line's region.
                     window_boxes = [boxes[k] for k in members]
+                elif target_mode == "anchored":
+                    # The in-line window UNION the rest of the current line.  The window
+                    # gives a sharp "which characters" cue; the line remainder restores
+                    # the sustained line-level context that the plain window loses --
+                    # measured at 8.4 hit tokens per step against the whole line's 77.6,
+                    # at the same B.  Half of the line is unaffected by ``window_max``,
+                    # so this sits on the coverage axis rather than the window-size one.
+                    start = next((k for k, char_index in enumerate(members) if char_index >= span[0]), None)
+                    if start is not None:
+                        want = max(window_min, min(window_max, span[1] - span[0]))
+                        if span[1] - span[0] > window_max:
+                            window_report["span_over_window"] += 1
+                        end = min(len(members), start + want)
+                        if end - start < window_min:  # line tail: top up to the left
+                            start = max(0, end - window_min)
+                            window_report["short_windows_at_line_end"] += 1
+                        if end > start:
+                            window_boxes = [boxes[members[k]] for k in range(start, end)]
+                            # Line remainder: from the window's end to the line's end.
+                            window_boxes += [boxes[members[k]] for k in range(end, len(members))]
                 else:
                     start = next((k for k, char_index in enumerate(members) if char_index >= span[0]), None)
                     if start is not None:
@@ -475,7 +496,7 @@ def build_mask_targets(
             )
             mask[0, index] = torch.maximum(mask[0, index], polygon_mask)
         else:
-            if target_mode == "window":
+            if target_mode in ("window", "anchored"):
                 window_report["window_fallbacks"] += 1
             for box in boxes_present:
                 box_mask = (

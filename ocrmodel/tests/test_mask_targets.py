@@ -147,3 +147,106 @@ def test_one_token_can_cover_several_characters_union():
     }
     targets = build_mask_targets(tokenizer, record, [10], {13}, _xywh())
     assert targets.mask[0, 0].tolist() == [1.0, 1.0, 1.0, 1.0]
+
+
+def _wide_grid(cells: int):
+    """A single-row grid of ``cells`` equal cells, so coverage is countable."""
+
+    width = 1.0 / cells
+    return torch.tensor(
+        [
+            [(i + 0.5) * width, 0.5, width, 1.0]
+            for i in range(cells)
+        ],
+        dtype=torch.float32,
+    ).unsqueeze(0)
+
+
+def _line_record(text: str, boxes, line_index: list[int]):
+    return {
+        "page_id": "p0",
+        "page_text": text,
+        "characters": [
+            {"bbox": list(box), "alignment_status": "exact", "line_index": line}
+            for box, line in zip(boxes, line_index)
+        ],
+    }
+
+
+def _targets_for(mode: str, text: str, boxes, line_index, ids, cells=10):
+    # Token ids start at 20: EOS is 13 below, and an id collision there would
+    # silently turn one of the fixture's characters into a stop token.
+    tokenizer = _Tokenizer({index: char for index, char in enumerate(ids, start=20)})
+    record = _line_record(text, boxes, line_index)
+    return build_mask_targets(
+        tokenizer,
+        record,
+        list(range(20, 20 + len(ids))),
+        {13},
+        _wide_grid(cells),
+        target_mode=mode,
+        window_min=3,
+        window_max=5,
+        line_source="annotation",
+        raster_mode="hard",
+    )
+
+
+def test_anchored_target_is_the_window_union_the_line_remainder():
+    """`anchored` adds the rest of the line to the window.
+
+    A single-character token has ``span`` length 1, so its window is
+    ``max(window_min, min(window_max, 1)) == 3`` characters wide.  `anchored`
+    keeps that window and adds the characters from the window's end to the end
+    of the line; `line` covers the whole line.  The three shapes therefore come
+    out strictly ordered on an eight-character line.
+    """
+
+    text = "abcdefgh"
+    boxes = [[i / 10, 0.0, (i + 1) / 10, 1.0] for i in range(8)]
+    lines = [0] * 8
+    window = _targets_for("window", text, boxes, lines, list(text))
+    anchored = _targets_for("anchored", text, boxes, lines, list(text))
+    whole = _targets_for("line", text, boxes, lines, list(text))
+
+    def covered(targets, token: int) -> int:
+        return int((targets.mask[0, token] > 0).sum())
+
+    # Line start: window is characters 0..2, the remainder 3..7 adds five cells.
+    assert covered(window, 0) == 3
+    assert covered(anchored, 0) == 8
+    assert covered(whole, 0) == 8
+    # Mid-line the remainder is shorter, so the same ordering holds with a gap.
+    assert covered(window, 3) == 3
+    assert covered(anchored, 3) == 5  # window 3..5, remainder 6..7
+    assert covered(whole, 3) == 8
+    # At the line tail the remainder is empty, so anchored collapses to window.
+    assert covered(anchored, 7) == covered(window, 7) == 3
+    # The three shapes are ordered on every token.
+    for token in range(8):
+        assert covered(window, token) <= covered(anchored, token) <= covered(whole, token)
+
+
+def test_anchored_is_a_superset_of_window_on_every_token():
+    """The anchored raster must contain the window raster cell for cell."""
+
+    text = "abcdefghij"
+    boxes = [[i / 10, 0.0, (i + 1) / 10, 1.0] for i in range(10)]
+    window = _targets_for("window", text, boxes, [0] * 10, list(text), cells=10)
+    anchored = _targets_for("anchored", text, boxes, [0] * 10, list(text), cells=10)
+    assert bool(((anchored.mask >= window.mask).all()))
+    assert not bool((anchored.mask == window.mask).all())
+
+
+def test_existing_modes_are_unchanged_by_the_anchored_addition():
+    """`window` and `line` must keep their recorded shapes exactly."""
+
+    text = "abcdefgh"
+    boxes = [[i / 10, 0.0, (i + 1) / 10, 1.0] for i in range(8)]
+    window = _targets_for("window", text, boxes, [0] * 8, list(text))
+    whole = _targets_for("line", text, boxes, [0] * 8, list(text))
+    assert int((window.mask[0, 0] > 0).sum()) == 3
+    assert int((whole.mask[0, 0] > 0).sum()) == 8
+    # Two lines on one page: the line mode must never reach the other line.
+    split = _targets_for("line", "abcdefgh", boxes, [0, 0, 0, 0, 1, 1, 1, 1], list(text))
+    assert int((split.mask[0, 0] > 0).sum()) == 4
