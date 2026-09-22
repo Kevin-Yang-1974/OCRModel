@@ -434,7 +434,7 @@ MTHv2 原官方 split 是随机页级划分，没有书籍/版本元数据，不
 
 **生成上限核对（2026-09-22，补登）**：验收 run 的 `results/summary.json` 与五片 `protocol.json` 均记录 `max_new_tokens=1536`，`validation.generation_limit_hits=0`，因此 `0.13693763` 不是生成预算截断的产物。历史整行 `line100`（`0.124694`）走 `tools/training/run_glmocr_layout_oracle_line_eval_a100.sh`，其 `max_eval_new_tokens` 同为 `1536`、触顶 `0`、分辨率同为 4M。两轮生成预算同口径，`0.13693763` 与 `0.124694` 的差可直接比较。
 
-## 2026-09-22 line100-window 失败归因诊断（两臂，五卡并行，运行中）
+## 2026-09-22 line100-window 失败归因诊断（两臂，五卡并行，已完成）
 
 验收未过线时，`LINE100_WINDOW_MASK_ROUTING.md` 规定先拆开「移除小版面分支」与「整行换 3–5 字窗口」两项同时变化，不得直接调 bias、指针、分辨率或评价子集。
 
@@ -453,9 +453,15 @@ MTHv2 原官方 split 是随机页级划分，没有书籍/版本元数据，不
 | 唯一变量 | `legacy-line`：保留原 geometry 小分支、GT 整行框（复核 `0.124694` 与装置可比性）；`gt + --legacy-layout-control`：新路径但把小分支放回，隔离「小分支移除」与「整行换窗口」 |
 | 产出边界 | 两臂均为诊断；`acceptance_eligible=false`，merge 只写 `results/merged.json`，**不写 `results/summary.json`**，不得读成验收结论 |
 | protocol 字段 | `test_manifest_read=false`；`test_used_for_selection=false`；不训练、不选点、无优化器/学习率/梯度累积 |
-| 状态 | 运行中（派发 2026-09-22 16:04 Asia/Shanghai）；preflight 通过，Torch `2.8.0+cu128`、Transformers `5.3.0`，五卡 admission 利用率 0%，`status/run.json=running`。完整 CER/I-D-S 待完成后追加 |
+| 结果 | 两臂均 complete。`legacy-line` CER=`0.12469390694771211`（替换/插入/删除 `3887/738/569`，每步命中 `77.62` token，gen tokens `50400`）；`layout_control` CER=`0.13693762903922793`（`3987/948/769`，每步命中 `8.38`，gen tokens `50321`）。两臂均 149 页、reference characters `41654`、`exact_page_rate=0`、`generation_limit_hits=0`，日志与 shard 日志错误扫描为空 |
+| 装置可比性 | **成立**。`legacy-line` 复现历史整行值到小数点后 11 位（`0.12469390694771211` 对 `0.124694`）；其 routing 诊断与历史一致（`bias=1.0`、`pointer=synced`、`box_source=line`、`line_map=regions`、`gated_steps=0`、`missing_box_steps=1.32`） |
+| 归因结论 | **小分支移除为精确零效应**：`gt+control` 与验收 `gt` 的 `validation_predictions.jsonl` SHA256 完全相同（`846acbede98c2c96c00e40408c529bb7c9334f669d8d622eaf24289d5baff37a`），三份副本逐一核对；控制臂 protocol 为 `layout_branch_present=true`，即小分支确实加载而 149 页输出一个 token 未变。**差距 100% 来自空间目标**：`legacy-line` − `gt` = `−0.012244`，逐页配对 bootstrap 按页 CI `[−0.022881, −0.003519]`、按卷分组 CI `[−0.043107, −0.003280]`，**两档均显著**（最坏情况仍支持 `−0.043107`）。失败签名与 `line100` 收益签名方向相反、量级相当：插入 `738→948`（+28.5%）、删除 `569→769`（+35.1%）、替换 `3887→3987`（+2.6%） |
+| 机制读数 | 每步命中 token 从 `77.62`（整行）降到 `8.38`（3–5 字窗口），`B=1.0` 两臂相同。3–5 字窗口并非更精确的点目标，而是每个字符只在自己那一步被覆盖、相邻窗口几乎不重叠，故行级持续上下文丢失 |
+| 归因边界 | 本轮为「框大小＋B＋页集多变量同变」的跨实验比较。按 `LAYOUT_ORACLE_LINE_RESULT.md` §7.1 预先划定的口径，**不能据此断定**是「每 key 强度」还是「覆盖重复度」在起作用；分离二者需刻意做「固定 B 变覆盖」或「固定覆盖变 B」的扫描 |
+| 后续处置 | 验收未过线的原因已收口为空间目标形态，且按 `LINE100_WINDOW_MASK_ROUTING.md` 完成处置：未改动 bias、指针、分辨率或评价子集。下一步为受控单变量阶梯（整行 → 行内窗口 → 窗口＋锚点），先零 GPU 量出第三种形态的每步覆盖分布，再投 GPU |
+| protocol 字段 | `test_manifest_read=false`；`test_used_for_selection=false`；`usable_for_selection=false`；`reads_ground_truth_for_routing=true`；`acceptance=null`；`acceptance_eligible=false`；不训练、不选点 |
 
-**判读口径（写在跑之前）**：
-1. `legacy-line` 复现 `0.124694`（或落在其误差内）→ 装置可比，后续差值可归因；不复现 → 先修装置，不读其余结论。
-2. `gt + --legacy-layout-control` 与验收 `0.13693763` 的差 = **小分支移除**单独贡献多少；该臂与 `0.124694` 的差 = **整行换 3–5 字窗口**单独贡献多少。
-3. 两个诊断臂都不作验收、不作选点，也不用于调整 bias 或窗口。
+**判读口径（写在跑之前，已完成核对）**：
+1. `legacy-line` 复现 `0.124694`（或落在其误差内）→ 装置可比，后续差值可归因；不复现 → 先修装置，不读其余结论。**已复现，装置可比。**
+2. `gt + --legacy-layout-control` 与验收 `0.13693763` 的差 = **小分支移除**单独贡献多少；该臂与 `0.124694` 的差 = **整行换 3–5 字窗口**单独贡献多少。**前者为精确 0；后者为全部 `0.012244`。**
+3. 两个诊断臂都不作验收、不作选点，也不用于调整 bias 或窗口。**已遵守。**
