@@ -80,3 +80,7 @@ attention 定义：末 decoder 层、对 heads 求均值、最后一个 query �
 - 选择/框/预测索引：`comparison_index.json`、`comparison_index.csv`；原始注意力：`attention/*.npz`；原图：`images/*.jpg`
 - 远端 v2 原始回放：`/data3/yky/yangky_ocr_models/glm_ocr_layout_mask_routing/diagnostics/glmocr_line_mask_v2_attention_val_20260923_v2/`
 - 远端 eager 失败回放保留于对应无 `_v2` 的 diagnostics 目录。
+
+## 图例补充（2026-09-23）
+
+按筛图需求，对上述10张并排图及 `contact_sheet.png` 使用已归档的 attention NPZ 重新渲染，增加数值色条；没有重放模型、重算 attention 或更改样例。每组左右共用本组动态范围 `0–max(baseline_raw, routed_raw)`，色条标出 0、25%、50%、75% 和组内最大值的 raw attention 数值；颜色使用 Inferno，图例在浅色底上合成并注明透明度规则 `alpha = sqrt(value / max) × 150/255`。不同样例仍各自按组内最大值缩放，故颜色不用于跨样例绝对比较。更新后的图保存在相同本地筛选目录；renderer SHA256 `ED5473E1771B9D362F9C9806157B28A55149643DCEE327DBE7D6D2C91CA59752`。`test_manifest_read=false`、`test_used_for_selection=false`。

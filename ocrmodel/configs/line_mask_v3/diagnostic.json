@@ -1,0 +1,97 @@
+{
+  "protocol": "line_mask_v3_stage_d",
+  "status": "fixed_before_inference",
+  "seed": 42,
+  "data_roles": {
+    "training": "train",
+    "diagnostic_and_screening": "val_tune",
+    "val_verify_status": "pending_audit_and_lock",
+    "val_verify_manifest_read": false,
+    "val_verify_used_for_selection": false,
+    "test_manifest_read": false,
+    "test_used_for_selection": false
+  },
+  "domains": {
+    "mthv2": {
+      "val_tune_pages": 240,
+      "diagnostic_pages": 32,
+      "train_manifest_sha256": "1016198040944e39329712eb2a7bdfe6db7526134b91d750c83afa91d854f9b3",
+      "val_tune_manifest_sha256": "efc29e22b42fb81c8915282f935ef6c77ddcdcb7169f7a48bae6471c6c0cd315",
+      "historical_sparse24_val_tune_pages": 149,
+      "historical_sparse24_val_tune_manifest_sha256": "36ec845875e1ea18a48d4a523b6c5a3f007b46e2a07de0cafd2c26139929a348",
+      "historical_sparse24_region_count_cap": 24,
+      "minimum_diagnostic32_pages_above_sparse24_cap": 8
+    },
+    "dunhuang_local_gazetteer": {
+      "train_manifest_sha256": "00ae8c30fc12046586cce836897af26b7a701a749fa10ff805bb4ae8022fb29d",
+      "val_tune_pages": 80,
+      "diagnostic_pages": 32,
+      "val_tune_manifest_sha256": "e20d2f9b07e535ccfab03c95a8f81222f75ee4f5a793e27dabb28338f48316e2"
+    }
+  },
+  "selection_strata": [
+    "source_group",
+    "layout_density_global_quartile",
+    "text_length_quartile_within_layout_density_quartile"
+  ],
+  "generation": {
+    "input": "whole_page_image_and_fixed_prompt_only",
+    "prompt": "Text Recognition:",
+    "processor": "fast",
+    "max_pixels": 4000000,
+    "max_new_tokens": 1536,
+    "sampling": "greedy",
+    "backbone_precision": "bfloat16",
+    "head_precision": "float32",
+    "attention_backend": "torch_sdpa_math"
+  },
+  "shared_start": {
+    "model_revision": "ca5d8b3e287e52589e37c28385d9655ee4372f9d",
+    "backbone_weights": "original_glm_ocr_revision_plus_frozen_decoder_lora_checkpoint_3000",
+    "decoder_lora_loaded": true,
+    "base_model_weights_sha256": "computed_and_locked_per_run",
+    "decoder_lora_sha256": "computed_and_locked_per_run",
+    "decoder_lora_checkpoint": "/data3/yky/yangky_ocr_models/glm_ocr_layout_ot/training_runs/glmocr_mthv2_sparse24_q32_layout_boxeq820_3000_from_boxeq58_a100_260916_v1/seed42/checkpoint-3000",
+    "decoder_lora_rank": 8,
+    "decoder_lora_alpha": 8,
+    "decoder_lora_dropout": 0,
+    "line_mask_head_epoch": 8,
+    "line_mask_head_step": 3456,
+    "line_mask_head_sha256": "d56023f270fd51812b58272141f8903bbd2ca1b437b8565b20ab5d12c7f59cac",
+    "line_mask_head_provenance": "trained_and_diagnosed_with_the_same_frozen_decoder_lora_checkpoint_3000"
+  },
+  "arms": {
+    "D0": {
+      "mask": "disabled",
+      "threshold": null,
+      "injection_layers": [],
+      "bias": 0.0
+    },
+    "D1": {
+      "mask": "hard",
+      "threshold": 0.5,
+      "injection_layers": "all",
+      "bias": 1.0
+    },
+    "D2": {
+      "mask": "hard",
+      "threshold": 0.5,
+      "injection_layers": "all",
+      "bias": 0.5
+    },
+    "D3": {
+      "mask": "hard",
+      "threshold": 0.5,
+      "injection_layers": "indices_ge_floor_layers_div_2",
+      "bias": 1.0
+    }
+  },
+  "candidate_rule": {
+    "eligible_if": "CER_candidate <= CER_D1 in both val_tune domains",
+    "score": "equal_domain_mean_of_relative_CER_change_vs_D1",
+    "tie_break": ["D2", "D3"],
+    "no_eligible_candidate": "full_val_tune_arms_are_D0_and_D1"
+  },
+  "test_manifest_read": false,
+  "test_used_for_selection": false
+}

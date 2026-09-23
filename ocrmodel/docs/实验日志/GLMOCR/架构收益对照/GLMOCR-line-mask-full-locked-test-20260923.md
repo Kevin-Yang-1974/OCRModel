@@ -22,6 +22,19 @@
 - **异常字段**：待记录CUDA/OOM/Traceback/NaN/Inf、worker退出、checkpoint finite、CER finite及EOS/触顶/循环。每个worker日志和分片保留在本run根目录。
 - **归档**：完成后将protocol、完整summary、分片预测、运行日志和checkpoint/manifest指纹下载至 `D:/yangky/glm-ocr-assets/line-mask-ddp-20260922/locked-test-20260923/`，再更新本日志与 `EXPERIMENT_REGISTER.md`。test永不回流至selection。
 
-## 全量结果
+## 全量结果（已完成）
 
-待运行完成后追加：baseline与epoch8/step3456各800页micro CER、I/D/S、EOS/触顶/循环、覆盖核验、finite与异常扫描，以及baseline差值。原始预测保留在本轮归档目录。
+两臂均完成官方test的800页全页自由生成。项目 `aggregate_ocr_metrics` 按去空白字符统计 micro CER：
+
+| 评估臂 | CER | 字符错误 | I / D / S | 参考字符 | exact page | EOS | 触顶 | 循环页 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 无路由 baseline | 0.32235647940700685 | 84,890 | 35,454 / 16,700 / 32,736 | 263,342 | 0/800 | 765/800 (95.625%) | 35/800 (4.375%) | 23/800 (2.875%) |
+| 行级 mask epoch8/step3456 | **0.3189312756795346** | **83,988** | 38,549 / 12,015 / 33,424 | 263,342 | 0/800 | 762/800 (95.25%) | 38/800 (4.75%) | 32/800 (4.0%) |
+
+mask 比 baseline 绝对降低 CER `0.003425203727472237`（0.3425个百分点），相对降低约`1.06%`。总错误减少902，但组成发生变化：删除减少4,685，插入增加3,095，替换增加688。平均生成token数为425.53 vs 435.975。test上的收益明显小于validation上的差距（validation选中CER 0.12846305）；该test结果仅作一次性泛化报告，不回流调整head、阈值、生成参数或选点。
+
+**核验**：两臂各800条、page_id唯一且与官方manifest次序和参考文本完全一致；分片为160×5，无重无漏，summary显示`coverage_verified=true`。独立重读原始manifest和两份合并预测后，用项目metrics实现复算的micro CER、I/D/S与summary逐项相同；两臂`I+D+S`分别等于总字符错误，EOS+触顶均为800。有限性检查通过：epoch8 checkpoint 29个head tensor全finite；共享decoder LoRA 192个tensor全finite；指标无NaN/Inf。五个worker均`complete`，launcher exit code 0；日志错误扫描未见CUDA/OOM/NaN/Inf/Traceback/NCCL/异常退出。
+
+**协议与产物**：官方test manifest SHA256 `2904bdaf155a4d1b162d4e4f5fc378cc2263f7d9ea9990c1e3e1020775911962`；epoch8 checkpoint SHA256 `d56023f270fd51812b58272141f8903bbd2ca1b437b8565b20ab5d12c7f59cac`；backbone LoRA SHA256 `ada4cdd3bb1f2f417d1c0a68054dc61e70ab59f215b3bc2018074b4f2fdcd5d5`。`test_manifest_read=true`（本次锁定test评估），`test_used_for_selection=false`；selection.json仍指向epoch8/step3456。原始两臂逐页预测及日志已下载至 `D:/yangky/glm-ocr-assets/line-mask-ddp-20260922/locked-test-20260923/`，本地protocol、summary和两份预测SHA256与远端一致（summary `e780a6dbdb61c70c188d602e239bec09cb6ef197ae17b503ecdf75a5c13cae5a`）。
+
+**结论边界**：在当前整页Greedy协议下，预测行mask相对无路由baseline仅小幅改善micro CER，同时插入、替换和循环页略增、删除明显减少；不支持把validation上约0.0415的改善外推为test增益。该locked test没有参与任何选择或后处理调整。低频字符召回未计算。

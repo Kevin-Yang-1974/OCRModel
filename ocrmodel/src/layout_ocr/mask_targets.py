@@ -16,6 +16,17 @@ Two alignments happen here, and both are explicit and reported:
 * character box -> grid: a box is rasterised onto the ``N`` merged visual cells
   by overlap-area share, normalised per box (plan 4.3), so a box smaller than a
   cell still gets a non-zero, well-shaped target.
+
+Two manifest granularities are supported, and the caller must say which one it
+has via ``line_source``.  ``annotation`` reads the char manifest's per-character
+``line_index`` and per-character boxes.  ``region_textline`` reads a line-level
+manifest -- regions that *are* the text lines, with no ``characters`` array at
+all -- and walks ``page_text`` against the regions' reading-order concatenation,
+giving every character of a line that line's single box.  That is deliberately
+the coarsest reading that is still checkable: it cannot localise within a line,
+and it refuses rather than guesses when the regions do not reproduce
+``page_text`` exactly.  ``MaskTargets.window_report['box_granularity']`` records
+which of the two a target came from.
 """
 
 from __future__ import annotations
@@ -30,6 +41,13 @@ MATCH_SCORE = 2
 MISMATCH_SCORE = -1
 GAP_SCORE = -1
 
+# ``line_source`` values understood by :func:`build_mask_targets`.  ``annotation``
+# reads the char manifest's authoritative per-character ``line_index``;
+# ``region_textline`` reads a line-level manifest whose ``regions`` are the text
+# lines themselves and carries no characters at all.
+REGION_LINE_SOURCE = "region_textline"
+LINE_SOURCES = ("annotation", REGION_LINE_SOURCE, "auto")
+
 
 @dataclass(frozen=True)
 class MaskTargets:
@@ -41,6 +59,9 @@ class MaskTargets:
     char_spans: list[tuple[int, int] | None]  # per token, span into page_text
     alignment_status: list[str]  # per token: exact/placeholder/missing/blank/unmapped
     alignment_report: dict[str, Any]  # token-char coverage counters for Gate A
+    line_evidence: str = "none"  # which manifest field supplied the boxes:
+    # "character" for a char manifest's per-character ``line_index``,
+    # "textline" for a line-level manifest's region boxes, "none" for token mode.
     # Present only in window mode; carried so line grouping (which poisons every
     # target on a page when it is wrong) is logged rather than inferred.
     window_report: dict[str, Any] = field(default_factory=dict)
@@ -102,6 +123,133 @@ def char_lines(record: dict[str, Any]) -> tuple[list[int | None], bool]:
     if len(ids) < width:
         ids.extend([None] * (width - len(ids)))
     return ids[:width], annotated
+
+
+class LineTargetError(ValueError):
+    """A page's manifest cannot supply line-level spatial targets at all."""
+
+
+@dataclass(frozen=True)
+class RegionLineTargets:
+    """Per-``page_text``-position boxes and line ids taken from line regions.
+
+    ``boxes`` and ``line_ids`` are both index-aligned with ``page_text`` and
+    always fully populated (or fully unmapped, since a non-reproducing page is
+    refused).  A line-level manifest has no inner-line geometry, so every
+    character of a line necessarily shares that line's single box;
+    ``granularity`` records that, so a caller cannot mistake a line box for a
+    character box.
+    """
+
+    boxes: list[list[float] | None]
+    line_ids: list[int | None]
+    statuses: list[str]
+    granularity: str
+    report: dict[str, Any]
+
+
+def _region_boxes(region: dict[str, Any]) -> list[float] | None:
+    bbox = region.get("bbox")
+    if not isinstance(bbox, (list, tuple)) or len(bbox) != 4:
+        return None
+    try:
+        return [float(value) for value in bbox]
+    except (TypeError, ValueError):
+        return None
+
+
+def region_line_targets(record: dict[str, Any]) -> RegionLineTargets:
+    """Map every ``page_text`` character to its text line's box and line id.
+
+    The manifest's ``regions`` are the page's text lines, ordered by
+    ``reading_order``, and ``page_text`` is their concatenation with no
+    separator.  The mapping is therefore a prefix-sum walk over region lengths,
+    not an approximate alignment: each region's characters are consumed in turn.
+
+    A page whose regions do not reproduce ``page_text`` exactly -- wrong text, a
+    separator, or a set that stops short -- raises :class:`LineTargetError`
+    instead of producing a guessed or partial mapping.  A wrong line grouping
+    would poison every spatial target on that page, and plan section 4.2 requires
+    unmappable pages to be reported rather than filled with fabricated labels.
+    Refusing the page outright rather than leaving its tail unmapped also keeps
+    "this page has line evidence" a property the locked evidence file can state:
+    both run the same raw concatenation check.
+    """
+
+    page_id = record.get("page_id")
+    page_text = record.get("page_text") or ""
+    if record.get("characters"):
+        raise LineTargetError(
+            f"page {page_id!r} carries a 'characters' array, so its lines must be read with "
+            "line_source='annotation'; the region-textline mapping would ignore that geometry"
+        )
+    if record.get("layout_level") != "textline":
+        raise LineTargetError(
+            f"page {page_id!r} has layout_level={record.get('layout_level')!r}; "
+            "line_source='region_textline' requires a textline-level manifest"
+        )
+    regions = record.get("regions")
+    if not isinstance(regions, list) or not regions:
+        raise LineTargetError(f"page {page_id!r} has no regions to read line boxes from")
+    ordered = sorted(regions, key=lambda region: int(region["reading_order"]))
+    separator = record.get("page_text_separator") or ""
+    if separator:
+        raise LineTargetError(
+            f"page {page_id!r} joins its regions with the separator {separator!r}; the character "
+            "walk below assumes regions concatenate directly into page_text"
+        )
+
+    boxes: list[list[float] | None] = []
+    line_ids: list[int | None] = []
+    statuses: list[str] = []
+    report: dict[str, Any] = {
+        "granularity": "textline",
+        "regions": len(ordered),
+        "regions_without_valid_bbox": 0,
+        "regions_without_text": 0,
+        "page_characters": len(page_text),
+        "mapped_characters": 0,
+    }
+    cursor = 0
+    for line_id, region in enumerate(ordered):
+        region_text = region.get("text")
+        if not isinstance(region_text, str) or not region_text:
+            region_text = ""
+            report["regions_without_text"] += 1
+        start = cursor
+        end = start + len(region_text)
+        if page_text[start:end] != region_text:
+            raise LineTargetError(
+                f"page {page_id!r} region line {line_id} does not reproduce page_text at "
+                f"characters [{start}, {end}); the regions are not a reading-order "
+                "concatenation of page_text and no line mapping can be trusted"
+            )
+        box = _region_boxes(region)
+        if box is None:
+            report["regions_without_valid_bbox"] += 1
+        boxes.extend([box] * len(region_text))
+        line_ids.extend([line_id] * len(region_text))
+        statuses.extend(["exact" if box is not None else "missing"] * len(region_text))
+        cursor = end
+
+    if cursor != len(page_text):
+        # The regions must account for exactly ``page_text``.  Accepting a short
+        # walk would leave trailing characters unsupervised while still calling
+        # the page locatable, so the evidence classifier could not tell which
+        # pages were really covered.  Refusing keeps "has line evidence" an
+        # all-or-nothing property of the page, which is what the protocol locks.
+        raise LineTargetError(
+            f"page {page_id!r} regions cover {cursor} of {len(page_text)} page_text "
+            "characters; a partial line mapping cannot be supervised as if it were complete"
+        )
+    report["mapped_characters"] = cursor
+    return RegionLineTargets(
+        boxes=boxes,
+        line_ids=line_ids,
+        statuses=statuses,
+        granularity="textline",
+        report=report,
+    )
 
 
 def _align(target: str, source: str) -> list[int | None]:
@@ -376,23 +524,46 @@ def build_mask_targets(
 
     if raster_mode not in ("soft", "hard"):
         raise ValueError(f"unknown raster_mode {raster_mode!r}")
+    if line_source not in LINE_SOURCES:
+        raise ValueError(f"line_source must be one of {LINE_SOURCES}, got {line_source!r}")
 
     page_text = record["page_text"]
-    boxes, char_statuses = char_boxes(record)
-    spans, statuses, report = token_char_spans(tokenizer, page_text, target_ids, char_statuses)
-
     # --- window mode: the target is the convex hull of an in-line run of chars.
     # Line membership comes from the manifest's authoritative ``line_index``; a
     # geometric rule would merge columns on a vertical page, so it is only a
-    # reported fallback, never a silent substitute.
-    line_ids, annotated = char_lines(record)
+    # reported fallback, never a silent substitute.  A line-level manifest has no
+    # per-character boxes at all, so it is read through ``region_textline``,
+    # which shares its single region box across the line's characters.
     line_modes = ("window", "line", "anchored")
     line_source = line_source if target_mode in line_modes else "token"
-    if target_mode in line_modes and line_source == "annotation" and not annotated:
-        raise ValueError(
-            f"target_mode='{target_mode}' with line_source='annotation' needs a 'line_index' in the "
-            "manifest; regenerate the char manifest or use line_source='auto'"
+    boxes, char_statuses = char_boxes(record)
+    line_ids, annotated = char_lines(record)
+    box_granularity = "character"
+    region_report: dict[str, Any] | None = None
+    if target_mode in line_modes and line_source == REGION_LINE_SOURCE:
+        region_targets = region_line_targets(record)
+        boxes, line_ids, char_statuses = (
+            region_targets.boxes, region_targets.line_ids, region_targets.statuses,
         )
+        annotated = True
+        box_granularity = region_targets.granularity
+        region_report = region_targets.report
+    if target_mode in line_modes and line_source != "auto" and not annotated:
+        raise ValueError(
+            f"target_mode='{target_mode}' with line_source='{line_source}' needs a 'line_index' in "
+            "the manifest; regenerate the char manifest with line_source='annotation', or use "
+            f"line_source='{REGION_LINE_SOURCE}' for a line-level manifest"
+        )
+    if target_mode in line_modes and line_source == "auto" and not annotated:
+        # ``auto`` has no fallback left: it silently degraded to per-token targets
+        # under a line-target flag, which is how a run reports line supervision it
+        # never applied.  Named sources are the only way to ask for line targets.
+        raise ValueError(
+            f"target_mode='{target_mode}' with line_source='auto' found no line grouping in the "
+            f"manifest; name the source explicitly ('annotation' or '{REGION_LINE_SOURCE}')"
+        )
+    spans, statuses, report = token_char_spans(tokenizer, page_text, target_ids, char_statuses)
+
     use_lines = target_mode in line_modes and annotated
     line_members: dict[int, list[int]] = {}
     if use_lines:
@@ -402,15 +573,29 @@ def build_mask_targets(
             line_members.setdefault(int(line_id), []).append(char_index)
     window_report: dict[str, Any] = {
         "mode": target_mode,
-        "line_source": "annotation" if use_lines else ("geometry_unavailable" if target_mode in line_modes else "token"),
+        "line_source": line_source if use_lines else (
+            "geometry_unavailable" if target_mode in line_modes else "token"
+        ),
+        "box_granularity": box_granularity,
         "lines": len(line_members),
         "singleton_lines": sum(1 for members in line_members.values() if len(members) == 1),
         "max_line_length": max((len(m) for m in line_members.values()), default=0),
         "window_fallbacks": 0,
+        # Line-mode tokens whose line id resolved to no usable members.  A
+        # ``window`` token legitimately has nothing to fall back to (its span is
+        # inside the line it cannot find), but a ``line``/``anchored`` token ought
+        # to have been caught by ``line_members``; a non-zero count there is the
+        # signature of a line grouping that silently failed to resolve.
+        "token_fallbacks": 0,
         "span_over_window": 0,
         "short_windows_at_line_end": 0,
         "raster_mode": raster_mode,
     }
+    if region_report is not None:
+        # Recorded as data rather than as the top-level ``line_source`` so a
+        # reader can tell that a missing/None region box was the cause of a
+        # drop in ``mapped_tokens``, not an alignment failure.
+        window_report["region_line_report"] = region_report
 
     eos = set(int(t) for t in eos_ids)
     n_tokens = len(target_ids)
@@ -445,6 +630,9 @@ def build_mask_targets(
                 if target_mode == "line":
                     # Line-level target: the full hull of the token's own text line,
                     # so every token on a line attends to the whole line's region.
+                    # With ``region_textline`` every member already shares the line's
+                    # own box, so the hull is that box and the target is a true line
+                    # target rather than a character union approximating one.
                     window_boxes = [boxes[k] for k in members]
                 elif target_mode == "anchored":
                     # The in-line window UNION the rest of the current line.  The window
@@ -484,8 +672,18 @@ def build_mask_targets(
             # line are near-collinear, so the hull is close to their union's
             # rectangle while still filling the gaps between glyphs -- one
             # connected blob for the bias instead of a row of separate dots.
+            #
+            # All four corners of every box must be fed in.  Taking only the
+            # top-left and bottom-right of each box leaves the hull with two
+            # distinct points whenever the window is a single box -- which is
+            # every token under ``region_textline`` -- and a two-point hull has no
+            # area, so the rasteriser returns an all-zero mask and silently
+            # supervises the token as if the line were blank.
             corners = torch.tensor(
-                [[box[0], box[1]] for box in window_boxes] + [[box[2], box[3]] for box in window_boxes],
+                [[box[0], box[1]] for box in window_boxes]
+                + [[box[0], box[3]] for box in window_boxes]
+                + [[box[2], box[1]] for box in window_boxes]
+                + [[box[2], box[3]] for box in window_boxes],
                 device=xywh.device,
                 dtype=xywh.dtype,
             )
@@ -498,6 +696,7 @@ def build_mask_targets(
         else:
             if target_mode in ("window", "anchored"):
                 window_report["window_fallbacks"] += 1
+            window_report["token_fallbacks"] += 1
             for box in boxes_present:
                 box_mask = (
                     rasterize_box_hard(box, xywh[0])
@@ -515,5 +714,6 @@ def build_mask_targets(
         char_spans=spans,
         alignment_status=statuses,
         alignment_report=report,
+        line_evidence=box_granularity if use_lines else "none",
         window_report=window_report,
     )

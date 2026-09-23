@@ -184,6 +184,7 @@ def main() -> None:
             hit = (targets.mask[0] > 0).sum(dim=-1).float()[valid]
             per_mode[mode].extend(hit.tolist())
             fallbacks[f"{mode}:{targets.window_report['window_fallbacks']}"] += 0
+            fallbacks["token_fallbacks"] += targets.window_report["token_fallbacks"]
             if mode == "window":
                 fallbacks["window_fallbacks"] += targets.window_report["window_fallbacks"]
                 lines_per_page.append(targets.window_report["lines"])
@@ -209,6 +210,7 @@ def main() -> None:
         "merged_cells_max": max(grid_sizes) if grid_sizes else None,
         "modes": {mode: summarise(values) for mode, values in per_mode.items() if values},
         "window_fallbacks": fallbacks["window_fallbacks"],
+        "token_fallbacks": fallbacks["token_fallbacks"],
         "mean_lines_per_page": statistics.fmean(lines_per_page) if lines_per_page else None,
         "reads_ground_truth": True,
         "usable_for_selection": False,

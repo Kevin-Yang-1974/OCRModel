@@ -65,6 +65,25 @@ def overlay_page(
     return composed, float(scores.max())
 
 
+def attention_legend_image(
+    width: int,
+    height: int,
+    shared_vmax: float,
+    background: tuple[int, int, int] = (247, 248, 250),
+) -> Image.Image:
+    """Build the paired attention scale using the overlay's cmap and alpha rule."""
+    values = np.linspace(0.0, shared_vmax, width, dtype=np.float32)
+    normalized = np.clip(values / max(shared_vmax, 1e-12), 0.0, 1.0)
+    colors = (colormaps["inferno"](normalized)[..., :3] * 255.0).astype(np.uint8)
+    alpha = (np.sqrt(normalized) * 150.0).astype(np.uint8)
+    base = np.asarray(background, dtype=np.float32)
+    composited = colors.astype(np.float32) * (alpha[:, None] / 255.0) + base * (
+        1.0 - alpha[:, None] / 255.0
+    )
+    pixels = np.clip(np.rint(composited), 0, 255).astype(np.uint8)
+    return Image.fromarray(np.broadcast_to(pixels[None, :, :], (height, width, 3)).copy())
+
+
 def main() -> None:
     args = parse_args()
     root = args.artifact_root.resolve()
@@ -153,7 +172,7 @@ def main() -> None:
         baseline_image = baseline_image.resize(display_size, Image.Resampling.LANCZOS)
         routed_image = routed_image.resize(display_size, Image.Resampling.LANCZOS)
 
-        header_height, panel_header_height, footer_height, gap = 178, 82, 78, 24
+        header_height, panel_header_height, footer_height, gap = 270, 82, 78, 24
         canvas_width = panel_width * 2 + gap
         image_top = header_height + panel_header_height
         canvas_height = image_top + display_size[1] + footer_height
@@ -168,8 +187,57 @@ def main() -> None:
         draw.text((24, 60), target_line, font=font_bold, fill=(28, 55, 40))
         draw.text((24, 111), edit_line, font=font_tiny, fill=(55, 60, 70))
         draw.text(
-            (24, 143),
-            f"本组共享色标上限：{shared_vmax:.6f}  |  {alignment_note}",
+            (24, 145),
+            f"热力数值：raw mean-head patch attention（概率）  |  本图动态范围：0–{shared_vmax:.6g}",
+            font=font_tiny,
+            fill=(55, 60, 70),
+        )
+        legend_x, legend_y, legend_width, legend_height = 24, 174, 700, 18
+        canvas.paste(
+            attention_legend_image(legend_width, legend_height, shared_vmax),
+            (legend_x, legend_y),
+        )
+        draw = ImageDraw.Draw(canvas)
+        draw.rectangle(
+            (legend_x, legend_y, legend_x + legend_width - 1, legend_y + legend_height - 1),
+            outline=(70, 70, 75),
+            width=1,
+        )
+        for fraction in (0.0, 0.25, 0.5, 0.75, 1.0):
+            tick_x = round(legend_x + fraction * (legend_width - 1))
+            draw.line(
+                (tick_x, legend_y + legend_height, tick_x, legend_y + legend_height + 5),
+                fill=(45, 48, 55),
+                width=1,
+            )
+            tick_value = f"{shared_vmax * fraction:.3g}"
+            tick_box = draw.textbbox((0, 0), tick_value, font=font_tiny)
+            tick_width = tick_box[2] - tick_box[0]
+            tick_label_x = max(
+                legend_x,
+                min(tick_x - tick_width // 2, legend_x + legend_width - tick_width),
+            )
+            draw.text(
+                (tick_label_x, legend_y + legend_height + 5),
+                tick_value,
+                font=font_tiny,
+                fill=(55, 60, 70),
+            )
+        draw.text(
+            (760, 173),
+            "颜色按 Inferno 映射；透明度随注意力增大",
+            font=font_tiny,
+            fill=(55, 60, 70),
+        )
+        draw.text(
+            (760, 199),
+            "左右共用本图色标；不同样本按各自动态范围缩放",
+            font=font_tiny,
+            fill=(55, 60, 70),
+        )
+        draw.text(
+            (24, 237),
+            alignment_note,
             font=font_tiny,
             fill=(70, 70, 75),
         )

@@ -518,8 +518,154 @@ MTHv2 原官方 split 是随机页级划分，没有书籍/版本元数据，不
 
 `glmocr_line_mask_v2_full_20260922_1940_test_20260923`：对全量官方test一次性比较共享checkpoint-3000 backbone LoRA下的无路由baseline与已由149页validation选定的epoch8/step3456行mask head；五张指定物理GPU各跑160页分片，每卡单实例依次评估两臂，Greedy/4M/1536/BF16/math-SDPA固定。不训练、不调参、不改selection。test manifest为800页，SHA256 `2904bdaf155a4d1b162d4e4f5fc378cc2263f7d9ea9990c1e3e1020775911962`；selected checkpoint SHA256 `d56023f270fd51812b58272141f8903bbd2ca1b437b8565b20ab5d12c7f59cac`；共享backbone LoRA SHA256 `ada4cdd3bb1f2f417d1c0a68054dc61e70ab59f215b3bc2018074b4f2fdcd5d5`。协议及结果见[实验日志](实验日志/GLMOCR/架构收益对照/GLMOCR-line-mask-full-locked-test-20260923.md)。**启动前登记：** 五张卡首次利用率0/0/0/0/0；全量结果待评估完成。`test_manifest_read=true`（协议/覆盖核验）；`test_used_for_selection=false`。
 
+**完成追加**：两臂均800页，无重无漏；baseline CER `0.32235647940700685`，I/D/S=`35454/16700/32736`；epoch8/step3456 CER **`0.3189312756795346`**，I/D/S=`38549/12015/33424`，同为263342参考字符。CER下降`0.003425203727472237`（相对1.06%）；EOS/触顶/循环分别为baseline `765/35/23`、mask `762/38/32`。summary与逐页预测已归档至`D:/yangky/glm-ocr-assets/line-mask-ddp-20260922/locked-test-20260923/`并完成覆盖、微平均指标、checkpoint/LoRA finite及日志核验；5 worker完成、launcher exit0、异常扫描为空。test只作locked报告、未用于选点；完整I/D/S、exact page、EOS/循环和SHA见上述实验日志。
+
 ## 2026-09-23 baseline vs 行级 mask-routing validation 注意力可视化
 
 离线图像诊断 run：初版 `glmocr_line_mask_v2_attention_val_20260923` 因末层 eager attention 导致所选页 baseline 重放前缀分叉而中止；保留失败产物，不用其 attention 图。最终 `glmocr_line_mask_v2_attention_val_20260923_v2` 以原 SDPA 生成输出、旁路重算末层最后 query 的 QK softmax，完成10个不同validation页、baseline/method共20条前缀校验。5 deletion + 5 insertion；全部预测字符、目标字符框与原图尺寸核对通过。筛样只使用 `glmocr_line_mask_v2_full_20260922_1940` 的149页validation归档（manifest SHA256 `36ec845875e1ea18a48d4a523b6c5a3f007b46e2a07de0cafd2c26139929a348`），未读训练或test split；`test_manifest_read=false`、`test_used_for_selection=false`。
 
 对照为无路由 baseline vs epoch8/step3456 line-mask，checkpoint-3000 decoder LoRA相同；图显示末层多头平均的raw patch attention、visual mass与validation目标字框。没有重新计算全页指标：所引用的上游validation结果为baseline CER `0.16992365679166466`、I/D/S=`1948/1082/4048`，epoch8 CER `0.12846305276804149`、I/D/S=`796/531/4024`。本轮无训练；继承的上游设置、checkpoint有限值/训练曲线、GPU admission、失败初版原因及逐样例索引见[完整实验日志](实验日志/GLMOCR/架构收益对照/GLMOCR-line-mask-validation-attention-visualization-20260923.md)。远端诊断产物位于 `/data3/yky/yangky_ocr_models/glm_ocr_layout_mask_routing/diagnostics/glmocr_line_mask_v2_attention_val_20260923_v2/`；本地图像归档位于 `D:/yangky/glmocr_mask_viz/glmocr_line_mask_v2_full_20260922_1940_validation_20260923/`，含 `contact_sheet.png`、10张并排原图、index和NPZ。图仅作validation样例筛选与注意力观察，不作为test证据或因果定位证明。
+
+**图例补充（2026-09-23）**：用已有NPZ重新渲染总览和10张并排图，新增每组动态范围 `0–max(raw attention)` 的数值色条与五个刻度；标注 Inferno 色彩和随值变化的透明度。未重放模型或读取test；`test_manifest_read=false`、`test_used_for_selection=false`。renderer SHA256 `ED5473E1771B9D362F9C9806157B28A55149643DCEE327DBE7D6D2C91CA59752`。
+
+## 2026-09-23 敦煌／地方志新增77页行 mask 扩展测试
+
+glmocr_dunhuang_local_plus_new77_line_mask_20260923 已完成：原Q32测试59页（敦煌19、地方志40）+清华云盘新增敦煌77页组成独立扩展test manifest共136页；canonical splits未改，新样本source-group与既有划分无重叠。新增77页只有JPG与RGN坐标，没有OCR转写，只用于推理与EOS/触顶/循环统计；CER/I-D/S只在59个有reference页面计算。原59页曾用于早期Q32测试，不称首次独立test。
+
+两臂使用GLM-OCR revision ca5d8b3e287e52589e37c28385d9655ee4372f9d和共享checkpoint-3000 decoder LoRA；baseline关闭路由，对照臂为MTHv2 validation锁定epoch8/step3456行mask，head SHA d56023f270fd51812b58272141f8903bbd2ca1b437b8565b20ab5d12c7f59cac。整页+Text Recognition:，fast、4M、greedy1536、BF16/SDPA、seed42；五个指定物理GPU各一个单卡worker并行推理（非DDP训练）。完整配置见[实验日志](实验日志/GLMOCR/架构收益对照/GLMOCR-dunhuang-new77-line-mask-test-20260923.md)。
+
+两臂136/136覆盖、无重无漏；launcher exit0，5片complete、head finite、错误扫描为空。59页/14,195字符micro CER：baseline 0.136879182811，I/D/S=519/404/1020；mask 0.138429024304，I/D/S=553/396/1016，mask高+0.001550。新增77页两臂EOS77/77、触顶0、循环0，不报告准确率。test_manifest_read=true，test_used_for_selection=false；扩展清单SHA b2e78dfe61d37f7110abb44ce8e9c230c00edace4a0978358ad26ed4f22b2c99。产物 D:/yangky/glm-ocr-assets/dunhuang-new77-20260923/locked-test/；源ZIP SHA 3c0c34824c1e7d90593d6c47b5a4e441ac2e26a8115620e32ba55459c979dd39。
+
+## 2026-09-23 Line-mask v3 Stage D 复杂度覆盖诊断（预注册，待启动）
+
+| 字段 | 预注册内容 |
+| --- | --- |
+| run ID / 状态 | `glmocr_line_mask_v3_stage_d_20260923_v1`；tmux已启动，正在执行数据清单/图像重叠审计；GPU准入和推理尚未开始 |
+| 分支 / commit | `glm-ocr-layout-mask-routing` / `ea73f182bc7ebe69f7c7386024b3b97bf89e392a`；既有工作区改动保留，不提交 |
+| 入口 / 远端代码 | `ocrmodel/tools/evaluation/run_line_mask_v3_diagnostic_a100.sh`；代码暂存 `/data3/yky/yangky_ocr_models/glm_ocr_layout_mask_routing/line_mask_v3/code_snapshots/glmocr_line_mask_v3_stage_d_20260923_v1/ocrmodel` |
+| 远端产物 / 会话 | `/data3/yky/yangky_ocr_models/glm_ocr_layout_mask_routing/line_mask_v3/glmocr_line_mask_v3_stage_d_20260923_v1`；tmux同run ID；Slurm不适用；启动前GPU准入尚未查询 |
+| 数据与角色 | seed 42；MTHv2 train2159 SHA `1016198040944e39329712eb2a7bdfe6db7526134b91d750c83afa91d854f9b3`、完整val_tune240 SHA `efc29e22b42fb81c8915282f935ef6c77ddcdcb7169f7a48bae6471c6c0cd315`；敦煌/地方志 train240 SHA `00ae8c30fc12046586cce836897af26b7a701a749fa10ff805bb4ae8022fb29d`、val_tune80 SHA `e20d2f9b07e535ccfab03c95a8f81222f75ee4f5a793e27dabb28338f48316e2`。32页/域筛查按来源、区域密度分位和分位内文本长度分层，且至少8页高于历史sparse24的24行上限；完整验证包含MTH240和敦煌80。重叠审计待执行。无独立val_verify；test未读取，`test_manifest_read=false`、`test_used_for_selection=false` |
+| 权重与共享起点 | 原始GLM-OCR revision `ca5d8b3e287e52589e37c28385d9655ee4372f9d`；Stage D按训练分布冻结注入 decoder LoRA，SHA `ada4cdd3bb1f2f417d1c0a68054dc61e70ab59f215b3bc2018074b4f2fdcd5d5`；共享冻结mask head epoch8/step3456 SHA `d56023f270fd51812b58272141f8903bbd2ca1b437b8565b20ab5d12c7f59cac`。后续非诊断R/C阶段使用原始GLM-OCR且不注入该LoRA |
+| 配置 / 预算 | D0无路由；D1 bias1.0、阈值0.5、全层；D2仅bias0.5；D3仅后半层。四臂共享数据次序、处理器、整页输入、prompt、1536生成上限及推理后端。筛查32页×4臂×2域；之后固定比较D0/D1及至多一个由val_tune筛出的D2/D3，完整页数各臂相同 |
+| 训练配置 | 本run为冻结权重推理诊断，不训练；可训练参数0；主adapter/decoder LoRA LR、warmup/schedule、总训练步数、loss权重、梯度累积均不适用；每臂每域同页预算。5个独立单卡worker，物理GPU0–4，page batch1，BF16 backbone/FP32 head，DDP=false。每个推理波次前仅查询GPU0–4的瞬时`utilization.gpu`，所有卡严格低于50%才运行 |
+| 结果 / 日志 | 当前远端代码树57个文件，源码fingerprint `9ebd6017f1f7a97071837b010b188689f7bbc8237381d7f15268544b7ada7c85`；raw GLM-OCR原始revision含1个权重文件，file SHA `a16eb0de98d199293371c560f95f83130d2a2c9612449df16839f08ff9498815`，aggregate SHA `cde6532e869801998c91ea7ac209f349e281d89859d0ed3eba59066a27f1eabe`；head/LoRA/val manifest SHA与预注册一致。MTH train/val精确图像跨集重复0；33个dHash候选经图像与文本复核为不同页，screen32未命中候选；MTH官方拆分标记`unavailable_official_random_page_split`，不作书籍级独立性结论。敦煌精确/近重复候选0。首波准入物理GPU0–4均为0%；MTHv2 diagnostic32 D0–D3推理进行中，尚无合并指标。失败/中止run保留并追加记录。详细预注册见[实验日志](实验日志/GLMOCR/架构收益对照/GLMOCR-line-mask-v3-stage-d-20260923.md) |
+
+### 2026-09-23 v1 失败归档与 v2 前置修正（追加更正，不覆盖上表）
+
+`glmocr_line_mask_v3_stage_d_20260923_v1` **已失败终止，不再运行**，上表"推理进行中"是失败前快照。
+
+- **终止状态**：tmux session 已不存在；`launcher_status.json` = `{"status":"failed","phase":"five_gpu_diagnostic32","exit_code":1}`。
+- **失败原因**：敦煌/地方志 diagnostic32 五个 worker 在首个页面臂全部抛 `ValueError`，位置 `build_mask_targets(target_mode="line", line_source="annotation")` 的 annotation 守卫。该域 manifest 为 `layout_level=textline`、`bbox_format=xyxy_normalized`，regions 带 `text` 与四元素 `bbox`，**无 `characters` 字段**，故无 `line_index`。D0 不构造行目标故不触发，D1–D3 全失败。MTHv2 char manifest 带 `line_index`，五片 D0–D3 全部完成。
+- **保留产物**：`results/mthv2/shard-{0..4}` 的 D0–D3 `predictions-*.jsonl`／`summary-*.json`／`status-*.json`（页数7/7/6/6/6，合计32，与锁定抽样一致）、`shard-1`/`shard-3` 的 `full-mask-traces/`、`manifests/`、`logs/`、`source/` 快照与 fingerprint、`base-model-fingerprint.json`、`decoder-lora-fingerprint.json`、`admission.json`（首波GPU0–4均0%）。敦煌各 shard 仅 `worker_protocol.json`，无预测。**不重启、不覆盖 v1。**
+- **复用判断**：v1 MTHv2 结果**不进入 v2 的 merge 或选点**。v2 使用新的 `line-evidence.json` 协议、新源码快照与新 run ID，merge 身份字段（`line_evidence_sha256`、`line_source`、`spatial_targets`、`spatial_target_granularity`）与 v1 不同，v1 产物无法通过 v2 身份校验；且 v1 未完成跨域 merge 与候选选择，**不得据此报告任何 CER 或机制结论**。
+- **前置修正（已实现并通过本地CPU测试与远端只读核对）**：新增 `line_source="region_textline"`，按 `reading_order` 拼接 region `text` 与 `page_text` **逐字**核对（不做空白规范化，避免行边界位移），以该行 region `bbox` 作为该行所有字符的监督框；无法映射或不完整映射的页面抛 `LineTargetError` 明确拒绝，不填猜测标签。新增锁定文件 `line-evidence.json`（分类 `annotation`/`region_textline`，含 `spatial_targets`、`box_granularity`、不可映射页清单），evaluator 与 merge 均先校验其 SHA 与字段才允许 D1–D3 运行；无可用行证据的域被明确拒绝而非退回 `auto`。同时修复 `target_mode='line'` 下 `line_source='auto'` 静默退化为逐 token 目标的问题（现直接报错），并修复单框窗口的凸包退化为两点导致栅格全零的缺陷。
+- **远端只读核对（未读 test）**：敦煌/地方志 train240 页与 val_tune80 页全部通过逐字拼接核对，字符覆盖率100%（train 66791字/4291行；val_tune 27045字/1617行）；MTHv2 val_tune240 页走 `annotation` 且240/240可行对齐。预处理产物可复现（两次运行 `line-evidence.json` 与 `selected-val-tune-32.jsonl` SHA 一致，抽样 manifest SHA 与 v1 相同：敦煌 `82998b196bdb516de9a79d642aa5557430546fe7f7df010808e1e59a14b7cdc8`，MTHv2 `20221a809232596d04a1c36c28d07adae8151e0d36a6c1dbf021fb50f69b65a9`）。
+- **协议字段**：v1 全程 `test_manifest_read=false`、`test_used_for_selection=false`，未读取或查询 test；`val_verify` 未锁定、未读取。详细失败归档见[实验日志](实验日志/GLMOCR/架构收益对照/GLMOCR-line-mask-v3-stage-d-20260923.md)的"v1 失败归档"节。
+
+### 2026-09-23 v2a 主动中止（追加更正）
+
+`glmocr_line_mask_v3_stage_d_20260923_v2` 首次启动（15:48）在 `phase=source_snapshot` 的 MTHv2 图像审计阶段（train 约 750/2159 页）被**主动中止**（15:52），原因是启动后复查新接线代码发现 `merge_line_mask_v3_diagnostic.py` 把每臂 `spatial_target_granularity` 写成 Python `set`，进入 `json.dumps(..., allow_nan=False)` 会抛 `TypeError: Object of type set is not JSON serializable`；该错误只在推理全部完成后的 merge 阶段触发，不修正会浪费约 2 小时五卡推理。
+
+- **产物**：`results/` 文件数为 **0**——未通过 GPU 准入、未启动任何 worker、未产生推理结果或指标。tmux 已 kill。
+- **保留方式**：run 目录与源码快照重命名为 `..._v2a`（`glmocr_line_mask_v3_stage_d_20260923_v2a/` 与 `code_snapshots/glmocr_line_mask_v3_stage_d_20260923_v2a/`），未覆盖、不删除。
+- **复用判断**：无可复用产物，仅作"含 merge 序列化缺陷的快照版本"留痕。
+- **修正**：改为写入锁定字符串 `protocol["line_evidence"]["box_granularity"]`（比较仍用集合），并加序列化冒烟测试。修正后重建 run 目录与源码快照，Run ID 仍为 `glmocr_line_mask_v3_stage_d_20260923_v2`。
+- **协议字段**：v2a 全程 `test_manifest_read=false`、`test_used_for_selection=false`；未读取或查询 test；`val_verify` 未读取。
+
+### 2026-09-23 v2b 失败（追加更正）—— 新增 line-evidence 守卫自身比较对象有误
+
+`glmocr_line_mask_v3_stage_d_20260923_v2`（15:53 启动）通过图像审计、写全 6 个 manifest 文件、通过 GPU 准入（`admission.json`=`0:0,1:0,2:0,3:0,4:0`），但五个 worker 在**首个页面臂之前**全部退出：`launcher_status={"status":"failed","phase":"five_gpu_diagnostic32","exit_code":1}`。`results/` 为 **0 文件，未做过任何推理**。
+
+- **失败原因**：五 worker 均在 `diagnose_line_mask_v3.py:353` 抛 `ValueError: line evidence does not cover every locked val_tune page`。这是本次**新加守卫自身写错比较对象**：`line_evidence.json` 按该域**整个 val_tune manifest** 计算（MTHv2 240 / 敦煌 80 页），而 diagnostic32 只评估其中 32 页，守卫却把证据的 `pages_with_line_mapping`（240）与本阶段页数（32）相比；两个域都会被误拒。证据文件本身正确：`pages=240`、`pages_with_line_mapping=240`、`unmappable_pages=[]`。
+- **修正**：改为"证据覆盖其来源 manifest 且无不可映射页"——`pages == protocol["val_tune_pages"]`、`pages_with_line_mapping == pages`、`unmappable_pages` 为空；diagnostic32 与 full_val_tune 两阶段均满足。已加 CPU 回归测试 `test_evidence_covers_the_source_manifest_not_the_stage_subset`（含 32/240 子集反例）。
+- **保留 / 复用**：run 目录与快照重命名为 `..._v2_b`（`glmocr_line_mask_v3_stage_d_20260923_v2_b/`、`code_snapshots/glmocr_line_mask_v3_stage_d_20260923_v2_b/`），未覆盖。无可复用推理产物；其 `manifests/*/line-evidence.json` 与 `protocol.json` 内容正确，可作证据格式留痕。
+- **协议字段**：`test_manifest_read=false`、`test_used_for_selection=false`；未读取 test；`val_verify` 未读取。
+
+### 2026-09-23 v3b 中止（追加更正）—— 诊断器逐 token 解码有误，mask 质量指标全为空
+
+`glmocr_line_mask_v3_stage_d_20260923_v3`（16:02 启动）已跑到 **40/40 个臂级 summary、9/10 个 worker_status**（仅敦煌 shard-0 未收尾），`launcher_status` 仍为 `running`、全程无报错，但在进入完整 val_tune 阶段前被**主动中止**（16:37）。
+
+- **发现方式**：读已完成的敦煌 `predictions-D1.jsonl` 时见 `alignment.alignment_coverage=0.0`、`reliable_spatial_character_count=0`；逐域逐臂复核确认为 **8/8（2域×4臂）全 0**，即从未产生任何 line-IoU——而 mask 定位质量正是 Stage D 的主要产出。
+- **根因**：`diagnose_line_mask_v3._decode_piece` 用 `tokenizer.decode([单个 token id])` 逐 token 解码。GLM-OCR 是字节级 BPE，一个汉字跨多个 token，单独解码得 `�`(U+FFFD)；`"".join(pieces)` 永不等于 `prediction`，`token_character_mapping_reliable` 恒 False，token→字符归属全置 None，所有对齐与 `line_quality` 统计随之全空（实测每页约 95 个 `�`）。**该缺陷在 v1 同一份代码中已存在**，v1 的 MTHv2 局部结果同样受影响。数据侧无问题：`full decode == prediction` 为 True，行级目标正确（敦煌该页 12 行、`mapped_characters=190`、`window_fallbacks=0`）。
+- **修正**：新增 `decode_pieces`，对每个前缀 decode 后与完整 decode 取**最长公共前缀**，输出 `full[cursor:k]`；逐段拼接在构造上等于完整 decode，且把多 token 拼成的字符归属于完成它的那个 token。中途试过的"前缀差集"写法同样错误（前缀停在半字符时输出 U+FFFD，补全后被替换而非追加），已写入函数文档防止回退。
+- **验证（真实 tokenizer + v3b 真实产物，未用 GPU）**：旧法 0/256 页可对齐；新法 **256/256（100%，MTHv2 128 + 敦煌 128）**。残留 5 处 U+FFFD 为真实非 BMP 字形在两条路径中同样出现，两侧一致故不影响判等。
+- **新增回归测试**：`tests/test_line_mask_v3_decode_pieces.py`（5 项，字节级 tokenizer 桩件）。
+- **保留 / 复用**：run 与快照重命名为 `..._v3_b`。40 个臂级 summary 与全部 predictions 保留；**CER/EOS/触顶/循环等不依赖 token 对齐的字段仍有效**，可作过程证据；但 `alignment_coverage`、`reliable_spatial_positions`、`mean_continuous_line_iou` 等**空间指标一律无效，不得引用**。
+- **协议字段**：`test_manifest_read=false`、`test_used_for_selection=false`；未读取 test。
+
+### 2026-09-23 Line-mask v3 Stage D v4（启动，开发中）
+
+| 字段 | 内容 |
+| --- | --- |
+| run ID / 状态 | `glmocr_line_mask_v3_stage_d_20260923_v4`；16:42 启动，tmux 同名；v1、v2a、v2b、v3b 四个目录全部保留未覆盖 |
+| 分支 / commit | `glm-ocr-layout-mask-routing`；既有工作区改动保留，不提交 |
+| 入口 / 远端代码 | `ocrmodel/tools/evaluation/run_line_mask_v3_diagnostic_a100.sh`；不可变快照 `.../code_snapshots/glmocr_line_mask_v3_stage_d_20260923_v4/ocrmodel`（57 文件）；已核实 7 项修正全部在位且 `bash -n`/LF 通过 |
+| 远端产物 / 会话 | `.../line_mask_v3/glmocr_line_mask_v3_stage_d_20260923_v4`；tmux 同名；Slurm 不适用 |
+| 数据与角色 | 与 v1 同协议同抽样：MTHv2 train2159/val_tune240 `10161980…4f9b3`/`efc29e22…0cd315`；敦煌 train240/val_tune80 `00ae8c30…2fb29d`/`e20d2f9b…8316e2`。seed42；32页/域分层抽样，MTHv2 至少8页高于历史 sparse24 上限。`line-evidence.json`：MTHv2 `annotation`/`character_boxes`（240/240），敦煌 `region_textline`/`line_regions`（80/80）。无独立 val_verify；`test_manifest_read=false`、`test_used_for_selection=false` |
+| 权重与共享起点 | raw GLM-OCR `ca5d8b3e…`，aggregate `cde6532e869801998c91ea7ac209f349e281d89859d0ed3eba59066a27f1eabe`；冻结 decoder LoRA `ada4cdd3…cd5d5`；冻结 head epoch8/step3456 `d56023f2…9cac`。三者与 v1 及预注册一致 |
+| 配置 / 预算 | D0 无路由；D1 bias1.0/阈值0.5/全层；D2 仅 bias0.5；D3 仅后半层。四臂共享数据次序、处理器、整页输入、prompt、1536 上限、`torch_sdpa_math`。32页×4臂×2域=256 次页面推理 |
+| 训练配置 | 冻结权重推理诊断，不训练；可训练参数 0；各 LR/warmup/schedule/steps/loss/梯度累积均不适用。5 个独立单卡 worker，物理 GPU0–4，batch1，BF16 backbone/FP32 head，DDP=false。每波次前仅查询 GPU0–4 瞬时利用率，全卡严格 <50% 才运行 |
+| 结果 / 日志 | 十片 worker 全部 `complete`、40/40 臂级 summary 写出、错误扫描为空；**失败于推理之后的 merge 阶段**（merge 自身预存缺陷：拿分片页数 7 与全集 32 比较），GPU 未浪费。结果见下节。详见[实验日志](实验日志/GLMOCR/架构收益对照/GLMOCR-line-mask-v3-stage-d-20260923.md) |
+| 协议字段 | `test_manifest_read=false`；`test_used_for_selection=false`；`val_verify` 未锁定、未读取 |
+
+**v4 diagnostic32 结果（32 页/臂 × 2 域；过程性汇总，未经预注册 merge 流程）**：MTHv2（参考字符 12,634）D0 CER `0.318031`、D1 `0.420294`、D2 `0.313519`、D3 `0.384835`；敦煌/地方志（参考字符 10,574）D0 `0.111973`、D1 `0.118593`、D2 `0.111500`、D3 `0.113391`。MTHv2 I/D/S：D0 `1344/710/1964`、D1 `2208/523/2579`、D2 `1174/741/2046`、D3 `2098/1082/1682`；敦煌 I/D/S：D0 `190/184/810`、D1 `284/157/813`、D2 `191/183/805`、D3 `206/183/810`。EOS/触顶/循环：MTHv2 D0–D3 为 `30/2/2`、`29/3/3`、`30/2/2`、`30/2/2`；敦煌四臂均 `32/0/0`。空间指标（D0 无路由故不适用）：MTHv2 coverage D1/D2/D3 = `0.7125/0.7448/0.7306`、行级 IoU `0.33730/0.33928/0.33089`，可靠对齐点 8,346–8,606；敦煌 coverage `0.8052/0.8108/0.8086`、IoU `0.39933/0.40281/0.39853`。granularity 与预注册一致（MTHv2 `character_boxes`/`character`，敦煌 `line_regions`/`textline`，`pages_with_unavailable_line_mapping=0`；`line_evidence_sha256` 分别为 `e9938f79…c3a6a`、`849e3e3c…c1723`）。按预注册规则 D2/D3 **均合格**（两域均不劣于 D1），等域平均相对 CER 变化 D2 `−0.156929` < D3 `−0.064116`，**规则算术上 D2 胜出**——但**在 merge 正式通过并完成锁定前不构成候选选择**。判读：D1 在两域均退化且以插入为主（1344→2208、190→284）；D2 是唯一两域都不劣于 D0 的臂；敦煌四臂差均在 ±0.007、参考字符仅 10,574，不足以支撑该域任何方向的结论。**未跑完整 240/80 页、无独立 val_verify、无来源分组 bootstrap、无显著性声明；空间指标第一次非零即"逐 token 解码"修正生效的证据。**
+
+### 2026-09-23 Line-mask v3 Stage D v3（已中止，见上条 v3b）
+
+| 字段 | 内容 |
+| --- | --- |
+| run ID / 状态 | `glmocr_line_mask_v3_stage_d_20260923_v3`；16:02 启动，tmux 同名 session；启动后进入源码快照与图像审计阶段。v1、v2a、v2b 三个目录均保留未覆盖 |
+| 分支 / commit | `glm-ocr-layout-mask-routing`；既有工作区改动保留，不提交 |
+| 入口 / 远端代码 | `ocrmodel/tools/evaluation/run_line_mask_v3_diagnostic_a100.sh`；不可变快照 `.../line_mask_v3/code_snapshots/glmocr_line_mask_v3_stage_d_20260923_v3/ocrmodel`（57 文件），run 内 tree SHA `593b659cc41382b55d4c2de74a4fbe3a459527d17bab875f532c1aaed75f9195`；快照内已核实 `region_textline`、`val_tune_pages` 守卫、merge 的 `row_granularity` 移除三项修正在位。**该快照不含其后发现的 full_val_tune 证据状态比对与页数边界两处修正**，故完整 val_tune 阶段须另起新快照与新 run ID |
+| 远端产物 / 会话 | `.../line_mask_v3/glmocr_line_mask_v3_stage_d_20260923_v3`；tmux 同名；Slurm 不适用 |
+| 数据与角色 | 与 v1 同协议同抽样：MTHv2 train2159/val_tune240 SHA `10161980…4f9b3`/`efc29e22…0cd315`；敦煌/地方志 train240/val_tune80 SHA `00ae8c30…2fb29d`/`e20d2f9b…8316e2`。seed 42；32页/域筛查按来源、全局区域密度分位与分位内文本长度分层，MTHv2 至少8页高于历史 sparse24 的24行上限。**新增 `line-evidence.json` 锁定行证据**：MTHv2 为 `annotation`/`character_boxes`（240/240页），敦煌/地方志为 `region_textline`/`line_regions`（80/80页）。无独立 val_verify；`test_manifest_read=false`、`test_used_for_selection=false` |
+| 权重与共享起点 | raw GLM-OCR revision `ca5d8b3e287e52589e37c28385d9655ee4372f9d`，aggregate SHA `cde6532e869801998c91ea7ac209f349e281d89859d0ed3eba59066a27f1eabe`；冻结 decoder LoRA SHA `ada4cdd3bb1f2f417d1c0a68054dc61e70ab59f215b3bc2018074b4f2fdcd5d5`；冻结 head epoch8/step3456 SHA `d56023f270fd51812b58272141f8903bbd2ca1b437b8565b20ab5d12c7f59cac`。三者与 v1 及预注册一致 |
+| 配置 / 预算 | D0 无路由；D1 bias1.0/阈值0.5/全层；D2 仅 bias0.5；D3 仅后半层。四臂共享数据次序、处理器、整页输入、prompt、1536 生成上限与 `torch_sdpa_math` 后端。筛查 32页×4臂×2域=256次页面推理；之后按预注册规则比较 D0/D1 及至多一个 D2/D3 候选 |
+| 训练配置 | 冻结权重推理诊断，不训练；可训练参数 0；各 LR、warmup/schedule、总步数、loss 权重、梯度累积均不适用。5 个独立单卡 worker，物理 GPU0–4，page batch1，BF16 backbone/FP32 head，DDP=false。每个推理波次前仅查询 GPU0–4 瞬时 `utilization.gpu`，全卡严格低于 50% 才运行 |
+| 结果 / 日志 | **16:06 已越过 v1 与 v2b 的死亡点**：两域 manifest 均锁定（敦煌/地方志 `region_textline`/`line_regions`，抽样 SHA `82998b19…7cdc8`；MTHv2 `annotation`/`character_boxes`，抽样 SHA `20221a80…b65a9`——两者均与 v1 相同），GPU 准入 `0:0,1:0,2:0,3:0,4:0`，五个 MTHv2 worker 全部越界成功并加载权重，错误扫描为空。CER/I-D-S 与 mask 指标待完成后追加。启动前 GPU0–4 瞬时均为 0%。详见[实验日志](实验日志/GLMOCR/架构收益对照/GLMOCR-line-mask-v3-stage-d-20260923.md) |
+| 协议字段 | `test_manifest_read=false`；`test_used_for_selection=false`；`val_verify` 未锁定、未读取 |
+
+
+## 2026-09-23 敦煌／地方志 GT 行mask bias=1.0 raw GLM-OCR oracle诊断
+
+| 字段 | 内容 |
+| --- | --- |
+| Run / 状态 | glmocr_dunhuang_oracle_gtline_rawglm_b1_20260923；完成，launcher exit 0；追加oracle机制诊断，非独立新test |
+| 分支 / commit | glm-ocr-layout-mask-routing / ea73f182bc7ebe69f7c7386024b3b97bf89e392a |
+| 入口 / 产物 | 外置run_oracle_gt_line.sh；远端 /data3/yky/yangky_ocr_models/glm_ocr_layout_mask_routing/locked_tests/glmocr_dunhuang_oracle_gtline_rawglm_b1_20260923；tmux glmocr_dh_oracle_raw_20260923；无Slurm |
+| 数据 | dunhuang_local_gazetteer_q32_v1全量59页有OCR真值（DH19/LG40、5来源组）；manifest SHA 75003905009b49513843f1396326aebf9b02f81429d655530fdef19707a085b8；source SHA da94dbd7e372e5e206c7c340be881e40f11eabff1b12df26668f9a983e7f782d；seed42。77张无转写图片排除。按字符数×行区域数分层：简单20（DH10/LG10）、中等20（DH9/LG11）、高复杂19（DH0/LG19） |
+| 模型 / 训练 | 原始GLM-OCR revision ca5d8b3e287e52589e37c28385d9655ee4372f9；config SHA 4e1daf0d8a3f63e58960ac14bcb58b7be96758cad231fb7a1e5fec60f42dcd8c；raw weights SHA a16eb0de98d199293371c560f95f83130d2a2c9612449df16839f08ff9498815；无LoRA/adapter/微调checkpoint，可训练参数0。Eval-only，train/val、LR、schedule、步数、batch/accumulation、loss和loss曲线不适用；无checkpoint |
+| 配置 / 组别 | 整页图像+Text Recognition:、fast、4M pixels、1536 tokens、greedy、BF16、math-SDPA、seed42；5单卡worker用物理GPU0–4，按用户要求豁免GPU准入。Baseline关闭路由；oracle仅增加GT行mask+GT转写同步和全部层cached decode bias 1.0；共享页池和等预算 |
+| 结果 | baseline CER 0.1368791828、14,195 chars、I/D/S 519/404/1020；oracle CER 0.1383585770、I/D/S 548/398/1018；差+0.0014794、+21 edits。Exact 0/59；两臂EOS59、触顶0、循环0；mean tokens 298.339/299.220。分域、来源、复杂度和bootstrap见[实验日志](实验日志/GLMOCR/架构收益对照/GLMOCR-dunhuang-oracle-gtline-rawglm-b1-20260923.md) |
+| 诊断 / 完成核验 | bias施加17,466/17,595步，missing box 0，past-GT pointer 129步；IoU/MAE不适用。分片12/12、12/12、12/12、12/12、11/11，完整覆盖无重无漏；5/5加载进度100%；无NaN/Inf、CUDA/OOM、Traceback、NCCL或异常退出 |
+| 协议 / 结论 | test_manifest_read=true；test_used_for_selection=false；测试页历史已暴露且oracle读GT，不可部署。点估计多21 edits，CER差按域分层page-bootstrap 95% CI [-0.0029173,+0.0066933]跨0；仅5来源组。raw baseline与此前protocol标注LoRA的59页重叠预测完全一致，作为核查观察，不推断相同权重 |
+| 归档 | D:\yangky\glm-ocr-assets\dunhuang-new77-20260923\oracle-gtline-rawglm-b1；无后续昂贵任务自动启动 |
+
+详细协议、模型加载说明、结果表、有限性及哈希均见上述实验日志。
+
+
+## 2026-09-23 敦煌 GT行mask Oracle典型错误注意力可视化（事后诊断）
+
+| 字段 | 内容 |
+| --- | --- |
+| Run / 状态 | `glmocr_dunhuang_gtline_attention_diag_20260923`；完成，launcher exit 0；raw GLM-OCR baseline/GT行框 bias=1.0 Oracle各重放4页，输出8/8逐字匹配归档 |
+| 分支 / 代码 | `glm-ocr-layout-mask-routing` / `ea73f182bc7ebe69f7c7386024b3b97bf89e392a`；沿用正式run不可变快照；只增加外置capture/渲染脚本，不改计划代码 |
+| 数据 / 用途 | 已历史暴露的59页敦煌/地方志test中事后挑选4个错误案例；新manifest SHA `61fdee622074d2b88de5c63287e546ba3fe948a671320173e95739b843cdf4c2`；test_manifest_read=true，test_used_for_selection=false；仅解释性可视化，不独立评测、不用于参数/权重选择 |
+| 权重 / 配置 | raw GLM-OCR revision `ca5d8b3e287e52589e37c28385d9655ee4372f9d`，无LoRA/微调；整页、4M pixels、1536 tokens、greedy、BF16、SDPA math、seed42；baseline无路由，Oracle GT line + synced pointer + bias1.0；物理GPU0单卡推理，不训练 |
+| 结果 | 全59页原run baseline CER `0.1368791828`/1,943 edits，Oracle `0.1383585770`/1,964 edits（+21）；本诊断4页的最终层注意力、GT框内质量及视觉总量见[实验日志](实验日志/GLMOCR/架构收益对照/GLMOCR-dunhuang-gtline-attention-diag-20260923.md)。热图均finite、行框patch栅格一致；错误日志扫描空 |
+| 归档 | 四页原图、NPZ、摘要和可视化位于 `D:/yangky/glm-ocr-assets/dunhuang-new77-20260923/oracle-gtline-rawglm-b1/attention-diagnostic-20260923` |
+
+
+## 2026-09-23 GT强制前缀同状态行mask注意力机制复核
+
+| 字段 | 内容 |
+| --- | --- |
+| Run / 状态 | v1 glmocr_dunhuang_gtline_sameprefix_mechanism_20260923 诊断器失败（2/4 案例后，非模型/GPU故障）；修订 v2 glmocr_dunhuang_gtline_sameprefix_mechanism_v2_20260923 完成（4/4，launcher exit 0） |
+| 分支 / 代码 | glm-ocr-layout-mask-routing / ea73f182bc7ebe69f7c7386024b3b97bf89e392a；代码来自不可变 line_mask_20260922_v4/ocrmodel 快照，未修改项目源码或计划；v2 capture SHA256 4b0dd34aed859b5b76524a3670a9d022642b3f53a1261b75c112ca07f57521c3 |
+| 入口 / 产物 | 外置 GT-forced same-prefix 脚本；远端 /data3/yky/yangky_ocr_models/glm_ocr_layout_mask_routing/diagnostics/glmocr_dunhuang_gtline_sameprefix_mechanism_v2_20260923；物理 GPU0 单卡、batch1、DDP=false；无 Slurm/tmux |
+| 数据 / 用途 | 已历史暴露的 dunhuang_local_gazetteer_q32_v1 test 59页中，按四种典型插入/替换/删除错误展示用例事后抽取4页，manifest SHA256 61fdee622074d2b88de5c63287e546ba3fe948a671320173e95739b843cdf4c2；seed42。小样本机制说明，不代表总体评测。test_manifest_read=true；test_used_for_selection=false |
+| 模型 / 训练 | 原始 GLM-OCR revision ca5d8b3e287e52589e37c28385d9655ee4372f9d，无微调/LoRA；冻结权重诊断，可训练参数0。学习率、warmup/schedule、步数、batch/累积、loss不适用 |
+| 配置 / 核验 | 全页、4M pixels、Text Recognition prompt、BF16/SDPA。GT前缀强制到目标 token，仅该 query 将 bias=1.0 注入GT行，其他query为0；同一层Q/K下比较bias移除与加入后的概率，16层×4例。4/4 mask匹配GT bbox patch-center栅格化及先前Oracle capture；attention finite，无NaN/Inf/OOM/Traceback/NCCL/CUDA错误 |
+| 结果 / 边界 | 四例行内总注意力质量均增加（22.13→35.91%、10.72→21.02%、3.84→9.37%、1.55→4.01%）；各层各head的行/其他key odds乘数与exp(1)吻合，最大相对误差9.56e-6。无CER或目标token-logit结论；该机制结果不能推翻59页自由生成CER Oracle劣于baseline的结论 |
+| 详细记录 / 归档 | [实验日志](实验日志/GLMOCR/架构收益对照/GLMOCR-dunhuang-gt-sameprefix-attention-mechanism-20260923.md)；全量脚本、JSON、CSV与PNG位于 D:/yangky/glm-ocr-assets/dunhuang-new77-20260923/oracle-gtline-rawglm-b1/attention-diagnostic-20260923/gt-forced-mechanism/v2 |
+
